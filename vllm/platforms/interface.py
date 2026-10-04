@@ -1155,7 +1155,7 @@ class Platform:
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
         """Verify whether the quantization is supported by the current platform."""
-        if quant == "exl3" and not cls.is_cuda():
+        if quant == "exl3" and cls._enum != PlatformEnum.CUDA:
             raise ValueError("EXL3 execution requires the NVIDIA CUDA platform")
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
