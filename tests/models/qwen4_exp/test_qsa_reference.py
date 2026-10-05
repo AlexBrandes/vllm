@@ -922,6 +922,50 @@ def test_qsa_prefill_selection_correctness(
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize("block_topk", [3, 512])
+def test_qsa_sorted_selection_preserves_packed_expansion(block_topk: int) -> None:
+    """Sorted padded/strided selections keep the causal tail and count ABI."""
+    storage = torch.full(
+        (5, 2 * block_topk + 3), -99, device="cuda", dtype=torch.int32
+    )
+    blocks = storage[1:4, 1 : 2 * block_topk + 1 : 2]
+    blocks.fill_(-1)
+    blocks[1, 0], blocks[1, -1] = 1, 0
+    blocks[2] = torch.arange(block_topk - 1, -1, -1, device="cuda") + 3
+    expected_blocks = torch.full_like(blocks, -1)
+    expected_blocks[1, :2] = torch.arange(2, device="cuda")
+    expected_blocks[2] = torch.arange(block_topk, device="cuda") + 3
+    expected_storage = storage.clone()
+    expected_storage[1:4, 1 : 2 * block_topk + 1 : 2] = expected_blocks
+
+    qsa_indexer_ops._sort_qsa_selected_indices_(blocks)
+
+    torch.testing.assert_close(storage, expected_storage)
+    positions = torch.tensor([2, 10, 4 * (block_topk + 5) + 2], device="cuda")
+    visible_blocks = ((positions + 1) // 4).to(torch.int32)
+    token_topk = 4 * block_topk
+    packed_width = token_topk + 4
+    packed_storage = torch.full(
+        (5, 2 * packed_width + 3), -99, device="cuda", dtype=torch.int32
+    )
+    packed = packed_storage[1:4, 1 : 2 * packed_width + 1 : 2]
+    expected_packed_storage = packed_storage.clone()
+    expected = _expand_qsa_indices_reference(
+        expected_blocks, positions, positions + 1, 4, token_topk
+    )
+    counts = torch.tensor([3, 11, token_topk + 3], device="cuda")
+    expected_packed_storage[1:4, 1 : 2 * packed_width + 1 : 2] = torch.cat(
+        (expected, counts[:, None]), dim=1
+    )
+
+    qsa_indexer_ops.expand_qsa_block_indices(
+        blocks, positions, visible_blocks, 4, token_topk, packed
+    )
+
+    torch.testing.assert_close(packed_storage, expected_packed_storage)
+
+
+@requires_qsa_kernels
 def test_qsa_block_expansion_correctness() -> None:
     blocks = torch.tensor([[0, -1], [1, 0]], device="cuda", dtype=torch.int32)
     query_positions = torch.tensor([5, 10], device="cuda")

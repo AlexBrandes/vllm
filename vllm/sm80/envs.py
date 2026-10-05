@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_EXL3: bool = False
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
+    VLLM_QWEN_QSA_TOPK_SORTED: bool = True
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -661,6 +662,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
         "VLLM_EXL3_PLE_PLACEMENT", "ssd", ["ssd", "ram", "device"]
     )(),
+    # Order Qwen QSA's native-selected blocks before expansion/attention.
+    # Set 0 to retain native traversal order without changing selection.
+    "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(
+        int(os.getenv("VLLM_QWEN_QSA_TOPK_SORTED", "1"))
+    ),
 }
 
 
