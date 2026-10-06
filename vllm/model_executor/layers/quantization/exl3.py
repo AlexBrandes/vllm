@@ -3,6 +3,7 @@
 """EXL3 packed linear and whole-expert inference with BF16 activations."""
 
 import re
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,6 +33,19 @@ from vllm.model_executor.layers.quantization.exl3_utils import (
     aligned_shard,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+
+@cache
+def _require_sm80() -> None:
+    """The extension is built for SM 8.0 only; refuse other GPUs up front."""
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    if capability is not None and capability.to_int() != 80:
+        raise ValueError(
+            "EXL3 kernels are built for SM 8.0 only; this GPU is SM "
+            f"{capability.major}.{capability.minor}"
+        )
 
 
 class Exl3Config(QuantizationConfig):
@@ -149,6 +163,7 @@ class Exl3Config(QuantizationConfig):
         return found
 
     def get_quant_method(self, layer: nn.Module, prefix: str):
+        _require_sm80()
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(self, prefix, layer.moe_config)
         if isinstance(layer, (LinearBase, ParallelLMHead)):
