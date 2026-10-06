@@ -80,7 +80,6 @@ void linear_out(const torch::Tensor& x, const torch::Tensor& trellis,
   check_tensor(svh, x, at::kHalf, "svh");
   check_tensor(out, x, at::kBFloat16, "out");
   check_tensor(workspace, x, at::kFloat, "workspace");
-  TORCH_CHECK(valid_format(bits_x2, codebook), "Unsupported EXL3 rate/codebook combination");
   TORCH_CHECK(x.dim() == 2 && trellis.dim() == 3 && suh.dim() == 1 &&
                   svh.dim() == 1 && out.dim() == 2,
               "EXL3 linear requires rank-2 x/out, rank-3 trellis and rank-1 scales");

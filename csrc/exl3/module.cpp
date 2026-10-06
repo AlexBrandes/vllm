@@ -13,18 +13,12 @@ TORCH_LIBRARY(_exl3_C, m) {
   m.def("ple_decode_out(Tensor packed_rows, Tensor global_ids, Tensor head_bias, "
         "Tensor head_offsets, Tensor head_vocab_sizes, int owner_lo, "
         "int owner_hi, int bits, Tensor(a!) out) -> ()");
-  m.def("validate_moe_tables(Tensor packed_ptrs, Tensor packed_meta, "
-        "int hidden_size, int intermediate_size) -> ()");
   // No tensor arguments: these are catch-all CPU arithmetic functions, not
   // CUDA-dispatched ops, and never inspect a device or initialize CUDA.
   m.def("linear_workspace_size(int max_rows, int padded_in, int padded_out) -> int",
         &exl3::linear_workspace_size);
   m.def("moe_workspace_size(int max_rows, int hidden_size, int intermediate_size, "
         "int topk, int local_experts) -> int", &exl3::moe_workspace_size);
-}
-
-TORCH_LIBRARY_IMPL(_exl3_C, CPU, m) {
-  m.impl("validate_moe_tables", &exl3::validate_moe_tables);
 }
 
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {

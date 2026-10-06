@@ -98,18 +98,6 @@ def moe_workspace_size(
     )
 
 
-def validate_moe_tables(
-    packed_ptrs: torch.Tensor,
-    packed_meta: torch.Tensor,
-    hidden_size: int,
-    intermediate_size: int,
-) -> None:
-    ensure_extension()
-    torch.ops._exl3_C.validate_moe_tables(
-        packed_ptrs, packed_meta, hidden_size, intermediate_size
-    )
-
-
 def linear_out(
     x,
     trellis,

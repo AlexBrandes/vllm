@@ -454,13 +454,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             pointers.append(ptrs)
             metadata.append(meta)
         device = layer.exl3_experts[0][0].trellis.device
-        pointers = torch.tensor(pointers, dtype=torch.int64, device="cpu")
-        metadata = torch.tensor(metadata, dtype=torch.int64, device="cpu")
-        exl3_ops.validate_moe_tables(
-            pointers, metadata, self.hidden_size, self.intermediate_size
+        layer.register_buffer(
+            "exl3_ptrs", torch.tensor(pointers, dtype=torch.int64, device=device)
         )
-        layer.register_buffer("exl3_ptrs", pointers.to(device))
-        layer.register_buffer("exl3_meta", metadata.to(device))
+        layer.register_buffer(
+            "exl3_meta", torch.tensor(metadata, dtype=torch.int64, device=device)
+        )
         if layer.expert_map is None:
             layer.register_buffer(
                 "exl3_expert_map",

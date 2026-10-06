@@ -35,11 +35,6 @@ inline void check_padded(int64_t n) {
                   n <= std::numeric_limits<int>::max(),
               "EXL3 padded dimensions must be positive H128 multiples fitting int32");
 }
-inline bool valid_format(int64_t bits_x2, int64_t codebook) {
-  return (codebook == 1 || codebook == 2) &&
-         ((bits_x2 >= 2 && bits_x2 <= 16 && bits_x2 % 2 == 0) ||
-          (codebook == 2 && (bits_x2 == 3 || bits_x2 == 5 || bits_x2 == 7)));
-}
 inline void check_tensor(const torch::Tensor& t, const torch::Tensor& x,
                          at::ScalarType dtype, const char* name) {
   TORCH_CHECK(t.is_cuda() && t.device() == x.device(), name,

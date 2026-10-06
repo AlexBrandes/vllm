@@ -149,49 +149,6 @@ __global__ void combine_routes(const float* down, const float* weights,
 
 }  // namespace
 
-// Setup-only CPU validation. The loader validates these construction tables
-// before copying them to CUDA; pointed tensors and immutable table ownership
-// remain with the caller. This function never initializes or queries CUDA.
-void validate_moe_tables(const torch::Tensor& packed_ptrs,
-                         const torch::Tensor& packed_meta,
-                         int64_t hidden_size, int64_t intermediate_size) {
-  TORCH_CHECK(packed_ptrs.device().is_cpu() && packed_meta.device().is_cpu(),
-              "EXL3 setup pointer/metadata tables must be CPU tensors");
-  TORCH_CHECK(packed_ptrs.scalar_type() == at::kLong &&
-                  packed_meta.scalar_type() == at::kLong &&
-                  packed_ptrs.is_contiguous() && packed_meta.is_contiguous(),
-              "EXL3 setup tables must be contiguous int64 tensors");
-  TORCH_CHECK(packed_ptrs.dim() == 3 && packed_meta.dim() == 3 &&
-                  packed_ptrs.size(1) == 3 && packed_ptrs.size(2) == 3 &&
-                  packed_meta.size(0) == packed_ptrs.size(0) &&
-                  packed_meta.size(1) == 3 && packed_meta.size(2) == 4,
-              "EXL3 setup pointer/metadata geometry mismatch");
-  const int64_t hpad = padded_size(hidden_size);
-  const int64_t ipad = padded_size(intermediate_size);
-  const int64_t* pointers = packed_ptrs.data_ptr<int64_t>();
-  const int64_t* metadata = packed_meta.data_ptr<int64_t>();
-  for (int64_t expert = 0; expert < packed_ptrs.size(0); ++expert) {
-    for (int projection = 0; projection < 3; ++projection) {
-      const int64_t* ptrs = pointers + expert * 9 + projection * 3;
-      const int64_t* meta = metadata + expert * 12 + projection * 4;
-      check_padded(meta[0]);
-      check_padded(meta[1]);
-      TORCH_CHECK(meta[0] >= (projection == 2 ? ipad : hpad) &&
-                      meta[1] >= (projection == 2 ? hpad : ipad),
-                  "EXL3 expert packed geometry is smaller than logical geometry");
-      TORCH_CHECK(valid_format(meta[2], meta[3]),
-                  "Unsupported EXL3 expert rate/codebook combination");
-      // Checked multiplication after positive-dimension validation: no
-      // division by untrusted metadata, including on error paths.
-      checked_mul(checked_mul(meta[0] / 16, meta[1] / 16),
-                  checked_mul(16, meta[2]));
-      TORCH_CHECK(ptrs[0] > 0 && ptrs[1] > 0 && ptrs[2] > 0 &&
-                      ptrs[0] % 2 == 0 && ptrs[1] % 2 == 0 && ptrs[2] % 2 == 0,
-                  "EXL3 expert pointers must be nonnull and 2-byte aligned");
-    }
-  }
-}
-
 int64_t moe_workspace_size(int64_t max_rows, int64_t hidden_size,
                            int64_t intermediate_size, int64_t topk,
                            int64_t local_experts) {
