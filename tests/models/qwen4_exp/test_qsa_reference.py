@@ -1035,6 +1035,8 @@ def test_qsa_native_topk_fills_exactly_min_visible_k_leading_slots(
 def test_qsa_sort_kill_switch_keeps_native_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The native top-k order is not repeatable between calls (the reason for
+    # the sort), so compare membership and whether the sort ran.
     logits, lengths = _native_topk_case(4096)
     shape = (logits.shape[0], 512)
     native = torch.full(shape, -7, dtype=torch.int32, device="cuda")
@@ -1042,17 +1044,32 @@ def test_qsa_sort_kill_switch_keeps_native_order(
     torch.ops._C.persistent_topk(
         logits, lengths, native, workspace, 512, logits.shape[1]
     )
+    sort = qsa_indexer_ops._sort_qsa_selected_indices_
+    calls = []
+
+    def counted_sort(block_indices: torch.Tensor) -> None:
+        calls.append(block_indices.data_ptr())
+        sort(block_indices)
+
+    monkeypatch.setattr(qsa_indexer_ops, "_sort_qsa_selected_indices_", counted_sort)
     outputs = {}
     for flag in (False, True):
         monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_SORTED", flag)
+        calls.clear()
         outputs[flag] = torch.full(shape, -7, dtype=torch.int32, device="cuda")
         qsa_indexer_ops._topk(logits, lengths, 2048, 4, outputs[flag], workspace)
-    assert torch.equal(outputs[False], native)
-    # Ascending with -1 last, as an unsigned key.
-    key = torch.where(native < 0, 2**32 - 1, native.long())
-    assert torch.equal(outputs[True], native.gather(1, key.argsort(dim=1)))
-    # Native order is not already sorted, so the switch is exercised.
-    assert not torch.equal(outputs[True], outputs[False])
+        assert calls == ([outputs[flag].data_ptr()] if flag else [])
+
+    def ordered(blocks: torch.Tensor) -> torch.Tensor:
+        # Ascending with -1 last: the order of the selected ids as uint32.
+        key = torch.where(blocks < 0, 2**32 - 1, blocks.long())
+        return blocks.gather(1, key.argsort(dim=1))
+
+    assert torch.equal(outputs[True], ordered(outputs[True]))
+    # Membership matches a separate native call except on the tied last row,
+    # where any 512 of the equal scores are a valid selection.
+    for output in outputs.values():
+        assert torch.equal(ordered(output)[:-1], ordered(native)[:-1])
 
 
 @requires_qsa_kernels

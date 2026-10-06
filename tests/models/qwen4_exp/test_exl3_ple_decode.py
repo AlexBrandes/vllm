@@ -112,10 +112,11 @@ def _check(packed, ids, bias, offsets, sizes, owner_lo, owner_hi, bits):
     assert torch.equal(out[masked], torch.zeros_like(out[masked]))
     # Bit-exact against FP32 multiply, FP32 add, BF16 round-to-nearest.
     assert torch.equal(out, torch.from_numpy(emulated).to(torch.bfloat16))
-    # Within BF16 rounding plus FP32 step error of the FP64 reference.
+    # Within BF16 rounding (unit roundoff 2^-8: 8 significand bits) of the
+    # FP32 result, whose two steps add at most 2^-24 each.
     got = out.double().numpy()
     terms = np.abs(codebook.astype(np.float64) * scale[:, None]) + np.abs(row_bias)
-    bound = 2.0**-9 * np.abs(reference) + 2.0**-23 * terms + 1e-30
+    bound = 2.0**-8 * np.abs(reference) + 2.0**-22 * terms + 1e-30
     assert np.all(np.abs(got - reference) <= bound)
     return out, valid
 
