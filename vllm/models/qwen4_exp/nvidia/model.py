@@ -730,6 +730,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -975,6 +976,8 @@ class Qwen4ExpForConditionalGeneration(
             raise ValueError(
                 "Qwen4ExpForConditionalGeneration requires multimodal_config"
             )
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            multimodal_config.mm_encoder_tp_mode = "data"
 
         self.config = config
         self.model_config = vllm_config.model_config

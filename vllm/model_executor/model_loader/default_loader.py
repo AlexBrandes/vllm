@@ -44,6 +44,7 @@ from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
@@ -261,6 +262,24 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         return hf_folder, hf_weights_files, use_safetensors, index_file
+
+    def create_model(
+        self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+    ) -> nn.Module:
+        if model_config.quantization == "exl3":
+            from vllm.model_executor.layers.quantization.exl3_ops import (
+                ensure_extension,
+            )
+
+            offload = vllm_config.offload_config
+            if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
+                raise ValueError("EXL3 permits runtime offload only for compressed PLE")
+            if vllm_config.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("EXL3 requires pipeline parallel size one")
+            if vllm_config.lora_config is not None:
+                raise ValueError("EXL3 does not support LoRA")
+            ensure_extension()
+        return super().create_model(vllm_config, model_config, prefix)
 
     def _get_weights_iterator(
         self, source: Source
@@ -488,6 +507,13 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        if model_config.quantization == "exl3":
+            from vllm.model_executor.model_loader.exl3_loader import load_exl3_weights
+
+            self.counter_before_loading_weights = time.perf_counter()
+            load_exl3_weights(model)
+            self.counter_after_loading_weights = time.perf_counter()
+            return
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import logging
+import os
+import struct
+import threading
 from dataclasses import dataclass
 from itertools import accumulate
 from types import SimpleNamespace
@@ -39,6 +43,11 @@ from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.models.qwen4_exp.amd import ple_layer as amd_ple_layer
 from vllm.models.qwen4_exp.amd.ple_layer import (
     Qwen4ExpPLELayer as Qwen4ExpPLELayerAMD,
+)
+from vllm.models.qwen4_exp.common.exl3_ple import (
+    Exl3PLERowReader,
+    Exl3PLESlot,
+    pread_exact_into,
 )
 from vllm.models.qwen4_exp.common.ops.ple import ple_conv
 from vllm.models.qwen4_exp.common.ple import (
@@ -178,6 +187,148 @@ def test_ple_metadata_preserves_request_and_token_order(
     assert metadata.nums_dict is None
     assert metadata.batch_ptr is None
     assert metadata.token_chunk_offset_ptr is None
+
+
+def _packed_ple_file(tmp_path, offset=32):
+    """Small real file with a nonzero tensor offset and one padded row."""
+    rows = [bytes([row + 1]) * 122 for row in range(10)]
+    header = {
+        "__metadata__": {"format": "exl3_ngram_trellis", "version": "1",
+                         "K": "6", "codebook": "mul1", "row_dim": "160",
+                         "rows": "10"},
+        "prefix": {"dtype": "I16", "shape": [offset // 2],
+                   "data_offsets": [0, offset]},
+        "embedding.trellis": {"dtype": "I16", "shape": [10, 61],
+                              "data_offsets": [offset, offset + 1220]},
+    }
+    raw = json.dumps(header).encode()
+    path = tmp_path / "packed.safetensors"
+    with path.open("wb") as file:
+        file.write(struct.pack("<Q", len(raw)))
+        file.write(raw)
+        file.seek(8 + len(raw) + offset)
+        file.write(b"".join(rows))
+    return path, rows, 8 + len(raw) + offset
+
+
+@pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
+def test_exl3_ple_positional_rows_preserve_order_and_masks(tmp_path, offset):
+    path, rows, base = _packed_ple_file(tmp_path, offset)
+    reader = Exl3PLERowReader(str(path), "embedding.trellis", 4, 10)
+    try:
+        reader.set_layout([0, 5], [5, 4])
+        ids = [8, 4, 5, 4, 9, -1, 3, 10]
+        target = bytearray(len(ids) * 122)
+        reader.read_rows(ids, memoryview(target))
+        assert reader.base == base
+        assert target == b"".join(rows[i] if i in (4, 5, 8) else bytes(122)
+                                  for i in ids)
+        assert os.lseek(reader.fd, 0, os.SEEK_CUR) == 0
+    finally:
+        reader.close()
+
+
+def test_exl3_ple_read_retries_interruptions_and_partial_reads(tmp_path, monkeypatch):
+    path, rows, _ = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
+    reader.set_layout([0], [9])
+    real_preadv = os.preadv
+    attempts = 0
+
+    def interrupted_read(fd, buffers, offset):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise InterruptedError()
+        return real_preadv(fd, [buffers[0][:7]], offset)
+
+    monkeypatch.setattr(os, "preadv", interrupted_read)
+    try:
+        target = bytearray(244)
+        reader.read_rows([8, 1], memoryview(target))
+        assert target == rows[8] + rows[1]
+    finally:
+        reader.close()
+
+
+def test_exl3_ple_truncation_after_open_is_an_error(tmp_path):
+    path, _, base = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
+    reader.set_layout([0], [9])
+    try:
+        os.truncate(path, base + 8 * 122 + 10)
+        with pytest.raises(EOFError, match="Truncated PLE"):
+            reader.read_rows([8], memoryview(bytearray(122)))
+    finally:
+        reader.close()
+    with pytest.raises(ValueError, match="outside file"):
+        Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
+
+
+def test_exl3_ple_rejects_invalid_ranges_and_destinations(tmp_path):
+    path, _, _ = _packed_ple_file(tmp_path)
+    with pytest.raises(ValueError, match="owner range"):
+        Exl3PLERowReader(str(path), "embedding.trellis", 0, 11)
+    reader = Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
+    try:
+        with pytest.raises(ValueError, match="contiguous"):
+            reader.set_layout([0, 6], [5, 3])
+        reader.set_layout([0], [9])
+        with pytest.raises(ValueError, match="destination"):
+            reader.read_rows([1, 2], memoryview(bytearray(122)))
+        with pytest.raises(ValueError, match="64-bit"):
+            pread_exact_into(reader.fd, memoryview(bytearray(1)), (1 << 63) - 1)
+    finally:
+        reader.close()
+
+
+def test_exl3_ple_slot_waits_for_copy_before_reuse():
+    """A released lease still waits for the asynchronous output copy."""
+    class Completion:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.done = threading.Event()
+
+        def synchronize(self):
+            self.entered.set()
+            if not self.done.wait(5):
+                raise TimeoutError("test copy did not complete")
+
+    completion = Completion()
+    completion.done.set()
+    slot = Exl3PLESlot(8, completion)
+    with pytest.raises(ValueError, match="capacity"):
+        slot.acquire(9)
+    slot.acquire(8)
+    with pytest.raises(RuntimeError, match="reading"):
+        slot.acquire(1)
+    with pytest.raises(RuntimeError, match="no matching"):
+        slot.release()
+    slot.ready()
+    with pytest.raises(RuntimeError, match="ready"):
+        slot.acquire(1)
+    completion.done.clear()
+    completion.entered.clear()
+    slot.release()
+    acquired = threading.Event()
+
+    def reuse():
+        slot.acquire(1)
+        acquired.set()
+
+    worker = threading.Thread(target=reuse)
+    worker.start()
+    try:
+        assert completion.entered.wait(2)
+        assert not acquired.is_set()
+        with pytest.raises(RuntimeError, match="waiting"):
+            slot.acquire(1)
+    finally:
+        completion.done.set()
+        worker.join(5)
+    assert acquired.is_set()
+    slot.ready()
+    slot.release()
 
 
 def _mock_etp_group(

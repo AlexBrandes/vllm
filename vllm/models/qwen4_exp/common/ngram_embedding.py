@@ -183,6 +183,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            from .exl3_ple import Exl3PLEEmbeddingMethod
+
+            return Exl3PLEEmbeddingMethod(quant_config)
         if embedding_dtype == "nvfp4":
             return Qwen4ExpPLENvFp4EmbeddingMethod()
         if embedding_dtype == "float8_e4m3fn":

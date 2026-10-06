@@ -158,6 +158,10 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+        if draft_quant_config.get_name() == "exl3":
+            setattr(  # noqa: B010
+                draft_quant_config, "mtp_start_layer_idx", mtp_start_layer_idx
+            )
 
     draft_vllm_config = replace(
         vllm_config,
@@ -192,7 +196,16 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        share_exl3_embeddings = (
+            vllm_config.quant_config is not None
+            and vllm_config.quant_config.get_name() == "exl3"
+            and not getattr(config, "mtp_use_dedicated_embeddings", False)
+        )
+        self.embed_tokens = (
+            PPMissingLayer()
+            if share_exl3_embeddings
+            else VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        )
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
@@ -422,13 +435,28 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
-        if get_pp_group().is_last_rank:
+        share_exl3_embeddings = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "exl3"
+            and not getattr(config, "mtp_use_dedicated_embeddings", False)
+        )
+        if share_exl3_embeddings:
+            self.lm_head = PPMissingLayer()
+            manifest = getattr(self.quant_config, "manifest", None)
+            if manifest is None:
+                raise ValueError("EXL3 MTP requires a checkpoint manifest")
+            self.exl3_shared_source_keys = {
+                name for name in manifest.tensors
+                if name.startswith(("lm_head.", "model.language_model.embed_tokens."))
+            }
+        elif get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

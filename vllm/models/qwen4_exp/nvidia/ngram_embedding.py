@@ -219,6 +219,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            from ..common.exl3_ple import Exl3PLEEmbedding
+
+            embedding_cls = Exl3PLEEmbedding
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
@@ -253,6 +257,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             weight.dtype,
             weight.device,
             weight.is_pinned(),
+        )
+
+    def setup_exl3_file(self, path: str, key: str) -> set[str]:
+        """Join a file-backed manifest entry and consume its small auxiliaries."""
+        from ..common.exl3_ple import Exl3PLEEmbedding
+
+        if not isinstance(self.ngram_embedding, Exl3PLEEmbedding):
+            raise TypeError("File-backed PLE setup requires EXL3 quantization")
+        return self.ngram_embedding.setup_file(
+            path, key, self.ngram_heads_offsets, self.ngram_heads_vocab_sizes,
+            self.layer_multipliers,
         )
 
     @staticmethod

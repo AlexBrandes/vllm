@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
+    VLLM_EXL3: bool = False
+    VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -654,6 +656,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_THIN_GEMM_CONCAT": lambda: bool(
         int(os.getenv("VLLM_THIN_GEMM_CONCAT", "0"))
     ),
+    # Qwen EXL3 checkpoints (vllm/model_executor/layers/quantization/exl3.py).
+    "VLLM_EXL3": lambda: bool(int(os.getenv("VLLM_EXL3", "0"))),
+    "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
+        "VLLM_EXL3_PLE_PLACEMENT", "ssd", ["ssd", "ram", "device"]
+    )(),
 }
 
 

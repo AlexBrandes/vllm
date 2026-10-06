@@ -1,0 +1,307 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU-only EXL3 header inventory and packed shard validation."""
+
+import json
+import math
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+
+_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "F32": 4,
+    "I64": 8,
+    "F64": 8,
+}
+_MARKERS = {"mcg": (1, 0xCBAC1FED), "mul1": (2, 0x83DCD12D)}
+PLE_AUXILIARIES = (
+    "head_bias",
+    "head_offsets",
+    "head_vocab_sizes",
+    "layer_multipliers",
+)
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+@dataclass(frozen=True)
+class TensorHeader:
+    name: str
+    path: Path
+    dtype: str
+    shape: tuple[int, ...]
+    data_start: int
+    data_offsets: tuple[int, int]
+
+    @property
+    def offset(self) -> int:
+        return self.data_start + self.data_offsets[0]
+
+    @property
+    def nbytes(self) -> int:
+        return self.data_offsets[1] - self.data_offsets[0]
+
+    def read_bytes(self) -> bytes:
+        with self.path.open("rb") as file:
+            file.seek(self.offset)
+            data = file.read(self.nbytes)
+        if len(data) != self.nbytes:
+            raise ValueError(f"Truncated EXL3 tensor: {self.name}")
+        return data
+
+
+def read_headers(path: Path) -> dict[str, TensorHeader]:
+    size = path.stat().st_size
+    with path.open("rb") as file:
+        prefix = file.read(8)
+        if len(prefix) != 8:
+            raise ValueError(f"Truncated safetensors header: {path.name}")
+        length = struct.unpack("<Q", prefix)[0]
+        if length > min(size - 8, 100_000_000):
+            raise ValueError(f"Invalid safetensors header size: {path.name}")
+        header = json.loads(file.read(length), object_pairs_hook=_unique_object)
+    start = 8 + length
+    tensors = {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        dtype, shape, offsets = (entry["dtype"], entry["shape"], entry["data_offsets"])
+        if dtype not in _DTYPE_BYTES or any(type(d) is not int or d < 0 for d in shape):
+            raise ValueError(f"Invalid dtype/shape: {name}")
+        if (
+            len(offsets) != 2
+            or any(type(x) is not int for x in offsets)
+            or not 0 <= offsets[0] <= offsets[1] <= size - start
+            or offsets[1] - offsets[0] != math.prod(shape) * _DTYPE_BYTES[dtype]
+            or start + offsets[1] >= 2**63
+        ):
+            raise ValueError(f"Invalid tensor extent: {name}")
+        tensors[name] = TensorHeader(
+            name, path, dtype, tuple(shape), start, tuple(offsets)
+        )
+    end = 0
+    for tensor in sorted(tensors.values(), key=lambda t: t.data_offsets):
+        if tensor.data_offsets[0] != end:
+            raise ValueError(f"Overlapping or noncontiguous extent: {tensor.name}")
+        end = tensor.data_offsets[1]
+    if start + end != size:
+        raise ValueError(f"Unaccounted safetensors payload: {path.name}")
+    return tensors
+
+
+@dataclass(frozen=True)
+class PackedMatrix:
+    prefix: str
+    padded_in: int
+    padded_out: int
+    bits_x2: int
+    codebook: int
+    marker: str
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(
+            f"{self.prefix}.{suffix}"
+            for suffix in ("trellis", "suh", "svh", self.marker)
+        )
+
+    def validate_logical(self, logical_in: int, logical_out: int) -> None:
+        if (logical_in + 127) // 128 * 128 != self.padded_in or (
+            logical_out + 127
+        ) // 128 * 128 != self.padded_out:
+            raise ValueError(f"EXL3 logical/padded geometry mismatch: {self.prefix}")
+
+
+def aligned_shard(logical: int, padded: int, rank: int, size: int) -> slice:
+    if size <= 0 or not 0 <= rank < size:
+        raise ValueError("Invalid EXL3 shard rank/size")
+    if size == 1:
+        return slice(0, padded)
+    if logical != padded or logical % size or (logical // size) % 128:
+        raise ValueError(
+            f"EXL3 TP cuts must preserve H128 blocks: {logical=} {padded=} {size=}"
+        )
+    width = logical // size
+    return slice(rank * width, (rank + 1) * width)
+
+
+class Exl3Manifest:
+    def __init__(self, directory: str | Path, *, require_qwen_aux: bool = False):
+        self.directory = Path(directory)
+        self.tensors: dict[str, TensorHeader] = {}
+        self.matrices: dict[str, PackedMatrix] = {}
+        self.unused: dict[str, str] = {}
+        paths = sorted(self.directory.glob("*.safetensors"))
+        if not paths:
+            raise ValueError("EXL3 requires local safetensors checkpoint files")
+        if require_qwen_aux:
+            for name in (
+                "ngram_embedding.safetensors",
+                "mtp_hyper_connection_mixer_patch.safetensors",
+            ):
+                if self.directory / name not in paths:
+                    raise ValueError(f"Missing required EXL3 auxiliary file: {name}")
+        for path in paths:
+            for name, tensor in read_headers(path).items():
+                if name in self.tensors:
+                    raise ValueError(f"Duplicate EXL3 source tensor: {name}")
+                self.tensors[name] = tensor
+        self.tensors = dict(sorted(self.tensors.items()))
+        index = self.directory / "model.safetensors.index.json"
+        if index.exists():
+            entries = json.loads(index.read_text(), object_pairs_hook=_unique_object)[
+                "weight_map"
+            ]
+            for name, filename in entries.items():
+                tensor = self.tensors.get(name)
+                if tensor is None or tensor.path.name != filename:
+                    raise ValueError(f"EXL3 index/header conflict: {name}")
+        self.ple_tables = {}
+        for name, tensor in self.tensors.items():
+            if not name.endswith(".trellis"):
+                continue
+            prefix = name.removesuffix(".trellis")
+            if prefix.endswith(".ngram_embedding"):
+                self._validate_ple(prefix, tensor)
+                self.ple_tables[prefix] = tensor
+                continue
+            self.matrices[prefix] = self._matrix(prefix, tensor)
+        packed_keys = {k for matrix in self.matrices.values() for k in matrix.keys}
+        for name in self.tensors:
+            if name.endswith((".suh", ".svh", ".mcg", ".mul1")):
+                if name not in packed_keys:
+                    raise ValueError(f"Orphan EXL3 quantization tensor: {name}")
+            if (
+                name.startswith(("model.visual.blocks.", "visual.blocks."))
+                and ".attn.qkv." in name
+                and name.endswith((".weight", ".bias"))
+            ):
+                root, suffix = name.rsplit(".qkv.", 1)
+                if all(
+                    f"{root}.{part}_proj" in self.matrices for part in ("q", "k", "v")
+                ):
+                    if suffix == "bias" and not all(
+                        f"{root}.{part}_proj.bias" in self.tensors
+                        for part in ("q", "k", "v")
+                    ):
+                        raise ValueError(
+                            f"Missing independent vision QKV biases: {root}"
+                        )
+                    self.unused[name] = "redundant fused vision QKV"
+        if require_qwen_aux:
+            patch = "mtp_hyper_connection_mixer_patch.safetensors"
+            down = self.tensors.get(
+                "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
+            )
+            if down is None or len(down.shape) != 2 or min(down.shape) <= 0:
+                raise ValueError("Invalid EXL3 MTP mixer down projection")
+            rank, hidden = down.shape
+            expected = {
+                "mtp.hyper_connection_mixer.hc_norm.weight": (hidden,),
+                "mtp.hyper_connection_mixer.input_mix_weight_down.weight": (
+                    rank,
+                    hidden,
+                ),
+                "mtp.hyper_connection_mixer.input_mix_weight_up.weight": (hidden, rank),
+            }
+            actual = {k for k, h in self.tensors.items() if h.path.name == patch}
+            if actual != expected.keys():
+                raise ValueError("Unexpected EXL3 MTP mixer patch keys")
+            for name, shape in expected.items():
+                self._expect(name, "F16", shape)
+            if not self.ple_tables:
+                raise ValueError("Missing compressed EXL3 PLE table")
+
+    def _expect(self, name: str, dtype: str, shape: tuple[int, ...]):
+        tensor = self.tensors.get(name)
+        if tensor is None or tensor.dtype != dtype or tensor.shape != shape:
+            raise ValueError(f"Missing or incompatible EXL3 tensor: {name}")
+        return tensor
+
+    def _matrix(self, prefix: str, trellis: TensorHeader) -> PackedMatrix:
+        if trellis.dtype != "I16" or len(trellis.shape) != 3:
+            raise ValueError(f"Invalid EXL3 trellis: {prefix}")
+        k, n, stride = trellis.shape
+        k, n = k * 16, n * 16
+        if k <= 0 or n <= 0 or k % 128 or n % 128 or stride % 8:
+            raise ValueError(f"Invalid EXL3 tile geometry: {prefix}")
+        self._expect(f"{prefix}.suh", "F16", (k,))
+        self._expect(f"{prefix}.svh", "F16", (n,))
+        markers = [m for m in _MARKERS if f"{prefix}.{m}" in self.tensors]
+        if len(markers) != 1:
+            raise ValueError(f"Missing/conflicting EXL3 codebook: {prefix}")
+        marker = markers[0]
+        codebook, value = _MARKERS[marker]
+        header = self._expect(f"{prefix}.{marker}", "I32", ())
+        if struct.unpack("<I", header.read_bytes())[0] != value:
+            raise ValueError(f"Unsupported EXL3 codebook multiplier: {prefix}")
+        bits_x2 = stride // 8
+        if not (bits_x2 in range(2, 17, 2) or (codebook == 2 and bits_x2 in (3, 5, 7))):
+            raise ValueError(f"Unsupported EXL3 bitrate/codebook: {prefix}")
+        if f"{prefix}.weight" in self.tensors:
+            raise ValueError(f"Conflicting dense and EXL3 weights: {prefix}")
+        return PackedMatrix(prefix, k, n, bits_x2, codebook, marker)
+
+    def _validate_ple(self, prefix: str, tensor: TensorHeader):
+        if tensor.dtype != "I16" or len(tensor.shape) != 2:
+            raise ValueError(f"Invalid compressed PLE table: {prefix}")
+        bias = self.tensors.get(f"{prefix}.head_bias")
+        if bias is None or bias.dtype != "F16" or len(bias.shape) != 2:
+            raise ValueError(f"Invalid compressed PLE bias: {prefix}")
+        heads, dim = bias.shape
+        if dim != 160 or tensor.shape[1] != 61:
+            raise ValueError("EXL3 PLE requires 160 channels and six-bit rows")
+        offsets = self._expect(f"{prefix}.head_offsets", "I64", (heads,))
+        sizes = self._expect(f"{prefix}.head_vocab_sizes", "I64", (heads,))
+        multipliers = self.tensors.get(f"{prefix}.layer_multipliers")
+        if (
+            multipliers is None
+            or multipliers.dtype != "I64"
+            or len(multipliers.shape) != 1
+        ):
+            raise ValueError(f"Invalid compressed PLE multipliers: {prefix}")
+        offsets = struct.unpack(f"<{heads}q", offsets.read_bytes())
+        sizes = struct.unpack(f"<{heads}q", sizes.read_bytes())
+        end = 0
+        for offset, size in zip(offsets, sizes):
+            if offset != end or size <= 0:
+                raise ValueError(f"Invalid compressed PLE head range: {prefix}")
+            end += size
+        if end > tensor.shape[0] or tensor.shape[0] - end >= 128:
+            raise ValueError(f"Invalid compressed PLE padding: {prefix}")
+
+
+class Exl3LoadLedger:
+    def __init__(self, manifest: Exl3Manifest):
+        self.manifest = manifest
+        self.entries: dict[str, tuple[str, str]] = {}
+        for name, reason in manifest.unused.items():
+            self.mark(name, "unused", reason)
+
+    def mark(self, name: str, disposition: str, owner: str):
+        if name not in self.manifest.tensors:
+            raise ValueError(f"Unknown EXL3 source: {name}")
+        if name in self.entries:
+            raise ValueError(f"EXL3 source consumed more than once: {name}")
+        if disposition not in ("consumed", "file-backed", "unused") or not owner:
+            raise ValueError("Invalid EXL3 ledger disposition")
+        self.entries[name] = disposition, owner
+
+    def finish(self):
+        missing = self.manifest.tensors.keys() - self.entries.keys()
+        if missing:
+            raise ValueError(f"Unaccounted EXL3 sources: {sorted(missing)[:16]}")

@@ -1132,6 +1132,7 @@ class precompiled_wheel_utils:
                             "vllm/_C.abi3.so",
                             "vllm/_C_stable_libtorch.abi3.so",
                             "vllm/_moe_C_stable_libtorch.abi3.so",
+                            "vllm/_exl3_C.abi3.so",
                             "vllm/_qutlass_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
@@ -1562,6 +1563,9 @@ def get_rocm_device_requirements() -> list[str]:
 
 ext_modules = []
 
+if _is_cuda():
+    ext_modules.append(CMakeExtension(name="vllm._exl3_C"))
+
 if BUILD_AMPERE_MARLIN:
     if not _is_cuda():
         raise RuntimeError("VLLM_AMPERE_MARLIN_BUILD=1 requires a CUDA build")
@@ -1650,6 +1654,8 @@ package_data = {
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",
+        "third_party/exl3/LICENSE",
+        "third_party/exl3/NOTICE",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",
