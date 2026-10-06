@@ -52,9 +52,19 @@ struct GemmProblem {
   const int64_t* pointers;   // [local][3 projections][trellis, suh, svh]
   const int64_t* metadata;   // [local][3 projections][padded_in, padded_out, bits_x2, codebook]
   int projection;
+  // MoE gate and up in one launch (x != nullptr; tiny and small shapes): the
+  // activation of projection q for assignment a is H128(x[a / topk] * suh_q),
+  // formed in the block from the BF16 rows; gate results go to c, up to c_up.
+  const __nv_bfloat16* x;
+  int64_t hidden;
+  int64_t topk;
+  float* c_up;
 };
 
 enum class GemmShape { kTiny, kSmall, kMedium, kLarge };
+
+// Whether a shape forms MoE gate/up activations in the block (see x above).
+bool gemm_fuses_input(GemmShape shape);
 
 int gemm_block_rows(GemmShape shape);
 int gemm_block_cols(GemmShape shape);

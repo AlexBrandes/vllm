@@ -358,18 +358,31 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
     problem.pointers = routing.pointers;
     problem.metadata = routing.metadata;
     const auto* bf16_input = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
-    for (int projection = 0; projection < 2; ++projection) {
-      expert_input<<<warp_blocks(assignments * (hpad / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
-          bf16_input, routing, table, hidden, hpad, projection, input);
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
-      problem.a = input;
-      problem.a_stride = hpad;
-      problem.c = projection == 0 ? gate : up;
-      problem.c_stride = ipad;
-      problem.k = static_cast<int>(hpad);
-      problem.n = static_cast<int>(ipad);
-      problem.projection = projection;
-      launch_gemm(problem, shape, max_tiles * (ipad / block_cols), stream);
+    problem.c_stride = ipad;
+    problem.k = static_cast<int>(hpad);
+    problem.n = static_cast<int>(ipad);
+    if (gemm_fuses_input(shape)) {
+      // Few rows: gate and up in one launch, each block forming its rows'
+      // x * suh H128 activations itself.
+      problem.x = bf16_input;
+      problem.hidden = hidden;
+      problem.topk = topk;
+      problem.c = gate;
+      problem.c_up = up;
+      problem.projection = 0;
+      launch_gemm(problem, shape, 2 * max_tiles * (ipad / block_cols), stream);
+      problem.x = nullptr;
+    } else {
+      for (int projection = 0; projection < 2; ++projection) {
+        expert_input<<<warp_blocks(assignments * (hpad / 128)), 32 * kWarpsPerBlock, 0,
+                       stream>>>(bf16_input, routing, table, hidden, hpad, projection, input);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        problem.a = input;
+        problem.a_stride = hpad;
+        problem.c = projection == 0 ? gate : up;
+        problem.projection = projection;
+        launch_gemm(problem, shape, max_tiles * (ipad / block_cols), stream);
+      }
     }
     activate_down_input<<<warp_blocks(assignments * (ipad / 128)), 32 * kWarpsPerBlock, 0,
                           stream>>>(routing, table, intermediate_size, ipad, gate, up);

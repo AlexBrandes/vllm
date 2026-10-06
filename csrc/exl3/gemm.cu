@@ -19,7 +19,7 @@ namespace {
   X(2, 2) X(3, 2) X(4, 2) X(5, 2) X(6, 2) X(7, 2) X(8, 2) X(10, 2) \
   X(12, 2) X(14, 2) X(16, 2)
 
-template <int Threads, int BM, int BN, int BK, int TM, int TN, int MinBlocks>
+template <int Threads, int BM, int BN, int BK, int TM, int TN, int MinBlocks, bool FuseInput>
 struct GemmConfig {
   static constexpr int kThreads = Threads;
   static constexpr int kBM = BM;
@@ -28,6 +28,10 @@ struct GemmConfig {
   static constexpr int kTM = TM;
   static constexpr int kTN = TN;
   static constexpr int kMinBlocks = MinBlocks;
+  // Can form MoE gate/up activations in the block from BF16 rows.
+  static constexpr bool kFuseInput = FuseInput;
+  static constexpr int kWarps = Threads / 32;
+  static constexpr int kRowsPerWarp = (BM + kWarps - 1) / kWarps;
   // Activations are stored k-major; rows are read as float4 when TM >= 4.
   static constexpr int kAStride = TM >= 4 ? BM + 4 : BM + 1;
   // BN + 4 is 4 (mod 16): the eight stores of a decoding warp hit 32 banks.
@@ -48,15 +52,17 @@ struct GemmConfig {
                 "micro-tile widths");
 };
 
-using TinyConfig = GemmConfig<128, 4, 32, 64, 1, 1, 4>;
-using SmallConfig = GemmConfig<128, 16, 32, 32, 4, 1, 4>;
-using MediumConfig = GemmConfig<128, 64, 64, 16, 8, 4, 3>;
-using LargeConfig = GemmConfig<256, 128, 128, 16, 8, 8, 2>;
+using TinyConfig = GemmConfig<128, 4, 32, 64, 1, 1, 4, true>;
+using SmallConfig = GemmConfig<128, 16, 32, 32, 4, 1, 4, true>;
+using MediumConfig = GemmConfig<128, 64, 64, 16, 8, 4, 3, false>;
+using LargeConfig = GemmConfig<256, 128, 128, 16, 8, 8, 2, false>;
 
 template <class Cfg>
 struct GemmSmem {
   float a[2][Cfg::kBK][Cfg::kAStride];
   float w[2][Cfg::kBK][Cfg::kWStride];
+  // One H128 block of formed activations per row (fused MoE gate/up only).
+  float block[Cfg::kFuseInput ? Cfg::kBM : 1][Cfg::kFuseInput ? 128 : 1];
   int row[Cfg::kBM];
 };
 
@@ -92,7 +98,7 @@ __device__ __forceinline__ void load_micro(const float* row, int t, float (&v)[T
 template <int kBitsX2, int kCodebook, class Cfg>
 __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
                                          const uint16_t* trellis, int64_t tiles_n,
-                                         int64_t col0, int rows) {
+                                         int64_t col0, int rows, float* c, const half* suh) {
   using Ring = TileRing<kBitsX2>;
   constexpr int BK = Cfg::kBK;
   constexpr int T = Cfg::kThreads;
@@ -105,6 +111,10 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
 
   uint32_t words[Cfg::kTasksPerThread][Ring::kLoadWords];
   float4 staged[Cfg::kAPerThread];
+  // Fused MoE gate/up: x * suh for this warp's rows of the current H128 block.
+  const bool forms_input = Cfg::kFuseInput && p.x != nullptr;
+  const int warp = tid >> 5;
+  float formed[Cfg::kFuseInput ? Cfg::kRowsPerWarp : 1][4];
 
   auto fetch = [&](int chunk) {
 #pragma unroll
@@ -116,6 +126,27 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
                             tile_col0 + tile_col;
       load_lane_words<kBitsX2>(trellis + index * Ring::kTileHalfwords, window, aligned,
                                words[t]);
+    }
+    if (forms_input) {
+      if constexpr (Cfg::kFuseInput) {
+        // Exactly linear_input's products, one H128 block at a time.
+        if ((chunk & (128 / BK - 1)) == 0) {
+#pragma unroll
+          for (int j = 0; j < Cfg::kRowsPerWarp; ++j) {
+            const int r = warp * Cfg::kRowsPerWarp + j;
+            const int row = r < Cfg::kBM ? s.row[r] : -1;
+            const __nv_bfloat16* xrow = p.x + (row >= 0 ? row / p.topk : 0) * p.hidden;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              const int64_t col = int64_t(chunk) * BK + lane + 32 * i;
+              formed[j][i] = row >= 0 && col < p.hidden
+                                 ? __fmul_rn(__bfloat162float(xrow[col]), __half2float(suh[col]))
+                                 : 0.0f;
+            }
+          }
+        }
+      }
+      return;
     }
 #pragma unroll
     for (int v = 0; v < Cfg::kAPerThread; ++v) {
@@ -133,7 +164,7 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
     }
   };
 
-  auto stash = [&](int buffer) {
+  auto stash = [&](int buffer, int chunk) {
 #pragma unroll
     for (int t = 0; t < Cfg::kTasksPerThread; ++t) {
       const int tile = (tid + t * T) >> 5;
@@ -146,6 +177,31 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
         s.w[buffer][tile_row * 16 + lane_tile_row(lane, j)]
            [tile_col * 16 + lane_tile_col(lane, j)] = value[j];
       }
+    }
+    if (forms_input) {
+      if constexpr (Cfg::kFuseInput) {
+        if ((chunk & (128 / BK - 1)) == 0) {
+          // The previous block's last slice was copied before the barrier
+          // that ended the previous chunk.
+#pragma unroll
+          for (int j = 0; j < Cfg::kRowsPerWarp; ++j) {
+            const int r = warp * Cfg::kRowsPerWarp + j;
+            hadamard128_warp(formed[j], lane);
+            if (r < Cfg::kBM) {
+#pragma unroll
+              for (int i = 0; i < 4; ++i) s.block[r][lane + 32 * i] = formed[j][i];
+            }
+          }
+          __syncthreads();
+        }
+        const int offset = (chunk & (128 / BK - 1)) * BK;
+        for (int index = tid; index < Cfg::kBM * BK; index += T) {
+          const int r = index / BK;
+          const int kk = index % BK;
+          s.a[buffer][kk][r] = s.block[r][offset + kk];
+        }
+      }
+      return;
     }
 #pragma unroll
     for (int v = 0; v < Cfg::kAPerThread; ++v) {
@@ -173,7 +229,7 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
   }
 
   fetch(0);
-  stash(0);
+  stash(0, 0);
   __syncthreads();
   for (int chunk = 0; chunk < chunks; ++chunk) {
     const int buffer = chunk & 1;
@@ -195,7 +251,7 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
         }
       }
     }
-    if (more) stash(buffer ^ 1);
+    if (more) stash(buffer ^ 1, chunk + 1);
     __syncthreads();
   }
 
@@ -204,7 +260,7 @@ __device__ __forceinline__ void run_tile(const GemmProblem& p, GemmSmem<Cfg>& s,
     for (int i = 0; i < Cfg::kTM; ++i) {
       const int r = micro_offset<Cfg::kTM, Cfg::kBM>(tm, i);
       if (r < rows) {
-        float* out = p.c + int64_t(s.row[r]) * p.c_stride + col0;
+        float* out = c + int64_t(s.row[r]) * p.c_stride + col0;
         if constexpr (Cfg::kTN == 1) {
           out[tn] = acc[i][0];
         } else {
@@ -227,12 +283,19 @@ gemm_kernel(GemmProblem p) {
   const int64_t col_tiles = p.n / Cfg::kBN;
   const bool moe = p.route != nullptr;
   const int64_t row_tiles = moe ? p.route[1] : (p.rows + Cfg::kBM - 1) / Cfg::kBM;
-  const int64_t items = row_tiles * col_tiles;
+  // Fused MoE gate/up: items of the gate projection, then of the up one.
+  const int64_t per_projection = row_tiles * col_tiles;
+  const int64_t items = (p.x != nullptr ? 2 : 1) * per_projection;
   const int* sorted = moe ? p.route + RouteLayout::sorted_offset() : nullptr;
   for (int64_t item = blockIdx.x; item < items; item += gridDim.x) {
-    const int64_t row_tile = item / col_tiles;
-    const int64_t col0 = (item % col_tiles) * Cfg::kBN;
+    const bool second = item >= per_projection;
+    const int64_t local_item = second ? item - per_projection : item;
+    const int64_t row_tile = local_item / col_tiles;
+    const int64_t col0 = (local_item % col_tiles) * Cfg::kBN;
+    const int projection = second ? 1 : p.projection;
+    float* c = second ? p.c_up : p.c;
     const uint16_t* trellis = p.trellis;
+    const half* suh = nullptr;
     int64_t tiles_n = p.tiles_n;
     int format = p.format;
     int rows;
@@ -240,9 +303,10 @@ gemm_kernel(GemmProblem p) {
       // Tiles follow the sorted list, so a block never mixes experts.
       const int4 tile = reinterpret_cast<const int4*>(
           p.route + RouteLayout::tiles_offset(p.rows))[row_tile];
-      const int64_t* ptrs = p.pointers + int64_t(tile.x) * 9 + p.projection * 3;
-      const int64_t* meta = p.metadata + int64_t(tile.x) * 12 + p.projection * 4;
+      const int64_t* ptrs = p.pointers + int64_t(tile.x) * 9 + projection * 3;
+      const int64_t* meta = p.metadata + int64_t(tile.x) * 12 + projection * 4;
       trellis = reinterpret_cast<const uint16_t*>(ptrs[0]);
+      suh = reinterpret_cast<const half*>(ptrs[1]);
       tiles_n = meta[1] / 16;
       format = format_key(static_cast<int>(meta[2]), static_cast<int>(meta[3]));
       rows = tile.z;
@@ -259,7 +323,8 @@ gemm_kernel(GemmProblem p) {
     __syncthreads();
     switch (format) {
 #define EXL3_CASE(B, C) \
-      case format_key(B, C): run_tile<B, C, Cfg>(p, s, trellis, tiles_n, col0, rows); break;
+      case format_key(B, C): run_tile<B, C, Cfg>(p, s, trellis, tiles_n, col0, rows, c, suh); \
+        break;
       EXL3_FORMATS(EXL3_CASE)
 #undef EXL3_CASE
       default:
@@ -279,6 +344,16 @@ void launch(const GemmProblem& problem, int64_t max_items, cudaStream_t stream) 
 }
 
 }  // namespace
+
+bool gemm_fuses_input(GemmShape shape) {
+  switch (shape) {
+    case GemmShape::kTiny: return TinyConfig::kFuseInput;
+    case GemmShape::kSmall: return SmallConfig::kFuseInput;
+    case GemmShape::kMedium: return MediumConfig::kFuseInput;
+    case GemmShape::kLarge: return LargeConfig::kFuseInput;
+  }
+  TORCH_CHECK(false, "unknown EXL3 GEMM shape");
+}
 
 int gemm_block_rows(GemmShape shape) {
   switch (shape) {
@@ -391,6 +466,8 @@ void launch_gemm(const GemmProblem& problem, GemmShape shape, int64_t max_items,
   EXL3_FORMATS(EXL3_KNOWN)
 #undef EXL3_KNOWN
   TORCH_CHECK(known, "Unsupported EXL3 rate/codebook combination");
+  TORCH_CHECK(problem.x == nullptr || (problem.route != nullptr && gemm_fuses_input(shape)),
+              "EXL3 fused gate/up needs a MoE problem and a tiny or small shape");
   switch (shape) {
     case GemmShape::kTiny: return launch<TinyConfig>(problem, max_items, stream);
     case GemmShape::kSmall: return launch<SmallConfig>(problem, max_items, stream);
