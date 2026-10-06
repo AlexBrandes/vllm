@@ -10,7 +10,6 @@ import torch
 from torch import nn
 
 from vllm import envs
-from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -308,19 +307,14 @@ class Exl3LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer):
         from vllm.model_executor.layers.quantization import exl3_ops
 
-        config = get_current_vllm_config()
-        max_rows = config.scheduler_config.max_num_batched_tokens
-        self.max_rows = max_rows
-        self.workspace_elements = []
+        self.row_chunks = []
         for weight in layer.exl3_weights:
             if not weight.loaded:
                 raise ValueError(f"Unloaded EXL3 matrix: {weight.matrix.prefix}")
             if not all(p.is_cuda for p in weight.parameters()):
                 raise ValueError("EXL3 packed weights and scales must remain on CUDA")
-            self.workspace_elements.append(
-                exl3_ops.linear_workspace_size(
-                    max_rows, weight.padded_in, weight.padded_out
-                )
+            self.row_chunks.append(
+                exl3_ops.linear_row_chunk(weight.padded_in, weight.padded_out)
             )
 
     def apply(self, layer, x, bias=None):
@@ -335,10 +329,9 @@ class Exl3LinearMethod(LinearMethodBase):
                 weight.matrix.bits_x2,
                 weight.matrix.codebook,
                 weight.logical_out,
-                workspace,
-                self.max_rows,
+                row_chunk,
             )
-            for weight, workspace in zip(layer.exl3_weights, self.workspace_elements)
+            for weight, row_chunk in zip(layer.exl3_weights, self.row_chunks)
         ]
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
         if bias is not None:
@@ -422,12 +415,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.fused_moe.all2all_utils import (
             maybe_make_prepare_finalize,
         )
-        from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import (
-            MoEPrepareAndFinalizeNaiveDPEPModular,
-        )
-        from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
-            MoEPrepareAndFinalizeNoDPEPModular,
-        )
         from vllm.model_executor.layers.quantization import exl3_ops
 
         pointers, metadata = [], []
@@ -476,15 +463,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
             allow_new_interface=True,
         )
-        if not isinstance(
-            prepare,
-            (
-                MoEPrepareAndFinalizeNaiveDPEPModular,
-                MoEPrepareAndFinalizeNoDPEPModular,
-            ),
-        ):
-            raise ValueError("EXL3 EP requires allgather_reducescatter dispatch")
-        max_rows = self.moe.max_num_tokens * self.moe.moe_parallel_config.ep_size
+        max_rows = dispatched_rows(prepare, self.moe)
         workspace = exl3_ops.moe_workspace_size(
             max_rows,
             self.hidden_size,
@@ -624,3 +603,27 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             output,
             workspace2.view(torch.float32),
         )
+
+
+def dispatched_rows(prepare, moe) -> int:
+    """Most rows the experts of one rank receive in one MoE call."""
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import (
+        MoEPrepareAndFinalizeNaiveDPEPModular,
+    )
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
+
+    parallel = moe.moe_parallel_config
+    rows = moe.max_num_tokens
+    if isinstance(prepare, MoEPrepareAndFinalizeNoDPEPModular):
+        # No dispatch (TP + EP without DP): each rank's experts see only the
+        # rows of its own forward.
+        return rows
+    if not isinstance(prepare, MoEPrepareAndFinalizeNaiveDPEPModular):
+        raise ValueError("EXL3 EP requires allgather_reducescatter dispatch")
+    if parallel.is_sequence_parallel:
+        # The EP group gathers every rank's padded sequence-parallel share.
+        return parallel.ep_size * -(-rows // parallel.sp_size)
+    # The DP (or PCP) group gathers every replica's rows.
+    return rows * parallel.dp_size * parallel.pcp_size

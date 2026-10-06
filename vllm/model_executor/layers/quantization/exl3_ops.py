@@ -11,6 +11,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 _loaded = False
 
+# One fixed FP32 scratch (32 MiB) per stream role, whatever the batch size.
+# Each matrix processes rows in chunks whose native workspace fits it.
+LINEAR_SCRATCH_ELEMENTS = 8 << 20
+
 
 def _linear_fake(
     x, trellis, suh, svh, bits_x2, codebook, logical_in, logical_out, out, workspace
@@ -82,6 +86,23 @@ def ensure_extension() -> None:
 def linear_workspace_size(max_rows: int, padded_in: int, padded_out: int) -> int:
     ensure_extension()
     return torch.ops._exl3_C.linear_workspace_size(max_rows, padded_in, padded_out)
+
+
+@lru_cache(maxsize=None)
+def linear_row_chunk(padded_in: int, padded_out: int) -> int:
+    """Return the most rows whose linear workspace fits the fixed scratch."""
+    rows, limit = 0, LINEAR_SCRATCH_ELEMENTS
+    while rows < limit:
+        middle = (rows + limit + 1) // 2
+        if linear_workspace_size(middle, padded_in, padded_out) <= (
+            LINEAR_SCRATCH_ELEMENTS
+        ):
+            rows = middle
+        else:
+            limit = middle - 1
+    if rows == 0:
+        raise ValueError("One EXL3 matrix row exceeds the fixed linear scratch")
+    return rows
 
 
 @lru_cache(maxsize=None)
@@ -175,6 +196,30 @@ def ple_decode_out(
     )
 
 
+def _linear_scratch(device: torch.device) -> torch.Tensor:
+    from vllm.utils.torch_utils import aux_stream, current_stream
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    def allocate():
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("EXL3 scratch must be allocated before graph capture")
+        # The compute and graph-capture streams never run model work at the
+        # same time and share one scratch. The shared-expert aux stream
+        # overlaps the compute stream, so it gets its own. Both are allocated
+        # on first use, before memory profiling ends, and never resized.
+        count = 1 if aux_stream() is None else 2
+        return [
+            torch.empty(LINEAR_SCRATCH_ELEMENTS, dtype=torch.float32, device=device)
+            for _ in range(count)
+        ]
+
+    scratch = current_workspace_manager().get_persistent_resource(
+        "exl3_linear_scratch", allocate
+    )
+    aux = aux_stream()
+    return scratch[1] if aux is not None and current_stream() == aux else scratch[0]
+
+
 def _linear(
     x: torch.Tensor,
     trellis: torch.Tensor,
@@ -183,31 +228,13 @@ def _linear(
     bits_x2: int,
     codebook: int,
     logical_out: int,
-    workspace_elements: int,
-    max_rows: int,
+    row_chunk: int,
 ) -> torch.Tensor:
-    from vllm.v1.worker.workspace import current_workspace_manager
-
-    manager = current_workspace_manager()
-    stream = torch.cuda.current_stream(x.device)
-
-    def allocate():
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("EXL3 scratch must be warmed before graph capture")
-        return torch.empty(workspace_elements, dtype=torch.float32, device=x.device)
-
-    storage = manager.get_persistent_resource(
-        ("exl3_linear_workspace", stream.cuda_stream), lambda: [allocate()]
-    )
-    if storage[0].numel() < workspace_elements:
-        if manager.is_locked():
-            raise RuntimeError("EXL3 scratch capacity was not warmed before capture")
-        storage[0] = allocate()
-    workspace = storage[0]
+    workspace = _linear_scratch(x.device)
     out = torch.empty((x.shape[0], logical_out), dtype=x.dtype, device=x.device)
-    for start in range(0, x.shape[0], max_rows):
+    for start in range(0, x.shape[0], row_chunk):
         linear_out(
-            x[start : start + max_rows],
+            x[start : start + row_chunk],
             trellis,
             suh,
             svh,
@@ -215,15 +242,13 @@ def _linear(
             codebook,
             x.shape[1],
             logical_out,
-            out[start : start + max_rows],
+            out[start : start + row_chunk],
             workspace,
         )
     return out
 
 
-def _linear_meta(
-    x, trellis, suh, svh, bits_x2, codebook, logical_out, workspace_elements, max_rows
-):
+def _linear_meta(x, trellis, suh, svh, bits_x2, codebook, logical_out, row_chunk):
     torch._check(x.dtype == torch.bfloat16)
     torch._check(x.dim() == 2)
     return x.new_empty((x.shape[0], logical_out))
