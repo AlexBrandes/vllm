@@ -320,12 +320,22 @@ def ple_layout(
         raise ValueError(f"Invalid compressed PLE bias: {prefix}")
     heads, dim = bias.shape
     rows, words = trellis.shape
-    if dim != 160 or words != 61:
-        raise ValueError("EXL3 PLE requires 160 channels and six-bit rows")
-    bits = 6
+    # K comes from the codec metadata, channels from the bias, the row size
+    # from the trellis: one FP16 scale word, then a ring of dim * K bits.
+    bits = _metadata_int(metadata, "K", prefix)
     if (
-        _metadata_int(metadata, "K", prefix) != bits
-        or _metadata_int(metadata, "row_dim", prefix) != dim
+        heads <= 0
+        or dim <= 0
+        or not 1 <= bits <= 16
+        or dim * bits % 16
+        or words != 1 + dim * bits // 16
+    ):
+        raise ValueError(
+            f"Compressed PLE rows of {words} words do not hold {dim} "
+            f"channels at K={bits}: {prefix}"
+        )
+    if (
+        _metadata_int(metadata, "row_dim", prefix) != dim
         or _metadata_int(metadata, "rows", prefix) != rows
     ):
         raise ValueError(f"Compressed PLE metadata disagrees with headers: {prefix}")

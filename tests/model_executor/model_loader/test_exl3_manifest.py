@@ -11,12 +11,16 @@ from vllm.model_executor.layers.quantization.exl3_utils import (
     Exl3LoadLedger,
     Exl3Manifest,
     aligned_shard,
+    ple_layout,
     read_headers,
+    read_metadata,
 )
 
 
-def _write(path, tensors):
+def _write(path, tensors, metadata=None):
     header, payload = {}, bytearray()
+    if metadata is not None:
+        header["__metadata__"] = metadata
     for name, (dtype, shape, data) in tensors.items():
         start = len(payload)
         payload.extend(data)
@@ -180,3 +184,66 @@ def test_loading_noncontiguous_h128_output_shards_preserves_packed_values(tmp_pa
     assert torch.equal(weight.suh, suh[128:])
     assert torch.equal(weight.svh, torch.cat([svh[:128], svh[384:]]))
     ledger.finish()
+
+
+def _ple(bits, dim, sizes, rows, prefix="model.layers.0.ple.ngram_embedding"):
+    heads = len(sizes)
+    offsets = [sum(sizes[:i]) for i in range(heads)]
+    words = 1 + dim * bits // 16
+    tensors = {
+        f"{prefix}.trellis": ("I16", [rows, words], bytes(rows * words * 2)),
+        f"{prefix}.head_bias": ("F16", [heads, dim], bytes(heads * dim * 2)),
+        f"{prefix}.head_offsets": ("I64", [heads], struct.pack(f"<{heads}q", *offsets)),
+        f"{prefix}.head_vocab_sizes": (
+            "I64",
+            [heads],
+            struct.pack(f"<{heads}q", *sizes),
+        ),
+        f"{prefix}.layer_multipliers": ("I64", [2], struct.pack("<2q", 3, 5)),
+    }
+    metadata = {
+        "format": "exl3_ngram_trellis",
+        "version": "1",
+        "codebook": "mul1",
+        "K": str(bits),
+        "row_dim": str(dim),
+        "rows": str(rows),
+    }
+    return tensors, metadata
+
+
+# The real Qwen3.8 table (K=6, 160 channels, 16 heads) and synthetic layouts.
+@pytest.mark.parametrize(
+    "bits,dim,sizes,rows",
+    [(6, 160, (100, 27) * 8, 1024), (3, 32, (7, 5, 3), 16), (5, 16, (9,), 10)],
+)
+def test_ple_layout_is_derived_from_headers(tmp_path, bits, dim, sizes, rows):
+    tensors, metadata = _ple(bits, dim, sizes, rows)
+    _write(tmp_path / "model.safetensors", _matrix())
+    _write(tmp_path / "ngram_embedding.safetensors", tensors, metadata)
+    manifest = Exl3Manifest(tmp_path)
+    prefix = "model.layers.0.ple.ngram_embedding"
+    assert manifest.ple_tables[prefix].name == f"{prefix}.trellis"
+    path = tmp_path / "ngram_embedding.safetensors"
+    layout = ple_layout(read_headers(path), read_metadata(path), prefix)
+    assert (layout.bits, layout.dim, layout.heads) == (bits, dim, len(sizes))
+    assert (layout.rows, layout.row_bytes) == (rows, 2 + dim * bits // 8)
+    assert layout.head_vocab_sizes == sizes
+
+
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        ({"K": "5"}, "do not hold"),
+        ({"K": "0"}, "do not hold"),
+        ({"K": "six"}, "metadata K"),
+        ({"row_dim": "48"}, "disagrees"),
+        ({"codebook": "mcg"}, "format"),
+    ],
+)
+def test_ple_layout_rejects_inconsistent_headers(tmp_path, change, match):
+    tensors, metadata = _ple(3, 32, (7, 5, 3), 16)
+    _write(tmp_path / "model.safetensors", _matrix())
+    _write(tmp_path / "ngram_embedding.safetensors", tensors, {**metadata, **change})
+    with pytest.raises(ValueError, match=match):
+        Exl3Manifest(tmp_path)

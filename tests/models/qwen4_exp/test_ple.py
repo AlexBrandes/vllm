@@ -242,9 +242,20 @@ def _packed_ple_file(
     return path, f"{_PLE_PREFIX}.trellis", rows_data, base
 
 
+# The real Qwen3.8 row layout and two synthetic K/channel layouts.
+_PLE_LAYOUTS = [
+    pytest.param(6, 160, id="k6x160"),
+    pytest.param(3, 32, id="k3x32"),
+    pytest.param(5, 16, id="k5x16"),
+]
+
+
+@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
 @pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
-def test_exl3_ple_positional_rows_preserve_order_and_masks(tmp_path, offset):
-    path, key, rows, base = _packed_ple_file(tmp_path, offset)
+def test_exl3_ple_positional_rows_preserve_order_and_masks(
+    tmp_path, offset, bits, dim
+):
+    path, key, rows, base = _packed_ple_file(tmp_path, offset, bits=bits, dim=dim)
     reader = Exl3PLERowReader(str(path), key, 4, 10)
     try:
         ids = [8, 4, 5, 4, 9, -1, 3, 10]
@@ -252,6 +263,8 @@ def test_exl3_ple_positional_rows_preserve_order_and_masks(tmp_path, offset):
         target = bytearray(len(ids) * row_bytes)
         reader.read_rows(ids, memoryview(target))
         assert reader.base == base
+        assert row_bytes == 2 + dim * bits // 8 == len(rows[0])
+        assert reader.layout.bits == bits
         assert target == b"".join(
             rows[i] if i in (4, 5, 8) else bytes(row_bytes) for i in ids
         )
@@ -260,8 +273,11 @@ def test_exl3_ple_positional_rows_preserve_order_and_masks(tmp_path, offset):
         reader.close()
 
 
-def test_exl3_ple_read_retries_interruptions_and_partial_reads(tmp_path, monkeypatch):
-    path, key, rows, _ = _packed_ple_file(tmp_path)
+@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
+def test_exl3_ple_read_retries_interruptions_and_partial_reads(
+    tmp_path, monkeypatch, bits, dim
+):
+    path, key, rows, _ = _packed_ple_file(tmp_path, bits=bits, dim=dim)
     reader = Exl3PLERowReader(str(path), key, 0, 10)
     real_preadv = os.preadv
     attempts = 0
@@ -319,6 +335,8 @@ def test_exl3_ple_rejects_invalid_ranges_and_destinations(tmp_path):
         ({"rows": 140}, "padding"),
         ({"metadata": {"codebook": "mcg"}}, "format"),
         ({"metadata": {"rows": "11"}}, "metadata"),
+        ({"metadata": {"K": "5"}}, "do not hold"),
+        ({"bits": 3, "dim": 24}, "do not hold"),
     ],
 )
 def test_exl3_ple_rejects_invalid_layouts(tmp_path, kwargs, match):
