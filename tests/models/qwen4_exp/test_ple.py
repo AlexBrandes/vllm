@@ -3,6 +3,7 @@
 
 import json
 import logging
+import mmap
 import os
 import struct
 import threading
@@ -194,7 +195,7 @@ _PLE_PREFIX = "model.layers.0.ple.ple_embedding.ngram_embedding"
 
 def _packed_ple_file(
     tmp_path, offset=32, *, bits=6, dim=160, sizes=(5, 4), rows=10, offsets=None,
-    metadata=None,
+    metadata=None, written_rows=None,
 ):
     """Small real PLE file: two heads, a sparse gap before the trellis and one
     padded row. Row r holds the byte r + 1 repeated."""
@@ -234,10 +235,13 @@ def _packed_ple_file(
         for name, _, _, data in parts:
             info = header[f"{_PLE_PREFIX}.{name}"]["data_offsets"]
             size = info[1] - info[0]
+            if name == "trellis" and written_rows is not None:
+                data = data[: written_rows * 2 * words]
             if data is None:
                 file.seek(size, os.SEEK_CUR)
             else:
                 file.write(data[:size])
+        file.truncate(8 + len(raw) + end)
     base = 8 + len(raw) + header[f"{_PLE_PREFIX}.trellis"]["data_offsets"][0]
     return path, f"{_PLE_PREFIX}.trellis", rows_data, base
 
@@ -343,6 +347,48 @@ def test_exl3_ple_rejects_invalid_layouts(tmp_path, kwargs, match):
     path, key, _, _ = _packed_ple_file(tmp_path, **kwargs)
     with pytest.raises(ValueError, match=match):
         Exl3PLERowReader(str(path), key, 0, 10)
+
+
+def test_exl3_ple_advises_random_reads_and_cold_drop(tmp_path, monkeypatch):
+    path, key, _, base = _packed_ple_file(tmp_path)
+    calls = []
+    real_fadvise = os.posix_fadvise
+
+    def record(fd, offset, length, advice):
+        calls.append((offset, length, advice))
+        real_fadvise(fd, offset, length, advice)
+
+    monkeypatch.setattr(os, "posix_fadvise", record)
+    reader = Exl3PLERowReader(str(path), key, 0, 10)
+    try:
+        assert calls == [(0, 0, os.POSIX_FADV_RANDOM)]
+        reader.drop_page_cache()
+        assert calls[1] == (base, 10 * reader.row_bytes, os.POSIX_FADV_DONTNEED)
+    finally:
+        reader.close()
+
+
+def test_exl3_ple_page_cache_residency_counts_table_pages(tmp_path):
+    """Only written table pages are resident; holes and other tensors are not
+    counted, and sampling itself faults nothing in."""
+    path, key, _, base = _packed_ple_file(
+        tmp_path, offset=(1 << 20), sizes=(150, 40), rows=200, written_rows=10
+    )
+    page = mmap.PAGESIZE
+    reader = Exl3PLERowReader(str(path), key, 0, 200)
+    try:
+        end = base + 200 * reader.row_bytes
+        total = (end - 1) // page - base // page + 1
+        written = (base + 10 * reader.row_bytes - 1) // page - base // page + 1
+        assert written < total
+        assert reader.page_cache_residency() == (written, total)
+        assert reader.page_cache_residency() == (written, total)
+        os.fsync(reader.fd)
+        reader.drop_page_cache()
+        resident, _ = reader.page_cache_residency()
+        assert resident in (0, written)  # tmpfs keeps pages; disks drop them
+    finally:
+        reader.close()
 
 
 def test_exl3_ple_slot_waits_for_copy_before_reuse():

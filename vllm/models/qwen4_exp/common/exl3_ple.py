@@ -2,14 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bounded compressed PLE storage and selected-row decoding."""
 
+import atexit
 import bisect
+import ctypes
+import functools
+import mmap
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.exl3_utils import (
@@ -25,6 +31,53 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .ngram_embedding import Qwen4ExpPLEEmbedding, Qwen4ExpPLEEmbeddingMethod
 
 logger = init_logger(__name__)
+
+
+# mincore is called per window so its residency vector stays small.
+_RESIDENCY_WINDOW = 1 << 30
+
+
+@functools.cache
+def _libc() -> ctypes.CDLL:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int64,
+    )
+    libc.munmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+    return libc
+
+
+def page_cache_residency(fd: int, start: int, length: int) -> tuple[int, int]:
+    """Return (resident, total) page-cache pages of a file extent.
+
+    Maps the extent without touching it and asks mincore, so sampling does
+    not change residency.
+    """
+    libc = _libc()
+    page = mmap.PAGESIZE
+    first = start // page * page
+    end = start + length
+    resident = 0
+    for window in range(first, end, _RESIDENCY_WINDOW):
+        size = min(_RESIDENCY_WINDOW, end - window)
+        address = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, window)
+        if address is None or address == ctypes.c_void_p(-1).value:
+            raise OSError(ctypes.get_errno(), "mmap of the PLE table failed")
+        try:
+            vector = (ctypes.c_ubyte * ((size + page - 1) // page))()
+            if libc.mincore(address, size, vector) != 0:
+                raise OSError(ctypes.get_errno(), "mincore of the PLE table failed")
+            resident += int((np.frombuffer(vector, dtype=np.uint8) & 1).sum())
+        finally:
+            libc.munmap(address, size)
+    return resident, (end - first + page - 1) // page
 
 
 def pread_exact_into(fd: int, target: memoryview, offset: int) -> None:
@@ -61,9 +114,24 @@ class Exl3PLERowReader:
             self.owner_lo, self.owner_hi = owner_lo, owner_hi
             self.base = self.layout.trellis.offset
             self.row_bytes = self.layout.row_bytes
+            # Rows are read at random; readahead would only fetch unused rows.
+            os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
         except BaseException:
             self.close()
             raise
+
+    def drop_page_cache(self) -> None:
+        """Evict the table's clean, unmapped page-cache pages (no root needed)."""
+        os.posix_fadvise(
+            self.fd,
+            self.base,
+            self.layout.trellis.nbytes,
+            os.POSIX_FADV_DONTNEED,
+        )
+
+    def page_cache_residency(self) -> tuple[int, int]:
+        """Return (resident, total) page-cache pages of the table extent."""
+        return page_cache_residency(self.fd, self.base, self.layout.trellis.nbytes)
 
     def read_tensor(self, header: TensorHeader) -> bytearray:
         data = bytearray(header.nbytes)
@@ -143,8 +211,6 @@ class Exl3PLEEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
     """Keep the table compressed independently of BF16 activations."""
 
     def __init__(self, quant_config=None):
-        from vllm import envs
-
         self.placement = envs.VLLM_EXL3_PLE_PLACEMENT
         if self.placement not in ("ssd", "ram", "device"):
             raise ValueError("EXL3 PLE placement must be ssd, ram or device")
@@ -240,6 +306,11 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 or layout.heads != self._heads
             ):
                 raise ValueError("PLE checkpoint rows/dim/heads differ from model")
+            self._log_residency("at open")
+            if envs.VLLM_EXL3_PLE_COLD:
+                # Cold run: start from storage, so SSD runs can be labelled.
+                reader.drop_page_cache()
+                self._log_residency("after cold drop")
             tensors = {}
             for name, header in zip(PLE_AUXILIARIES, layout.auxiliaries):
                 dtype = torch.float16 if header.dtype == "F16" else torch.int64
@@ -334,6 +405,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                         self._table[begin : begin + length].copy_(staging[:length])
                     self._table_view = self._table
             self._slot = Exl3PLESlot(self._capacity, self._released)
+            # Engine shutdown does not close modules; log residency at exit.
+            atexit.register(self.close)
             logger.info(
                 "EXL3 PLE: placement=%s storage=int16 output=bfloat16 "
                 "owner=[%d,%d) row_bytes=%d capacity=%d",
@@ -348,6 +421,26 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
             reader.close()
             raise
 
+    def page_cache_residency(self) -> tuple[int, int]:
+        """Return (resident, total) page-cache pages of the PLE table.
+
+        Sampling does not change residency; lab scripts call this between
+        runs to tell page-cache hits from SSD reads.
+        """
+        if self._reader is None or self._reader.fd < 0:
+            raise RuntimeError("EXL3 PLE file is not open")
+        return self._reader.page_cache_residency()
+
+    def _log_residency(self, when: str) -> None:
+        resident, total = self.page_cache_residency()
+        logger.info(
+            "EXL3 PLE page cache %s: %d/%d table pages resident (%.1f%%)",
+            when,
+            resident,
+            total,
+            100.0 * resident / max(total, 1),
+        )
+
     def close(self):
         if self._slot is not None:
             self._stream.synchronize()
@@ -355,7 +448,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
-        if self._reader is not None:
+        if self._reader is not None and self._reader.fd >= 0:
+            self._log_residency("at close")
             self._reader.close()
         self._slot = None
 

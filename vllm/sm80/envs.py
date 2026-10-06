@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_EXL3: bool = False
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
+    VLLM_EXL3_PLE_COLD: bool = False
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -667,6 +668,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(
         int(os.getenv("VLLM_QWEN_QSA_TOPK_SORTED", "1"))
     ),
+    # Drop the compressed PLE table from the page cache at setup so a run
+    # starts cold (reads come from storage). Residency is logged either way.
+    "VLLM_EXL3_PLE_COLD": lambda: bool(int(os.getenv("VLLM_EXL3_PLE_COLD", "0"))),
 }
 
 

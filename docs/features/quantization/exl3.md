@@ -56,6 +56,8 @@ All modes use the same GPU row decoder. Its layout comes from the PLE file: `K` 
 
 SSD reads occur at eager Python breaks between CUDA graph segments: ID completion, CPU reads, H2D readiness, decode and output-copy completion have explicit ordering. This is not a captured CUDA host callback. Staging cannot be reused until the previous output consumer has completed. Warm stable workspaces before capture; growth after capture locking is rejected.
 
+The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel does not read ahead around requested rows. Buffered reads still hit the page cache, so warm runs mostly read RAM. Set `VLLM_EXL3_PLE_COLD=1` to call `POSIX_FADV_DONTNEED` on the table at setup (no root needed; pages that another process has mapped stay resident). Page-cache residency of the table (via `mincore`) is logged at setup, after the cold drop and at process exit. `Exl3PLEEmbedding.page_cache_residency()` returns `(resident, total)` pages for sampling between runs.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`vllm/third_party/exl3`](../../../vllm/third_party/exl3). Both the `LICENSE` and `NOTICE` are included in source and binary distributions.
