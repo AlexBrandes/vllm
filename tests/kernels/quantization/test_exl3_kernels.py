@@ -186,9 +186,10 @@ def _moe_case(rng, experts, hidden, intermediate, formats):
     matrices, owners = [], []
     for expert in range(experts):
         projections = []
-        for projection, (k, n) in enumerate(
-            ((hidden, intermediate), (hidden, intermediate), (intermediate, hidden))
-        ):
+        # Packed matrices are stored at whole H128 blocks; the logical
+        # intermediate width is cropped by the operator.
+        hpad, ipad = -(-hidden // 128) * 128, -(-intermediate // 128) * 128
+        for projection, (k, n) in enumerate(((hpad, ipad), (hpad, ipad), (ipad, hpad))):
             bits_x2, codebook = formats[(expert + projection) % len(formats)]
             trellis, suh, svh = _random_matrix(rng, k, n, bits_x2)
             projections.append((trellis, suh, svh, bits_x2, codebook))
