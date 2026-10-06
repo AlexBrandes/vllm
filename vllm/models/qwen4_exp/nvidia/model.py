@@ -13,6 +13,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -88,6 +89,8 @@ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
+
+logger = init_logger(__name__)
 
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
@@ -186,6 +189,13 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             self.experts.moe_config.skip_final_all_reduce = False
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
+        if envs.VLLM_QWEN4_ROUTER_FP32:
+            self.gate.set_out_dtype(torch.float32)
+        logger.info_once(
+            "Qwen4Exp router logits: %s (VLLM_QWEN4_ROUTER_FP32=%d)",
+            "FP32" if envs.VLLM_QWEN4_ROUTER_FP32 else "model dtype",
+            int(envs.VLLM_QWEN4_ROUTER_FP32),
+        )
 
 
 class Qwen4ExpDecoderLayer(nn.Module):

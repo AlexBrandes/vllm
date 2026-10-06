@@ -87,6 +87,8 @@ if TYPE_CHECKING:
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
+    VLLM_QWEN4_ROUTER_FP32: bool = False
+    VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -676,6 +678,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # before the requests using that row are finished with an error.
     "VLLM_EXL3_PLE_READ_RETRIES": lambda: int(
         os.getenv("VLLM_EXL3_PLE_READ_RETRIES", "3")
+    ),
+    # Preserve BF16 router operands but accumulate and return logits in FP32.
+    "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_ROUTER_FP32", "0"))
+    ),
+    # Normalize each MTP hidden stream instead of the concatenated stack.
+    "VLLM_QWEN4_MTP_PER_STREAM_NORM": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", "0"))
     ),
 }
 

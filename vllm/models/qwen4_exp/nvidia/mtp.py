@@ -24,6 +24,7 @@ from vllm import envs
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -63,6 +64,8 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+
+logger = init_logger(__name__)
 
 
 def _remap_ignored_layers(
@@ -253,6 +256,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.pre_fc_norm_hidden = GemmaRMSNorm(
             self.hidden_size * self.hc_count, eps=config.rms_norm_eps
         )
+        self.per_stream_hidden_norm = envs.VLLM_QWEN4_MTP_PER_STREAM_NORM
+        logger.info_once(
+            "Qwen4Exp MTP hidden norm: %s "
+            "(VLLM_QWEN4_MTP_PER_STREAM_NORM=%d)",
+            "per-stream" if self.per_stream_hidden_norm else "flat",
+            int(self.per_stream_hidden_norm),
+        )
         # HC final mixer collapses the multi stream into [T, H] for the LM head.
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
@@ -270,6 +280,21 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.hidden_size * self.hc_count
         )
+
+    def _normalize_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.per_stream_hidden_norm:
+            return self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view_as(
+                hidden_states
+            )
+        # Keep the checkpoint's distinct affine weights for every stream.
+        # Like GemmaRMSNorm, apply (1 + weight) in FP32 before one BF16 cast.
+        x = hidden_states.float()
+        variance = x.square().mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.pre_fc_norm_hidden.variance_epsilon)
+        weight = self.pre_fc_norm_hidden.weight.float().view(
+            self.hc_count, self.hidden_size
+        )
+        return (x * (1.0 + weight)).to(hidden_states.dtype)
 
     def _iter_qsa_attentions(self):
         """Yield MTP attention modules that own a QSA indexer."""
@@ -325,9 +350,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             # step's multi stream).
             num_tokens = hidden_states.shape[0]
             hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-                num_tokens, hc_count, hidden_size
-            )
+            hidden_states = self._normalize_hidden(hidden_states)
             hidden_states = self.fc_hidden(hidden_states)
             hidden_states = hidden_states.flatten(-2)
             prev_block_output = inputs_embeds
