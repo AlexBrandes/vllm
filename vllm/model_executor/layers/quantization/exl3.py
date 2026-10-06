@@ -62,6 +62,7 @@ class Exl3Config(QuantizationConfig):
         self.mtp_start_layer_idx = 0
         self.mapped_prefixes: dict[str, str] = {}
         self.is_qwen = False
+        self.is_draft = False
 
     @classmethod
     def get_name(cls) -> Literal["exl3"]:
@@ -93,6 +94,7 @@ class Exl3Config(QuantizationConfig):
         )
         self.manifest = Exl3Manifest(model_name, require_qwen_aux=is_qwen)
         self.is_qwen = is_qwen
+        self.is_draft = getattr(hf_config, "model_type", "") == "qwen4_exp_mtp"
         text = getattr(hf_config, "text_config", hf_config)
         self.mtp_start_layer_idx = getattr(text, "num_hidden_layers", 0)
 
@@ -109,6 +111,11 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(f"Conflicting EXL3 module mapping: {mapped}")
             mapped_prefixes[mapped] = source
         self.mapped_prefixes = mapped_prefixes
+
+    def release_manifest(self) -> None:
+        """Drop the checkpoint inventory once this config's model is loaded."""
+        self.manifest = None
+        self.mapped_prefixes = {}
 
     def source_prefix(self, prefix: str) -> str:
         """Resolve model construction prefixes to checkpoint module names."""

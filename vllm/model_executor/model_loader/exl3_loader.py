@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Load EXL3 constituents without materializing unassigned packed tensors."""
 
+from collections import Counter
 from contextlib import ExitStack
 
 import torch
@@ -36,7 +37,7 @@ def load_exl3_weights(model: torch.nn.Module) -> set[str]:
     if config.parallel_config.pipeline_parallel_size != 1:
         raise ValueError("EXL3 loading currently requires pipeline parallel size one")
     ledger = Exl3LoadLedger(manifest)
-    is_draft = model.__class__.__name__ == "Qwen4ExpMTP"
+    is_draft = quant.is_draft
     loaded = set()
     file_backed_parameters = set()
     modules = dict(model.named_modules())
@@ -148,14 +149,18 @@ def load_exl3_weights(model: torch.nn.Module) -> set[str]:
     for name, parameter in model.named_parameters():
         if not parameter.is_cuda:
             raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
-    model.exl3_load_ledger = ledger
+    counts = Counter(disposition for disposition, _ in ledger.entries.values())
     logger.info(
-        "EXL3 packed format, BF16 activations; PLE placement=%s; TP rank=%d/%d, EP=%s; "
-        "whole routed experts, replicated shared experts and vision",
+        "EXL3 packed format, BF16 activations; %s model; PLE placement=%s; "
+        "TP rank=%d/%d, EP=%s; sources: %d consumed, %d file-backed, %d unused",
+        "draft" if is_draft else "target",
         quant.ple_placement,
         get_tensor_model_parallel_rank(),
         config.parallel_config.tensor_parallel_size,
         config.parallel_config.enable_expert_parallel,
+        counts["consumed"],
+        counts["file-backed"],
+        counts["unused"],
     )
     assignments = {
         tuple(module.quant_method.global_expert_ids)
@@ -164,4 +169,7 @@ def load_exl3_weights(model: torch.nn.Module) -> set[str]:
     }
     for assignment in sorted(assignments):
         logger.info("EXL3 local routed expert IDs: %s", assignment)
+    # The draft model has its own config and manifest; neither is needed after
+    # its model is loaded.
+    quant.release_manifest()
     return loaded
