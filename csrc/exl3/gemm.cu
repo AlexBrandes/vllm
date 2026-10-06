@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <limits>
 
 namespace exl3 {
@@ -311,18 +312,63 @@ void set_gemm_shape_override(int64_t shape) {
   shape_override.store(static_cast<int>(shape));
 }
 
+// Issue-cycle model of one block per element of K, for a block holding
+// `rows` valid rows. Decoding costs ~65 thread instructions per encoder-lane
+// task (8 weights); staging an activation float4 ~5; a warp FFMA occupies
+// the FP32 pipe for 2 cycles, plus the shared loads of the micro-tile.
+template <class Cfg>
+void block_cycles_per_k(int64_t rows, double& issue, double& duration) {
+  constexpr int kWarps = Cfg::kThreads / 32;
+  constexpr int kRowStep = Cfg::kTM == 1 ? 1 : 4;
+  constexpr double kLoads = (Cfg::kTM == 8 ? 2 : 1) + (Cfg::kTN == 8 ? 2 : 1);
+  constexpr double kFmaCost = (2.0 * Cfg::kTM * Cfg::kTN + kLoads) / (32.0 * Cfg::kTM * Cfg::kTN);
+  const int64_t row_threads = std::min<int64_t>(Cfg::kBM / Cfg::kTM,
+                                                (rows + kRowStep - 1) / kRowStep);
+  const double fma_warps = std::ceil(double(row_threads * Cfg::kColThreads) / 32.0);
+  const double common = Cfg::kBN * 65.0 / 256.0 + Cfg::kBM * 5.0 / 128.0;
+  const double fma = double(row_threads * Cfg::kTM) * Cfg::kBN * kFmaCost;
+  issue = common + fma;
+  // A lone block spreads its warps over the four schedulers; the FMA chain
+  // itself needs at least 4 cycles per k.
+  duration = std::max(4.0, common / std::min(kWarps, 4) + fma / std::min(fma_warps, 4.0));
+}
+
+// Estimated cycles per element of K for a dense launch with this config:
+// the slower of one block's own duration and all blocks' issue spread over
+// the SMs.
+template <class Cfg>
+double dense_cycles_per_k(int64_t rows, int64_t n, int sms) {
+  const int64_t col_tiles = n / Cfg::kBN;
+  const int64_t full = rows / Cfg::kBM;
+  const int64_t rest = rows % Cfg::kBM;
+  double issue = 0.0;
+  double duration = 0.0;
+  double block_issue, block_duration;
+  if (full > 0) {
+    block_cycles_per_k<Cfg>(Cfg::kBM, block_issue, block_duration);
+    issue += double(full * col_tiles) * block_issue;
+    duration = std::max(duration, block_duration);
+  }
+  if (rest > 0) {
+    block_cycles_per_k<Cfg>(rest, block_issue, block_duration);
+    issue += double(col_tiles) * block_issue;
+    duration = std::max(duration, block_duration);
+  }
+  return std::max(duration, issue / (4.0 * std::max(sms, 1)));
+}
+
 GemmShape dense_gemm_shape(int64_t rows, int64_t n, int sms) {
   const int forced = shape_override.load();
   if (forced >= 0) return static_cast<GemmShape>(forced);
-  if (rows <= TinyConfig::kBM) return GemmShape::kTiny;
-  if (rows <= SmallConfig::kBM) return GemmShape::kSmall;
-  // Large blocks only when they still give every SM a few blocks.
-  const int64_t large_blocks = (rows + LargeConfig::kBM - 1) / LargeConfig::kBM *
-                               (n / LargeConfig::kBN);
-  if (rows > 2 * MediumConfig::kBM && large_blocks >= 4 * int64_t(sms)) {
-    return GemmShape::kLarge;
+  const double cost[] = {dense_cycles_per_k<TinyConfig>(rows, n, sms),
+                         dense_cycles_per_k<SmallConfig>(rows, n, sms),
+                         dense_cycles_per_k<MediumConfig>(rows, n, sms),
+                         dense_cycles_per_k<LargeConfig>(rows, n, sms)};
+  int best = 0;
+  for (int shape = 1; shape < 4; ++shape) {
+    if (cost[shape] < cost[best]) best = shape;
   }
-  return GemmShape::kMedium;
+  return static_cast<GemmShape>(best);
 }
 
 GemmShape moe_gemm_shape(int64_t assignments, int64_t global_experts) {
