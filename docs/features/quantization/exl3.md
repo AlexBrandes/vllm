@@ -2,7 +2,7 @@
 
 EXL3 loads the checkpoint's packed trellis matrices and original FP16 scales without requantizing them. Linear and whole-expert MoE operators accept and return BF16 tensors, with FP32 transforms and accumulation. There is no FP16 activation adapter, persistent decoded-weight cache, or dependency on the standalone ExLlamaV3 runtime.
 
-The CUDA build includes `vllm._exl3_C`, targeting SM 8.0. It is compiled ahead of time; serving never compiles this extension. A successful build, CPU helper check or Meta dispatch is not GPU numerical, graph, quality or capacity validation. Validate those paths before deployment.
+The CUDA build includes `vllm._exl3_C`, built for SM 8.0 only; selecting EXL3 on any other GPU is an error. It is compiled ahead of time; serving never compiles this extension. A successful build, CPU helper check or Meta dispatch is not GPU numerical, graph, quality or capacity validation. Validate those paths before deployment.
 
 ## Enablement and checkpoint loading
 
@@ -13,9 +13,11 @@ VLLM_EXL3=1 vllm serve ./exl3-checkpoint \
   --quantization exl3 --dtype bfloat16
 ```
 
-The checkpoint must already be a local safetensors directory. Loading inventories actual file headers, verifies packed geometry/codebook markers and accounts for consumed, file-backed and explicitly unused tensors. An index cannot hide auxiliary files or override their headers. Integer rates from 1 through 8 bits are supported; 1.5-, 2.5- and 3.5-bit formats require the `mul1` codebook.
+The checkpoint must already be a local safetensors directory. Loading inventories actual file headers, verifies packed geometry/codebook markers and accounts for consumed, file-backed and explicitly unused tensors; the counts are logged and the inventory is released once the model (and, separately, the MTP draft) is loaded. An index cannot hide auxiliary files or override their headers. Integer rates from 1 through 8 bits are supported; 1.5-, 2.5- and 3.5-bit formats require the `mul1` codebook.
 
 Tensor-parallel cuts must preserve complete 128-channel transform blocks. Routed experts use whole-expert expert parallelism rather than splitting each expert's transform. Pipeline parallelism other than one and LoRA are rejected. Ordinary embeddings and active non-PLE weights remain on the GPU; general CPU weight offload is not supported by this path.
+
+Dense layers share one fixed 32 MiB FP32 scratch per GPU, plus one for the shared-expert stream, and process rows in chunks that fit it, so neither batch size nor graph capture grows it. The routed-expert scratch is sized for the rows the selected dispatch delivers: with tensor and expert parallelism but no data parallelism, each rank's own tokens.
 
 ## Qwen3.8-Flash-Next
 
