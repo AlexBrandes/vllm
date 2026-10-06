@@ -72,6 +72,8 @@ int gemm_block_cols(GemmShape shape);
 // bitwise identical rows.
 GemmShape dense_gemm_shape(int64_t rows, int64_t n, int sms);
 GemmShape moe_gemm_shape(int64_t assignments, int64_t global_experts);
+// Whether moe_out runs gate and up in one launch with in-block activations.
+bool moe_fuses_gate_up(GemmShape shape, int64_t assignments);
 // Launches a fixed grid of min(max_items, limit) blocks; blocks stride over
 // the items the problem actually has (MoE: known on the device only).
 void launch_gemm(const GemmProblem& problem, GemmShape shape, int64_t max_items,

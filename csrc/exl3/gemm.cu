@@ -409,8 +409,8 @@ void block_cycles_per_k(int64_t rows, double& issue, double& duration) {
 }
 
 // Estimated cycles per element of K for a dense launch with this config:
-// the slower of one block's own duration and all blocks' issue spread over
-// the SMs.
+// the slower of one block's own duration and the issue of the busiest SM,
+// which receives ceil(blocks / SMs) blocks.
 template <class Cfg>
 double dense_cycles_per_k(int64_t rows, int64_t n, int sms) {
   const int64_t col_tiles = n / Cfg::kBN;
@@ -429,7 +429,9 @@ double dense_cycles_per_k(int64_t rows, int64_t n, int sms) {
     issue += double(col_tiles) * block_issue;
     duration = std::max(duration, block_duration);
   }
-  return std::max(duration, issue / (4.0 * std::max(sms, 1)));
+  const int64_t blocks = (full + (rest > 0 ? 1 : 0)) * col_tiles;
+  const int64_t per_sm = (blocks + std::max(sms, 1) - 1) / std::max(sms, 1);
+  return std::max(duration, double(per_sm) * (issue / double(blocks)) / 4.0);
 }
 
 GemmShape dense_gemm_shape(int64_t rows, int64_t n, int sms) {
@@ -449,12 +451,19 @@ GemmShape dense_gemm_shape(int64_t rows, int64_t n, int sms) {
 GemmShape moe_gemm_shape(int64_t assignments, int64_t global_experts) {
   const int forced = shape_override.load();
   if (forced >= 0) return static_cast<GemmShape>(forced);
-  // Expected rows per routed expert; actual loads vary per expert and per
-  // step, which only changes how full the row tiles are.
-  const int64_t expected = global_experts > 0 ? assignments / global_experts : assignments;
-  if (expected <= 1) return GemmShape::kTiny;
-  if (expected <= 8) return GemmShape::kSmall;
+  // From the assignments per global expert; actual loads vary per expert and
+  // per step, which only changes how full the row tiles are. Thresholds
+  // measured on 2560x640 experts with real routing (CMP 170HX).
+  const int64_t experts = std::max<int64_t>(global_experts, 1);
+  if (2 * assignments <= experts) return GemmShape::kTiny;
+  if (assignments <= 16 * experts) return GemmShape::kSmall;
   return GemmShape::kMedium;
+}
+
+bool moe_fuses_gate_up(GemmShape shape, int64_t assignments) {
+  // Forming the activations in every column block pays only while a step
+  // has very few routed rows (measured: up to 40 assignments).
+  return gemm_fuses_input(shape) && assignments <= 40;
 }
 
 void launch_gemm(const GemmProblem& problem, GemmShape shape, int64_t max_items,

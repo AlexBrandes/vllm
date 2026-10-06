@@ -361,7 +361,7 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
     problem.c_stride = ipad;
     problem.k = static_cast<int>(hpad);
     problem.n = static_cast<int>(ipad);
-    if (gemm_fuses_input(shape)) {
+    if (moe_fuses_gate_up(shape, assignments)) {
       // Few rows: gate and up in one launch, each block forming its rows'
       // x * suh H128 activations itself.
       problem.x = bf16_input;
