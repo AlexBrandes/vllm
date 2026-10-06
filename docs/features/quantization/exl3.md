@@ -2,6 +2,8 @@
 
 EXL3 loads the checkpoint's packed trellis matrices and original FP16 scales without requantizing them. Linear and whole-expert MoE operators accept and return BF16 tensors, with FP32 transforms and accumulation. There is no FP16 activation adapter, persistent decoded-weight cache, or dependency on the standalone ExLlamaV3 runtime.
 
+Each GPU block decodes a 16-row slab of trellis tiles once into shared memory and applies it to a block of up to 128 rows; routed experts are grouped by local expert on the device every step, so each active expert is decoded once per step and block of rows. Every output element is still one FP32 fused multiply-add chain over the input channels in increasing order, so a row's result does not depend on how many rows share the launch or which block shape was chosen. The extension keeps the original scalar kernels as test-only reference operators (`linear_out_reference`, `moe_out_reference`) that the fast operators must match bit for bit.
+
 The CUDA build includes `vllm._exl3_C`, built for SM 8.0 only; selecting EXL3 on any other GPU is an error. It is compiled ahead of time; serving never compiles this extension. A successful build, CPU helper check or Meta dispatch is not GPU numerical, graph, quality or capacity validation. Validate those paths before deployment.
 
 ## Enablement and checkpoint loading

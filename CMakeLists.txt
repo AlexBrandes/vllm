@@ -1547,8 +1547,10 @@ endif()
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(EXL3_SRC
     "csrc/exl3/dense.cu"
+    "csrc/exl3/gemm.cu"
     "csrc/exl3/moe.cu"
     "csrc/exl3/ple.cu"
+    "csrc/exl3/reference.cu"
     "csrc/exl3/module.cpp")
   set_gencode_flags_for_srcs(SRCS "${EXL3_SRC}" CUDA_ARCHS "8.0")
   define_extension_target(

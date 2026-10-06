@@ -7,9 +7,11 @@ Copyright (c) 2025 Turboderp. Licensed under the MIT License; see LICENSE.
 Matrix trellis packing, procedural codebooks, tensor-core lane ordering and
 Hadamard conventions are adapted from quant/pack.cu, quant/frac.cu,
 quant/codebook.cuh, quant/exl3_dq.cuh, quant/hadamard_inner.cuh and
-modules/quant/exl3_lib/quantize.py. Modifications provide scalar generic
-ring decoding, BF16 operator input/output, FP32 transforms and accumulation,
-whole-expert routing, caller-owned scratch and vLLM native registration.
+modules/quant/exl3_lib/quantize.py. Modifications provide per-lane ring
+window decoding into row-blocked FP32 GEMM tiles, the scalar generic ring
+decoder as a test-only reference, BF16 operator input/output, FP32 transforms
+and accumulation, expert-grouped whole-expert routing, caller-owned scratch
+and vLLM native registration.
 
 Compressed n-gram ring mapping and mul1 constants are adapted from
 modules/quant/exl3_lib/ngram_codec.py. Modifications provide allocation-free

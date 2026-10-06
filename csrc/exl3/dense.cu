@@ -1,59 +1,67 @@
 #include "ops.h"
 #include "common.h"
 #include "codec.cuh"
+#include "gemm.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <limits>
+
 namespace exl3 {
 namespace {
 
-__global__ void linear_input(const __nv_bfloat16* x, Matrix matrix,
-                             int64_t rows, int64_t logical_in, float* transformed) {
-  __shared__ float shared[128];
-  const int64_t blocks = matrix.padded_in / 128;
-  for (int64_t task = blockIdx.x; task < rows * blocks; task += gridDim.x) {
-    const int64_t row = task / blocks;
-    const int64_t col = (task % blocks) * 128 + threadIdx.x;
-    const float value = col < logical_in
-        ? __fmul_rn(__bfloat162float(x[row * logical_in + col]),
-                     __half2float(matrix.suh[col])) : 0.0f;
-    transformed[row * matrix.padded_in + col] = hadamard128(value, shared);
-  }
+constexpr int kWarpsPerBlock = 8;
+
+unsigned int warp_blocks(int64_t tasks) {
+  return launch_blocks((tasks + kWarpsPerBlock - 1) / kWarpsPerBlock);
 }
 
-__global__ void linear_core(const float* input, Matrix matrix, int64_t rows,
-                            float* result) {
-  __shared__ float shared_input[128];
-  const int64_t blocks = matrix.padded_out / 128;
-  for (int64_t task = blockIdx.x; task < rows * blocks; task += gridDim.x) {
+// One warp per (row, 128-column block): x * suh, then H128.
+__global__ void linear_input(const __nv_bfloat16* x, const half* suh, int64_t rows,
+                             int64_t logical_in, int64_t padded_in, float* transformed) {
+  const int lane = threadIdx.x & 31;
+  const int64_t blocks = padded_in / 128;
+  for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
+       task < rows * blocks; task += int64_t(gridDim.x) * kWarpsPerBlock) {
     const int64_t row = task / blocks;
-    const int64_t col = (task % blocks) * 128 + threadIdx.x;
-    float sum = 0.0f;
-    for (int64_t base = 0; base < matrix.padded_in; base += 128) {
-      shared_input[threadIdx.x] = input[row * matrix.padded_in + base + threadIdx.x];
-      __syncthreads();
-      for (int k = 0; k < 128; ++k) {
-        sum = __fmaf_rn(shared_input[k], core_value(matrix, base + k, col), sum);
-      }
-      __syncthreads();
+    const int64_t base = (task % blocks) * 128 + lane;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int64_t col = base + 32 * i;
+      v[i] = col < logical_in ? __fmul_rn(__bfloat162float(x[row * logical_in + col]),
+                                          __half2float(suh[col]))
+                              : 0.0f;
     }
-    result[row * matrix.padded_out + col] = sum;
+    hadamard128_warp(v, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) transformed[row * padded_in + base + 32 * i] = v[i];
   }
 }
 
-__global__ void linear_output(const float* result, Matrix matrix, int64_t rows,
-                              int64_t logical_out, __nv_bfloat16* out) {
-  __shared__ float shared[128];
-  const int64_t blocks = matrix.padded_out / 128;
-  for (int64_t task = blockIdx.x; task < rows * blocks; task += gridDim.x) {
+// One warp per (row, 128-column block): H128, then svh and BF16 rounding.
+__global__ void linear_output(const float* result, const half* svh, int64_t rows,
+                              int64_t padded_out, int64_t logical_out,
+                              __nv_bfloat16* out) {
+  const int lane = threadIdx.x & 31;
+  const int64_t blocks = padded_out / 128;
+  for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
+       task < rows * blocks; task += int64_t(gridDim.x) * kWarpsPerBlock) {
     const int64_t row = task / blocks;
-    const int64_t col = (task % blocks) * 128 + threadIdx.x;
-    const float value = hadamard128(result[row * matrix.padded_out + col], shared);
-    if (col < logical_out) {
-      out[row * logical_out + col] = __float2bfloat16_rn(
-          __fmul_rn(value, __half2float(matrix.svh[col])));
+    const int64_t base = (task % blocks) * 128 + lane;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = result[row * padded_out + base + 32 * i];
+    hadamard128_warp(v, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int64_t col = base + 32 * i;
+      if (col < logical_out) {
+        out[row * logical_out + col] =
+            __float2bfloat16_rn(__fmul_rn(v[i], __half2float(svh[col])));
+      }
     }
   }
 }
@@ -96,28 +104,44 @@ void linear_out(const torch::Tensor& x, const torch::Tensor& trellis,
                   svh.numel() == padded_out,
               "EXL3 linear input/output/scale geometry mismatch");
   const int64_t rows = x.size(0);
+  TORCH_CHECK(rows <= std::numeric_limits<int>::max(), "EXL3 linear has too many rows");
   TORCH_CHECK(workspace.numel() >= linear_workspace_size(rows, padded_in, padded_out),
               "EXL3 linear workspace is too small");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 16 == 0,
+              "EXL3 linear workspace must be 16-byte aligned");
   check_mutations(out, workspace, {&x, &trellis, &suh, &svh});
   if (rows == 0) return;
   const c10::cuda::CUDAGuard guard(x.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
-  const Matrix matrix{reinterpret_cast<const uint16_t*>(trellis.data_ptr<int16_t>()),
-                      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()),
-                      reinterpret_cast<const half*>(svh.data_ptr<at::Half>()),
-                      padded_in, padded_out, static_cast<int>(bits_x2),
-                      static_cast<int>(codebook)};
+  const auto* suh_ptr = reinterpret_cast<const half*>(suh.data_ptr<at::Half>());
+  const auto* svh_ptr = reinterpret_cast<const half*>(svh.data_ptr<at::Half>());
   float* transformed = workspace.data_ptr<float>();
   float* result = transformed + rows * padded_in;
-  linear_input<<<launch_blocks(rows * (padded_in / 128)), 128, 0, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-      matrix, rows, logical_in, transformed);
+  linear_input<<<warp_blocks(rows * (padded_in / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), suh_ptr, rows,
+      logical_in, padded_in, transformed);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  linear_core<<<launch_blocks(rows * (padded_out / 128)), 128, 0, stream>>>(
-      transformed, matrix, rows, result);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  linear_output<<<launch_blocks(rows * (padded_out / 128)), 128, 0, stream>>>(
-      result, matrix, rows, logical_out,
+
+  GemmProblem problem{};
+  problem.a = transformed;
+  problem.c = result;
+  problem.a_stride = padded_in;
+  problem.c_stride = padded_out;
+  problem.k = static_cast<int>(padded_in);
+  problem.n = static_cast<int>(padded_out);
+  problem.trellis = reinterpret_cast<const uint16_t*>(trellis.data_ptr<int16_t>());
+  problem.tiles_n = padded_out / 16;
+  problem.format = format_key(static_cast<int>(bits_x2), static_cast<int>(codebook));
+  problem.rows = rows;
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const GemmShape shape = dense_gemm_shape(rows, padded_out, sms);
+  const int64_t block_rows = gemm_block_rows(shape);
+  launch_gemm(problem, shape,
+              (rows + block_rows - 1) / block_rows * (padded_out / gemm_block_cols(shape)),
+              stream);
+
+  linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
+      result, svh_ptr, rows, padded_out, logical_out,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

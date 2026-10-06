@@ -24,4 +24,22 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
              const torch::Tensor& expert_map, int64_t intermediate_size,
              torch::Tensor& out, torch::Tensor& workspace);
 
+// Test-only: today's scalar kernels, the bit-exact oracle for the operators
+// above (same signatures; their workspace needs never exceed the sizes above).
+void linear_out_reference(const torch::Tensor& x, const torch::Tensor& trellis,
+                          const torch::Tensor& suh, const torch::Tensor& svh,
+                          int64_t bits_x2, int64_t codebook, int64_t logical_in,
+                          int64_t logical_out, torch::Tensor& out,
+                          torch::Tensor& workspace);
+void moe_out_reference(const torch::Tensor& x, const torch::Tensor& topk_ids,
+                       const torch::Tensor& topk_weights,
+                       const torch::Tensor& packed_ptrs,
+                       const torch::Tensor& packed_meta,
+                       const torch::Tensor& expert_map, int64_t intermediate_size,
+                       torch::Tensor& out, torch::Tensor& workspace);
+// Test-only: force one GEMM block shape (0 tiny .. 3 large) for every later
+// launch in the process, or -1 for the row-count heuristic. Any shape gives
+// bitwise identical rows.
+void set_gemm_shape_override(int64_t shape);
+
 }  // namespace exl3
