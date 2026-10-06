@@ -9,6 +9,7 @@ synthetic headers, so no weights are read.
 import json
 import math
 import struct
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -494,3 +495,34 @@ def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch):
             first = calls[0][1]
         assert calls[0][1] == first
     workspace.reset_workspace_manager()
+
+
+@pytest.mark.parametrize(
+    "draft_model,is_draft,needed",
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_target_manifest_outlives_the_target_until_the_draft_loads(
+    draft_model, is_draft, needed
+):
+    from vllm.model_executor.model_loader.exl3_loader import manifest_still_needed
+
+    spec = SimpleNamespace(draft_model_config=object()) if draft_model else None
+    assert manifest_still_needed(
+        SimpleNamespace(speculative_config=spec), is_draft
+    ) is (needed)
+
+
+def test_release_frees_the_loader_and_layer_configs(exl3_config):
+    from vllm.model_executor.model_loader.exl3_loader import release_manifests
+
+    # The MTP draft loads with the target's config while its MoE layer holds a
+    # second, draft-only config; both inventories are freed.
+    target = exl3_module.Exl3Config()
+    target.maybe_update_config(str(exl3_config.manifest.directory))
+    layer = torch.nn.Module()
+    layer.quant_method = exl3_module.Exl3MoEMethod(
+        exl3_config, "model.layers.0.mlp.experts", _moe_config()
+    )
+    model = torch.nn.Sequential(layer)
+    release_manifests(model, target)
+    assert target.manifest is None and exl3_config.manifest is None

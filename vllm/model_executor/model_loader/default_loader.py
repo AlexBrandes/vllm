@@ -511,7 +511,7 @@ class DefaultModelLoader(BaseModelLoader):
             from vllm.model_executor.model_loader.exl3_loader import load_exl3_weights
 
             self.counter_before_loading_weights = time.perf_counter()
-            load_exl3_weights(model)
+            load_exl3_weights(model, model_config)
             self.counter_after_loading_weights = time.perf_counter()
             return
         if model_config.quantization == "torchao":

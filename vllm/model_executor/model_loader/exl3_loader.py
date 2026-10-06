@@ -12,6 +12,7 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.exl3 import (
+    Exl3Config,
     Exl3LinearMethod,
     Exl3MoEMethod,
 )
@@ -23,7 +24,29 @@ from vllm.model_executor.layers.quantization.exl3_utils import (
 logger = init_logger(__name__)
 
 
-def load_exl3_weights(model: torch.nn.Module) -> set[str]:
+def manifest_still_needed(vllm_config, is_draft: bool) -> bool:
+    """Whether a draft model will still be built from the target's EXL3 config.
+
+    The MTP draft is constructed and loaded after the target, and its top
+    module and the loader use the target's quantization config (the inner
+    draft layers use a second config of their own).
+    """
+    spec = vllm_config.speculative_config
+    return not is_draft and spec is not None and spec.draft_model_config is not None
+
+
+def release_manifests(model: torch.nn.Module, quant: Exl3Config) -> None:
+    """Free every EXL3 checkpoint inventory the loaded model still references."""
+    configs = {id(quant): quant}
+    for module in model.modules():
+        owner = getattr(getattr(module, "quant_method", None), "config", None)
+        if isinstance(owner, Exl3Config):
+            configs[id(owner)] = owner
+    for owner in configs.values():
+        owner.release_manifest()
+
+
+def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     from vllm.model_executor.layers.quantization.exl3_ops import ensure_extension
 
     ensure_extension()
@@ -37,7 +60,7 @@ def load_exl3_weights(model: torch.nn.Module) -> set[str]:
     if config.parallel_config.pipeline_parallel_size != 1:
         raise ValueError("EXL3 loading currently requires pipeline parallel size one")
     ledger = Exl3LoadLedger(manifest)
-    is_draft = quant.is_draft
+    is_draft = model_config.hf_config.model_type == "qwen4_exp_mtp"
     loaded = set()
     file_backed_parameters = set()
     modules = dict(model.named_modules())
@@ -169,7 +192,6 @@ def load_exl3_weights(model: torch.nn.Module) -> set[str]:
     }
     for assignment in sorted(assignments):
         logger.info("EXL3 local routed expert IDs: %s", assignment)
-    # The draft model has its own config and manifest; neither is needed after
-    # its model is loaded.
-    quant.release_manifest()
+    if not manifest_still_needed(config, is_draft):
+        release_manifests(model, quant)
     return loaded

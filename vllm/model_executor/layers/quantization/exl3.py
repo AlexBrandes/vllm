@@ -62,7 +62,6 @@ class Exl3Config(QuantizationConfig):
         self.mtp_start_layer_idx = 0
         self.mapped_prefixes: dict[str, str] = {}
         self.is_qwen = False
-        self.is_draft = False
 
     @classmethod
     def get_name(cls) -> Literal["exl3"]:
@@ -94,7 +93,6 @@ class Exl3Config(QuantizationConfig):
         )
         self.manifest = Exl3Manifest(model_name, require_qwen_aux=is_qwen)
         self.is_qwen = is_qwen
-        self.is_draft = getattr(hf_config, "model_type", "") == "qwen4_exp_mtp"
         text = getattr(hf_config, "text_config", hf_config)
         self.mtp_start_layer_idx = getattr(text, "num_hidden_layers", 0)
 
