@@ -189,49 +189,80 @@ def test_ple_metadata_preserves_request_and_token_order(
     assert metadata.token_chunk_offset_ptr is None
 
 
-def _packed_ple_file(tmp_path, offset=32):
-    """Small real file with a nonzero tensor offset and one padded row."""
-    rows = [bytes([row + 1]) * 122 for row in range(10)]
+_PLE_PREFIX = "model.layers.0.ple.ple_embedding.ngram_embedding"
+
+
+def _packed_ple_file(
+    tmp_path, offset=32, *, bits=6, dim=160, sizes=(5, 4), rows=10, offsets=None,
+    metadata=None,
+):
+    """Small real PLE file: two heads, a sparse gap before the trellis and one
+    padded row. Row r holds the byte r + 1 repeated."""
+    words = 1 + dim * bits // 16
+    heads = len(sizes)
+    offsets = list(accumulate((0, *sizes[:-1]))) if offsets is None else offsets
+    rows_data = [bytes([row + 1]) * (2 * words) for row in range(rows)]
+    parts = [
+        ("head_bias", "F16", [heads, dim], bytes(range(256)) * (heads * dim)),
+        ("head_offsets", "I64", [heads], struct.pack(f"<{heads}q", *offsets)),
+        ("head_vocab_sizes", "I64", [heads], struct.pack(f"<{heads}q", *sizes)),
+        ("layer_multipliers", "I64", [3], struct.pack("<3q", 3, 5, 7)),
+        ("gap", "I16", [offset // 2], None),
+        ("trellis", "I16", [rows, words], b"".join(rows_data)),
+    ]
     header = {
-        "__metadata__": {"format": "exl3_ngram_trellis", "version": "1",
-                         "K": "6", "codebook": "mul1", "row_dim": "160",
-                         "rows": "10"},
-        "prefix": {"dtype": "I16", "shape": [offset // 2],
-                   "data_offsets": [0, offset]},
-        "embedding.trellis": {"dtype": "I16", "shape": [10, 61],
-                              "data_offsets": [offset, offset + 1220]},
+        "__metadata__": {
+            "format": "exl3_ngram_trellis", "version": "1", "K": str(bits),
+            "codebook": "mul1", "row_dim": str(dim), "rows": str(rows),
+            **(metadata or {}),
+        }
     }
+    end = 0
+    for name, dtype, shape, _ in parts:
+        size = (2 if dtype in ("F16", "I16") else 8) * shape[0] * (
+            shape[1] if len(shape) > 1 else 1
+        )
+        header[f"{_PLE_PREFIX}.{name}"] = {
+            "dtype": dtype, "shape": shape, "data_offsets": [end, end + size],
+        }
+        end += size
     raw = json.dumps(header).encode()
-    path = tmp_path / "packed.safetensors"
+    path = tmp_path / "ngram_embedding.safetensors"
     with path.open("wb") as file:
         file.write(struct.pack("<Q", len(raw)))
         file.write(raw)
-        file.seek(8 + len(raw) + offset)
-        file.write(b"".join(rows))
-    return path, rows, 8 + len(raw) + offset
+        for name, _, _, data in parts:
+            info = header[f"{_PLE_PREFIX}.{name}"]["data_offsets"]
+            size = info[1] - info[0]
+            if data is None:
+                file.seek(size, os.SEEK_CUR)
+            else:
+                file.write(data[:size])
+    base = 8 + len(raw) + header[f"{_PLE_PREFIX}.trellis"]["data_offsets"][0]
+    return path, f"{_PLE_PREFIX}.trellis", rows_data, base
 
 
 @pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
 def test_exl3_ple_positional_rows_preserve_order_and_masks(tmp_path, offset):
-    path, rows, base = _packed_ple_file(tmp_path, offset)
-    reader = Exl3PLERowReader(str(path), "embedding.trellis", 4, 10)
+    path, key, rows, base = _packed_ple_file(tmp_path, offset)
+    reader = Exl3PLERowReader(str(path), key, 4, 10)
     try:
-        reader.set_layout([0, 5], [5, 4])
         ids = [8, 4, 5, 4, 9, -1, 3, 10]
-        target = bytearray(len(ids) * 122)
+        row_bytes = reader.row_bytes
+        target = bytearray(len(ids) * row_bytes)
         reader.read_rows(ids, memoryview(target))
         assert reader.base == base
-        assert target == b"".join(rows[i] if i in (4, 5, 8) else bytes(122)
-                                  for i in ids)
+        assert target == b"".join(
+            rows[i] if i in (4, 5, 8) else bytes(row_bytes) for i in ids
+        )
         assert os.lseek(reader.fd, 0, os.SEEK_CUR) == 0
     finally:
         reader.close()
 
 
 def test_exl3_ple_read_retries_interruptions_and_partial_reads(tmp_path, monkeypatch):
-    path, rows, _ = _packed_ple_file(tmp_path)
-    reader = Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
-    reader.set_layout([0], [9])
+    path, key, rows, _ = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, 0, 10)
     real_preadv = os.preadv
     attempts = 0
 
@@ -244,7 +275,7 @@ def test_exl3_ple_read_retries_interruptions_and_partial_reads(tmp_path, monkeyp
 
     monkeypatch.setattr(os, "preadv", interrupted_read)
     try:
-        target = bytearray(244)
+        target = bytearray(2 * reader.row_bytes)
         reader.read_rows([8, 1], memoryview(target))
         assert target == rows[8] + rows[1]
     finally:
@@ -252,34 +283,48 @@ def test_exl3_ple_read_retries_interruptions_and_partial_reads(tmp_path, monkeyp
 
 
 def test_exl3_ple_truncation_after_open_is_an_error(tmp_path):
-    path, _, base = _packed_ple_file(tmp_path)
-    reader = Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
-    reader.set_layout([0], [9])
+    path, key, _, base = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, 0, 10)
     try:
-        os.truncate(path, base + 8 * 122 + 10)
+        os.truncate(path, base + 8 * reader.row_bytes + 10)
         with pytest.raises(EOFError, match="Truncated PLE"):
-            reader.read_rows([8], memoryview(bytearray(122)))
+            reader.read_rows([8], memoryview(bytearray(reader.row_bytes)))
     finally:
         reader.close()
-    with pytest.raises(ValueError, match="outside file"):
-        Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
+    with pytest.raises(ValueError, match="extent"):
+        Exl3PLERowReader(str(path), key, 0, 10)
 
 
 def test_exl3_ple_rejects_invalid_ranges_and_destinations(tmp_path):
-    path, _, _ = _packed_ple_file(tmp_path)
+    path, key, _, _ = _packed_ple_file(tmp_path)
     with pytest.raises(ValueError, match="owner range"):
-        Exl3PLERowReader(str(path), "embedding.trellis", 0, 11)
-    reader = Exl3PLERowReader(str(path), "embedding.trellis", 0, 10)
+        Exl3PLERowReader(str(path), key, 0, 11)
+    with pytest.raises(ValueError, match="trellis"):
+        Exl3PLERowReader(str(path), key.removesuffix(".trellis"), 0, 10)
+    reader = Exl3PLERowReader(str(path), key, 0, 10)
     try:
-        with pytest.raises(ValueError, match="contiguous"):
-            reader.set_layout([0, 6], [5, 3])
-        reader.set_layout([0], [9])
         with pytest.raises(ValueError, match="destination"):
-            reader.read_rows([1, 2], memoryview(bytearray(122)))
+            reader.read_rows([1, 2], memoryview(bytearray(reader.row_bytes)))
         with pytest.raises(ValueError, match="64-bit"):
             pread_exact_into(reader.fd, memoryview(bytearray(1)), (1 << 63) - 1)
     finally:
         reader.close()
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"offsets": [0, 6]}, "head range"),
+        ({"sizes": (5, 0)}, "head range"),
+        ({"rows": 140}, "padding"),
+        ({"metadata": {"codebook": "mcg"}}, "format"),
+        ({"metadata": {"rows": "11"}}, "metadata"),
+    ],
+)
+def test_exl3_ple_rejects_invalid_layouts(tmp_path, kwargs, match):
+    path, key, _, _ = _packed_ple_file(tmp_path, **kwargs)
+    with pytest.raises(ValueError, match=match):
+        Exl3PLERowReader(str(path), key, 0, 10)
 
 
 def test_exl3_ple_slot_waits_for_copy_before_reuse():

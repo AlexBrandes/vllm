@@ -64,7 +64,8 @@ class TensorHeader:
         return data
 
 
-def read_headers(path: Path) -> dict[str, TensorHeader]:
+def _read_header(path: Path) -> tuple[dict, int, int]:
+    """Return the parsed safetensors header, its payload start and file size."""
     size = path.stat().st_size
     with path.open("rb") as file:
         prefix = file.read(8)
@@ -74,7 +75,18 @@ def read_headers(path: Path) -> dict[str, TensorHeader]:
         if length > min(size - 8, 100_000_000):
             raise ValueError(f"Invalid safetensors header size: {path.name}")
         header = json.loads(file.read(length), object_pairs_hook=_unique_object)
-    start = 8 + length
+    return header, 8 + length, size
+
+
+def read_metadata(path: Path) -> dict[str, str]:
+    metadata = _read_header(path)[0].get("__metadata__", {})
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid safetensors metadata: {path.name}")
+    return metadata
+
+
+def read_headers(path: Path) -> dict[str, TensorHeader]:
+    header, start, size = _read_header(path)
     tensors = {}
     for name, entry in header.items():
         if name == "__metadata__":
@@ -176,7 +188,7 @@ class Exl3Manifest:
                 continue
             prefix = name.removesuffix(".trellis")
             if prefix.endswith(".ngram_embedding"):
-                self._validate_ple(prefix, tensor)
+                ple_layout(self.tensors, read_metadata(tensor.path), prefix)
                 self.ple_tables[prefix] = tensor
                 continue
             self.matrices[prefix] = self._matrix(prefix, tensor)
@@ -256,33 +268,86 @@ class Exl3Manifest:
             raise ValueError(f"Conflicting dense and EXL3 weights: {prefix}")
         return PackedMatrix(prefix, k, n, bits_x2, codebook, marker)
 
-    def _validate_ple(self, prefix: str, tensor: TensorHeader):
-        if tensor.dtype != "I16" or len(tensor.shape) != 2:
-            raise ValueError(f"Invalid compressed PLE table: {prefix}")
-        bias = self.tensors.get(f"{prefix}.head_bias")
-        if bias is None or bias.dtype != "F16" or len(bias.shape) != 2:
-            raise ValueError(f"Invalid compressed PLE bias: {prefix}")
-        heads, dim = bias.shape
-        if dim != 160 or tensor.shape[1] != 61:
-            raise ValueError("EXL3 PLE requires 160 channels and six-bit rows")
-        offsets = self._expect(f"{prefix}.head_offsets", "I64", (heads,))
-        sizes = self._expect(f"{prefix}.head_vocab_sizes", "I64", (heads,))
-        multipliers = self.tensors.get(f"{prefix}.layer_multipliers")
-        if (
-            multipliers is None
-            or multipliers.dtype != "I64"
-            or len(multipliers.shape) != 1
-        ):
-            raise ValueError(f"Invalid compressed PLE multipliers: {prefix}")
-        offsets = struct.unpack(f"<{heads}q", offsets.read_bytes())
-        sizes = struct.unpack(f"<{heads}q", sizes.read_bytes())
-        end = 0
-        for offset, size in zip(offsets, sizes):
-            if offset != end or size <= 0:
-                raise ValueError(f"Invalid compressed PLE head range: {prefix}")
-            end += size
-        if end > tensor.shape[0] or tensor.shape[0] - end >= 128:
-            raise ValueError(f"Invalid compressed PLE padding: {prefix}")
+
+@dataclass(frozen=True)
+class PLELayout:
+    """Geometry of one compressed PLE table, taken from its file headers."""
+
+    trellis: TensorHeader
+    # Headers in PLE_AUXILIARIES order.
+    auxiliaries: tuple[TensorHeader, ...]
+    bits: int
+    dim: int
+    heads: int
+    head_offsets: tuple[int, ...]
+    head_vocab_sizes: tuple[int, ...]
+
+    @property
+    def rows(self) -> int:
+        return self.trellis.shape[0]
+
+    @property
+    def words(self) -> int:
+        return self.trellis.shape[1]
+
+    @property
+    def row_bytes(self) -> int:
+        return self.words * 2
+
+
+def _metadata_int(metadata: dict[str, str], key: str, prefix: str) -> int:
+    value = metadata.get(key)
+    if not isinstance(value, str) or not value.isdigit():
+        raise ValueError(f"Missing compressed PLE metadata {key}: {prefix}")
+    return int(value)
+
+
+def ple_layout(
+    tensors: dict[str, TensorHeader], metadata: dict[str, str], prefix: str
+) -> PLELayout:
+    """Validate one compressed PLE table and return its layout."""
+    trellis = tensors.get(f"{prefix}.trellis")
+    if trellis is None or trellis.dtype != "I16" or len(trellis.shape) != 2:
+        raise ValueError(f"Invalid compressed PLE table: {prefix}")
+    if (
+        metadata.get("format") != "exl3_ngram_trellis"
+        or metadata.get("version") != "1"
+        or metadata.get("codebook") != "mul1"
+    ):
+        raise ValueError(f"Unsupported compressed PLE format: {prefix}")
+    bias = tensors.get(f"{prefix}.head_bias")
+    if bias is None or bias.dtype != "F16" or len(bias.shape) != 2:
+        raise ValueError(f"Invalid compressed PLE bias: {prefix}")
+    heads, dim = bias.shape
+    rows, words = trellis.shape
+    if dim != 160 or words != 61:
+        raise ValueError("EXL3 PLE requires 160 channels and six-bit rows")
+    bits = 6
+    if (
+        _metadata_int(metadata, "K", prefix) != bits
+        or _metadata_int(metadata, "row_dim", prefix) != dim
+        or _metadata_int(metadata, "rows", prefix) != rows
+    ):
+        raise ValueError(f"Compressed PLE metadata disagrees with headers: {prefix}")
+    head_offsets = tensors.get(f"{prefix}.head_offsets")
+    head_vocab_sizes = tensors.get(f"{prefix}.head_vocab_sizes")
+    for header in (head_offsets, head_vocab_sizes):
+        if header is None or header.dtype != "I64" or header.shape != (heads,):
+            raise ValueError(f"Invalid compressed PLE head table: {prefix}")
+    multipliers = tensors.get(f"{prefix}.layer_multipliers")
+    if multipliers is None or multipliers.dtype != "I64" or len(multipliers.shape) != 1:
+        raise ValueError(f"Invalid compressed PLE multipliers: {prefix}")
+    offsets = struct.unpack(f"<{heads}q", head_offsets.read_bytes())
+    sizes = struct.unpack(f"<{heads}q", head_vocab_sizes.read_bytes())
+    end = 0
+    for offset, size in zip(offsets, sizes):
+        if offset != end or size <= 0:
+            raise ValueError(f"Invalid compressed PLE head range: {prefix}")
+        end += size
+    if end > rows or rows - end >= 128:
+        raise ValueError(f"Invalid compressed PLE padding: {prefix}")
+    auxiliaries = (bias, head_offsets, head_vocab_sizes, multipliers)
+    return PLELayout(trellis, auxiliaries, bits, dim, heads, offsets, sizes)
 
 
 class Exl3LoadLedger:

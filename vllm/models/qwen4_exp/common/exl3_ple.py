@@ -3,16 +3,22 @@
 """Bounded compressed PLE storage and selected-row decoding."""
 
 import bisect
-import json
 import os
-import struct
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import torch
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.exl3_utils import (
+    PLE_AUXILIARIES,
+    TensorHeader,
+    ple_layout,
+    read_headers,
+    read_metadata,
+)
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -37,94 +43,39 @@ def pread_exact_into(fd: int, target: memoryview, offset: int) -> None:
 
 
 class Exl3PLERowReader:
-    """Read owned rows from a validated safetensors extent into caller storage."""
+    """Read owned rows of a validated compressed PLE table into caller storage."""
 
     def __init__(self, path: str, key: str, owner_lo: int, owner_hi: int):
         self.fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
         try:
-            file_size = os.fstat(self.fd).st_size
-            prefix = bytearray(8)
-            pread_exact_into(self.fd, memoryview(prefix), 0)
-            length = struct.unpack("<Q", prefix)[0]
-            if length > min(16 << 20, file_size - 8):
-                raise ValueError("Invalid PLE safetensors header length")
-            raw = bytearray(length)
-            pread_exact_into(self.fd, memoryview(raw), 8)
-            self.header = json.loads(raw)
-            self.data_start = 8 + length
-            extents = []
-            widths = {"F16": 2, "I16": 2, "I64": 8}
-            for name, tensor in self.header.items():
-                if name == "__metadata__":
-                    continue
-                size = widths[tensor["dtype"]]
-                for dim in tensor["shape"]:
-                    if type(dim) is not int or dim < 0:
-                        raise ValueError("Invalid PLE tensor dimensions")
-                    size *= dim
-                extents.append(self.extent(name, size))
-            extents.sort()
-            if any(a[1] > b[0] for a, b in zip(extents, extents[1:])):
-                raise ValueError("Overlapping PLE tensor extents")
-            meta = self.header.get("__metadata__", {})
-            if (
-                meta.get("format") != "exl3_ngram_trellis"
-                or meta.get("version") != "1"
-                or meta.get("codebook") != "mul1"
-            ):
-                raise ValueError("Unsupported PLE file format")
-            self.bits = int(meta["K"])
-            self.dim = int(meta["row_dim"])
-            if self.bits != 6 or self.dim != 160:
-                raise ValueError("EXL3 PLE requires 6-bit, 160-channel rows")
-            entry = self.header[key]
-            self.rows, self.words = entry["shape"]
-            if entry["dtype"] != "I16" or self.words != 1 + self.dim * self.bits // 16:
-                raise ValueError("Invalid packed PLE shape/dtype")
-            if not 0 <= owner_lo <= owner_hi <= self.rows:
+            if not key.endswith(".trellis"):
+                raise ValueError("PLE source key must name the packed trellis")
+            source = Path(path)
+            self.layout = ple_layout(
+                read_headers(source),
+                read_metadata(source),
+                key.removesuffix(".trellis"),
+            )
+            if not 0 <= owner_lo <= owner_hi <= self.layout.rows:
                 raise ValueError("PLE owner range exceeds stored padded rows")
             self.owner_lo, self.owner_hi = owner_lo, owner_hi
-            self.row_bytes = self.words * 2
-            start, end = self.extent(key, self.rows * self.row_bytes)
-            self.base = start
-            if end > file_size or int(meta["rows"]) != self.rows:
-                raise ValueError("PLE file extent does not match row metadata")
-            self.key = key
-            self.offsets: tuple[int, ...] = ()
-            self.sizes: tuple[int, ...] = ()
+            self.base = self.layout.trellis.offset
+            self.row_bytes = self.layout.row_bytes
         except BaseException:
             self.close()
             raise
 
-    def extent(self, key: str, size: int) -> tuple[int, int]:
-        start, end = self.header[key]["data_offsets"]
-        if not 0 <= start <= end or end - start != size:
-            raise ValueError(f"Invalid PLE extent for {key}")
-        start, end = self.data_start + start, self.data_start + end
-        if end > min(os.fstat(self.fd).st_size, (1 << 63) - 1):
-            raise ValueError(f"PLE extent outside file for {key}")
-        return start, end
-
-    def set_layout(self, offsets, sizes) -> None:
-        offsets, sizes = tuple(offsets), tuple(sizes)
-        if not offsets or len(offsets) != len(sizes) or offsets[0] != 0:
-            raise ValueError("Invalid PLE head layout")
-        end = 0
-        for offset, size in zip(offsets, sizes):
-            if offset != end or size <= 0:
-                raise ValueError("PLE heads must be positive contiguous ranges")
-            end = offset + size
-        if end > self.rows:
-            raise ValueError("PLE head layout exceeds stored rows")
-        self.offsets, self.sizes = offsets, sizes
+    def read_tensor(self, header: TensorHeader) -> bytearray:
+        data = bytearray(header.nbytes)
+        pread_exact_into(self.fd, memoryview(data), header.offset)
+        return data
 
     def owns(self, row: int) -> bool:
-        if not self.offsets:
-            raise RuntimeError("PLE head layout has not been loaded")
         if not self.owner_lo <= row < self.owner_hi:
             return False
-        head = bisect.bisect_right(self.offsets, row) - 1
-        return head >= 0 and row < self.offsets[head] + self.sizes[head]
+        offsets = self.layout.head_offsets
+        head = bisect.bisect_right(offsets, row) - 1
+        return head >= 0 and row < offsets[head] + self.layout.head_vocab_sizes[head]
 
     def read_rows(
         self, ids, target: memoryview, begin: int = 0, end: int | None = None
@@ -153,7 +104,8 @@ class Exl3PLERowReader:
 
 
 class Exl3PLESlot:
-    """Bounded staging lease whose reuse waits for the previous output copy."""
+    """The PLE step state: one bounded staging lease whose reuse waits for the
+    previous output copy."""
 
     def __init__(self, capacity, completion):
         self.capacity = capacity
@@ -182,6 +134,9 @@ class Exl3PLESlot:
         if self.state != "ready":
             raise RuntimeError("PLE finalize has no matching prefetched rows")
         self.state = "idle"
+
+    def fail(self):
+        self.state = "failed"
 
 
 class Exl3PLEEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
@@ -245,13 +200,13 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._output_dim = self._heads * self.embedding_dim
         self._reader = None
         self._pool = None
-        self._state = "unloaded"
+        self._slot: Exl3PLESlot | None = None
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
 
     def check_ready(self):
-        if self._state in ("unloaded", "closed", "failed"):
+        if self._slot is None:
             raise RuntimeError("EXL3 PLE file/auxiliary loader join is missing")
 
     def setup_file(
@@ -262,10 +217,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         The manifest must exclude these keys and the trellis from ordinary
         tensor iteration. Hash buffers belong to the parent n-gram module.
         """
-        if self._state != "unloaded" or self._reader is not None:
+        if self._reader is not None:
             raise RuntimeError("EXL3 PLE file was already set up")
-        if not key.endswith(".trellis"):
-            raise ValueError("PLE source key must name the packed trellis")
         device = self.weight.device
         if device.type != "cuda" or any(
             t.device != device
@@ -280,33 +233,27 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         )
         self._reader = reader
         try:
-            if reader.rows != self.org_vocab_size or reader.dim != self.embedding_dim:
-                raise ValueError("PLE checkpoint rows/dim differ from model layout")
-            prefix = key.removesuffix("trellis")
-            tensors = {}
-            consumed = {key}
-            for name, dtype, shape in (
-                ("head_bias", torch.float16, (self._heads, reader.dim)),
-                ("head_offsets", torch.int64, tuple(head_offsets.shape)),
-                ("head_vocab_sizes", torch.int64, tuple(head_vocab_sizes.shape)),
-                ("layer_multipliers", torch.int64, tuple(layer_multipliers.shape)),
+            layout = reader.layout
+            if (
+                layout.rows != self.org_vocab_size
+                or layout.dim != self.embedding_dim
+                or layout.heads != self._heads
             ):
-                source_key = prefix + name
-                entry = reader.header[source_key]
-                expected_dtype = "F16" if dtype == torch.float16 else "I64"
-                if entry["dtype"] != expected_dtype or tuple(entry["shape"]) != shape:
-                    raise ValueError(f"Invalid PLE auxiliary {source_key}")
-                size = 2 if dtype == torch.float16 else 8
-                for dim in shape:
-                    size *= dim
-                start, end = reader.extent(source_key, size)
-                raw = bytearray(end - start)
-                pread_exact_into(reader.fd, memoryview(raw), start)
-                tensors[name] = torch.frombuffer(raw, dtype=dtype).reshape(shape)
-                consumed.add(source_key)
-            reader.set_layout(
-                tensors["head_offsets"].tolist(), tensors["head_vocab_sizes"].tolist()
-            )
+                raise ValueError("PLE checkpoint rows/dim/heads differ from model")
+            tensors = {}
+            for name, header in zip(PLE_AUXILIARIES, layout.auxiliaries):
+                dtype = torch.float16 if header.dtype == "F16" else torch.int64
+                tensors[name] = torch.frombuffer(
+                    reader.read_tensor(header), dtype=dtype
+                ).reshape(header.shape)
+            for name, target in (
+                ("head_offsets", head_offsets),
+                ("head_vocab_sizes", head_vocab_sizes),
+                ("layer_multipliers", layer_multipliers),
+            ):
+                if tensors[name].shape != target.shape:
+                    raise ValueError(f"Invalid PLE auxiliary {name}")
+            consumed = {key} | {header.name for header in layout.auxiliaries}
             head_offsets.copy_(tensors["head_offsets"])
             head_vocab_sizes.copy_(tensors["head_vocab_sizes"])
             layer_multipliers.copy_(tensors["layer_multipliers"])
@@ -318,13 +265,12 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
             self._ready = torch.cuda.Event()
             self._released = torch.cuda.Event()
             self._released.record(torch.cuda.current_stream())
-            self._slot = Exl3PLESlot(self._capacity, self._released)
             self._ids = torch.empty(self._capacity, dtype=torch.int64, device=device)
             self._packed = torch.empty(
-                self._capacity, reader.words, dtype=torch.int16, device=device
+                self._capacity, layout.words, dtype=torch.int16, device=device
             )
             self._decoded = torch.empty(
-                self._capacity, reader.dim, dtype=torch.bfloat16, device=device
+                self._capacity, layout.dim, dtype=torch.bfloat16, device=device
             )
             if self.placement == "ssd":
                 self._host_ids = torch.empty(
@@ -332,7 +278,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 )
                 self._host_rows = torch.empty(
                     self._capacity,
-                    reader.words,
+                    layout.words,
                     dtype=torch.int16,
                     device="cpu",
                     pin_memory=True,
@@ -353,7 +299,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                         raise RuntimeError("RAM PLE comparison requires CUDA UVA")
                     self._table = torch.empty(
                         count,
-                        reader.words,
+                        layout.words,
                         dtype=torch.int16,
                         device="cpu",
                         pin_memory=True,
@@ -367,12 +313,12 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     self._table_view = get_accelerator_view_from_cpu_tensor(self._table)
                 else:
                     self._table = torch.empty(
-                        count, reader.words, dtype=torch.int16, device=device
+                        count, layout.words, dtype=torch.int16, device=device
                     )
                     block = min(count, self._capacity)
                     staging = torch.empty(
                         block,
-                        reader.words,
+                        layout.words,
                         dtype=torch.int16,
                         device="cpu",
                         pin_memory=True,
@@ -387,7 +333,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                         )
                         self._table[begin : begin + length].copy_(staging[:length])
                     self._table_view = self._table
-            self._state = "idle"
+            self._slot = Exl3PLESlot(self._capacity, self._released)
             logger.info(
                 "EXL3 PLE: placement=%s storage=int16 output=bfloat16 "
                 "owner=[%d,%d) row_bytes=%d capacity=%d",
@@ -399,21 +345,19 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
             )
             return consumed
         except BaseException:
-            self._state = "failed"
             reader.close()
             raise
 
     def close(self):
-        if self._state not in ("unloaded", "closed"):
-            if hasattr(self, "_stream"):
-                self._stream.synchronize()
-                self._released.synchronize()
+        if self._slot is not None:
+            self._stream.synchronize()
+            self._released.synchronize()
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
         if self._reader is not None:
             self._reader.close()
-        self._state = "closed"
+        self._slot = None
 
     @eager_break_during_capture
     def start_prefetch(self, hidden_states, ngram_ids):
@@ -424,7 +368,6 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         gathered = self._gather_dp_ids(ngram_ids, slot_size)
         count = gathered.numel()
         self._slot.acquire(count)
-        self._state = "reading"
         try:
             self._local_tokens = ngram_ids.shape[0]
             self._slot_offset = slot_offset
@@ -484,21 +427,20 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     self.head_vocab_sizes,
                     self._reader.owner_lo,
                     self._reader.owner_hi,
-                    self._reader.bits,
+                    self._reader.layout.bits,
                     self._decoded[:count],
                 )
                 self._ready.record(stream)
             self._slot.ready()
-            self._state = "ready"
         except BaseException:
-            self._state = "failed"
+            self._slot.fail()
             raise
 
     @eager_break_during_capture
     def _finalize_prefetch(self, output):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("EXL3 PLE finalize requires an eager graph break")
-        if self._state != "ready" or output.shape[0] != self._local_tokens:
+        if self._slot.state != "ready" or output.shape[0] != self._local_tokens:
             raise RuntimeError("PLE finalize has no matching prefetched rows")
         current = torch.cuda.current_stream()
         current.wait_event(self._ready)
@@ -511,7 +453,6 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         output.copy_(rows.flatten(-2))
         self._released.record(current)
         self._slot.release()
-        self._state = "idle"
 
     def forward(self, hidden_states):
         output = self._decoded.new_empty((hidden_states.shape[0], self._output_dim))
