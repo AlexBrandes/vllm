@@ -683,6 +683,29 @@ class KVCacheManager:
         """
         self.block_pool.evict_blocks(block_ids)
 
+    def evict_blocks_from(
+        self, request_id: str, num_tokens: int
+    ) -> tuple[set[int], ...]:
+        """Evict a request's blocks holding tokens at or after `num_tokens`
+        from the prefix cache.
+
+        Returns, per KV cache group, the evicted block IDs that another
+        request can hold only if it reused those tokens. Groups without
+        positionally stable blocks lose all of the request's blocks; they
+        return no IDs when a positional group exists, because reusing their
+        later states implies reusing that group's later blocks.
+        """
+        managers = self.coordinator.single_type_managers
+        any_stable = any(m.has_positionally_stable_blocks for m in managers)
+        reused = []
+        for manager, blocks in zip(managers, self.coordinator.get_blocks(request_id)):
+            stable = manager.has_positionally_stable_blocks
+            first = num_tokens // manager.block_size if stable else 0
+            block_ids = {b.block_id for b in blocks[first:] if not b.is_null}
+            manager.block_pool.evict_blocks(block_ids)
+            reused.append(block_ids if stable or not any_stable else set())
+        return tuple(reused)
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,

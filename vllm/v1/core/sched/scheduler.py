@@ -2636,6 +2636,11 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        failed_input_req_ids: set[str] = set()
+        if model_runner_output.failed_req_ids:
+            failed_input_req_ids = self._handle_failed_inputs(
+                model_runner_output.failed_req_ids
+            )
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2656,6 +2661,9 @@ class Scheduler(SchedulerInterface):
                     assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
+                continue
+            if failed_input_req_ids and req_id in failed_input_req_ids:
+                # The step's output was computed from wrong inputs.
                 continue
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
@@ -2900,6 +2908,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_mismatch_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
+        error_req_ids.update(failed_input_req_ids)
         if self.ec_connector is not None:
             # An encoder input the connector can no longer obtain. Failing is
             # retryable: re-issuing the request re-runs the encode.
@@ -3960,6 +3969,52 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)
         return set() if self.recompute_kv_load_failures else affected_req_ids
+
+    def _handle_failed_inputs(self, failed_req_ids: set[str]) -> set[str]:
+        """Handle requests whose model inputs failed on a worker.
+
+        KV computed from the failed step on is wrong. Drop it from the prefix
+        cache and also fail running requests that already reused it, so no
+        request is served from those inputs.
+
+        Returns:
+            Set of request IDs to skip in update_from_output and finish with
+            FINISHED_ERROR.
+        """
+        affected: set[str] = set()
+        reused: list[set[int]] = []
+        for req_id in failed_req_ids:
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            affected.add(req_id)
+            # num_in_flight_tokens still counts the failed step's tokens.
+            first_token = max(
+                0, request.num_computed_tokens - request.num_in_flight_tokens
+            )
+            group_ids = self.kv_cache_manager.evict_blocks_from(req_id, first_token)
+            reused = (
+                [a | b for a, b in zip(reused, group_ids)]
+                if reused
+                else list(group_ids)
+            )
+        if any(reused):
+            for request in self.running:
+                if request.request_id not in affected and any(
+                    not group.isdisjoint(ids)
+                    for group, ids in zip(
+                        reused, self.kv_cache_manager.get_block_ids(request.request_id)
+                    )
+                ):
+                    affected.add(request.request_id)
+        if affected:
+            logger.error(
+                "Failing %d request(s) whose model inputs could not be produced "
+                "on a worker, or that reused KV computed from them: %s",
+                len(affected),
+                sorted(affected),
+            )
+        return affected
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]

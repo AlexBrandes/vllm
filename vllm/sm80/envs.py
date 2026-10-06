@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_EXL3_PLE_COLD: bool = False
+    VLLM_EXL3_PLE_READ_RETRIES: int = 3
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -671,6 +672,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
     "VLLM_EXL3_PLE_COLD": lambda: bool(int(os.getenv("VLLM_EXL3_PLE_COLD", "0"))),
+    # Retries (1 ms backoff, doubling) for a failed or truncated PLE row read
+    # before the requests using that row are finished with an error.
+    "VLLM_EXL3_PLE_READ_RETRIES": lambda: int(
+        os.getenv("VLLM_EXL3_PLE_READ_RETRIES", "3")
+    ),
 }
 
 

@@ -172,6 +172,13 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def take_failed_tokens(self) -> torch.Tensor | None:
+        """Bool mask over the last forward's tokens whose model inputs could
+        not be produced on this worker (for example a failed storage read),
+        or None. The requests owning masked tokens are finished with an
+        error. Taking the mask clears it."""
+        return None
+
     @abstractmethod
     def prepare_inputs_embeds(
         self,

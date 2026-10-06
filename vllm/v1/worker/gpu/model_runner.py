@@ -2406,6 +2406,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            failed_tokens=self.model_state.take_failed_tokens(),
+            query_start_loc_np=input_batch.query_start_loc_np,
         )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.

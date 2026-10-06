@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import errno
 import json
 import logging
 import mmap
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from itertools import accumulate
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from compressed_tensors.quantization import QuantizationArgs
@@ -45,9 +47,12 @@ from vllm.models.qwen4_exp.amd import ple_layer as amd_ple_layer
 from vllm.models.qwen4_exp.amd.ple_layer import (
     Qwen4ExpPLELayer as Qwen4ExpPLELayerAMD,
 )
+from vllm.models.qwen4_exp.common import exl3_ple
 from vllm.models.qwen4_exp.common.exl3_ple import (
     Exl3PLERowReader,
     Exl3PLESlot,
+    copy_masking_failed,
+    poison_rows,
     pread_exact_into,
 )
 from vllm.models.qwen4_exp.common.ops.ple import ple_conv
@@ -302,13 +307,17 @@ def test_exl3_ple_read_retries_interruptions_and_partial_reads(
         reader.close()
 
 
-def test_exl3_ple_truncation_after_open_is_an_error(tmp_path):
-    path, key, _, base = _packed_ple_file(tmp_path)
-    reader = Exl3PLERowReader(str(path), key, 0, 10)
+def test_exl3_ple_truncation_after_open_fails_only_cut_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(exl3_ple.time, "sleep", lambda _: None)
+    path, key, rows, base = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, 0, 10, retries=2)
     try:
         os.truncate(path, base + 8 * reader.row_bytes + 10)
-        with pytest.raises(EOFError, match="Truncated PLE"):
-            reader.read_rows([8], memoryview(bytearray(reader.row_bytes)))
+        target = bytearray(2 * reader.row_bytes)
+        failed = reader.read_rows([8, 1], memoryview(target))
+        assert [(index, type(error)) for index, error in failed] == [(0, EOFError)]
+        assert "Truncated PLE" in str(failed[0][1])
+        assert target[reader.row_bytes :] == rows[1]
     finally:
         reader.close()
     with pytest.raises(ValueError, match="extent"):
@@ -347,6 +356,112 @@ def test_exl3_ple_rejects_invalid_layouts(tmp_path, kwargs, match):
     path, key, _, _ = _packed_ple_file(tmp_path, **kwargs)
     with pytest.raises(ValueError, match=match):
         Exl3PLERowReader(str(path), key, 0, 10)
+
+
+def _faulty_preadv(monkeypatch, fault, rows_to_fail, base, row_bytes, times=None):
+    """Make reads of the given rows fail `times` times (always if None)."""
+    real_preadv = os.preadv
+    attempts = {}
+
+    def preadv(fd, buffers, offset):
+        row, within = divmod(offset - base, row_bytes)
+        if row in rows_to_fail:
+            if within == 0:
+                attempts[row] = attempts.get(row, 0) + 1
+            if times is None or attempts[row] <= times:
+                if fault != "short":
+                    raise OSError(fault, os.strerror(fault))
+                # Part of the row, then end of file.
+                if within == 0:
+                    return real_preadv(fd, [buffers[0][:5]], offset)
+                return 0
+        return real_preadv(fd, buffers, offset)
+
+    monkeypatch.setattr(os, "preadv", preadv)
+    return attempts
+
+
+_READ_FAULTS = [
+    pytest.param(errno.EINTR, id="eintr"),
+    pytest.param(errno.EIO, id="eio"),
+    pytest.param("short", id="short"),
+]
+
+
+@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
+@pytest.mark.parametrize("fault", _READ_FAULTS)
+def test_exl3_ple_transient_read_error_is_retried(
+    tmp_path, monkeypatch, fault, bits, dim
+):
+    sleeps = []
+    monkeypatch.setattr(exl3_ple.time, "sleep", sleeps.append)
+    path, key, rows, base = _packed_ple_file(tmp_path, bits=bits, dim=dim)
+    reader = Exl3PLERowReader(str(path), key, 0, 10, retries=3)
+    try:
+        attempts = _faulty_preadv(
+            monkeypatch, fault, {4}, base, reader.row_bytes, times=1
+        )
+        ids = [4, 2, 4, 8]
+        target = bytearray(len(ids) * reader.row_bytes)
+        assert reader.read_rows(ids, memoryview(target)) == []
+        assert target == b"".join(rows[i] for i in ids)
+        assert sleeps == [0.001]
+        assert attempts[4] >= 2
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("fault", _READ_FAULTS)
+def test_exl3_ple_persistent_read_error_fails_only_its_rows(
+    tmp_path, monkeypatch, fault
+):
+    sleeps = []
+    monkeypatch.setattr(exl3_ple.time, "sleep", sleeps.append)
+    path, key, rows, base = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, 0, 10, retries=3)
+    try:
+        _faulty_preadv(monkeypatch, fault, {5}, base, reader.row_bytes)
+        ids = [5, 2, 9, 5, 7]
+        target = bytearray(len(ids) * reader.row_bytes)
+        failed = reader.read_rows(ids, memoryview(target))
+        assert [index for index, _ in failed] == [0, 3]
+        error = EOFError if fault == "short" else OSError
+        assert all(isinstance(e, error) for _, e in failed)
+        # Bounded: retries + 1 attempts per failed row, doubling backoff.
+        assert sleeps == [0.001, 0.002, 0.004] * 2
+        size = reader.row_bytes
+        for index, row in ((1, rows[2]), (2, bytes(size)), (4, rows[7])):
+            assert target[index * size : (index + 1) * size] == row
+        # The reader is not stuck: later reads of other rows succeed...
+        target = bytearray(2 * reader.row_bytes)
+        assert reader.read_rows([1, 8], memoryview(target)) == []
+        assert target == rows[1] + rows[8]
+        # ...and the failed row reads again once the fault clears.
+        monkeypatch.undo()
+        target = bytearray(reader.row_bytes)
+        assert reader.read_rows([5], memoryview(target)) == []
+        assert target == rows[5]
+    finally:
+        reader.close()
+
+
+def test_exl3_ple_poisoned_rows_become_zero_failed_tokens():
+    """A poisoned row decodes to NaN (NaN scale times any codebook value);
+    the NaN survives the rank sum and only its token is zeroed and flagged."""
+    packed = np.zeros((6, 61), dtype=np.int16)
+    packed[:, 0] = np.float16(0.5).view(np.int16)
+    poison_rows(packed, [3])
+    scales = packed[:, 0].view(np.float16).astype(np.float32)
+    assert np.isnan(scales[3]) and not np.isnan(np.delete(scales, 3)).any()
+    # Rows are [tokens=3, heads=2, dim]; row 3 is token 1, head 1.
+    owner = torch.from_numpy(scales).repeat_interleave(4).view(3, 2, 4)
+    other = torch.ones(3, 2, 4)
+    summed = (owner * 2 + other).to(torch.bfloat16)
+    output = torch.full((3, 8), 7.0, dtype=torch.bfloat16)
+    failed = copy_masking_failed(summed, output)
+    assert failed.tolist() == [False, True, False]
+    assert torch.equal(output[1], torch.zeros(8, dtype=torch.bfloat16))
+    assert torch.equal(output[[0, 2]], summed[[0, 2]].flatten(-2))
 
 
 def test_exl3_ple_advises_random_reads_and_cold_drop(tmp_path, monkeypatch):

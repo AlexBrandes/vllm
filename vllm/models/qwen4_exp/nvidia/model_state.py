@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE inputs."""
 
+import functools
 from typing import Any
 
 import torch
@@ -25,6 +26,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
+        from ..common.exl3_ple import Exl3PLEEmbedding
+
+        self.exl3_ple = [m for m in model.modules() if isinstance(m, Exl3PLEEmbedding)]
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
         if not self.uses_ngram_embedding:
@@ -91,6 +95,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
             )
         )
         return context
+
+    def take_failed_tokens(self) -> torch.Tensor | None:
+        masks = [
+            mask
+            for mask in (ple.take_failed_tokens() for ple in self.exl3_ple)
+            if mask is not None
+        ]
+        return functools.reduce(torch.logical_or, masks) if masks else None
 
     def prepare_inputs(
         self,

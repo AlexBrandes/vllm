@@ -48,13 +48,15 @@ The MTP count is configurable; this example is not a measured optimum. Keep visi
 
 `VLLM_EXL3_PLE_PLACEMENT` accepts `ssd` (default), `ram` or `device`. Placement is explicit and logged; RAM/device modes are comparisons, not automatic fallbacks.
 
-- `ssd`: retain the file descriptor and read only requested owned rows with buffered positional reads into bounded reusable pinned staging. Read errors and truncated valid rows fail the request.
+- `ssd`: retain the file descriptor and read only requested owned rows with buffered positional reads into bounded reusable pinned staging. A failed or truncated row read is retried up to `VLLM_EXL3_PLE_READ_RETRIES` times (default 3, backoff 1 ms doubling); see below for a read that still fails.
 - `ram`: explicitly pin the compressed rank shard and expose its accelerator view.
 - `device`: explicitly load the compressed rank shard to the GPU.
 
 All modes use the same GPU row decoder. Its layout comes from the PLE file: `K` from the codec metadata, the channel count from the head bias, and the row size (one FP16 scale word plus a ring of `channels * K` bits) from the trellis. Ownership and head padding are masked before bias; only decoded BF16 rows participate in the embedding reduction. Repeated IDs preserve request order. Original auxiliary tensors stay GPU-resident.
 
 SSD reads occur at eager Python breaks between CUDA graph segments: ID completion, CPU reads, H2D readiness, decode and output-copy completion have explicit ordering. This is not a captured CUDA host callback. Staging cannot be reused until the previous output consumer has completed. Warm stable workspaces before capture; growth after capture locking is rejected.
+
+A row read that still fails after its retries fails only the requests that use the row; the engine keeps serving the rest. The reader stages the row with an FP16 NaN scale, so the decoder emits a NaN row. NaN survives the tensor-parallel sum of row shards, so every rank sees which tokens failed, whichever rank owns the row. Those tokens' PLE embeddings are zeroed before the forward continues, so NaN cannot reach other requests. The model runner reports the requests that own the tokens. The scheduler finishes them with `FINISHED_ERROR` (finish reason `error`) and drops from the prefix cache the KV blocks they computed from that step on. It also fails any running request that already reused those blocks, so no request is served from a wrong embedding. The worker logs the row and the OS error; the scheduler logs the request IDs. The reader stays usable, and later requests read the row again. Errors while reading the table or its auxiliaries during startup still fail startup. `ram` and `device` read the table only at startup.
 
 The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel does not read ahead around requested rows. Buffered reads still hit the page cache, so warm runs mostly read RAM. Set `VLLM_EXL3_PLE_COLD=1` to call `POSIX_FADV_DONTNEED` on the table at setup (no root needed; pages that another process has mapped stay resident). Page-cache residency of the table (via `mincore`) is logged at setup, after the cold drop and at process exit. `Exl3PLEEmbedding.page_cache_residency()` returns `(resident, total)` pages for sampling between runs.
 

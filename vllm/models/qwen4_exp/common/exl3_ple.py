@@ -8,6 +8,7 @@ import ctypes
 import functools
 import mmap
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -81,24 +82,59 @@ def page_cache_residency(fd: int, start: int, length: int) -> tuple[int, int]:
 
 
 def pread_exact_into(fd: int, target: memoryview, offset: int) -> None:
-    """Fill a byte view without changing the descriptor's seek position."""
+    """Fill a byte view without changing the descriptor's seek position.
+
+    Partial reads continue; errors, EINTR included, and end of file are
+    raised for the caller's bounded retry.
+    """
     if offset < 0 or offset + len(target) > (1 << 63) - 1:
         raise ValueError("PLE file offset exceeds signed 64-bit range")
     done = 0
     while done < len(target):
-        try:
-            count = os.preadv(fd, [target[done:]], offset + done)
-        except InterruptedError:
-            continue
+        count = os.preadv(fd, [target[done:]], offset + done)
         if count == 0:
             raise EOFError(f"Truncated PLE data at byte {offset + done}")
         done += count
 
 
+# The first retry waits 1 ms, each later one twice as long.
+_READ_BACKOFF_S = 0.001
+# An FP16 quiet NaN as a row's scale makes every decoded channel NaN.
+_POISONED_SCALE = 0x7E00
+
+
+def poison_rows(rows: np.ndarray, indices) -> None:
+    """Mark staged packed rows that could not be read.
+
+    The decoder turns them into NaN rows; NaN survives the cross-rank sum,
+    so every rank sees which tokens failed, whichever rank owns the row.
+    """
+    rows[list(indices), 0] = _POISONED_SCALE
+
+
+def copy_masking_failed(rows: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    """Copy [tokens, heads, dim] rows into output, zeroing poisoned tokens.
+
+    Returns the per-token failure mask. Zero rows keep NaN out of the
+    forward; the runner fails the requests that own the masked tokens.
+    """
+    failed = rows[..., 0].isnan().any(-1)
+    output.copy_(rows.flatten(-2))
+    output.masked_fill_(failed.unsqueeze(-1), 0)
+    return failed
+
+
 class Exl3PLERowReader:
     """Read owned rows of a validated compressed PLE table into caller storage."""
 
-    def __init__(self, path: str, key: str, owner_lo: int, owner_hi: int):
+    def __init__(
+        self,
+        path: str,
+        key: str,
+        owner_lo: int,
+        owner_hi: int,
+        retries: int | None = None,
+    ):
         self.fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
         try:
             if not key.endswith(".trellis"):
@@ -114,6 +150,11 @@ class Exl3PLERowReader:
             self.owner_lo, self.owner_hi = owner_lo, owner_hi
             self.base = self.layout.trellis.offset
             self.row_bytes = self.layout.row_bytes
+            if retries is None:
+                retries = envs.VLLM_EXL3_PLE_READ_RETRIES
+            self.retries = retries
+            if self.retries < 0:
+                raise ValueError("PLE read retries must be nonnegative")
             # Rows are read at random; readahead would only fetch unused rows.
             os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
         except BaseException:
@@ -133,9 +174,21 @@ class Exl3PLERowReader:
         """Return (resident, total) page-cache pages of the table extent."""
         return page_cache_residency(self.fd, self.base, self.layout.trellis.nbytes)
 
+    def read_exact(self, target: memoryview, offset: int) -> None:
+        """Read with bounded retries and exponential backoff; raise the last
+        error once retries are exhausted."""
+        for attempt in range(self.retries + 1):
+            try:
+                pread_exact_into(self.fd, target, offset)
+                return
+            except (OSError, EOFError):
+                if attempt == self.retries:
+                    raise
+                time.sleep(_READ_BACKOFF_S * 2**attempt)
+
     def read_tensor(self, header: TensorHeader) -> bytearray:
         data = bytearray(header.nbytes)
-        pread_exact_into(self.fd, memoryview(data), header.offset)
+        self.read_exact(memoryview(data), header.offset)
         return data
 
     def owns(self, row: int) -> bool:
@@ -147,19 +200,29 @@ class Exl3PLERowReader:
 
     def read_rows(
         self, ids, target: memoryview, begin: int = 0, end: int | None = None
-    ) -> None:
-        """Preserve order/repetitions; mask only nonowned or padding rows."""
+    ) -> list[tuple[int, BaseException]]:
+        """Preserve order/repetitions; mask only nonowned or padding rows.
+
+        Returns (index, error) for owned rows that still failed after the
+        retries; their bytes in target are unspecified. Other rows are read
+        regardless, and the reader stays usable.
+        """
         end = len(ids) if end is None else end
         if not 0 <= begin <= end <= len(ids) or len(target) < end * self.row_bytes:
             raise ValueError("PLE row destination is too small")
         zero = bytes(self.row_bytes)
+        failed = []
         for index in range(begin, end):
             row = int(ids[index])
             dest = target[index * self.row_bytes : (index + 1) * self.row_bytes]
-            if self.owns(row):
-                pread_exact_into(self.fd, dest, self.base + row * self.row_bytes)
-            else:
+            if not self.owns(row):
                 dest[:] = zero
+                continue
+            try:
+                self.read_exact(dest, self.base + row * self.row_bytes)
+            except (OSError, EOFError) as error:
+                failed.append((index, error))
+        return failed
 
     def close(self) -> None:
         fd = getattr(self, "fd", -1)
@@ -267,6 +330,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._reader = None
         self._pool = None
         self._slot: Exl3PLESlot | None = None
+        self._failed_tokens: torch.Tensor | None = None
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
@@ -355,7 +419,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     pin_memory=True,
                 )
                 self._host_ids_np = self._host_ids.numpy()
-                self._host_bytes = memoryview(self._host_rows.numpy()).cast("B")
+                self._host_rows_np = self._host_rows.numpy()
+                self._host_bytes = memoryview(self._host_rows_np).cast("B")
                 self._workers = min(8, os.cpu_count() or 1)
                 self._pool = ThreadPoolExecutor(
                     max_workers=self._workers, thread_name_prefix="ple-read"
@@ -376,8 +441,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                         pin_memory=True,
                     )
                     view = memoryview(self._table.numpy()).cast("B")
-                    pread_exact_into(
-                        reader.fd,
+                    reader.read_exact(
                         view,
                         reader.base + reader.owner_lo * reader.row_bytes,
                     )
@@ -397,8 +461,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     view = memoryview(staging.numpy()).cast("B")
                     for begin in range(0, count, block):
                         length = min(block, count - begin)
-                        pread_exact_into(
-                            reader.fd,
+                        reader.read_exact(
                             view[: length * reader.row_bytes],
                             reader.base + (reader.owner_lo + begin) * reader.row_bytes,
                         )
@@ -492,13 +555,26 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                         )
                 # Join every read even if one fails, before the slot can close.
                 errors = []
+                failed = []
                 for future in futures:
                     try:
-                        future.result()
+                        failed.extend(future.result())
                     except BaseException as error:
                         errors.append(error)
                 if errors:
                     raise errors[0]
+                if failed:
+                    poison_rows(self._host_rows_np, (index for index, _ in failed))
+                    index, error = failed[0]
+                    logger.error(
+                        "EXL3 PLE: %d row read(s) failed after %d retries "
+                        "(first: row %d: %s); the requests using them will be "
+                        "finished with an error",
+                        len(failed),
+                        self._reader.retries,
+                        int(ids[index]),
+                        error,
+                    )
             with torch.cuda.stream(stream):
                 packed = self._packed[:count]
                 if self.placement == "ssd":
@@ -544,9 +620,14 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         if self.tp_size > 1:
             rows = self.parallel_group.all_reduce(rows)
         rows = self._select_embeddings(rows, self._local_tokens, self._slot_offset)
-        output.copy_(rows.flatten(-2))
+        self._failed_tokens = copy_masking_failed(rows, output)
         self._released.record(current)
         self._slot.release()
+
+    def take_failed_tokens(self) -> torch.Tensor | None:
+        """Return the last forward's per-token read-failure mask, once."""
+        failed, self._failed_tokens = self._failed_tokens, None
+        return failed
 
     def forward(self, hidden_states):
         output = self._decoded.new_empty((hidden_states.shape[0], self._output_dim))
