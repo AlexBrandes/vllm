@@ -46,6 +46,10 @@ vllm serve ./qwen-exl3-checkpoint \
 
 The MTP count is configurable; this example is not a measured optimum. Keep vision enabled. Validate eager execution before graph replay and test the native context independently of a shorter diagnostic boot.
 
+`VLLM_QWEN4_ROUTER_FP32=1` selects the existing `GateLinear` BF16-by-BF16 GEMM with FP32 accumulation and FP32 router logits, without changing the stored router weights. It defaults to `0`; the model logs the selected precision at construction. This switch applies to both the target and native MTP router.
+
+`VLLM_QWEN4_MTP_PER_STREAM_NORM=1` computes a separate RMS for each native MTP hidden stream. It preserves the checkpoint's affine weight for each channel and applies the Gemma `(1 + weight)` scaling in FP32 before returning BF16. The default `0` retains one RMS over the entire concatenated hidden stack. The draft model logs the selected normalization. These are precision/normalization comparison paths, not validated default changes.
+
 ## Compressed PLE placement
 
 `VLLM_EXL3_PLE_PLACEMENT` accepts `ssd` (default), `ram` or `device`. Placement is explicit and logged; RAM/device modes are comparisons, not automatic fallbacks.
