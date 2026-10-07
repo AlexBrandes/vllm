@@ -56,6 +56,16 @@ DENSE = {
     "model.layers.0.mlp.shared_expert.down_proj": (640, 2560, 14),
     "lm_head": (2560, VOCAB, 12),
 }
+QSA_INDEX = 640  # (4 indexer query heads + 1 key head) x 128
+for _qsa in ("model.language_model.layers.3.self_attn", "mtp.layers.0.self_attn"):
+    DENSE.update(
+        {
+            f"{_qsa}.q_proj": (2560, 12288, 14),
+            f"{_qsa}.k_proj": (2560, 512, 14),
+            f"{_qsa}.v_proj": (2560, 512, 14),
+            f"{_qsa}.indexer.index_qk_proj": (2560, QSA_INDEX, 14),
+        }
+    )
 EXPERTS, EXPERT_HIDDEN, EXPERT_INTERMEDIATE = 8, 256, 128
 
 
@@ -233,6 +243,83 @@ def test_qkv_shards_kv_heads_and_their_replicas(exl3_config, monkeypatch, size):
         kv_parts += layer.exl3_weights[1].output_slices
     assert _covered(q_parts, 12288) == [1] * 12288
     # Each KV head is held by exactly `replicas` ranks.
+    assert _covered(kv_parts, 512) == [replicas] * 512
+
+
+@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize(
+    "owner,prefix",
+    [
+        ("Qwen4ExpForConditionalGeneration", "language_model.model.layers.3.self_attn"),
+        ("Qwen4ExpMTP", "mtp.layers.0.self_attn"),
+    ],
+)
+def test_qsa_fused_qkv_indexer_shards_heads_and_replicates_the_indexer(
+    exl3_config, monkeypatch, owner, prefix, size
+):
+    import vllm.models.qwen4_exp.nvidia.model as qwen_model
+    from vllm.models.qwen4_exp.nvidia import mtp as qwen_mtp
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAQKVIndexerLinear
+
+    # The target's packed mapping lists the indexer, the MTP draft's does not;
+    # both build the same layers.
+    model_class = getattr(qwen_model, owner, None) or getattr(qwen_mtp, owner)
+    monkeypatch.setattr(exl3_config, "is_qwen", True)
+    monkeypatch.setattr(
+        exl3_config, "packed_modules_mapping", model_class.packed_modules_mapping
+    )
+    source = exl3_config.source_prefix(prefix)
+    replicas = max(1, size // 2)
+    q_parts, kv_parts = [], []
+    for rank in range(size):
+        _tp(monkeypatch, rank, size)
+        # Qwen4ExpQSAAttention builds this Q/K/V layer, then fuses the indexer.
+        qkv = QKVParallelLinear(
+            HIDDEN,
+            256,
+            48,
+            2,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=exl3_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        assert [w.matrix.prefix for w in qkv.exl3_weights] == [
+            f"{source}.{name}_proj" for name in "qkv"
+        ]
+        layer = Qwen4ExpQSAQKVIndexerLinear(qkv, QSA_INDEX, exl3_config)
+        q_width = 12288 // size
+        kv_rank, kv_width = rank // replicas, 512 // (size // replicas)
+        kv = [slice(kv_rank * kv_width, (kv_rank + 1) * kv_width)]
+        assert _slices(layer) == [
+            (
+                f"{source}.q_proj",
+                slice(0, HIDDEN),
+                [slice(rank * q_width, (rank + 1) * q_width)],
+                (160, q_width // 16, 112),
+            ),
+            (f"{source}.k_proj", slice(0, HIDDEN), kv, (160, kv_width // 16, 112)),
+            (f"{source}.v_proj", slice(0, HIDDEN), kv, (160, kv_width // 16, 112)),
+            (
+                f"{source}.indexer.index_qk_proj",
+                slice(0, HIDDEN),
+                [slice(0, QSA_INDEX)],
+                (160, QSA_INDEX // 16, 112),
+            ),
+        ]
+        # Output columns line up with the layer's split of Q/gate+K+V | indexer.
+        assert [w.logical_out for w in layer.exl3_weights] == [
+            q_width,
+            kv_width,
+            kv_width,
+            QSA_INDEX,
+        ]
+        assert sum(w.logical_out for w in layer.exl3_weights) == (
+            layer.output_size_per_partition
+        )
+        q_parts += layer.exl3_weights[0].output_slices
+        kv_parts += layer.exl3_weights[1].output_slices
+    assert _covered(q_parts, 12288) == [1] * 12288
     assert _covered(kv_parts, 512) == [replicas] * 512
 
 

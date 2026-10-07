@@ -34,6 +34,12 @@ from vllm.model_executor.layers.quantization.exl3_utils import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+# Qwen4Exp QSA projects Q/gate, K, V and the replicated indexer Q/K in one
+# layer. It first builds a three-output QKV layer, then replaces it with the
+# four-output fused one, and the target, MTP and LoRA packed mappings disagree
+# on the indexer, so each layer's output count selects its members.
+_QSA_QKV_MEMBERS = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+
 
 @cache
 def _require_sm80() -> None:
@@ -147,7 +153,7 @@ class Exl3Config(QuantizationConfig):
                 prefix = f"mtp.layers.{index - self.mtp_start_layer_idx}.{match[2]}"
         return prefix
 
-    def constituents(self, prefix: str) -> list[PackedMatrix]:
+    def constituents(self, prefix: str, outputs: int = 0) -> list[PackedMatrix]:
         assert self.manifest is not None
         source = self.source_prefix(prefix)
         if source in self.manifest.matrices:
@@ -156,6 +162,8 @@ class Exl3Config(QuantizationConfig):
         members = self.packed_modules_mapping.get(leaf, [leaf])
         if leaf == "qkv" and ".visual." in source:
             members = ["q_proj", "k_proj", "v_proj"]
+        elif leaf == "qkv_proj" and self.is_qwen and outputs:
+            members = list(_QSA_QKV_MEMBERS[:outputs])
         names = [
             self.source_prefix(f"{parent}.{member}" if parent else member)
             for member in members
@@ -172,7 +180,9 @@ class Exl3Config(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(self, prefix, layer.moe_config)
         if isinstance(layer, (LinearBase, ParallelLMHead)):
-            matrices = self.constituents(prefix)
+            matrices = self.constituents(
+                prefix, len(getattr(layer, "output_sizes", ()))
+            )
             if matrices:
                 return Exl3LinearMethod(matrices)
             if isinstance(layer, LinearBase):
@@ -287,14 +297,20 @@ class Exl3LinearMethod(LinearMethodBase):
             groups = [[n] for n in parts]
         if len(groups) != len(self.matrices):
             raise ValueError("EXL3 packed constituents do not match linear outputs")
+        # The fused QSA layer's K/V follow the KV heads like QKVParallelLinear;
+        # its indexer Q/K is replicated on every rank.
+        qsa_indexer = len(self.matrices) == 4 and self.matrices[3].prefix.endswith(
+            ".indexer.index_qk_proj"
+        )
+        kv_heads = isinstance(layer, QKVParallelLinear) or qsa_indexer
         weights = []
         for index, (matrix, group) in enumerate(zip(self.matrices, groups)):
             output_rank, output_size_tp = rank, size
-            if isinstance(layer, QKVParallelLinear) and index > 0:
+            if row_parallel or (qsa_indexer and index == 3):
+                output_rank, output_size_tp = 0, 1
+            elif kv_heads and index in (1, 2):
                 output_rank //= layer.num_kv_head_replicas
                 output_size_tp //= layer.num_kv_head_replicas
-            if row_parallel:
-                output_rank, output_size_tp = 0, 1
             logical_output = sum(group) * output_size_tp
             matrix.validate_logical(input_size, logical_output)
             input_slice = aligned_shard(
