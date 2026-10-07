@@ -23,7 +23,7 @@ Dense layers share one fixed 32 MiB FP32 scratch per GPU, plus one for the share
 
 ## Qwen3.8-Flash-Next
 
-The model integration preserves packed constituents of fused projections, replicates shared experts when their widths cannot be legally split, retains full indexer keys, and uses data-parallel vision encoding. Native MTP shares the target embedding and head when the checkpoint does not provide dedicated ones. The loader requires the compressed ngram table and MTP hyper-connection mixer patch in addition to the main shards.
+The model integration preserves packed constituents of fused projections, replicates shared experts when their widths cannot be legally split, retains full indexer keys, and uses data-parallel vision encoding. Sparse attention computes Q/gate, K, V and the indexer Q/K in one fused projection; Q/gate splits across ranks, K/V follow the key-value heads, and every rank holds the whole indexer matrix. Native MTP shares the target embedding and head when the checkpoint does not provide dedicated ones. The loader requires the compressed ngram table and MTP hyper-connection mixer patch in addition to the main shards.
 
 For the two-card configuration:
 
@@ -44,7 +44,7 @@ vllm serve ./qwen-exl3-checkpoint \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
-The MTP count is configurable; this example is not a measured optimum. Keep vision enabled. Validate eager execution before graph replay and test the native context independently of a shorter diagnostic boot.
+The MTP count is configurable; this example is not a measured optimum. Keep vision enabled. Validate eager execution before graph replay and test the native context independently of a shorter diagnostic boot. `tests/models/qwen4_exp/test_exl3_construction.py` builds the target and MTP draft at two-rank expert-parallel shapes on the CPU from the checkpoint's configuration and tensor headers when `VLLM_TEST_EXL3_QWEN_CHECKPOINT` names the checkpoint directory.
 
 `VLLM_QWEN4_ROUTER_FP32=1` selects the existing `GateLinear` BF16-by-BF16 GEMM with FP32 accumulation and FP32 router logits, without changing the stored router weights. It defaults to `0`; the model logs the selected precision at construction. This switch applies to both the target and native MTP router.
 
