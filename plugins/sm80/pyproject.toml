@@ -8,16 +8,22 @@
 # directory and add that directory to PYTHONPATH:
 #   pip install --no-deps --target <dir> plugins/sm80
 # vllm/sm80/guard.py stops vLLM at startup when the plugin is missing.
+#
+# licenses/exl3/ holds byte copies of vllm/third_party/exl3/{LICENSE,NOTICE}
+# (MIT grant of the adapted ExLlamaV3 code), so every install of the plugin
+# carries them in its dist-info. License files must sit inside this
+# directory; tests/sm80/test_plugin_distribution.py checks the copies.
 
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-sm80-plugin"
 version = "0.1.0"
 description = "vLLM plugin entry point of the CMP 170HX (sm_80) fork"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0 AND MIT"
+license-files = ["licenses/exl3/LICENSE", "licenses/exl3/NOTICE"]
 requires-python = ">=3.10"
 
 [project.entry-points."vllm.general_plugins"]
