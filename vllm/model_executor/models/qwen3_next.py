@@ -166,10 +166,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 quant_config,
                 f"{prefix}.shared_expert.down_proj",
             )
-            if quant_config is not None and quant_config.get_name() == "exl3":
-                shared_expert_group_size = getattr(
-                    quant_config, "min_transform_size", None
-                )
+            shared_expert_group_size = getattr(
+                quant_config, "shared_expert_shard_group_size", shared_expert_group_size
+            )
             self.replicate_shared_expert = _should_replicate_misaligned_shared_expert(
                 config.shared_expert_intermediate_size,
                 self.tp_size,

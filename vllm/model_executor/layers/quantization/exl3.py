@@ -85,7 +85,15 @@ def _require_sm80() -> None:
 
 
 class Exl3Config(QuantizationConfig):
+    """Registered as "exl3" by vllm/sm80/plugin.py.
+
+    Upstream model code consults the attributes and methods below through
+    getattr, so they apply only to this config.
+    """
+
     min_transform_size = 128
+    # Qwen3-Next shared experts: TP shards keep whole transform blocks.
+    shared_expert_shard_group_size = min_transform_size
 
     def __init__(self):
         super().__init__()
@@ -161,6 +169,29 @@ class Exl3Config(QuantizationConfig):
                 raise ValueError(f"Conflicting EXL3 module mapping: {mapped}")
             mapped_prefixes[mapped] = source
         self.mapped_prefixes = mapped_prefixes
+
+    def get_ple_embedding_method(self):
+        """Qwen4Exp PLE method (vllm/models/qwen4_exp/common/ngram_embedding.py)."""
+        from vllm.models.qwen4_exp.common.exl3_ple import Exl3PLEEmbeddingMethod
+
+        return Exl3PLEEmbeddingMethod(self)
+
+    @property
+    def ple_embedding_cls(self):
+        """Qwen4Exp PLE table (vllm/models/qwen4_exp/nvidia/ngram_embedding.py)."""
+        from vllm.models.qwen4_exp.common.exl3_ple import Exl3PLEEmbedding
+
+        return Exl3PLEEmbedding
+
+    def set_mtp_start_layer_idx(self, index: int) -> None:
+        """MTP draft layers are numbered after the target's (nvidia/mtp.py)."""
+        self.mtp_start_layer_idx = index
+
+    @staticmethod
+    def mtp_shares_target_embeddings(config) -> bool:
+        """Whether the Qwen4Exp MTP draft reuses the target embedding and head
+        (nvidia/mtp.py builds PPMissingLayer placeholders for them)."""
+        return not getattr(config, "mtp_use_dedicated_embeddings", False)
 
     def release_manifest(self) -> None:
         """Drop the checkpoint inventory once this config's model is loaded."""
