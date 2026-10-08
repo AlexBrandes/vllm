@@ -6,6 +6,14 @@ Code dispatched from shared vLLM ops with shape gates any sm_80 model could
 hit lives here, one subpackage per kernel family. Kernels only one model
 calls live in that model's ``vllm/models/<model>/nvidia/ops/`` instead.
 
-Importing this package does no work: every family is opt-in behind its own
-switch, and its kernel modules are imported only when that switch is on.
+Importing this package does no work. Every family dispatched from shared
+ops is opt-in behind its own switch, and its kernel modules are imported only
+when that switch is on.
+
+``exl3`` is different: it is the quantization method and load format "exl3",
+registered by vllm/sm80/plugin.py. Its ``quant``, ``loader`` and ``utils``
+modules are imported at plugin load in every process, whatever VLLM_EXL3 is;
+VLLM_EXL3 is checked when an EXL3 checkpoint builds ``Exl3Config``. ``ops``,
+which loads the compiled ``vllm._exl3_C``, is imported only when
+Exl3ModelLoader builds an EXL3 model or an EXL3 layer processes its weights.
 """

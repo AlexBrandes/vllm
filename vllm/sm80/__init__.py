@@ -4,7 +4,8 @@
 can reach.
 
 - ``kernels``: kernels dispatched from shared vLLM ops, one subpackage per
-  family (attention, indexer, kda, marlin_moe, mhc, moe, thin_gemm).
+  family (attention, indexer, kda, marlin_moe, mhc, moe, thin_gemm), and
+  ``exl3``, the EXL3 quantization method and load format.
 - ``attention``: the Triton sparse-MLA attention backend.
 - ``distributed``: the host-staged and the flags-in-data custom all-reduce,
   and the opt-in PCIe peer-to-peer topology leg (``pcie_p2p``).
@@ -15,12 +16,14 @@ can reach.
 - ``envs``: the fork's environment variables; ``vllm/envs.py`` registers
   them at the end of its own import.
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point
-  (distribution in ``plugins/sm80``) and the startup check that it loaded.
+  (distribution in ``plugins/sm80``), which registers ``kernels.exl3``, and
+  the startup check that it loaded.
 - ``platform``: the fork's CUDA platform, selected by the
   ``vllm.platform_plugins`` entry point of the same distribution; the guard
   also checks that it is the platform in use on CUDA.
 
 Kernels only one model calls live under ``vllm/models/<model>/nvidia/ops``.
 Importing this package does no work: the upstream files that use a module
-here import that module directly.
+here import that module directly, and ``plugin`` imports the EXL3 modules it
+registers.
 """

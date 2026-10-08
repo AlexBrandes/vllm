@@ -34,13 +34,13 @@ def _params_on_meta(module, name, param, register):
 
 
 def _summary(model):
-    from vllm.sm80.kernels.exl3.quant import (
-        Exl3LinearMethod,
-        Exl3MoEMethod,
-    )
     from vllm.models.qwen4_exp.nvidia.qsa import (
         Qwen4ExpQSAAttention,
         Qwen4ExpQSAQKVIndexerLinear,
+    )
+    from vllm.sm80.kernels.exl3.quant import (
+        Exl3LinearMethod,
+        Exl3MoEMethod,
     )
 
     def span(part):
