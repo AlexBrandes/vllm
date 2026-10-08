@@ -122,6 +122,8 @@ def _build(rank, port, checkpoint, out):
             max_model_len=32768,
             max_num_batched_tokens=3460,
             enforce_eager=True,
+            load_format="exl3",
+            mm_encoder_tp_mode="data",
             speculative_config={"method": "mtp", "num_speculative_tokens": 3},
         ).create_engine_config()
         assert vllm_config.quant_config.get_name() == "exl3"

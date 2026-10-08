@@ -41,6 +41,36 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 _QSA_QKV_MEMBERS = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
 
 
+def _verify_launch_options(vllm_config) -> None:
+    """Refuse a model built without the EXL3 launch options.
+
+    EXL3 weights load only through the "exl3" load format (Exl3ModelLoader),
+    and EXL3 vision towers run data-parallel. Without the options vLLM would
+    pick the default loader or shard the vision tower by weights, so fail
+    instead. initialize_model sets the current config while a model is
+    built; a layer built outside a model (unit tests) has none to check.
+    """
+    if vllm_config is None:
+        return
+    load_format = vllm_config.load_config.load_format
+    if load_format != "exl3":
+        raise ValueError(
+            f"EXL3 checkpoints need --load-format exl3, not {load_format!r}"
+        )
+    model_config = vllm_config.model_config
+    multimodal = model_config.multimodal_config
+    # The MTP draft config carries no launch options of its own.
+    if (
+        multimodal is not None
+        and model_config.runner_type != "draft"
+        and multimodal.mm_encoder_tp_mode != "data"
+    ):
+        raise ValueError(
+            "EXL3 vision towers need --mm-encoder-tp-mode data, not "
+            f"{multimodal.mm_encoder_tp_mode!r}"
+        )
+
+
 @cache
 def _require_sm80() -> None:
     """The extension is built for SM 8.0 only; refuse other GPUs up front."""
@@ -84,6 +114,22 @@ class Exl3Config(QuantizationConfig):
     @staticmethod
     def get_config_filenames() -> list[str]:
         return []
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg, user_quant, hf_config=None
+    ) -> None:
+        """Refuse EXL3 off CUDA while ModelConfig verifies quantization.
+
+        ModelConfig asks every registered method before it checks the
+        platform; EXL3 never replaces the checkpoint's method.
+        """
+        if hf_quant_cfg.get("quant_method") == "exl3" or user_quant == "exl3":
+            from vllm.platforms import current_platform
+
+            if not current_platform.is_cuda():
+                raise ValueError("EXL3 execution requires the NVIDIA CUDA platform")
+        return None
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Exl3Config":
@@ -176,6 +222,9 @@ class Exl3Config(QuantizationConfig):
         return found
 
     def get_quant_method(self, layer: nn.Module, prefix: str):
+        from vllm.config import get_current_vllm_config_or_none
+
+        _verify_launch_options(get_current_vllm_config_or_none())
         _require_sm80()
         if isinstance(layer, RoutedExperts):
             return Exl3MoEMethod(self, prefix, layer.moe_config)

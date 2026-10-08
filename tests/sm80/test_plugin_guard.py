@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The fork's plugin entry point and the startup guard (vllm/sm80/guard.py)."""
 
+import json
 import os
 import pathlib
 import site
@@ -163,7 +164,12 @@ def _is_source_tree(path: str) -> bool:
 
 
 def _start(
-    tmp_path, with_metadata: bool, plugins: str | None = None, platform: bool = True
+    tmp_path,
+    with_metadata: bool,
+    plugins: str | None = None,
+    platform: bool = True,
+    child: str = CHILD,
+    args: tuple[str, ...] = (),
 ):
     site_dir = tmp_path / "site"
     site_dir.mkdir()
@@ -182,7 +188,7 @@ def _start(
     if plugins is not None:
         env["VLLM_PLUGINS"] = plugins
     return subprocess.run(
-        [sys.executable, "-c", CHILD],
+        [sys.executable, "-c", child, *args],
         env=env,
         cwd=tmp_path,
         capture_output=True,
@@ -224,3 +230,70 @@ def test_config_fails_loudly_without_the_plugin(tmp_path, with_metadata, plugins
     assert proc.returncode != 0, out
     assert "STARTED" not in proc.stdout
     assert "not the fork's plugin 'sm80'" in out
+
+
+# A text-only checkpoint config whose quantization method is EXL3. Model
+# config verification needs no weights and no EXL3 extension.
+EXL3_CONFIG = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "model_type": "qwen3",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 32,
+    "vocab_size": 1024,
+    "max_position_embeddings": 256,
+    "torch_dtype": "bfloat16",
+    "quantization_config": {"quant_method": "exl3"},
+}
+
+EXL3_CHILD = """
+import sys
+import vllm.plugins
+from vllm.config import ModelConfig
+vllm.plugins.load_general_plugins()
+config = ModelConfig(
+    model=sys.argv[1], skip_tokenizer_init=True, max_model_len=128, dtype="bfloat16"
+)
+print("QUANTIZATION", config.quantization)
+"""
+
+
+def _start_exl3(tmp_path, with_metadata: bool, plugins: str | None = None):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(EXL3_CONFIG))
+    proc = _start(
+        tmp_path, with_metadata, plugins, child=EXL3_CHILD, args=(str(checkpoint),)
+    )
+    return proc, proc.stdout + proc.stderr
+
+
+def test_exl3_checkpoint_selects_the_registered_method(tmp_path):
+    proc, out = _start_exl3(tmp_path, with_metadata=True)
+    # EXL3 was selected: verification passes on CUDA hosts and refuses the
+    # checkpoint where vLLM resolved another platform.
+    assert "QUANTIZATION exl3" in proc.stdout or (
+        "EXL3 execution requires the NVIDIA CUDA platform" in out
+    ), out
+    assert "Unknown quantization method" not in out
+
+
+@pytest.mark.parametrize(
+    "with_metadata,plugins",
+    [(False, None), (True, "some_other_plugin")],
+    ids=["not-installed", "filtered-by-VLLM_PLUGINS"],
+)
+def test_exl3_checkpoint_fails_at_startup_without_the_plugin(
+    tmp_path, with_metadata, plugins
+):
+    if not with_metadata and _metadata_always_visible():
+        pytest.skip("the plugin metadata is installed where the child must look")
+    proc, out = _start_exl3(tmp_path, with_metadata, plugins)
+    assert proc.returncode != 0, out
+    # No fallback to an unquantized model: the method is unknown without the
+    # plugin, so the model config itself fails.
+    assert "QUANTIZATION" not in proc.stdout
+    assert "Unknown quantization method: exl3" in out

@@ -8,11 +8,13 @@ The CUDA build includes `vllm._exl3_C`, built for SM 8.0 only; selecting EXL3 on
 
 ## Enablement and checkpoint loading
 
-`VLLM_EXL3` defaults to `0`. Set it to `1` to select EXL3; a selected EXL3 checkpoint with the switch disabled is an error, not a fallback to another quantization method. A missing or incompatible compiled extension is also an error.
+EXL3 is registered by the fork's vLLM plugin (`vllm/sm80/plugin.py`, entry point `sm80` of the `vllm-sm80-plugin` distribution in `plugins/sm80/`): the quantization method `exl3`, which a checkpoint whose `quant_method` is `exl3` selects, and the load format `exl3`. Without the plugin such a checkpoint is an unknown quantization method at startup, never an unquantized model.
+
+`VLLM_EXL3` defaults to `0`. Set it to `1` to select EXL3; a selected EXL3 checkpoint with the switch disabled is an error, not a fallback to another quantization method. A missing or incompatible compiled extension is also an error. EXL3 needs `--load-format exl3`, and models with a vision tower also need `--mm-encoder-tp-mode data`; building the model without them is an error. Off the CUDA platform, model configuration refuses EXL3 checkpoints.
 
 ```bash
 VLLM_EXL3=1 vllm serve ./exl3-checkpoint \
-  --quantization exl3 --dtype bfloat16
+  --quantization exl3 --load-format exl3 --dtype bfloat16
 ```
 
 The checkpoint must already be a local safetensors directory. Loading inventories actual file headers, verifies packed geometry/codebook markers and accounts for consumed, file-backed and explicitly unused tensors; the counts are logged per model. The inventory is released after the last model that uses it is loaded: the target, or the MTP draft when a speculative draft is configured (the draft is built with the target's configuration). An index cannot hide auxiliary files or override their headers. Integer rates from 1 through 8 bits are supported; 1.5-, 2.5- and 3.5-bit formats require the `mul1` codebook.
@@ -33,7 +35,7 @@ VLLM_EXL3=1 \
 VLLM_EXL3_PLE_PLACEMENT=ssd \
 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve ./qwen-exl3-checkpoint \
-  --quantization exl3 \
+  --quantization exl3 --load-format exl3 --mm-encoder-tp-mode data \
   --tensor-parallel-size 2 --pipeline-parallel-size 1 \
   --enable-expert-parallel \
   --dtype bfloat16 --kv-cache-dtype bfloat16 \

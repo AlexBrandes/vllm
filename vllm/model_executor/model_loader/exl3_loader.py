@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Load EXL3 constituents without materializing unassigned packed tensors."""
 
+import time
 from collections import Counter
 from contextlib import ExitStack
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
+from torch import nn
 
-from vllm.config import get_current_vllm_config
+from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.exl3 import (
@@ -21,7 +24,52 @@ from vllm.model_executor.layers.quantization.exl3_utils import (
     Exl3LoadLedger,
 )
 
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.tracing import instrument
+
 logger = init_logger(__name__)
+
+
+class Exl3ModelLoader(DefaultModelLoader):
+    """Load format "exl3" (--load-format exl3), registered by vllm/sm80/plugin.py.
+
+    EXL3 checkpoints get the checks below and manifest-driven weight loading;
+    anything else loads as with the default loader. Exl3Config refuses EXL3
+    checkpoints under any other load format.
+    """
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        if model_config.quantization != "exl3":
+            super().download_model(model_config)
+        elif not Path(model_config.model).is_dir():
+            raise ValueError("Download the EXL3 safetensors checkpoint before loading")
+
+    def create_model(
+        self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
+    ) -> nn.Module:
+        if model_config.quantization == "exl3":
+            from vllm.model_executor.layers.quantization.exl3_ops import (
+                ensure_extension,
+            )
+
+            offload = vllm_config.offload_config
+            if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
+                raise ValueError("EXL3 permits runtime offload only for compressed PLE")
+            if vllm_config.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("EXL3 requires pipeline parallel size one")
+            if vllm_config.lora_config is not None:
+                raise ValueError("EXL3 does not support LoRA")
+            ensure_extension()
+        return super().create_model(vllm_config, model_config, prefix)
+
+    @instrument(span_name="Load weights")
+    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        if model_config.quantization != "exl3":
+            super().load_weights(model, model_config)
+            return
+        self.counter_before_loading_weights = time.perf_counter()
+        load_exl3_weights(model, model_config)
+        self.counter_after_loading_weights = time.perf_counter()
 
 
 def manifest_still_needed(vllm_config, is_draft: bool) -> bool:

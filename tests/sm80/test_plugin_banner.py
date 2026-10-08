@@ -19,6 +19,7 @@ def test_register_logs_once_per_process(monkeypatch):
     monkeypatch.setattr(vllm.logger, "init_logger", lambda name: recorder)
     for name in (
         "register_models",
+        "_register_exl3",
         "register_triton_mla_sparse_backend",
         "register_moe_layers",
     ):

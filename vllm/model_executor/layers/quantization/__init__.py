@@ -13,7 +13,6 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 QuantizationMethods = Literal[
-    "exl3",
     "awq",
     "auto_awq",
     "fp8",
@@ -137,7 +136,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-    from .exl3 import Exl3Config
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
@@ -156,7 +154,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .torchao import TorchAOConfig
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
-        "exl3": Exl3Config,
         "awq": AutoAWQConfig,
         "awq_marlin": AutoAWQConfig,
         "auto_awq": AutoAWQConfig,
