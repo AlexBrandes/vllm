@@ -999,3 +999,136 @@ seams:
   why: _load_following_width decides from it whether the drafter's convs get the runtime block length (adaptive_k.draft_by_load)
   sha256: 9a777298b7bb3e6cb4731760d24e69bb67f61071070a7d82973d890bf4a7349f
   signature: '(vllm_config: vllm.config.vllm.VllmConfig, log: bool = False) -> tuple[int, ...]'
+
+- id: quant-register-quantization-config
+  kind: function
+  target: vllm.model_executor.layers.quantization:register_quantization_config
+  why: the plugin registers Exl3Config as "exl3"; registration appends the name to QUANTIZATION_METHODS and maps it in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG
+  sha256: 86aaf3aa2be48b6522091ec976f66c781cd4032189bf4a15e214ac2473895eb2
+  signature: '(quantization: str)'
+
+- id: quant-get-quantization-config
+  kind: function
+  target: vllm.model_executor.layers.quantization:get_quantization_config
+  why: a registered method resolves through _CUSTOMIZED_METHOD_TO_QUANT_CONFIG, so a checkpoint whose quant_method is "exl3" gets Exl3Config
+  sha256: b8a9bc0c86e91383fd3c2143a9f1d3aa8567a96e9595c355b9a12909f277b48f
+  signature: '(quantization: str) -> type[vllm.model_executor.layers.quantization.base_config.QuantizationConfig]'
+
+- id: model-config-verify-quantization
+  kind: method
+  target: vllm.config.model:ModelConfig._verify_quantization
+  why: calls override_quantization_method of every registered method before current_platform.verify_quantization; Exl3Config refuses EXL3 off CUDA there
+  sha256: 2708e0499573b6e35398bdbf8b6f843a046042cf199d59031fd89bedf5c8837d
+  signature: (self) -> None
+
+- id: loader-register-model-loader
+  kind: function
+  target: vllm.model_executor.model_loader:register_model_loader
+  why: the plugin registers Exl3ModelLoader as load format "exl3"
+  sha256: 1a41a9b26196c9d15816d7e576ac90e9c86597cfcfe6647bd19902951359c3bc
+  signature: '(load_format: str)'
+
+- id: loader-get-model-loader
+  kind: function
+  target: vllm.model_executor.model_loader:get_model_loader
+  why: --load-format exl3 selects the registered loader class by name
+  sha256: 4647727e736016e9d917428cb01d591d260a43e984b2b52f2f7ed8ec99ed96d8
+  signature: '(load_config: vllm.config.load.LoadConfig) -> vllm.model_executor.model_loader.base_loader.BaseModelLoader'
+
+- id: loader-base-load-model
+  kind: method
+  target: vllm.model_executor.model_loader.base_loader:BaseModelLoader.load_model
+  why: Exl3ModelLoader relies on create_model, then load_weights, then process_weights_after_loading, in that order
+  sha256: 62172ee4f85c6cf6c94b7e5b129a8234f7e86419d8fa8b1711c8f0a08c21e9f7
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, model_config: vllm.config.model.ModelConfig, prefix: str = '''') -> torch.nn.modules.module.Module'
+
+- id: loader-base-create-model
+  kind: method
+  target: vllm.model_executor.model_loader.base_loader:BaseModelLoader.create_model
+  why: Exl3ModelLoader.create_model checks EXL3 limits and then builds the model through it (initialize_model)
+  sha256: 062b2a6fef222707528c6c150ff3e98ec6b6bc6c40f18f22654db2652a8aa30f
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, model_config: vllm.config.model.ModelConfig, prefix: str = '''') -> torch.nn.modules.module.Module'
+
+- id: loader-default-load-weights
+  kind: method
+  target: vllm.model_executor.model_loader.default_loader:DefaultModelLoader.load_weights
+  why: Exl3ModelLoader.load_weights replaces it for EXL3 and sets counter_before/after_loading_weights the same way
+  sha256: e5f56d174cc3a796192c519e09c2826f443a290d41c7da61ab81a1fbb2c293a2
+  signature: '(self, model: ''nn.Module'', model_config: ''ModelConfig'') -> ''None'''
+
+- id: loader-default-download-model
+  kind: method
+  target: vllm.model_executor.model_loader.default_loader:DefaultModelLoader.download_model
+  why: Exl3ModelLoader.download_model replaces it for EXL3 (a local directory, no load-format file patterns)
+  sha256: 723b81b177f4ef4f4252ac3388ca39df35b652ac430e7d29c7ca965713b99fec
+  signature: '(self, model_config: ''ModelConfig'') -> ''None'''
+
+- id: loader-initialize-model
+  kind: function
+  target: vllm.model_executor.model_loader.utils:initialize_model
+  why: builds the model inside set_current_vllm_config, so Exl3Config.get_quant_method can check the launch options of the current config
+  sha256: 5facc9b6e86d78553b927bc2d3d8755ad256905983c4de3e150ae31a5e246b3a
+  signature: '(vllm_config: vllm.config.vllm.VllmConfig, *, prefix: str = '''', model_class: type[torch.nn.modules.module.Module] | None = None, model_config: vllm.config.model.ModelConfig | None = None) -> torch.nn.modules.module.Module'
+
+- id: config-current-vllm-config-or-none
+  kind: function
+  target: vllm.config.vllm:get_current_vllm_config_or_none
+  why: Exl3Config reads the current config (None outside model construction) to check --load-format and --mm-encoder-tp-mode
+  sha256: d90dcc2065ca173f7ccbf122db3e9472b0eb8556a88b90d3ba0c8834e18d3f06
+  signature: () -> vllm.config.vllm.VllmConfig | None
+
+- id: spec-draft-load-config
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.utils:get_pp_safe_draft_load_config
+  why: the MTP draft inherits the target load config, so the draft also loads through Exl3ModelLoader
+  sha256: 39dcb7398756ed21105a3903262d6d2926cd093f56261083f27919cb3e46cd52
+  signature: '(load_config: vllm.config.load.LoadConfig) -> vllm.config.load.LoadConfig'
+
+- id: qwen4-ngram-embedding-init
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.__init__
+  why: exl3_loader._setup_ple_file reads ngram_embedding, ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers set here
+  sha256: c723c423fda12aaa99fb9a66454948541908c74206fb5ccac500a96fe4cbeabf
+  signature: '(self, config: transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig, embedding_dim: int, ple_dense_layer_id: int, max_total_tokens: int, *, data_parallel_rank: int, prefix: str, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, params_dtype: torch.dtype | None = None) -> None'
+
+- id: kv-coordinator-init
+  kind: method
+  target: vllm.v1.core.kv_cache_coordinator:KVCacheCoordinator.__init__
+  why: failed_inputs.evict_blocks_from iterates coordinator.single_type_managers in KV cache group order
+  sha256: 57894a3768221c4faa6a69302ab519d82467d2a59a6ef4096dbe1cf7d3cae639
+  signature: '(self, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, max_model_len: int, max_in_flight_tokens: int, use_eagle: bool, enable_caching: bool, enable_kv_cache_events: bool, dcp_world_size: int, pcp_world_size: int, scheduler_block_size: int, hash_block_size: int, metrics_collector: vllm.v1.core.kv_cache_metrics.KVCacheMetricsCollector | None = None, num_prefill_lookahead: int = 0, use_dflash_boundary: bool = False)'
+
+- id: kv-coordinator-get-blocks
+  kind: method
+  target: vllm.v1.core.kv_cache_coordinator:KVCacheCoordinator.get_blocks
+  why: failed_inputs.evict_blocks_from reads a request's blocks per group, aligned with single_type_managers
+  sha256: 40c34911c1e471e9a675806ff8f634931bb63e5dfd4d95eccf4121f57a89f9f7
+  signature: '(self, request_id: str) -> tuple[list[vllm.v1.core.kv_cache_utils.KVCacheBlock], ...]'
+
+- id: kv-single-type-init
+  kind: method
+  target: vllm.v1.core.single_type_kv_cache_manager:SingleTypeKVCacheManager.__init__
+  why: failed_inputs.evict_blocks_from reads each manager's block_size and block_pool
+  sha256: 33e2debcc5dba9a538e30202026674475d0fa2d1591ea15425f23209bafadaa2
+  signature: '(self, kv_cache_spec: vllm.v1.kv_cache_interface.KVCacheSpec, block_pool: vllm.v1.core.block_pool.BlockPool, enable_caching: bool, kv_cache_group_id: int, scheduler_block_size: int, dcp_world_size: int = 1, pcp_world_size: int = 1, needs_kv_cache_zeroing: bool = False, max_admission_blocks_per_request: int | None = None) -> None'
+
+- id: kv-single-type-positionally-stable
+  kind: method
+  target: vllm.v1.core.single_type_kv_cache_manager:SingleTypeKVCacheManager.has_positionally_stable_blocks.fget
+  why: failed_inputs.evict_blocks_from keeps the blocks before the failed token only for positionally stable groups
+  sha256: 0234db5656ece836d037ac454f9cb8f4472a6cfb127b7c971f73bf18b0c74c65
+  signature: (self) -> bool
+
+- id: kv-block-pool-evict-blocks
+  kind: method
+  target: vllm.v1.core.block_pool:BlockPool.evict_blocks
+  why: failed_inputs.evict_blocks_from removes the failed step's blocks from the prefix cache with it
+  sha256: 248299850d00032e23ca4486c1bcca12e99bca79f9c83e3a62e7ca97be6f0e62
+  signature: '(self, block_ids: set[int]) -> None'
+
+- id: kv-manager-get-block-ids
+  kind: method
+  target: vllm.v1.core.kv_cache_manager:KVCacheManager.get_block_ids
+  why: failed_inputs.handle_failed_inputs finds running requests that reused evicted blocks with it
+  sha256: 2550895d3b06f2c947b9dd88e76aa37edd546480f2ccf824ab695bbcf08f42f9
+  signature: '(self, request_id: str) -> tuple[list[int], ...]'
