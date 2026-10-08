@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Build the EXL3 extension vllm._exl3_C (SM 8.0, BF16) without rebuilding vLLM.
 
-EXL3 checkpoints need it (vllm/model_executor/layers/quantization/exl3_ops.py).
+EXL3 checkpoints need it (vllm/sm80/kernels/exl3/ops.py).
 Requires CUDA-enabled PyTorch, a matching CUDA toolkit, a C++20 compiler and
 Ninja. No visible GPU is needed. The output directory is explicit; an installed
 precompiled engine is retained. module.cpp registers the operators with the
 non-stable TORCH_LIBRARY API, so the library works only with the PyTorch it
-was built against: exl3_ops.ensure_extension compares its build_info() with
+was built against: exl3.ops.ensure_extension compares its build_info() with
 the running PyTorch and refuses another build.
 """
 

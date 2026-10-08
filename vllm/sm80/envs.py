@@ -661,7 +661,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_THIN_GEMM_CONCAT": lambda: bool(
         int(os.getenv("VLLM_THIN_GEMM_CONCAT", "0"))
     ),
-    # Qwen EXL3 checkpoints (vllm/model_executor/layers/quantization/exl3.py).
+    # Qwen EXL3 checkpoints (vllm/sm80/kernels/exl3/quant.py).
     "VLLM_EXL3": lambda: bool(int(os.getenv("VLLM_EXL3", "0"))),
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
         "VLLM_EXL3_PLE_PLACEMENT", "ssd", ["ssd", "ram", "device"]

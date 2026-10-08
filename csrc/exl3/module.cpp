@@ -42,7 +42,7 @@ TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
 
 namespace {
 
-// TORCH_LIBRARY is not the stable ABI: exl3_ops.ensure_extension compares
+// TORCH_LIBRARY is not the stable ABI: exl3.ops.ensure_extension compares
 // these with the running PyTorch and refuses a library built for another.
 PyObject* build_info(PyObject*, PyObject*) {
   return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 1, "torch_version",

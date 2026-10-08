@@ -34,7 +34,7 @@ def _params_on_meta(module, name, param, register):
 
 
 def _summary(model):
-    from vllm.model_executor.layers.quantization.exl3 import (
+    from vllm.sm80.kernels.exl3.quant import (
         Exl3LinearMethod,
         Exl3MoEMethod,
     )
@@ -183,7 +183,7 @@ def built(tmp_path_factory):
             proc.kill()
             pytest.fail("EXL3 construction timed out")
         assert proc.exitcode == 0
-    from vllm.model_executor.layers.quantization.exl3_utils import Exl3Manifest
+    from vllm.sm80.kernels.exl3.utils import Exl3Manifest
 
     manifest = Exl3Manifest(CHECKPOINT, require_qwen_aux=True)
     ranks = [json.loads((out / f"rank{r}.json").read_text()) for r in range(TP)]

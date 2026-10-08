@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization import exl3_ops
+from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),

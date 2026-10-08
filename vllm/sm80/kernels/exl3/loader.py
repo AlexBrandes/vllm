@@ -14,17 +14,16 @@ from torch import nn
 from vllm.config import ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.exl3 import (
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.sm80.kernels.exl3.quant import (
     Exl3Config,
     Exl3LinearMethod,
     Exl3MoEMethod,
 )
-from vllm.model_executor.layers.quantization.exl3_utils import (
+from vllm.sm80.kernels.exl3.utils import (
     PLE_AUXILIARIES,
     Exl3LoadLedger,
 )
-
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.tracing import instrument
 
 logger = init_logger(__name__)
@@ -48,7 +47,7 @@ class Exl3ModelLoader(DefaultModelLoader):
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         if model_config.quantization == "exl3":
-            from vllm.model_executor.layers.quantization.exl3_ops import (
+            from vllm.sm80.kernels.exl3.ops import (
                 ensure_extension,
             )
 
@@ -113,7 +112,7 @@ def _setup_ple_file(module, path: str, key: str) -> set[str]:
 
 
 def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
-    from vllm.model_executor.layers.quantization.exl3_ops import ensure_extension
+    from vllm.sm80.kernels.exl3.ops import ensure_extension
 
     ensure_extension()
     config = get_current_vllm_config()

@@ -81,7 +81,7 @@ def _reference(packed, ids, bias, offsets, sizes, owner_lo, owner_hi, bits):
 
 
 def _decode(packed, ids, bias, offsets, sizes, owner_lo, owner_hi, bits):
-    from vllm.model_executor.layers.quantization.exl3_ops import ple_decode_out
+    from vllm.sm80.kernels.exl3.ops import ple_decode_out
 
     device = torch.device("cuda")
     out = torch.full(
@@ -190,7 +190,7 @@ def test_ple_decode_rows_beyond_one_grid_pass():
     reason="set EXL3_PLE_CHECKPOINT to an EXL3 Qwen3.8 checkpoint directory",
 )
 def test_ple_decode_real_checkpoint_rows():
-    from vllm.model_executor.layers.quantization.exl3_utils import (
+    from vllm.sm80.kernels.exl3.utils import (
         ple_layout,
         read_headers,
         read_metadata,

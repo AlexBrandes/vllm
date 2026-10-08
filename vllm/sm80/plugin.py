@@ -193,9 +193,9 @@ def _register_exl3() -> None:
     """EXL3 checkpoints: quantization method "exl3" (a checkpoint whose
     quant_method is "exl3" selects it) and load format "exl3"."""
     from vllm.model_executor.layers.quantization import register_quantization_config
-    from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+    from vllm.sm80.kernels.exl3.quant import Exl3Config
     from vllm.model_executor.model_loader import register_model_loader
-    from vllm.model_executor.model_loader.exl3_loader import Exl3ModelLoader
+    from vllm.sm80.kernels.exl3.loader import Exl3ModelLoader
 
     register_quantization_config("exl3")(Exl3Config)
     register_model_loader("exl3")(Exl3ModelLoader)

@@ -7,7 +7,7 @@ import struct
 
 import pytest
 
-from vllm.model_executor.layers.quantization.exl3_utils import (
+from vllm.sm80.kernels.exl3.utils import (
     Exl3LoadLedger,
     Exl3Manifest,
     aligned_shard,
@@ -155,7 +155,7 @@ def test_loading_noncontiguous_h128_output_shards_preserves_packed_values(tmp_pa
     import torch
     from safetensors import safe_open
 
-    from vllm.model_executor.layers.quantization.exl3 import Exl3PackedWeight
+    from vllm.sm80.kernels.exl3.quant import Exl3PackedWeight
 
     tensors = _matrix(padded_in=256, padded_out=512)
     original = torch.arange(16 * 32 * 80, dtype=torch.int32).to(torch.int16)

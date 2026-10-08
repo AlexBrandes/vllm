@@ -19,7 +19,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.exl3_utils import (
+from vllm.sm80.kernels.exl3.utils import (
     PLE_AUXILIARIES,
     TensorHeader,
     ple_layout,
@@ -585,7 +585,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     # Invalid indices use row zero; the decoder masks before bias.
                     local.clamp_(0, self._reader.owner_hi - self._reader.owner_lo - 1)
                     torch.index_select(self._table_view, 0, local, out=packed)
-                from vllm.model_executor.layers.quantization.exl3_ops import (
+                from vllm.sm80.kernels.exl3.ops import (
                     ple_decode_out,
                 )
 

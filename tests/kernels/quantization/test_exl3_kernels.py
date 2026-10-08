@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization import exl3_ops
+from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
@@ -275,7 +275,7 @@ def test_moe_matches_fp64_with_expert_map_and_masked_routes(rows):
 
 
 def _checkpoint_tiles():
-    from vllm.model_executor.layers.quantization.exl3_utils import Exl3Manifest
+    from vllm.sm80.kernels.exl3.utils import Exl3Manifest
 
     manifest = Exl3Manifest(CHECKPOINT)
     chosen = {}

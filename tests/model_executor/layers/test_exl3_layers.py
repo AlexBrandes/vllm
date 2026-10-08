@@ -32,11 +32,11 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization import exl3 as exl3_module
-from vllm.model_executor.layers.quantization import exl3_ops
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.sm80.kernels.exl3 import ops as exl3_ops
+from vllm.sm80.kernels.exl3 import quant as exl3_module
 
 _BYTES = {"I16": 2, "F16": 2, "I32": 4}
 _MUL1 = 0x83DCD12D
@@ -591,7 +591,7 @@ def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch):
 def test_target_manifest_outlives_the_target_until_the_draft_loads(
     draft_model, is_draft, needed
 ):
-    from vllm.model_executor.model_loader.exl3_loader import manifest_still_needed
+    from vllm.sm80.kernels.exl3.loader import manifest_still_needed
 
     spec = SimpleNamespace(draft_model_config=object()) if draft_model else None
     assert manifest_still_needed(
@@ -600,7 +600,7 @@ def test_target_manifest_outlives_the_target_until_the_draft_loads(
 
 
 def test_release_frees_the_loader_and_layer_configs(exl3_config):
-    from vllm.model_executor.model_loader.exl3_loader import release_manifests
+    from vllm.sm80.kernels.exl3.loader import release_manifests
 
     # The MTP draft loads with the target's config while its MoE layer holds a
     # second, draft-only config; both inventories are freed.

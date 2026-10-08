@@ -11,11 +11,11 @@ from torch import nn
 import vllm.config
 from vllm.config.load import LoadConfig
 from vllm.model_executor.layers import quantization
-from vllm.model_executor.layers.quantization import exl3
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.exl3_loader import Exl3ModelLoader
 from vllm.platforms import current_platform
 from vllm.sm80 import plugin
+from vllm.sm80.kernels.exl3 import quant as exl3
+from vllm.sm80.kernels.exl3.loader import Exl3ModelLoader
 
 
 @pytest.fixture

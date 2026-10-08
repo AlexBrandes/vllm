@@ -27,12 +27,12 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.quantization.exl3_utils import (
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.sm80.kernels.exl3.utils import (
     Exl3Manifest,
     PackedMatrix,
     aligned_shard,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 # Qwen4Exp QSA projects Q/gate, K, V and the replicated indexer Q/K in one
 # layer. It first builds a three-output QKV layer, then replaces it with the
@@ -421,7 +421,7 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.exl3_weights = nn.ModuleList(weights)
 
     def process_weights_after_loading(self, layer):
-        from vllm.model_executor.layers.quantization import exl3_ops
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         self.row_chunks = []
         for weight in layer.exl3_weights:
@@ -531,7 +531,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.fused_moe.all2all_utils import (
             maybe_make_prepare_finalize,
         )
-        from vllm.model_executor.layers.quantization import exl3_ops
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         pointers, metadata = [], []
         for expert in layer.exl3_experts:
@@ -698,7 +698,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         expert_tokens_meta,
         apply_router_weight_on_input,
     ):
-        from vllm.model_executor.layers.quantization.exl3_ops import moe_out
+        from vllm.sm80.kernels.exl3.ops import moe_out
 
         if hidden_states.shape[0] > self.max_rows:
             raise ValueError("EXL3 MoE exceeds configured dispatched row capacity")
