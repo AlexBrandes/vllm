@@ -479,7 +479,6 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
