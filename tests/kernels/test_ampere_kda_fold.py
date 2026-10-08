@@ -787,14 +787,14 @@ def gpu_test_fold_verify_bitwise():
     owed) -> FOLD verify k + 1 owing n. Equal bitwise: step k + 1 outputs
     (normed and SKIP_NORM), its records, the state slot after k + 1 (fold:
     the committed state the prologue stored == today's commit) and the conv
-    window; for T 1..8, nseq 1/2/4/8, n 1..T."""
+    window; for T 1..8, nseq 1/2/4/7/8, n 1..T."""
     from vllm.sm80.kernels.kda import recover as kr
     from vllm.models.glm5next.nvidia.ops import kda_decode as k2
     from tests.kernels.test_ampere_kda_recover import _context
 
     nfail = checks = 0
     for T in range(1, 9):
-        for nseq in (1, 2, 4, 8):
+        for nseq in (1, 2, 4, 7, 8):
             k2.warmup(plans=((nseq, T),), recover=True, width=8)
             k2.warmup(plans=((nseq, T),), recover=True, width=8, fold=True)
             nslot = 2 + nseq * 8
@@ -935,6 +935,13 @@ def gpu_test_fold_graph_zero_growth():
     pool = torch.zeros(1, 3, 8, kr.WS_T, 16, 128, device="cuda")
     ctx = _context(p.conv, p.rec, pool)
     nsamp = torch.tensor([2, 8, 1, 5], device="cuda", dtype=torch.int32)
+    # finite owed records (the previous step's corrections, unit keys, decay
+    # gates in (0.5, 1)), so the replay under capture does real arithmetic
+    g = torch.Generator(device="cuda").manual_seed(5)
+    pool[0, 0].normal_(0.0, 0.05, generator=g)
+    keys = torch.randn(pool[0, 1].shape, device="cuda", generator=g)
+    pool[0, 1].copy_(keys / keys.norm(dim=-1, keepdim=True))
+    pool[0, 2].uniform_(0.5, 1.0, generator=g)
     # every input the step reads and writes: the state, the conv window, the
     # owed lengths and the record pool (the FOLD verify replays owed tokens
     # from the records and stores this step's records over them)
