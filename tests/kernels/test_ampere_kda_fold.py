@@ -935,7 +935,10 @@ def gpu_test_fold_graph_zero_growth():
     pool = torch.zeros(1, 3, 8, kr.WS_T, 16, 128, device="cuda")
     ctx = _context(p.conv, p.rec, pool)
     nsamp = torch.tensor([2, 8, 1, 5], device="cuda", dtype=torch.int32)
-    rec0, conv0, pend0 = p.rec.clone(), p.conv.clone(), f.pend.clone()
+    # every input the step reads and writes: the state, the conv window, the
+    # owed lengths and the record pool (the FOLD verify replays owed tokens
+    # from the records and stores this step's records over them)
+    rec0, conv0, pend0, pool0 = p.rec.clone(), p.conv.clone(), f.pend.clone(), pool.clone()
 
     recs = kr.layer_records(pool, 0)
     recs.fold = (f.lens[0], f.record_rows)
@@ -948,7 +951,7 @@ def gpu_test_fold_graph_zero_growth():
     step()
     torch.cuda.synchronize()
     want = (p.rec.clone(), p.conv.clone(), f.pend.clone(), pool.clone())
-    for t, v in ((p.rec, rec0), (p.conv, conv0), (f.pend, pend0)):
+    for t, v in ((p.rec, rec0), (p.conv, conv0), (f.pend, pend0), (pool, pool0)):
         t.copy_(v)
     scratch = torch.zeros(16, device="cuda")
     torch.cuda.synchronize()
@@ -967,7 +970,7 @@ def gpu_test_fold_graph_zero_growth():
     assert torch.cuda.memory_allocated() - m0 - cap <= 0
     m1 = torch.cuda.memory_allocated()
     for _ in range(2):
-        for t, v in ((p.rec, rec0), (p.conv, conv0), (f.pend, pend0)):
+        for t, v in ((p.rec, rec0), (p.conv, conv0), (f.pend, pend0), (pool, pool0)):
             t.copy_(v)
         g.replay()
         torch.cuda.synchronize()
