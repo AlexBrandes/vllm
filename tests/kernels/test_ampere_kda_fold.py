@@ -11,8 +11,11 @@ verify modelled) with byte identity of everything a consumer reads, on
 random schedules at block size 16 and at the 1,152-token boundary, in align
 and in "none" mode, and on schedules replayed from captured commits
 (KDA_FOLD_REPLAY_DIR, optional); the same sequences with deliberately broken
-folds must fail; the host cost of a step (launches, no sync, no allocation);
-the CUDA-graph buffers and warmup.
+folds must fail; request lifecycle: streaming-input re-adds (the owed commit
+is written first), a preempted request resumed in a later step and one
+preempted and resumed in the same step (never written); the host cost of a
+step (launches, no sync, no allocation); the off path; the CUDA-graph
+buffers and warmup; the real TP4 config's metadata.
 GPU part (skipped without CUDA): the real verify kernel, fold against
 recover + commit, bitwise on one card, per kernel and over sequences, and
 under CUDA-graph capture.
@@ -350,6 +353,16 @@ def _streaming():
         world.add(3, 1, 10**6, rid=gone.rid, tag="resume")
         world.step([(s, 3, 2) for s in range(5)])
         world.step([(s, 2, 1) for s in range(5)])
+        # Scheduler.reset_prefix_cache(reset_running_requests=True): a running
+        # request (owing its last commit) is preempted and resumed in the same
+        # step: removed in finish_requests, removed again and re-added by
+        # add_requests, on its freed blocks, with computed tokens kept (a KV
+        # connector hit). Its state is the resumed one, never the old commit.
+        world.step([(s, 6, 5) for s in range(5)])
+        again = world.finish(1, front=True)
+        world.add(1, 7, 10**6, rid=again.rid, tag="reset")
+        world.step([(s, 3, 2) for s in range(5)])
+        world.step([(s, 2, 1) for s in range(5)])
         return world
 
     for kw in (dict(block_size=1152), dict(block_size=16, mode="none")):
@@ -381,9 +394,19 @@ def _streaming():
         fold.owner[slot] = req_id
         seen[req_id] = slot
 
-    for what, fn in (("re-add resets the debt", reset_only),
-                     ("a preempted request's re-add flushes", flush_any_readd)):
-        with _patched(kr.FoldHooks, "add_request", fn):
+    orig_remove = kr.FoldHooks.remove_request
+
+    def remember_once(self, req_id):               # the 13f9e61da2 behaviour
+        fold = kr.FoldState.peek(self.device)
+        if req_id in fold.owner:
+            return orig_remove(self, req_id)
+
+    for what, attr, fn in (
+            ("re-add resets the debt", "add_request", reset_only),
+            ("a preempted request's re-add flushes", "add_request", flush_any_readd),
+            ("a same-step preempt + re-add flushes (second removal kept)", "remove_request",
+             remember_once)):
+        with _patched(kr.FoldHooks, attr, fn):
             b = scenario(W.World(fold=True, block_size=1152))
         problems = W.diff(base, b)
         assert problems, f"not detected: {what}"
@@ -954,7 +977,8 @@ def gpu_test_fold_graph_zero_growth():
 
 
 CPU_TESTS = (test_switch_and_banner, test_fold_plan_matches_upstream, test_gather,
-             test_sequences_byte_identical, test_broken_folds_fail, test_host_cost_of_a_step,
+             test_sequences_byte_identical, test_broken_folds_fail,
+             test_streaming_readd_keeps_owed_commit, test_host_cost_of_a_step,
              test_cuda_graph_buffers, test_off_path_untouched)
 GPU_TESTS = (gpu_test_fold_verify_bitwise, gpu_test_fold_sequences_bitwise,
              gpu_test_fold_graph_zero_growth)

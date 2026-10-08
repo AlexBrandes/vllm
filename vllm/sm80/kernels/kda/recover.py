@@ -57,14 +57,18 @@ GLM model state (vllm/models/glm5next/nvidia/model_state.py) holds FoldHooks
     whose state is kept (the worker removes and re-adds it with the next
     input chunk, whose prefill reads that state): its owed commit is written
     first (FoldState.flush, the commit's own plan values and kernels);
-  * remove_request: remembers the removed request until the next step.
+  * remove_request: remembers the removed request until the next step.  A
+    second removal of the same id in one step drops that record: a request
+    finished or preempted in finish_requests and re-added in the same step
+    (Scheduler.reset_prefix_cache(reset_running_requests=True) preempts and
+    resumes running requests in one step) is removed again by add_requests'
+    streaming-update removal before it is re-added.
 
 Consumers that read a committed state between steps (align pre-copy and
 post-copy, prefix-cache hits on boundary blocks, a streaming session's next
 chunk) only ever see eager or flushed rows.  A finished or preempted request
-is never flushed: its blocks are freed and may already belong to another
-request (preempted requests are not rescheduled in the step they are
-preempted in, so they are never re-added in the step they were removed in).
+is never flushed, whenever it is re-added: its blocks are freed and may
+already belong to another request.
 
 The per-draft-slot chain (fused_recurrent_kda) cannot pay an owed commit; it
 is not reached under RecoverSSM: a pure verify takes the recover verify
@@ -928,9 +932,14 @@ class FoldHooks:
         fold.owner[slot] = req_id
 
     def remove_request(self, req_id: str) -> None:
-        """Remember a removed request until the next step (add_request)."""
+        """Remember a removed request until the next step (add_request). A
+        second removal in the step (finished or preempted, then removed again
+        by add_requests before its re-add) forgets it: its state was freed."""
         fold = FoldState.peek(self.device)
-        if fold is None or req_id not in fold.owner:
+        if fold is None:
+            return
+        if req_id not in fold.owner:
+            fold.removed.pop(req_id, None)
             return
         slot = fold.owner.index(req_id)
         fold.owner[slot] = None

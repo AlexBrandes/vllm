@@ -273,6 +273,9 @@ class World:
                 self.conv[l][blk] = torch.randn(SLEN, self.conv_dim, generator=g0).to(
                     self.dev, self.conv[l].dtype)
         self.reqs[slot] = r
+        # the worker's add_requests removes every new request id first (the
+        # streaming-update removal; a no-op for an id it does not hold)
+        self._model_state_remove(r)
         self._model_state_add(slot, r)
         return r
 
