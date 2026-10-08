@@ -1080,9 +1080,16 @@ seams:
 - id: spec-draft-load-config
   kind: function
   target: vllm.v1.worker.gpu.spec_decode.utils:get_pp_safe_draft_load_config
-  why: the MTP draft inherits the target load config, so the draft also loads through Exl3ModelLoader
+  why: load_eagle_model passes the draft load config through this; it rewrites only fastsafetensors under PP, so load format exl3 reaches the draft unchanged
   sha256: 39dcb7398756ed21105a3903262d6d2926cd093f56261083f27919cb3e46cd52
   signature: '(load_config: vllm.config.load.LoadConfig) -> vllm.config.load.LoadConfig'
+
+- id: draft-load-config
+  kind: function
+  target: vllm.model_executor.model_loader.utils:get_draft_load_config
+  why: load_eagle_model takes the MTP draft load config from this; it returns the target load config for any format but ipc_cache, so the draft inherits exl3 and loads through Exl3ModelLoader
+  sha256: 0007cbb1594abcf9a5bce004418d75e110d556fe6b5b7a5eaca74e6139c100a2
+  signature: '(vllm_config: vllm.config.vllm.VllmConfig) -> vllm.config.load.LoadConfig'
 
 - id: qwen4-ngram-embedding-init
   kind: method
