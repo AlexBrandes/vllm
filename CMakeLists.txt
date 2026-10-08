@@ -1544,37 +1544,6 @@ if(VLLM_AMPERE_MARLIN_BUILD)
     BUILD_RPATH_USE_ORIGIN TRUE INSTALL_RPATH "")
 endif()
 
-if(VLLM_GPU_LANG STREQUAL "CUDA")
-  set(EXL3_SRC
-    "csrc/exl3/dense.cu"
-    "csrc/exl3/gemm.cu"
-    "csrc/exl3/moe.cu"
-    "csrc/exl3/ple.cu"
-    "csrc/exl3/reference.cu"
-    "csrc/exl3/module.cpp")
-  set_gencode_flags_for_srcs(SRCS "${EXL3_SRC}" CUDA_ARCHS "8.0")
-  define_extension_target(
-    _exl3_C
-    DESTINATION vllm
-    LANGUAGE CUDA
-    SOURCES ${EXL3_SRC}
-    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    USE_SABI 3
-    WITH_SOABI)
-  target_compile_definitions(_exl3_C PRIVATE USE_CUDA)
-  foreach(_map
-      "${CMAKE_CURRENT_SOURCE_DIR}=vllm"
-      "${CMAKE_CURRENT_BINARY_DIR}=build"
-      "$ENV{HOME}=source"
-      "${TORCH_INSTALL_PREFIX}=torch")
-    target_compile_options(_exl3_C PRIVATE
-      "$<$<COMPILE_LANGUAGE:CXX>:-ffile-prefix-map=${_map}>"
-      "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${_map}>")
-  endforeach()
-  set_target_properties(_exl3_C PROPERTIES
-    BUILD_RPATH_USE_ORIGIN TRUE INSTALL_RPATH "")
-endif()
-
 message(STATUS "Enabling MoE C_stable extension.")
 define_extension_target(
   _moe_C_stable_libtorch

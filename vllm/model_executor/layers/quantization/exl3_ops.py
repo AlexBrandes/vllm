@@ -62,16 +62,57 @@ def _ple_fake(
     torch._check(global_ids.numel() == packed_rows.shape[0])
 
 
+_ABI_VERSION = 1
+# Operators this tree calls; a library without one of them is refused.
+_OPERATORS = (
+    "linear_out",
+    "moe_out",
+    "ple_decode_out",
+    "linear_workspace_size",
+    "moe_workspace_size",
+)
+
+
+def _runtime_build_info() -> dict:
+    cuda = torch.version.cuda
+    major, minor = (int(v) for v in cuda.split(".")[:2]) if cuda else (0, 0)
+    return {
+        "abi_version": _ABI_VERSION,
+        "torch_version": torch.__version__.split("+")[0],
+        "cuda_version": major * 1000 + minor * 10,
+        "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI),
+    }
+
+
+def _validate_extension(module) -> None:
+    """module.cpp registers through TORCH_LIBRARY, which is bound to the
+    PyTorch build: refuse a library built against another one."""
+    built = module.build_info()
+    for key, expected in _runtime_build_info().items():
+        actual = built.get(key)
+        # CUDA minor toolkits within one major share the runtime ABI.
+        if key == "cuda_version" and isinstance(actual, int):
+            actual, expected = actual // 1000, expected // 1000
+        if actual != expected:
+            raise ValueError(
+                f"{key} mismatch: extension {built.get(key)!r}, runtime {expected!r}"
+            )
+    for name in _OPERATORS:
+        torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
+
+
 def ensure_extension() -> None:
     global _loaded
     if _loaded:
         return
     try:
-        importlib.import_module("vllm._exl3_C")
-    except ImportError as exc:
+        module = importlib.import_module("vllm._exl3_C")
+        _validate_extension(module)
+    except (ImportError, OSError, AttributeError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
-            "EXL3 requires the compiled vllm._exl3_C extension; "
-            "rebuild vLLM with CUDA EXL3 support."
+            "EXL3 requires the compiled vllm._exl3_C extension, built for the "
+            "running PyTorch: build it with python csrc/exl3/build_standalone.py "
+            f"--out vllm (in the vLLM source tree). Detail: {exc}"
         ) from exc
     for name, fake in (
         ("linear_out", _linear_fake),

@@ -1,7 +1,9 @@
 #include "ops.h"
 #include "ple.h"
-#include "core/registration.h"
+#include <Python.h>
+#include <cuda_runtime_api.h>
 #include <torch/library.h>
+#include <torch/version.h>
 
 TORCH_LIBRARY(_exl3_C, m) {
   m.def("linear_out(Tensor x, Tensor trellis, Tensor suh, Tensor svh, "
@@ -38,4 +40,25 @@ TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("moe_out_reference", &exl3::moe_out_reference);
 }
 
-REGISTER_EXTENSION(_exl3_C)
+namespace {
+
+// TORCH_LIBRARY is not the stable ABI: exl3_ops.ensure_extension compares
+// these with the running PyTorch and refuses a library built for another.
+PyObject* build_info(PyObject*, PyObject*) {
+  return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 1, "torch_version",
+                       TORCH_VERSION, "cuda_version", CUDART_VERSION,
+                       "cxx11_abi", _GLIBCXX_USE_CXX11_ABI);
+}
+
+PyMethodDef methods[] = {
+    {"build_info", build_info, METH_NOARGS, "Return the compiled ABI metadata."},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+}  // namespace
+
+PyMODINIT_FUNC PyInit__exl3_C() {
+  static PyModuleDef module = {PyModuleDef_HEAD_INIT, "_exl3_C", nullptr, 0,
+                               methods};
+  return PyModule_Create(&module);
+}
