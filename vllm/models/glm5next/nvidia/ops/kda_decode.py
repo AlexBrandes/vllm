@@ -7,7 +7,7 @@
                   ssm_state_indices, num_accepted_tokens, cu_seqlens,
                   max_query_len, a_log, g_bias, lower_bound=-5.0, eps=1e-5,
                   l2_eps=1e-6, scale=None, out=None, records=None,
-                  skip_norm=False, wide=False) -> out [1, M, H, D] bf16
+                  skip_norm=False, wide=False, fold=None) -> out [1, M, H, D] bf16
 
 replaces, in meaning,
 
@@ -71,6 +71,17 @@ rank-1 update is written as an explicit fma(c, k, h*e) (the same instruction
 the unfused form compiles to), so the commit's replay of the accepted tokens
 reproduces the per-token states bitwise.  SKIP_NORM leaves the recurrence
 output unnormalised (the mixed prefill + verify step norms it afterwards).
+
+FOLD (RecoverSSM commit fold, VLLM_AMPERE_KDA_FOLD, see recover.py): records
+are kept per request slot (`rr`), and a row that still owes the previous
+step's commit (`fl` tokens) replays those tokens from its records over the
+loaded state first -- the commit's fma(c, k, h*e) sequence, so the state is
+bitwise the committed one -- and stores the result back to the slot.  Its
+conv window is read shifted by the owed count, as the commit's compaction
+would have left it (the per-draft-slot step reads it the same way).  The
+head's slices arrive on the gate counter only after reading the owed
+records, so the first slice cannot overwrite them (step 4) before every
+slice has read them.
 
 CUDA-GRAPH SAFE: no autotune, no host sync, no .item(); `warmup()` compiles
 and allocates the counters and the workspace before capture; counters
@@ -282,6 +293,8 @@ def _kda_decode_v2_kernel(
     rc,                      # RECOVER: [rows, WS_T, H, D] fp32 corrections
     rk,                      # RECOVER: [rows, WS_T, H, D] fp32 normalised keys
     re,                      # RECOVER: [rows, WS_T, H, D] fp32 decay gates
+    fl,                      # FOLD: [>= nseq] int32 owed commit length of each row
+    rr,                      # FOLD: [>= nseq] int32 record row (request slot), -1: none
     scale,
     eps,
     stride_x_t,
@@ -318,6 +331,7 @@ def _kda_decode_v2_kernel(
     RECOVER: gl.constexpr = False,
     SKIP_NORM: gl.constexpr = False,
     ST_CACHE: gl.constexpr = "",
+    FOLD: gl.constexpr = False,
 ):
     gl.static_assert(CONV_K == 4, "conv window is specialised to width 4")
     gl.static_assert(NV > 1, "the gate chunks are shared across >= 2 slices")
@@ -353,6 +367,9 @@ def _kda_decode_v2_kernel(
     bos = gl.load(cu_seqlens + i_n).to(gl.int64)
     eos = gl.load(cu_seqlens + i_n + 1).to(gl.int64)
     acc = gl.load(num_acc + i_n).to(gl.int64)
+    if FOLD:
+        n_f = gl.load(fl + i_n)
+        r_row = gl.maximum(gl.load(rr + i_n), 0).to(gl.int64)
     c_slot = gl.load(conv_idx + i_n * stride_cidx).to(gl.int64)
     # the whole slot row: the token loop's slot lookups would otherwise be
     # global loads the compiler cannot hoist above the state stores
@@ -367,9 +384,64 @@ def _kda_decode_v2_kernel(
     # T == 0, or NULL_BLOCK_ID (padded batch entry): nothing to do
     if (T == 0) | (s_init <= 0) | (c_slot <= 0):
         return
-    off = acc - 1
+    if FOLD:
+        # the conv window was not compacted: read it at the owed position
+        off = gl.maximum(n_f, 1).to(gl.int64) - 1
+    else:
+        off = acc - 1
     csb = conv_state + c_slot * stride_cs_slot
     p_ws = ws + i_nh * (WS_T * WS_W)
+
+    if FOLD:
+        # ---- 0. commit fold: replay the owed tokens over the state and store
+        # it back (the commit, bitwise); step 2 then loads it as usual.  Runs
+        # before this slice's gate arrival: every slice of the head has read
+        # the owed records before the head's first slice overwrites them.
+        if n_f > 0:
+            p_hf = rec + s_init * stride_rec_slot + i_h * D * D
+            LW: gl.constexpr = gl.BlockedLayout([WS_T, 1], [8, 4], [1, NW], [0, 1])
+            o_tw = gl.expand_dims(gl.arange(0, WS_T, layout=gl.SliceLayout(1, LC)), 1)
+            o_dw = gl.expand_dims(gl.arange(0, D, layout=gl.SliceLayout(0, LC)), 0)
+            p_rw = ((r_row * WS_T + o_tw) * H + i_h) * D
+            k_o = gl.load(rk + p_rw + o_dw, mask=o_tw < n_f, other=0.0)
+            e_o = gl.load(re + p_rw + o_dw, mask=o_tw < n_f, other=0.0)
+            o_tw2 = gl.expand_dims(gl.arange(0, WS_T, layout=gl.SliceLayout(1, LW)), 1)
+            o_vw = gl.expand_dims(i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, LW)), 0)
+            c_o = gl.load(rc + ((r_row * WS_T + o_tw2) * H + i_h) * D + o_vw,
+                          mask=o_tw2 < n_f, other=0.0)
+            # Staged in shared memory, read back one token row at a time in a
+            # runtime loop over the owed tokens (row views: an unswizzled
+            # [WS_T, ...] buffer reinterpreted with a layout one rank lower).
+            SM2: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+            SM1: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+            ko_s = gl.allocate_shared_memory(
+                gl.float32, [WS_T, DJ, DC], SMEM, gl.reshape(k_o, [WS_T, DJ, DC])
+            )._reinterpret(gl.float32, [WS_T, DJ, DC], SM2)
+            eo_s = gl.allocate_shared_memory(
+                gl.float32, [WS_T, DJ, DC], SMEM, gl.reshape(e_o, [WS_T, DJ, DC])
+            )._reinterpret(gl.float32, [WS_T, DJ, DC], SM2)
+            co_s = gl.allocate_shared_memory(
+                gl.float32, [WS_T, BV], SM2, c_o)._reinterpret(gl.float32, [WS_T, BV], SM1)
+            LJC: gl.constexpr = gl.SliceLayout(1, L3)                 # [DJ, DC]
+            gl.barrier()
+            # The update is elementwise in the state, so the slice is replayed
+            # in sub-tiles of 4 * NW value rows (one row per row lane: a few
+            # registers per thread instead of the whole [DJ, BV, DC] tile).
+            BVS: gl.constexpr = 4 * NW
+            for j in gl.static_range(BV // BVS):
+                f_off3 = (_ar3(DJ, 0, L3) * DC
+                          + (i_v * BV + j * BVS + _ar3(BVS, 1, L3)) * D + _ar3(DC, 2, L3))
+                h_f = gl.load(p_hf + f_off3)
+                for t in range(0, n_f):
+                    k3 = gl.expand_dims(ko_s.index(t).load(LJC), 1)     # [DJ, 1, DC]
+                    e3 = gl.expand_dims(eo_s.index(t).load(LJC), 1)
+                    c3 = gl.expand_dims(gl.expand_dims(
+                        co_s.index(t).slice(j * BVS, BVS).load(SV), 1), 0)
+                    h_f = h_f * e3
+                    cb, kb = gl.broadcast(c3, k3)
+                    h_f = gl.fma(cb, kb, h_f)
+                gl.store(p_hf + f_off3, h_f)
+            gl.barrier()
 
     # ---- 1. this slice's gate chunks -> workspace -> arrival ----------------
     b_a = gl.exp(gl.load(a_log + i_h).to(gl.float32))
@@ -485,7 +557,10 @@ def _kda_decode_v2_kernel(
             b_o = gl.sum(gl.sum(b_h * q3, 0), 1)
 
             if RECOVER:
-                p_r = ((i_n * WS_T + t) * H + i_h) * D
+                if FOLD:
+                    p_r = ((r_row * WS_T + t) * H + i_h) * D
+                else:
+                    p_r = ((i_n * WS_T + t) * H + i_h) * D
                 gl.store(rc + p_r + o_vs, b_v)
                 if i_v == 0:
                     gl.store(rk + p_r + o_jh * DC + o_ch, k3)
@@ -582,7 +657,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
                   ssm_state_indices, num_accepted_tokens, cu_seqlens,
                   max_query_len, a_log, g_bias, lower_bound=-5.0, eps=1e-5,
                   l2_eps=1e-6, scale=None, out=None, records=None,
-                  skip_norm=False, wide=False):
+                  skip_norm=False, wide=False, fold=None):
     """One fused KDA decode step including f_b_proj and g_b_proj.
 
     `qkv`, `beta`, `f_a`, `g_a` are read, never written.  `conv_state` and
@@ -595,6 +670,10 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
     column 0 of `ssm_state_indices` and no recurrent state is written.
     `skip_norm` (RecoverSSM only) leaves `out` unnormalised.  `wide` takes
     the 64-head wide schedule (the caller decides with wide_schedule).
+    `fold` (RecoverSSM commit fold, needs `records`; default `records.fold`,
+    see recover.LayerRecords): (owed commit lengths, record rows), int32
+    [>= nseq] each; records are read and written at the record row and the
+    owed tokens are replayed first (module docstring).
     """
     M, _ = qkv.shape
     H = a_log.shape[0]
@@ -617,6 +696,12 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
             assert r.dtype == torch.float32 and r.is_contiguous()
             assert r.shape[1:] == (_WS_T, H, D)
             assert r.shape[0] >= cu_seqlens.numel() - 1
+    if fold is None and records is not None:
+        fold = getattr(records, "fold", None)
+    if fold is not None:
+        assert records is not None, "fold needs records"
+        for f in fold:
+            assert f.dtype == torch.int32 and f.numel() >= cu_seqlens.numel() - 1
 
     nseq = cu_seqlens.numel() - 1
     assert nseq * H <= _CTR_SLOTS, "arrival counter buffer too small"
@@ -641,6 +726,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
         norm_weight, out, rec_state, cu_seqlens, conv_state_indices, ssm,
         num_accepted_tokens, a_log, g_bias, ctr, ctr[_CTR_SLOTS:], ws,
         *(records if records is not None else (ws, ws, ws)),
+        *(fold if fold is not None else (ctr, ctr)),
         scale, eps,
         qkv.stride(0), f_a.stride(0), g_a.stride(0),
         w_f.stride(0), w_g.stride(0),
@@ -656,6 +742,7 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
         BS=triton.next_power_of_2(CONV_K - 2 + max_query_len),
         BT=BT, WS_T=_WS_T, DC=DC, SW=triton.next_power_of_2(n_tok), NW=num_warps,
         RECOVER=records is not None, SKIP_NORM=bool(skip_norm), ST_CACHE=st_cache,
+        FOLD=fold is not None,
         num_warps=num_warps,
     )
     return out
@@ -665,14 +752,14 @@ _WARMED = set()
 
 
 def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False,
-           width=None):
+           width=None, fold=False):
     """Compile every plan and allocate the counters and the gate workspace
     before capture.
 
     A plan is (nseq, T) or (nseq, T, wide): T is the token tile
     (max_query_len), `wide` the schedule (see wide_schedule).  `recover`
     compiles the RecoverSSM verify (normed and SKIP_NORM), otherwise the
-    per-draft-slot step.
+    per-draft-slot step; `fold` (with `recover`) the commit-fold variants.
     `width` is the column count of the state-index rows the caller passes
     (num_speculative_tokens + 1; default T), a compile-time constant of the
     kernel.  Uses the production input layout (column views of one [M, 6416]
@@ -692,6 +779,8 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False,
         key = (nseq, T, H, W, wide, TARGET_CTAS, BV_MIN, BV_MAX, NUM_WARPS, DC)
         if recover:
             key = key + ("recover",)
+        if fold:
+            key = key + ("fold",)
         if key in _WARMED:
             continue
         M = nseq * T
@@ -716,10 +805,14 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False,
         if recover:
             recs = tuple(torch.zeros(nseq, _WS_T, H, D, device=dev,
                                      dtype=torch.float32) for _ in range(3))
+        folds = None
+        if fold:
+            folds = (torch.zeros(nseq, device=dev, dtype=torch.int32),
+                     torch.arange(nseq, device=dev, dtype=torch.int32))
         for skip in ((False, True) if recover else (False,)):
             kda_decode_v2(qkv, beta, fa, ga, wf, wf, cs, cw, None, nw, rec,
                           sidx[:, 0][:nseq], sidx, nacc, qsl, T, al, gbi,
-                          records=recs, skip_norm=skip, wide=wide)
+                          records=recs, skip_norm=skip, wide=wide, fold=folds)
         _WARMED.add(key)
     if dev.type == "cuda":
         torch.cuda.synchronize()
@@ -847,15 +940,20 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
     wide = getattr(layer, "_kda_wide", False)
     if getattr(layer, "_kda_recover", False):
         # RecoverSSM: every spec-verify step takes the recover variants (pure
-        # and mixed), for 1..max_num_seqs sequences.
+        # and mixed), for 1..max_num_seqs sequences; under the commit fold
+        # their fold variants.
+        from vllm.sm80.kernels.kda.recover import kda_fold_enabled
+
+        fold = kda_fold_enabled(worker.vllm_config)
         rts = range(1, window + 1) if step_tile else (window,)
         rplans = tuple((n, t) for t in rts for n in range(1, max_seqs + 1))
         warmup(
             plans=rplans, device=torch.device(device), heads=heads, recover=True,
-            width=window,
+            width=window, fold=fold,
         )
         logger.info(
-            "Warmed up sm_80 KDA recover verify for (nseq, T) in %s.", list(rplans)
+            "Warmed up sm_80 KDA recover verify%s for (nseq, T) in %s.",
+            " (commit fold)" if fold else "", list(rplans),
         )
         return
     nseqs = {max(1, int(s) // window) for s in capture_sizes if int(s) >= 1}

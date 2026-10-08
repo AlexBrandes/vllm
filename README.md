@@ -79,7 +79,9 @@ says which layout each serves):
   the KDA step for PP4 decode batches beyond one short request (where it
   measures faster) — `VLLM_GLM5_DECODE_KDA_WIDE`; second
   generation `VLLM_MOE_DECODE_ROUTE_V2`, `VLLM_GLM5_DECODE_MHC_V2`,
-  `VLLM_AMPERE_DECODE_IDX_GLUE`.
+  `VLLM_AMPERE_DECODE_IDX_GLUE`; under TP4, the KDA state commit after
+  sampling folded into the next decode step, same state bit for bit
+  (not yet validated, off unless set) — `VLLM_AMPERE_KDA_FOLD`.
 - Prefill kernels (mHC projection, sparse attention) — `VLLM_GLM5_PREFILL_KERNELS`,
   `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`; at TP4 shapes `VLLM_AMPERE_KDA_PREFILL_NARROW`,
   `VLLM_AMPERE_MARLIN_PREFILL_NARROW`; at PP4 shapes `VLLM_AMPERE_KDA_PREFILL_WIDE`,

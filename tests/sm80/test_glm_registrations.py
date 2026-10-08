@@ -129,6 +129,78 @@ def test_glm_model_state_enables_recoverssm(
     assert isinstance(state.recoverssm, RecoverSSMState) == expected
 
 
+@pytest.mark.parametrize("fold", [False, True])
+def test_glm_model_state_calls_the_fold_hooks(monkeypatch, fold):
+    """The KDA commit fold's hooks run after the hybrid state's own work on
+    add_request, remove_request and prepare_attn (on the metadata it built);
+    with the fold off there are no hooks and the hybrid results pass through."""
+    from types import SimpleNamespace
+
+    from vllm.models.glm5next.nvidia.model_state import Glm5NextModelState
+    from vllm.sm80.kernels.kda import recover
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    calls = []
+    metadata = {"layer": object()}
+
+    def base_init(self, vllm_config, model, encoder_cache, device):
+        self.recoverssm = None
+
+    def base_prepare_attn(self, input_batch, *args, **kwargs):
+        calls.append(("base.prepare_attn", kwargs["for_capture"]))
+        return metadata
+
+    class Hooks:
+        def __init__(self, vllm_config, device):
+            calls.append(("hooks", device))
+
+        def add_request(self, slot, req_id, num_computed_tokens):
+            calls.append(("fold.add", slot, req_id, num_computed_tokens))
+
+        def remove_request(self, req_id):
+            calls.append(("fold.remove", req_id))
+
+        def prepare_step(self, attn_metadata, idx_mapping, for_capture):
+            calls.append(("fold.step", attn_metadata is metadata, idx_mapping,
+                          for_capture))
+
+    monkeypatch.setattr(MambaHybridModelState, "__init__", base_init)
+    monkeypatch.setattr(
+        MambaHybridModelState, "add_request",
+        lambda self, i, data: calls.append(("base.add", i)))
+    monkeypatch.setattr(
+        MambaHybridModelState, "remove_request",
+        lambda self, req_id: calls.append(("base.remove", req_id)))
+    monkeypatch.setattr(MambaHybridModelState, "prepare_attn", base_prepare_attn)
+    monkeypatch.setattr(recover, "kda_recover_enabled", lambda config: fold)
+    monkeypatch.setattr(
+        recover, "kda_fold_hooks",
+        lambda config, device: Hooks(config, device) if fold else None)
+
+    state = Glm5NextModelState(SimpleNamespace(), None, None, "dev")
+    assert (state._kda_fold is None) != fold
+    state.add_request(3, SimpleNamespace(req_id="r", num_computed_tokens=17))
+    state.remove_request("r")
+    batch = SimpleNamespace(idx_mapping="idx")
+    for for_capture in (False, True):
+        out = state.prepare_attn(batch, None, (), None, [], None,
+                                 for_capture=for_capture)
+        assert out is metadata
+    if fold:
+        assert calls == [
+            ("hooks", "dev"),
+            ("base.add", 3), ("fold.add", 3, "r", 17),
+            ("base.remove", "r"), ("fold.remove", "r"),
+            ("base.prepare_attn", False), ("fold.step", True, "idx", False),
+            ("base.prepare_attn", True), ("fold.step", True, "idx", True),
+        ]
+    else:
+        assert calls == [
+            ("base.add", 3), ("base.remove", "r"),
+            ("base.prepare_attn", False), ("base.prepare_attn", True),
+        ]
+
+
 def test_kda_layer_is_replaced_by_the_fork_layer():
     """Importing the fork GLM model module registers the KDA layer override;
     the upstream layer class then builds the fork layer, whose attention

@@ -147,9 +147,23 @@ seams:
 - id: glm-mamba-state-prepare-attn
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.prepare_attn
-  why: records the RecoverSSM step through self.recoverssm when it is set
+  why: records the RecoverSSM step through self.recoverssm when it is set and returns the attention metadata it built; Glm5NextModelState hands that dict to the KDA commit fold's step hook after it, with input_batch.idx_mapping
   sha256: 0a09be223419a915c85bd6aaf685d9bba883bbf79362a06ff0c2de9cca371d35
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, cudagraph_mode: vllm.config.compilation.CUDAGraphMode, block_tables: tuple[torch.Tensor, ...], slot_mappings: torch.Tensor, attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, for_capture: bool = False, ubatch_idx: int = 0, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None) -> dict[str, typing.Any]'
+
+- id: glm-mamba-state-add-request
+  kind: method
+  target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.add_request
+  why: takes the request slot (acceptance count, align-mode state block) and calls nothing that reads the KDA commit fold, so Glm5NextModelState calls the fold's add_request hook after it with new_req_data.req_id and num_computed_tokens
+  sha256: 97199f4878e3a9a66bb2e8730de6183a573faeeb338046e9e6795dce90af7454
+  signature: '(self, req_index: int, new_req_data: vllm.v1.core.sched.output.NewRequestData) -> None'
+
+- id: glm-mamba-state-remove-request
+  kind: method
+  target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.remove_request
+  why: the hybrid state inherits remove_request and it calls nothing that reads the KDA commit fold, so Glm5NextModelState calls the fold's remove_request hook after it
+  sha256: 18fbe78bce3871325c9e13be190f9c236fda584c734167bb78202e5eadc10642
+  signature: '(self, req_id: str) -> None'
 
 - id: glm-mamba-state-postprocess
   kind: method

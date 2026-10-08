@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     VLLM_MOE_DECODE_ROUTE_V2: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_KDA_WIDE: bool = True
+    VLLM_AMPERE_KDA_FOLD: bool = False
     VLLM_FLA_PIN_AUTOTUNE: bool = False
     VLLM_AMPERE_DECODE_IDX_GLUE: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
@@ -326,6 +327,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_DECODE_KDA_WIDE": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_KDA_WIDE", "1"))
     ),
+    # RecoverSSM commit fold (TP4, vllm/sm80/kernels/kda/recover.py): the
+    # replay of a step's accepted tokens over the KDA state runs at the start
+    # of the next verify instead of in a separate commit after sampling; steps
+    # whose state is read before then (block boundaries) commit as before.
+    # Bitwise the same state. Off by default; no effect where RecoverSSM is off.
+    "VLLM_AMPERE_KDA_FOLD": lambda: bool(int(os.getenv("VLLM_AMPERE_KDA_FOLD", "0"))),
     # Pin every @triton.autotune'd kernel of the vendored flash-linear-attention
     # ops and the GLM-5 KDA chunked-prefill kernels to ONE config per autotune
     # key on sm_80 (table in
