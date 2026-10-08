@@ -664,12 +664,13 @@ def thin_gemm(x: torch.Tensor, w: torch.Tensor,
     return out
 
 
-def warmup(shapes, ms, device=None) -> None:
+def warmup(shapes, ms, device=None, groups=()) -> None:
     """JIT-compile and allocate for every (M, N, K) that will be replayed.
 
     Triton compiles on first launch and the workspace is allocated lazily, so
     neither may happen inside a `torch.cuda.graph` capture.  vLLM calls this
     once before capture (``vllm/sm80/kernels/thin_gemm/warmup.py``).
+    ``groups``: ((N_1, ..., N_g), K) concat groups served by thin_gemm_group.
     """
     device = device or torch.device("cuda", torch.cuda.current_device())
     for N, K in shapes:
@@ -677,4 +678,360 @@ def warmup(shapes, ms, device=None) -> None:
         for M in ms:
             x = torch.empty((M, K), dtype=torch.bfloat16, device=device)
             thin_gemm(x, w)
+    for Ns, K in groups:
+        ws = [torch.empty((N, K), dtype=torch.bfloat16, device=device) for N in Ns]
+        for M in ms:
+            x = torch.empty((M, K), dtype=torch.bfloat16, device=device)
+            thin_gemm_group(x, ws)
+            thin_gemm_group_split(x, ws)
     torch.cuda.synchronize(device)
+
+
+# --------------------------------------------------------------------------
+# Concat groups: one launch for projections that read the same x
+# --------------------------------------------------------------------------
+# Column n of the output reads only x and the weight row n, and its value is
+# fixed by its summation order: the split-K partition (BLOCK_K, SPLIT_K), the
+# rotation start (`_rotate_k` and the N tile index) and the fixed partial
+# order.  A group launch runs every member's CTAs with the member's own
+# `_select_config` schedule, its member-local tile numbering and its own
+# workspace, so each member's output is bitwise its separate `thin_gemm` call.
+# BLOCK_N only decides which CTA computes a column (and, through the tile
+# index, the rotation start, which stays member-local); num_warps and
+# num_stages are per launch and do not change the order of any column.
+# `_gemm_tile` is `_thin_gemm_kernel`'s body with the tile coordinates and the
+# arrival counter passed in; the solo kernel above is left as it is.
+
+
+@triton.jit
+def _gemm_tile(
+    X, W, Y, P, LOCK,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    stride_pk, stride_pm, stride_pn,
+    pid_n, pid_k, pid_m,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    TILED_M: tl.constexpr,
+    ROTATE_K: tl.constexpr,
+):
+    """One (M tile, N tile, K split) output block.  Reads its K-blocks of W once.
+
+    When SPLIT_K > 1 the FP32 partials are reduced by whichever CTA of the
+    column arrives last, not by a second launch: the second launch cost 2-3.5 us
+    per call (a bare in-graph launch is ~0.9 us on this part, and the rest is
+    the drain plus one full HBM latency round with nothing left to overlap it).
+
+    The reduction stays bitwise deterministic because the *order* is fixed -
+    always partial 0, then 1, ... SPLIT_K-1 - even though *which* CTA performs
+    it varies run to run.  That is the whole reason this is not an atomic_add
+    into Y, which would not be reproducible.  ``LOCK`` is this output block's
+    arrival counter (unused when SPLIT_K == 1).
+    """
+    # BLOCK_M is capped by shared memory, so a caller with more rows than one
+    # tile gets several M tiles.  Masking alone is NOT enough: with a pinned
+    # BLOCK_M and no pid_m, rows past BLOCK_M were never written.
+    # Every M the model uses (1..64) is a single tile, and there the row offset
+    # must stay a compile-time zero -- a runtime `pid_m * BLOCK_M` in the
+    # address arithmetic costs 0.5-4.5 % on every shape (measured), so the
+    # one-tile case is specialized rather than paying for generality.
+    if TILED_M:
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    else:
+        offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    # Clamping the row/column index keeps every address inside the tensor, so
+    # the masked-off lanes of a ragged tile cannot fault even before the mask
+    # is applied.
+    x_m = tl.where(m_mask, offs_m, 0)
+    w_n = tl.where(n_mask, offs_n, 0)
+
+    x_ptrs = X + x_m[:, None] * stride_xm + \
+        (pid_k * BLOCK_K + offs_k)[None, :] * stride_xk
+    w_ptrs = W + w_n[:, None] * stride_wn + \
+        (pid_k * BLOCK_K + offs_k)[None, :] * stride_wk
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    step = BLOCK_K * SPLIT_K
+    n_iter = tl.cdiv(K, step)
+    if ROTATE_K:
+        # Every CTA streams the same x.  In lock step they would all read the
+        # same x K-block from the same L2 lines at once; starting each N tile
+        # at a different K-block spreads those reads (summation order changes,
+        # deterministically: the start depends only on the tile).  Only taken
+        # when EVEN_K, so every K-block is whole.
+        shift = (pid_n * 3) % n_iter
+        for i in range(n_iter):
+            j = i + shift
+            j = tl.where(j >= n_iter, j - n_iter, j)
+            x = tl.load(x_ptrs + j * step * stride_xk, mask=m_mask[:, None], other=0.0)
+            w = tl.load(w_ptrs + j * step * stride_wk, mask=n_mask[:, None], other=0.0)
+            acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+    else:
+        for i in range(n_iter):
+            if EVEN_K:
+                x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+                w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+            else:
+                k_now = i * step + pid_k * BLOCK_K + offs_k
+                k_mask = k_now < K
+                x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+                w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+            x_ptrs += step * stride_xk
+            w_ptrs += step * stride_wk
+
+    y_ptrs = Y + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    if SPLIT_K == 1:
+        if EVEN_N:
+            tl.store(y_ptrs, acc.to(Y.dtype.element_ty), mask=m_mask[:, None])
+        else:
+            tl.store(y_ptrs, acc.to(Y.dtype.element_ty),
+                     mask=m_mask[:, None] & n_mask[None, :])
+    else:
+        p_mask = m_mask[:, None] & n_mask[None, :]
+        p_off = offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
+        # ".cg" keeps the partial out of the non-coherent per-SM L1 so the
+        # reducing CTA, which runs on a different SM, can see it in L2.
+        tl.store(P + pid_k * stride_pk + p_off, acc, mask=p_mask,
+                 cache_modifier=".cg")
+        # Release the store, then count arrivals for this output block.  No CTA
+        # ever spins, so this cannot deadlock however the grid is scheduled.
+        # The arrival only needs release (it publishes this CTA's partial).
+        # Only the last arriver needs acquire, and it gets it from the counter
+        # reset: an acquire RMW on the same counter, after the others' release
+        # RMWs in its modification order, synchronizes with all of them.  The
+        # non-last CTAs thus skip the acquire fence (measured +3-10 % on the
+        # split-K shapes vs one acq_rel arrival).  Launches on one stream are
+        # serialized, so resetting before the reads cannot race a later CTA.
+        arrived = tl.atomic_add(LOCK, 1, sem="release", scope="gpu")
+        if arrived == SPLIT_K - 1:
+            tl.atomic_xchg(LOCK, 0, sem="acquire", scope="gpu")
+            tot = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k in tl.static_range(SPLIT_K):
+                tot += tl.load(P + k * stride_pk + p_off, mask=p_mask,
+                               other=0.0, cache_modifier=".cv")
+            tl.store(y_ptrs, tot.to(Y.dtype.element_ty), mask=p_mask)
+
+
+@triton.jit
+def _group_member(
+    X, W, Y, P, LOCK,
+    M, N, K, local, pid_m, tiles_n,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    stride_pk, stride_pm, stride_pn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    TILED_M: tl.constexpr,
+    ROTATE_K: tl.constexpr,
+):
+    # Same CTA -> (pid_n, pid_k) numbering as the member's own thin_gemm grid
+    # (dim 0 = N tile, fastest), so the member-local tile index drives the
+    # rotation shift exactly as in a separate call.
+    pid_n = local % tiles_n
+    pid_k = local // tiles_n
+    if TILED_M:
+        lock = LOCK + pid_m * tiles_n + pid_n
+    else:
+        lock = LOCK + pid_n
+    _gemm_tile(X, W, Y, P, lock, M, N, K,
+               stride_xm, stride_xk, stride_wn, stride_wk,
+               stride_ym, stride_yn, stride_pk, stride_pm, stride_pn,
+               pid_n, pid_k, pid_m,
+               BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, EVEN_K, EVEN_N, TILED_M, ROTATE_K)
+
+
+@triton.jit
+def _thin_gemm_group_kernel(
+    X, M, K, stride_xm, stride_xk,
+    W0, Y0, P0, L0, N0, T0, swn0, swk0, sym0, syn0, spk0, spm0, spn0,
+    W1, Y1, P1, L1, N1, T1, swn1, swk1, sym1, syn1, spk1, spm1, spn1,
+    W2, Y2, P2, L2, N2, T2, swn2, swk2, sym2, syn2, spk2, spm2, spn2,
+    C1, C2,
+    BLOCK_M: tl.constexpr, TILED_M: tl.constexpr, NUM_MEMBERS: tl.constexpr,
+    BN0: tl.constexpr, BK0: tl.constexpr, SK0: tl.constexpr,
+    EK0: tl.constexpr, EN0: tl.constexpr, RK0: tl.constexpr,
+    BN1: tl.constexpr, BK1: tl.constexpr, SK1: tl.constexpr,
+    EK1: tl.constexpr, EN1: tl.constexpr, RK1: tl.constexpr,
+    BN2: tl.constexpr, BK2: tl.constexpr, SK2: tl.constexpr,
+    EK2: tl.constexpr, EN2: tl.constexpr, RK2: tl.constexpr,
+):
+    """One launch for a concat group: CTAs [0, C1) are member 0's grid, [C1, C2)
+    member 1's, [C2, ...) member 2's; each member keeps its own schedule
+    (BLOCK_N, BLOCK_K, SPLIT_K, rotation), workspace, arrival counters and
+    output (pointer and strides)."""
+    pid = tl.program_id(0)
+    if TILED_M:
+        pid_m = tl.program_id(1)
+    else:
+        pid_m = 0
+    if pid < C1:
+        _group_member(X, W0, Y0, P0, L0, M, N0, K, pid, pid_m, T0,
+                      stride_xm, stride_xk, swn0, swk0, sym0, syn0,
+                      spk0, spm0, spn0,
+                      BLOCK_M, BN0, BK0, SK0, EK0, EN0, TILED_M, RK0)
+    elif pid < C2:
+        _group_member(X, W1, Y1, P1, L1, M, N1, K, pid - C1, pid_m, T1,
+                      stride_xm, stride_xk, swn1, swk1, sym1, syn1,
+                      spk1, spm1, spn1,
+                      BLOCK_M, BN1, BK1, SK1, EK1, EN1, TILED_M, RK1)
+    else:
+        if NUM_MEMBERS == 3:
+            _group_member(X, W2, Y2, P2, L2, M, N2, K, pid - C2, pid_m, T2,
+                          stride_xm, stride_xk, swn2, swk2, sym2, syn2,
+                          spk2, spm2, spn2,
+                          BLOCK_M, BN2, BK2, SK2, EK2, EN2, TILED_M, RK2)
+
+
+def _group_partials(numel, device):
+    """Flat FP32 partials for every split-K member of one group launch."""
+    key = _lane_key(device.index, "group", numel)
+    buf = _WORKSPACE.get(key)
+    if buf is None:
+        buf = torch.empty(max(1, numel), dtype=torch.float32, device=device)
+        _WORKSPACE[key] = buf
+    return buf
+
+
+def thin_gemm_group(x: torch.Tensor, ws, out: torch.Tensor | None = None) -> torch.Tensor:
+    """y = x @ cat(ws).T for weights that read the same input x (a concat group).
+
+    ws: the members' own [N_i, K] bf16 weights (separate tensors, read in place:
+    no concatenated copy).  Member i lands in columns [off_i, off_i + N_i) of one
+    [M, sum N_i] bf16 output (out, if given, may be a strided view).  Up to three
+    members run in ONE launch (two serialized launches cost 2.1-3.6 us more than
+    one); each member keeps the schedule its own thin_gemm would use, so every
+    column has the same K order as a separate call.
+    """
+    assert x.dtype == torch.bfloat16 and x.ndim == 2
+    M, K = x.shape
+    Ns = [w.shape[0] for w in ws]
+    for w in ws:
+        assert w.dtype == torch.bfloat16 and w.ndim == 2 and w.shape[1] == K
+    if out is None:
+        out = torch.empty((M, sum(Ns)), dtype=torch.bfloat16, device=x.device)
+    if M == 0:
+        return out
+    members = []
+    off = 0
+    for w, n in zip(ws, Ns):
+        if n > 0:
+            members.append((w, out[:, off:off + n]))
+        off += n
+    _group_run(x, members)
+    return out
+
+
+def thin_gemm_group_split(x: torch.Tensor, ws) -> list[torch.Tensor]:
+    """``thin_gemm_group`` with member i in its own contiguous [M, N_i] tensor.
+
+    Bitwise ``[thin_gemm(x, w) for w in ws]``, in one launch per (up to) three
+    members.
+    """
+    assert x.dtype == torch.bfloat16 and x.ndim == 2
+    M, K = x.shape
+    for w in ws:
+        assert w.dtype == torch.bfloat16 and w.ndim == 2 and w.shape[1] == K
+    outs = [torch.empty((M, w.shape[0]), dtype=torch.bfloat16, device=x.device)
+            for w in ws]
+    if M > 0:
+        _group_run(x, [(w, y) for w, y in zip(ws, outs) if w.shape[0] > 0])
+    return outs
+
+
+def _group_run(x, members) -> None:
+    for i in range(0, len(members), 3):
+        chunk = members[i:i + 3]
+        if len(chunk) == 1:
+            thin_gemm(x, chunk[0][0], out=chunk[0][1])
+        else:
+            _group_launch(x, chunk)
+
+
+def _group_launch(x, members) -> None:
+    """One _thin_gemm_group_kernel launch over 2-3 (w, out) members."""
+    M, K = x.shape
+    # Split-K members' CTAs go first (stable otherwise): their reduction tail
+    # then hides under the unsplit member's streaming instead of trailing the
+    # launch (qkva_kpool M4: 0.96x -> 1.35x over two launches; at M24, where
+    # both members split, the given order measured better).  Members own their
+    # output columns, so the CTA order does not change any result.
+    cfgs = [_select_config(M, w.shape[0], K) for w, _ in members]
+    order = sorted(range(len(members)), key=lambda i: cfgs[i][3] == 1)
+    members = [members[i] for i in order]
+    cfgs = [cfgs[i] for i in order]
+    BLOCK_M = cfgs[0][0]
+    tiles_m = triton.cdiv(M, BLOCK_M)
+    # num_warps / num_stages are per launch: take the member with the most
+    # weight bytes, then trim the pipeline until every member's tiles fit.
+    lead = max(range(len(members)), key=lambda i: members[i][0].shape[0])
+    num_warps, num_stages = cfgs[lead][4], cfgs[lead][5]
+    while num_stages > 2 and any(
+            num_stages * (c[1] + BLOCK_M) * c[2] * 2 > _MAX_SMEM for c in cfgs):
+        num_stages -= 1
+
+    part_sizes, lock_sizes = [], []
+    for (w, _), c in zip(members, cfgs):
+        n, split = w.shape[0], c[3]
+        part_sizes.append(split * M * n if split > 1 else 0)
+        lock_sizes.append(triton.cdiv(n, c[1]) * tiles_m if split > 1 else 0)
+    p_all = _group_partials(sum(part_sizes), x.device)
+    l_all = _locks(max(1, sum(lock_sizes)), x.device)
+
+    args, consts = [], {}
+    starts, cta = [], 0
+    p_off = l_off = 0
+    for i in range(3):
+        if i < len(members):
+            w, y = members[i]
+            _, BLOCK_N, BLOCK_K, SPLIT_K, _, _ = cfgs[i]
+            n = w.shape[0]
+            even_k = (K % (BLOCK_K * SPLIT_K)) == 0
+            tiles_n = triton.cdiv(n, BLOCK_N)
+            if SPLIT_K > 1:
+                p = p_all[p_off:p_off + part_sizes[i]].view(SPLIT_K, M, n)
+                sp = (p.stride(0), p.stride(1), p.stride(2))
+                lock = l_all[l_off:l_off + lock_sizes[i]]
+            else:
+                p, sp, lock = p_all, (0, 0, 0), l_all
+            p_off += part_sizes[i]
+            l_off += lock_sizes[i]
+            args += [w, y, p, lock, n, tiles_n, w.stride(0), w.stride(1),
+                     y.stride(0), y.stride(1), *sp]
+            consts.update({
+                f"BN{i}": BLOCK_N, f"BK{i}": BLOCK_K, f"SK{i}": SPLIT_K,
+                f"EK{i}": even_k, f"EN{i}": (n % BLOCK_N) == 0,
+                f"RK{i}": _rotate_k(even_k, SPLIT_K, BLOCK_M, BLOCK_N),
+            })
+            if i > 0:
+                starts.append(cta)
+            cta += tiles_n * SPLIT_K
+        else:
+            w, y = members[0]
+            args += [w, y, p_all, l_all, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+            consts.update({f"BN{i}": 16, f"BK{i}": 16, f"SK{i}": 1,
+                           f"EK{i}": True, f"EN{i}": True, f"RK{i}": False})
+            if i > 0:
+                starts.append(cta)
+    _thin_gemm_group_kernel[(cta, tiles_m)](
+        x, M, K, x.stride(0), x.stride(1),
+        *args, *starts,
+        BLOCK_M=BLOCK_M, TILED_M=(tiles_m > 1), NUM_MEMBERS=len(members),
+        **consts, num_warps=num_warps, num_stages=num_stages,
+    )
