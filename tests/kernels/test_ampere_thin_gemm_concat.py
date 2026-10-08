@@ -48,7 +48,9 @@ BF16 = torch.bfloat16
 PKG = "vllm.sm80.kernels.thin_gemm"
 CONCAT = "vllm.sm80.kernels.thin_gemm.concat"
 
-TP4_MS = (1, 2, 3, 4, 8, 12, 16, 24, 32)
+# Every CUDA-graph capture size of the served TP4 configuration up to the
+# thin-GEMM bound (1-8 under deep drafting at one request, then 10-32).
+TP4_MS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32)
 PP4_MS = (4, 8)
 # (Ns, K, Ms). The qkva_kpool members are replicated, so TP4 and PP4 share them.
 SERVED = {
@@ -812,6 +814,38 @@ def test_gate_closed_says_why(concat_env, monkeypatch, case):
     assert concat._MEMBERS == {}
     assert log.lines == [f"VLLM_THIN_GEMM_CONCAT set but off: {reason}"]
     assert not any(c[0] == "warmup" for c in fake.calls)
+
+
+def test_register_groups_lines_through_the_vllm_logger(concat_env, monkeypatch,
+                                                       caplog):
+    """The banner and a gate-closed line, emitted through vLLM's own logger
+    (its ``info_once`` / ``warning_once``), not a stand-in."""
+    import logging
+
+    import vllm.logger as vllm_logger
+    from vllm.config import CompilationMode
+    concat, _, _ = concat_env
+    monkeypatch.setattr(concat, "logger", vllm_logger.init_logger(CONCAT))
+    # The vllm logger does not propagate to the root, where caplog listens.
+    root = logging.getLogger("vllm")
+    root.addHandler(caplog.handler)
+    caplog.set_level(logging.INFO, logger="vllm")
+    try:
+        for once in (vllm_logger._print_info_once, vllm_logger._print_warning_once):
+            once.cache_clear()
+        concat.register_groups(_worker(_model()), [4, 16])
+        concat.register_groups(_worker(_model(), CompilationMode.VLLM_COMPILE), [4])
+    finally:
+        root.removeHandler(caplog.handler)
+    lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
+    assert (logging.INFO, CONCAT,
+            "sm_80 thin GEMM concat groups active (qb_wqb, qkva_kpool) "
+            "[VLLM_THIN_GEMM_CONCAT=1]") in lines
+    assert (logging.WARNING, CONCAT,
+            "VLLM_THIN_GEMM_CONCAT set but off: compilation mode VLLM_COMPILE, "
+            "needs NONE") in lines
+    assert concat._MEMBERS == {}
+
 
 
 # -------------------------------------------------------------------- GPU ----
