@@ -118,6 +118,16 @@ _WIDE_ST_CACHE = ".cs"
 _CTR_SLOTS = 8192
 _WS_HEADS = 512            # default (sequence, head) capacity of the workspace
 _WS_T = 8                  # token rows per head in the workspace
+# At 32 rows per warp (one warp per CTA: nseq >= 7 at 16 heads) the RecoverSSM
+# verify spills: 2,184 B of stack per thread, 2,624 B with the commit fold.
+# The driver reserves the largest stack launched (at least its default
+# 1,024 B) for every thread an SM can hold (2,048 per SM), and the first
+# verify launch falls in the CUDA-graph memory profile, so the excess comes
+# out of the KV cache. The small-stack config keeps one warp per CTA with
+# SMALL_STACK_ROWS_MAX rows (more CTAs): the warp's layouts, hence every
+# reduction order, stay those of the 32-row config (two warps would sum the
+# q / k norms across warps), and the stack stays under 1,024 B.
+SMALL_STACK_ROWS_MAX = 8
 
 
 def _kda_tile(step_bound: int | None, window: int, keep_same_rows: bool = False) -> int:
@@ -142,11 +152,13 @@ def _next_pow2(n: int) -> int:
     return 1 << (max(1, int(n)) - 1).bit_length()
 
 
-def _select(nseq, H, D):
+def _select(nseq, H, D, small_stack=False):
     """(BV, num_warps): a pure function of the shape, taken on the host.
 
     Rows per warp are a power of two in [BV_MIN, BV_MAX] with nseq * H * D /
     rows close to TARGET_CTAS; BV = rows * num_warps, and NV = D / BV >= 2.
+    `small_stack`: a one-warp config above SMALL_STACK_ROWS_MAX rows takes
+    SMALL_STACK_ROWS_MAX rows instead.
     """
     nv = max(1, min(D // BV_MIN, TARGET_CTAS // max(1, nseq * H)))
     rw = BV_MIN
@@ -159,7 +171,24 @@ def _select(nseq, H, D):
     nw = NUM_WARPS if (nseq > 1 and rw <= 16) else 1
     while nw > 1 and D // (rw * nw) < 2:
         nw //= 2
+    if small_stack and nw == 1 and rw > SMALL_STACK_ROWS_MAX:
+        return SMALL_STACK_ROWS_MAX, 1
     return rw * nw, nw
+
+
+_SMALL_STACK = None        # VLLM_AMPERE_KDA_SMALL_STACK, read at the first launch
+
+
+def _small_stack() -> bool:
+    """VLLM_AMPERE_KDA_SMALL_STACK: RecoverSSM verify launches cap their rows
+    per warp at SMALL_STACK_ROWS_MAX. Read once, at the first launch (the
+    CUDA-graph memory profile, before any warmup)."""
+    global _SMALL_STACK
+    if _SMALL_STACK is None:
+        from vllm import envs
+
+        _SMALL_STACK = bool(envs.VLLM_AMPERE_KDA_SMALL_STACK)
+    return _SMALL_STACK
 
 
 def wide_schedule(nseq: int, tokens_per_seq: int, heads: int) -> bool:
@@ -709,7 +738,8 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
         assert H == WIDE_HEADS, "the wide schedule is for 64 heads"
         bv, num_warps, st_cache = WIDE_BV, WIDE_NW, _WIDE_ST_CACHE
     else:
-        bv, num_warps = _select(nseq, H, D)
+        small = records is not None and _small_stack()
+        bv, num_warps = _select(nseq, H, D, small_stack=small)
         st_cache = ""
     nv = D // bv
     BT = triton.next_power_of_2(max_query_len)
@@ -920,6 +950,11 @@ def warmup_from_worker(worker, capture_sizes) -> None:
     from vllm import envs
 
     if not envs.VLLM_AMPERE_DECODE_KERNELS:
+        if envs.VLLM_AMPERE_KDA_SMALL_STACK:
+            logger.info_once(
+                "VLLM_AMPERE_KDA_SMALL_STACK=1 set but off: "
+                "VLLM_AMPERE_DECODE_KERNELS is off, the fused KDA verify is not used."
+            )
         return
     _warmup_kda_v2(worker, worker.get_model(), worker.device, capture_sizes)
 
@@ -930,6 +965,11 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
     allocate its arrival counters and gate workspace, before capture."""
     layer = find_module(model, "_conv_state_dim_first")
     if layer is None or not getattr(layer, "_kda_v2", False):
+        if _small_stack():
+            logger.info_once(
+                "VLLM_AMPERE_KDA_SMALL_STACK=1 set but off: the fused KDA "
+                "decode is not used by this model."
+            )
         return
     heads = int(layer.local_num_heads)
     head_dim = int(layer.head_dim)
@@ -955,7 +995,29 @@ def _warmup_kda_v2(worker, model, device, capture_sizes) -> None:
             "Warmed up sm_80 KDA recover verify%s for (nseq, T) in %s.",
             " (commit fold)" if fold else "", list(rplans),
         )
+        if _small_stack():
+            changed = [n for n in range(1, max_seqs + 1)
+                       if _select(n, heads, head_dim, small_stack=True)
+                       != _select(n, heads, head_dim)]
+            if changed:
+                logger.info_once(
+                    "sm_80 KDA verify small-stack configs active "
+                    "(VLLM_AMPERE_KDA_SMALL_STACK=1): one warp of %d rows per CTA, the "
+                    "commit fold's verify included, where today's config has one "
+                    "32-row warp (nseq 7-8 at 16 heads).",
+                    SMALL_STACK_ROWS_MAX,
+                )
+            else:
+                logger.info_once(
+                    "VLLM_AMPERE_KDA_SMALL_STACK=1 set but off: no verify batch up to "
+                    "max_num_seqs %d has a 32-row warp to replace.", max_seqs,
+                )
         return
+    if _small_stack():
+        logger.info_once(
+            "VLLM_AMPERE_KDA_SMALL_STACK=1 set but off: RecoverSSM is off for "
+            "this configuration; the KDA decode keeps its block configs."
+        )
     nseqs = {max(1, int(s) // window) for s in capture_sizes if int(s) >= 1}
     nseqs.update(range(1, max_seqs + 1))
     plans = set()

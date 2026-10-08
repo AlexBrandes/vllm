@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     VLLM_AMPERE_KDA_FOLD: bool = False
     VLLM_FLA_PIN_AUTOTUNE: bool = False
     VLLM_AMPERE_DECODE_IDX_GLUE: bool = False
+    VLLM_AMPERE_KDA_SMALL_STACK: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_MOE_DETERMINISTIC_ALIGN: int = 0
     VLLM_GLM5_TOPK_SORTED: bool = False
@@ -343,6 +344,18 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # devices keep normal autotuning. Off by default.
     "VLLM_FLA_PIN_AUTOTUNE": lambda: bool(
         int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))
+    ),
+    # RecoverSSM verify of the fused KDA decode (TP4, kda_decode.py; the commit
+    # fold's included): nseq 7-8 take one 8-row warp per CTA (four times the
+    # CTAs) instead of one 32-row warp that spills 2,184 B of stack per thread
+    # (2,624 B with the fold). The driver reserves the largest
+    # stack launched (at least its default 1,024 B) for every thread an SM can
+    # hold and the verify's first launch falls in the CUDA-graph memory
+    # profile, so the smaller stack leaves that memory to the KV cache. The
+    # same warp layouts, hence bitwise the same outputs and states. Off by
+    # default; no effect where RecoverSSM is off.
+    "VLLM_AMPERE_KDA_SMALL_STACK": lambda: bool(
+        int(os.getenv("VLLM_AMPERE_KDA_SMALL_STACK", "0"))
     ),
     # Rank tokens inside each expert segment of moe_align_block_size by
     # ascending flat routed-row index instead of by atomic arrival order.
