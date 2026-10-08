@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_THIN_GEMM_MAX_TOKENS: int = 32
+    VLLM_THIN_GEMM_CONCAT: bool = False
     VLLM_SHARED_EXPERT_REORDER: bool = False
     VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_PP_PACKED_HOP: bool = False
@@ -606,6 +607,16 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # touching this.
     "VLLM_THIN_GEMM_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_THIN_GEMM_MAX_TOKENS", "32")
+    ),
+    # Run each MLA layer's two thin-GEMM concat groups (q_b_proj + the
+    # indexer's wq_b on q_c; fused_qkv_a_proj + the indexer's kpool gate on
+    # hidden_states) as one launch per group, paired inside the thin-GEMM
+    # dispatch (vllm/sm80/kernels/thin_gemm/concat.py). Every member keeps
+    # its solo schedule, so each output is bitwise the separate call. Needs
+    # VLLM_THIN_GEMM, sm_80 and compilation mode NONE. Default OFF: unset,
+    # the pairing module is never imported.
+    "VLLM_THIN_GEMM_CONCAT": lambda: bool(
+        int(os.getenv("VLLM_THIN_GEMM_CONCAT", "0"))
     ),
 }
 

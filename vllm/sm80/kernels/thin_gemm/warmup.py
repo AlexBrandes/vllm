@@ -24,6 +24,7 @@ that never runs costs one compile of an already-compiled config.
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -99,6 +100,12 @@ def _discover_nk(worker) -> set[tuple[int, int]]:
 
 def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
     """Compile and preallocate for every (M, N, K) the graphs can replay."""
+    if envs.VLLM_THIN_GEMM_CONCAT:
+        # Registers the concat groups, or says why it cannot.
+        from vllm.sm80.kernels.thin_gemm.concat import register_groups
+
+        register_groups(worker, capture_sizes)
+
     from vllm.sm80.kernels.thin_gemm import (
         dispatch_threshold,
         impl,

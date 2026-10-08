@@ -177,3 +177,13 @@ def thin_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if use_ampere_thin_gemm() and thin_gemm_supported(x, weight, None):
         return impl().thin_gemm(x, weight)
     return torch.nn.functional.linear(x, weight)
+
+
+# VLLM_THIN_GEMM_CONCAT: the two entry points above are replaced by
+# concat.py's, which pair each concat group's members in one launch. Unset,
+# concat.py is never imported and every caller binds the functions above.
+if envs.VLLM_THIN_GEMM_CONCAT:
+    from vllm.sm80.kernels.thin_gemm.concat import (  # noqa: E402, F811
+        ampere_thin_gemm,
+        thin_linear,
+    )
