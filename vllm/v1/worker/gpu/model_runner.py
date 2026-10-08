@@ -77,6 +77,7 @@ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.failed_inputs import take_failed_tokens
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -2406,7 +2407,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
-            failed_tokens=self.model_state.take_failed_tokens(),
+            failed_tokens=take_failed_tokens(self.model),
             query_start_loc_np=input_batch.query_start_loc_np,
         )
 

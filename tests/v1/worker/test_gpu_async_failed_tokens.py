@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import numpy as np
 
-from vllm.v1.worker.gpu.async_utils import failed_request_ids
+from vllm.v1.failed_inputs import failed_request_ids
 
 
 def test_failed_tokens_map_to_their_requests():
