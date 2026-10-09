@@ -538,8 +538,8 @@ def test_library_declares_the_explicit_tiles():
                         "false, 4, 8, false, false")
                 assert want in ks, (bs, tk, tn)
     assert "#define MARLIN_MOE_FAST_DEQUANT_REDO" in (LIB / "common_tiles.h").read_text()
-    units = {"decode_orig.cu", "prefill_tiles.cu", "kernels_tiles_sm80.cu",
-             "module.cpp"}
+    units = {"decode_orig.cu", "decode_v2.cu", "prefill_tiles.cu",
+             "kernels_tiles_sm80.cu", "module.cpp"}
     assert {p.name for p in LIB.iterdir() if p.suffix in (".cu", ".cpp")} == units
     cmake = (ROOT / "CMakeLists.txt").read_text()
     assert set(re.findall(r'"csrc/libtorch_stable/moe/ampere_marlin/([^"]+)"',
@@ -549,10 +549,11 @@ def test_library_declares_the_explicit_tiles():
     assert '"prefill_schedule_version", 2' in (LIB / "module.cpp").read_text()
 
 
-def test_decode_source_includes_no_tile_header():
-    """decode_orig.cu compiles from its own source only: the tile settings and
-    the marlin_moe_wna16 template cannot change the decode operators."""
-    src = (LIB / "decode_orig.cu").read_text()
+@pytest.mark.parametrize("unit", ["decode_orig.cu", "decode_v2.cu"])
+def test_decode_source_includes_no_tile_header(unit):
+    """The decode sources compile from their own text only: the tile settings
+    and the marlin_moe_wna16 template cannot change the decode operators."""
+    src = (LIB / unit).read_text()
     includes = re.findall(r'#include\s+[<"]([^>"]+)[>"]', src)
     assert not [i for i in includes if "marlin" in i or "tiles" in i], includes
 

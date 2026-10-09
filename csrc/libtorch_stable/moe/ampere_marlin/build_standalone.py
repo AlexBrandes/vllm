@@ -53,8 +53,8 @@ def build(out: Path, build_dir: Path, verbose: bool) -> None:
     cpp_extension.load(
         name=NAME,
         sources=[str(HERE / source) for source in
-                 ("decode_orig.cu", "prefill_tiles.cu", "kernels_tiles_sm80.cu",
-                  "module.cpp")],
+                 ("decode_orig.cu", "decode_v2.cu", "prefill_tiles.cu",
+                  "kernels_tiles_sm80.cu", "module.cpp")],
         extra_include_paths=[str(CSRC)],
         extra_cuda_cflags=cuda_flags,
         extra_cflags=[*flags, *maps],

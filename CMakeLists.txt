@@ -1513,6 +1513,7 @@ endif()
 if(VLLM_AMPERE_MARLIN_BUILD)
   set(AMPERE_MARLIN_SRC
     "csrc/libtorch_stable/moe/ampere_marlin/decode_orig.cu"
+    "csrc/libtorch_stable/moe/ampere_marlin/decode_v2.cu"
     "csrc/libtorch_stable/moe/ampere_marlin/prefill_tiles.cu"
     "csrc/libtorch_stable/moe/ampere_marlin/kernels_tiles_sm80.cu"
     "csrc/libtorch_stable/moe/ampere_marlin/module.cpp")
