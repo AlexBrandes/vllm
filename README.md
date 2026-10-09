@@ -85,6 +85,10 @@ says which layout each serves):
   `VLLM_AMPERE_DECODE_IDX_GLUE`; under TP4, the KDA state commit after
   sampling folded into the next decode step, same state bit for bit
   (not yet validated, off unless set) — `VLLM_AMPERE_KDA_FOLD`.
+  A diagnostic, never for serving: under TP4, one KDA state per draft
+  position instead of one per request (the reference without state
+  recovery, as wherever that path's limits are not met) —
+  `VLLM_AMPERE_KDA_RECOVER_OFF`.
 - Prefill kernels (mHC projection, sparse attention) — `VLLM_GLM5_PREFILL_KERNELS`,
   `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`; at TP4 shapes `VLLM_AMPERE_KDA_PREFILL_NARROW`,
   `VLLM_AMPERE_MARLIN_PREFILL_NARROW`; at PP4 shapes `VLLM_AMPERE_KDA_PREFILL_WIDE`,

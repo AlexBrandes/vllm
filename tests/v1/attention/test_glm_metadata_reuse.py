@@ -73,9 +73,21 @@ def cpu_cuda_allocations(monkeypatch, meta_platform):
 
 
 @pytest.mark.parametrize(
-    "tp,pp,recover",
-    [(4, 1, False), (4, 1, True), (1, 4, False)],
-    ids=["tp4-16-head-kernels-off", "tp4-16-head-recover", "pp4-64-head"],
+    "tp,pp,kernels,recover_off",
+    [
+        (4, 1, False, None),
+        (4, 1, True, None),
+        (4, 1, True, "0"),
+        (4, 1, True, "1"),
+        (1, 4, True, None),
+    ],
+    ids=[
+        "tp4-16-head-kernels-off",
+        "tp4-16-head-recover",
+        "tp4-16-head-recover-off-0",
+        "tp4-16-head-recover-off-1",
+        "pp4-64-head",
+    ],
 )
 @pytest.mark.parametrize("cache_mode", ["none", "align"])
 @pytest.mark.parametrize("query_lens,capture", _SHAPES)
@@ -84,13 +96,21 @@ def test_glm_metadata_group_ownership(
     cpu_cuda_allocations,
     tp,
     pp,
-    recover,
+    kernels,
+    recover_off,
     cache_mode,
     query_lens,
     capture,
 ):
-    # RecoverSSM follows the decode kernels at 16 KDA heads per card.
-    monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", str(int(recover or pp > 1)))
+    # RecoverSSM follows the decode kernels at 16 KDA heads per card, unless
+    # the diagnostic VLLM_AMPERE_KDA_RECOVER_OFF=1 keeps the per-draft-position
+    # states there (the builders then match the kernels-off case).
+    monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", str(int(kernels)))
+    if recover_off is None:
+        monkeypatch.delenv("VLLM_AMPERE_KDA_RECOVER_OFF", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_AMPERE_KDA_RECOVER_OFF", recover_off)
+    recover = kernels and tp == 4 and recover_off != "1"
     config = _vllm_config("glm53_flash", tp, pp, with_dflash=True)
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     config.compilation_config.max_cudagraph_capture_size = 64

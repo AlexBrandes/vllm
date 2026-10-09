@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_KDA_WIDE: bool = True
     VLLM_AMPERE_KDA_FOLD: bool = False
+    VLLM_AMPERE_KDA_RECOVER_OFF: bool = False
     VLLM_FLA_PIN_AUTOTUNE: bool = False
     VLLM_AMPERE_DECODE_IDX_GLUE: bool = False
     VLLM_AMPERE_KDA_SMALL_STACK: bool = False
@@ -335,6 +336,15 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # whose state is read before then (block boundaries) commit as before.
     # Bitwise the same state. Off by default; no effect where RecoverSSM is off.
     "VLLM_AMPERE_KDA_FOLD": lambda: bool(int(os.getenv("VLLM_AMPERE_KDA_FOLD", "0"))),
+    # Diagnostic, never for serving: RecoverSSM off (TP4,
+    # vllm/sm80/kernels/kda/recover.py) where its gate holds. The KDA layers
+    # then keep one state per draft position, as wherever that gate is closed
+    # (draft-position state pages, the per-position verify; no records, commit
+    # or commit fold): the same-tree reference without state recovery. Off by
+    # default.
+    "VLLM_AMPERE_KDA_RECOVER_OFF": lambda: bool(
+        int(os.getenv("VLLM_AMPERE_KDA_RECOVER_OFF", "0"))
+    ),
     # Pin every @triton.autotune'd kernel of the vendored flash-linear-attention
     # ops and the GLM-5 KDA chunked-prefill kernels to ONE config per autotune
     # key on sm_80 (table in

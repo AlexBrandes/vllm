@@ -6,7 +6,9 @@ Speculative verification normally keeps one recurrent state per draft
 position per request (`num_speculative_blocks = num_spec` extra state pages per
 KDA layer), so that the state at the accepted position can be picked up next
 step.  With RecoverSSM (on wherever kda_recover_enabled() holds: tensor
-parallel with 16 KDA heads per card, up to 7 drafts, up to 8 sequences):
+parallel with 16 KDA heads per card, up to 7 drafts, up to 8 sequences; the
+diagnostic VLLM_AMPERE_KDA_RECOVER_OFF=1 turns it off there, never for
+serving):
 
   * the KV spec reserves no draft-position state pages
     (`num_speculative_blocks = 0`); the attention block size is unchanged;
@@ -126,10 +128,27 @@ def _closed_reason(vllm_config) -> str | None:
     return None
 
 
+def _recover_off_unused(reason: str) -> None:
+    from vllm import envs
+
+    if envs.VLLM_AMPERE_KDA_RECOVER_OFF:
+        logger.info_once(
+            "VLLM_AMPERE_KDA_RECOVER_OFF=1 set but has no effect: RecoverSSM is "
+            "off for this configuration anyway (%s).",
+            reason,
+        )
+
+
 def kda_recover_enabled(vllm_config) -> bool:
     """RecoverSSM for this configuration: a GLM-5 Next model with the sm_80
     decode kernels on (VLLM_AMPERE_DECODE_KERNELS=1) and the configuration the
-    verify kernel is built for.
+    verify kernel is built for, unless VLLM_AMPERE_KDA_RECOVER_OFF=1.
+
+    VLLM_AMPERE_KDA_RECOVER_OFF=1 is a diagnostic, never for serving: it
+    returns False where the gate holds, so every caller takes the path a
+    closed gate takes (one KDA state per draft position, upstream's
+    speculative state handling). It gives a same-tree reference without
+    state recovery.
 
     Cheap; called at init by the KDA layers, the metadata builders and the
     model state. Logs the banner (or why it stays off) once.
@@ -137,6 +156,7 @@ def kda_recover_enabled(vllm_config) -> bool:
     from vllm import envs
 
     if not envs.VLLM_AMPERE_DECODE_KERNELS:
+        _recover_off_unused("VLLM_AMPERE_DECODE_KERNELS is off")
         return False
     model_config = vllm_config.model_config
     archs = tuple(getattr(model_config.hf_config, "architectures", None) or ())
@@ -144,11 +164,19 @@ def kda_recover_enabled(vllm_config) -> bool:
         return False
     reason = _closed_reason(vllm_config)
     if reason is None:
+        if envs.VLLM_AMPERE_KDA_RECOVER_OFF:
+            logger.warning_once(
+                "sm_80 KDA recover off by VLLM_AMPERE_KDA_RECOVER_OFF=1 (a "
+                "diagnostic, not for serving): keeping one KDA state per draft "
+                "position."
+            )
+            return False
         logger.info_once(
             "sm_80 KDA recover active: one KDA state per request, accepted "
             "tokens replayed after sampling."
         )
         return True
+    _recover_off_unused(reason)
     logger.info_once(
         "sm_80 KDA recover off: %s; keeping one KDA state per draft position.",
         reason,

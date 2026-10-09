@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for RecoverSSM (vllm/sm80/kernels/kda/recover.py).
 
-CPU part: when it is on (no switch of its own), the KV spec (no draft-position state pages)
+CPU part: when it is on (no switch of its own; the diagnostic VLLM_AMPERE_KDA_RECOVER_OFF=1
+turns it off where it would be on), the KV spec (no draft-position state pages)
 and the KV capacity it gives through the real KV-sizing code, the record
 buffer size, the replay arithmetic, and the original Triton-interpreted
 allocator -> commit -> next precopy -> consumer/prefix-hit control path.
@@ -40,7 +41,8 @@ def _records_nbytes(vllm_config, num_kda_layers: int) -> int:
             * kr.HEADS * kr.HEAD_DIM * 4)
 
 
-ENV = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_KV_MAMBA_INFLIGHT_STATES")
+ENV = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_KV_MAMBA_INFLIGHT_STATES",
+       "VLLM_AMPERE_KDA_RECOVER_OFF", "VLLM_AMPERE_KDA_FOLD")
 
 
 class _Env:
@@ -86,32 +88,162 @@ def _cfg(tp=4, pp=1, num_spec=7, max_seqs=8, mode="align", arch="Glm5NextForCond
 
 # ------------------------------------------------------------------ CPU tests
 
-def test_no_switch_of_its_own():
-    """The former VLLM_GLM5_KDA_RECOVER switch is gone (validated in 1.7.0)."""
+def test_switches():
+    """The former VLLM_GLM5_KDA_RECOVER switch is gone (validated in 1.7.0).
+    The only switch is the diagnostic VLLM_AMPERE_KDA_RECOVER_OFF, off unless
+    set."""
     from vllm import envs
 
     assert "VLLM_GLM5_KDA_RECOVER" not in envs.environment_variables
     assert not hasattr(kr, "kda_recover_requested")
+    assert "VLLM_AMPERE_KDA_RECOVER_OFF" in envs.environment_variables
+    e = _Env()
+    try:
+        os.environ.pop("VLLM_AMPERE_KDA_RECOVER_OFF", None)
+        assert envs.VLLM_AMPERE_KDA_RECOVER_OFF is False
+        e.set(VLLM_AMPERE_KDA_RECOVER_OFF=0)
+        assert envs.VLLM_AMPERE_KDA_RECOVER_OFF is False
+        e.set(VLLM_AMPERE_KDA_RECOVER_OFF=1)
+        assert envs.VLLM_AMPERE_KDA_RECOVER_OFF is True
+    finally:
+        e.undo()
+
+
+_GATE_CFGS = (
+    _cfg(), _cfg(num_spec=3, mode="none"), _cfg(num_spec=1), _cfg(max_seqs=1),
+    _cfg(pp=4, tp=1), _cfg(num_spec=0), _cfg(num_spec=8), _cfg(tp=2), _cfg(max_seqs=16),
+    _cfg(mode="all"), _cfg(arch="KimiLinearForCausalLM"), _cfg(arch="Qwen3NextForCausalLM"),
+)
+
+
+def _parent_gate(cfg):
+    """The gate of the parent commit (before the diagnostic switch existed)."""
+    from vllm import envs
+
+    archs = cfg.model_config.hf_config.architectures
+    return (bool(envs.VLLM_AMPERE_DECODE_KERNELS)
+            and any(a in kr._ARCHS for a in archs)
+            and kr._closed_reason(cfg) is None)
 
 
 def test_gate():
     """On exactly for the TP4 decode-kernel configuration; off with the decode
-    kernels off, under PP, on other models and outside the kernel's shapes."""
+    kernels off, under PP, on other models and outside the kernel's shapes.
+    VLLM_AMPERE_KDA_RECOVER_OFF unset and =0 give the parent's gate on every
+    configuration; =1 turns it off everywhere."""
     e = _Env()
     try:
-        e.set(VLLM_AMPERE_DECODE_KERNELS=0)
-        assert not kr.kda_recover_enabled(_cfg())
-        e.set(VLLM_AMPERE_DECODE_KERNELS=1)
-        assert kr.kda_recover_enabled(_cfg())
-        assert kr.kda_recover_enabled(_cfg(num_spec=3, mode="none"))
-        for bad in (_cfg(pp=4, tp=1), _cfg(num_spec=0), _cfg(num_spec=8), _cfg(tp=2),
-                    _cfg(max_seqs=16), _cfg(mode="all"), _cfg(arch="KimiLinearForCausalLM"),
-                    _cfg(arch="Qwen3NextForCausalLM")):
-            assert not kr.kda_recover_enabled(bad)
-        e.set(sm80=False)
-        assert not kr.kda_recover_enabled(_cfg())
+        for flag in (None, "0"):
+            if flag is None:
+                os.environ.pop("VLLM_AMPERE_KDA_RECOVER_OFF", None)
+            else:
+                e.set(VLLM_AMPERE_KDA_RECOVER_OFF=flag)
+            e.set(VLLM_AMPERE_DECODE_KERNELS=0)
+            assert not kr.kda_recover_enabled(_cfg())
+            e.set(VLLM_AMPERE_DECODE_KERNELS=1)
+            assert kr.kda_recover_enabled(_cfg())
+            assert kr.kda_recover_enabled(_cfg(num_spec=3, mode="none"))
+            for bad in (_cfg(pp=4, tp=1), _cfg(num_spec=0), _cfg(num_spec=8), _cfg(tp=2),
+                        _cfg(max_seqs=16), _cfg(mode="all"),
+                        _cfg(arch="KimiLinearForCausalLM"),
+                        _cfg(arch="Qwen3NextForCausalLM")):
+                assert not kr.kda_recover_enabled(bad)
+            for kernels in (0, 1):
+                for sm80 in (True, False):
+                    e.set(sm80=sm80, VLLM_AMPERE_DECODE_KERNELS=kernels)
+                    for cfg in _GATE_CFGS:
+                        assert kr.kda_recover_enabled(cfg) == _parent_gate(cfg), (flag, cfg)
+            e.set(sm80=False, VLLM_AMPERE_DECODE_KERNELS=1)
+            assert not kr.kda_recover_enabled(_cfg())
+            e.set(sm80=True)
+        e.set(VLLM_AMPERE_KDA_RECOVER_OFF=1)
+        for kernels in (0, 1):
+            e.set(VLLM_AMPERE_DECODE_KERNELS=kernels)
+            for cfg in _GATE_CFGS:
+                assert not kr.kda_recover_enabled(cfg), cfg
     finally:
         e.undo()
+
+
+def test_recover_off_selects_per_position_path():
+    """VLLM_AMPERE_KDA_RECOVER_OFF=1 on the TP4 configuration: the GLM model
+    state keeps no RecoverSSM state and no commit fold hooks (the fold switch
+    set), as where the gate is closed; unset, the same state holds RecoverSSM.
+    The metadata builders and their output on both settings:
+    tests/v1/attention/test_glm_metadata_reuse.py."""
+    from vllm.models.glm5next.nvidia.model_state import Glm5NextModelState
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+    from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+
+    def base_init(self, vllm_config, model, encoder_cache, device):
+        self.recoverssm = None
+
+    e = _Env()
+    saved_init = MambaHybridModelState.__init__
+    MambaHybridModelState.__init__ = base_init
+    try:
+        e.set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_AMPERE_KDA_FOLD=1,
+              VLLM_AMPERE_KDA_RECOVER_OFF=1)
+        state = Glm5NextModelState(_cfg(), None, None, "cpu")
+        assert state.recoverssm is None and state._kda_fold is None
+        assert not kr.kda_fold_enabled(_cfg())
+        e.set(VLLM_AMPERE_KDA_FOLD=0)
+        os.environ.pop("VLLM_AMPERE_KDA_RECOVER_OFF", None)
+        state = Glm5NextModelState(_cfg(), None, None, "cpu")
+        assert isinstance(state.recoverssm, RecoverSSMState) and state._kda_fold is None
+    finally:
+        MambaHybridModelState.__init__ = saved_init
+        e.undo()
+
+
+def test_recover_off_banners():
+    """The banners through the real vLLM logger in a fresh process: unset, the
+    active banner and no word of the diagnostic; =1, the diagnostic banner
+    (never the active one), the no-effect line where the gate is closed anyway
+    and the commit fold's off line."""
+    import subprocess
+    import sys
+
+    import vllm
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(vllm.__file__)))
+    code = (
+        # A serving process configures the vLLM logger from its arguments; the
+        # bootstrap configuration reads the same environment defaults.
+        "from vllm.logger import _configure_vllm_root_logger\n"
+        "_configure_vllm_root_logger()\n"
+        "from vllm.sm80.kernels import _platform\n"
+        "_platform._SM80_CACHE = True\n"
+        "from tests.kernels.test_ampere_kda_recover import _cfg\n"
+        "from vllm.sm80.kernels.kda import recover as kr\n"
+        "print('GATE', kr.kda_recover_enabled(_cfg()),"
+        " kr.kda_recover_enabled(_cfg(max_seqs=16)), kr.kda_fold_enabled(_cfg()))\n"
+    )
+    out = {}
+    for flag in (None, "1"):
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_AMPERE_DECODE_KERNELS="1",
+                   VLLM_AMPERE_KDA_FOLD="1", VLLM_CONFIGURE_LOGGING="1",
+                   VLLM_LOGGING_LEVEL="INFO", VLLM_LOGGING_CONFIG_PATH="",
+                   PYTHONPATH=os.pathsep.join(
+                       p for p in (root, os.environ.get("PYTHONPATH")) if p))
+        env.pop("VLLM_AMPERE_KDA_RECOVER_OFF", None)
+        if flag is not None:
+            env["VLLM_AMPERE_KDA_RECOVER_OFF"] = flag
+        r = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+                           capture_output=True, text=True, timeout=600)
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-4000:]
+        out[flag] = r.stdout + r.stderr
+    on, off = out[None], out["1"]
+    assert "GATE True False True" in on, on[-3000:]
+    assert "sm_80 KDA recover active" in on, on[-3000:]
+    assert "VLLM_AMPERE_KDA_RECOVER_OFF" not in on, on[-3000:]
+    assert "GATE False False False" in off, off[-3000:]
+    assert "sm_80 KDA recover active" not in off, off[-3000:]
+    assert ("sm_80 KDA recover off by VLLM_AMPERE_KDA_RECOVER_OFF=1 (a diagnostic, "
+            "not for serving)") in off, off[-3000:]
+    assert ("VLLM_AMPERE_KDA_RECOVER_OFF=1 set but has no effect: RecoverSSM is off "
+            "for this configuration anyway (needs max_num_seqs <= 8)") in off, off[-3000:]
+    assert "VLLM_AMPERE_KDA_FOLD=1 set but off: RecoverSSM is off" in off, off[-3000:]
 
 
 def _kda_spec(recover, num_spec=7):
@@ -816,7 +948,8 @@ def gpu_test_graph_zero_growth():
     del g
 
 
-CPU_TESTS = (test_no_switch_of_its_own, test_gate, test_kv_spec_has_no_draft_state_pages,
+CPU_TESTS = (test_switches, test_gate, test_recover_off_selects_per_position_path,
+             test_recover_off_banners, test_kv_spec_has_no_draft_state_pages,
              test_kv_capacity_tp4_depth7, test_records_bytes,
              test_commit_reference_replays_per_position_states,
              test_import_does_not_initialise_cuda,

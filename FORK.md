@@ -58,7 +58,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/indexer/topk_tiefix.py` | 526 |
 | `vllm/sm80/kernels/indexer/topk_tiefix_gate.py` | 145 |
 | `vllm/sm80/kernels/kda/__init__.py` | 11 |
-| `vllm/sm80/kernels/kda/recover.py` | 1,026 |
+| `vllm/sm80/kernels/kda/recover.py` | 1,054 |
 | `vllm/sm80/kernels/marlin_moe/__init__.py` | 13 |
 | `vllm/sm80/kernels/marlin_moe/decode.py` | 321 |
 | `vllm/sm80/kernels/marlin_moe/extension.py` | 138 |
@@ -80,7 +80,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 138 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **36 files** | **11,385** |
+| **36 files** | **11,413** |
 
 ### `vllm/sm80/`
 
@@ -96,7 +96,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 640 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 828 |
+| `vllm/sm80/envs.py` | 838 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
@@ -121,7 +121,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **33 files** | **7,948** |
+| **33 files** | **7,958** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -190,7 +190,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_kda_dispatch.py` | 836 |
 | `tests/kernels/test_ampere_kda_fold.py` | 1,030 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
-| `tests/kernels/test_ampere_kda_recover.py` | 867 |
+| `tests/kernels/test_ampere_kda_recover.py` | 1,000 |
 | `tests/kernels/test_ampere_kda_small_stack.py` | 504 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 193 |
 | `tests/kernels/test_ampere_marlin_optional.py` | 231 |
@@ -235,7 +235,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/seams.yaml` | 1,001 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_fork_map.py` | 55 |
-| `tests/sm80/test_glm_registrations.py` | 305 |
+| `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_plugin_banner.py` | 35 |
@@ -245,7 +245,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_setup_envs_load.py` | 79 |
 | `tests/sm80/update_seams.py` | 173 |
 | `tests/test_retired_env_vars.py` | 158 |
-| `tests/v1/attention/test_glm_metadata_reuse.py` | 208 |
+| `tests/v1/attention/test_glm_metadata_reuse.py` | 228 |
 | `tests/v1/attention/test_indexer_logits_budget_exact.py` | 224 |
 | `tests/v1/attention/test_indexer_prefill_chunk_budget.py` | 177 |
 | `tests/v1/attention/test_kpool_tail_padding_invariant.py` | 118 |
@@ -267,7 +267,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **98 files** | **34,217** |
+| **98 files** | **34,374** |
 
 #### `tools/`
 
@@ -359,7 +359,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `.github/ISSUE_TEMPLATE/700-performance-discussion.yml` | deleted | 0 | 59 | 1 |
 | `.github/ISSUE_TEMPLATE/750-RFC.yml` | deleted | 0 | 52 | 1 |
 | `.github/ISSUE_TEMPLATE/config.yml` | modified | 6 | 2 | 3 |
-| `README.md` | modified | 185 | 86 | 20 |
+| `README.md` | modified | 189 | 86 | 20 |
 | `docs/features/quantization/README.md` | modified | 63 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 3 | 1 | 1 |
@@ -373,15 +373,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 120 | 2 | 7 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 26 | 1 | 8 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **23 files** | | **1,041** | **561** | **78** |
+| **23 files** | | **1,045** | **561** | **78** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
 | Product code | 60 | 3,766 | 253 | 481 |
-| Tests, docs and .github | 23 | 1,041 | 561 | 78 |
-| All | 83 | 4,807 | 814 | 559 |
+| Tests, docs and .github | 23 | 1,045 | 561 | 78 |
+| All | 83 | 4,811 | 814 | 559 |
 
 ## 3. Fork environment variables
 
@@ -396,6 +396,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_KDA_FOLD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_PREFILL_NARROW` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
+| `VLLM_AMPERE_KDA_RECOVER_OFF` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_SMALL_STACK` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_BUILD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_CUDA` | `bool` | `False` | `'0'` |
@@ -454,7 +455,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **63 variables** | | | |
+| **64 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -469,11 +470,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 85 |
-| Fork-added product lines | 24,053 |
+| Fork-added product lines | 24,091 |
 | Patched upstream files | 83 |
-| Patched upstream lines | +4,807 / -814 |
+| Patched upstream lines | +4,811 / -814 |
 | Patched upstream product files | 60 |
 | Patched upstream product lines | +3,766 / -253 |
-| Product lines added (new files and patches) | 27,819 |
-| Fork environment variables (flags) | 63 |
+| Product lines added (new files and patches) | 27,857 |
+| Fork environment variables (flags) | 64 |
 | Unreferenced fork definitions | 0 (0 lines) |
