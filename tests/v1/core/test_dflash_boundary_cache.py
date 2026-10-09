@@ -106,15 +106,20 @@ def test_warm_hit_and_split_at_cached_boundary(enabled, tail):
     assert manager.get_computed_blocks(cold)[1] == 0
     ends = _prefill(manager, stub, cold)
     manager.cache_blocks(cold, cold.num_computed_tokens)
-    # At an exact prompt edge, the sparse Mamba checkpoint is at the
-    # prompt end, past the last-logit replay limit; no older checkpoint exists.
-    expected = (BOUNDARY if enabled else BOUNDARY - BLOCK) if tail else 0
+    # Admit the warm request in a later step, as the scheduler does: caching
+    # the block-aligned prompt checkpoint again marks its Mamba block as
+    # written this step.
+    manager.new_step_starts()
+    # A resend recomputes its last token, so without the Mamba block drop an
+    # exact prompt edge keeps its checkpoint one block lower, where the drop
+    # puts it too. Past the edge only the boundary mode keeps the last block.
+    expected = BOUNDARY if enabled and tail else BOUNDARY - BLOCK
     # The last token is always evaluated again to obtain the target logits.
     warm = make_request("warm", tokens, BLOCK, sha256)
     blocks, hit, _ = manager.get_computed_blocks(warm)
     assert hit == expected
+    assert expected in ends
     if enabled and tail:
-        assert BOUNDARY in ends
         assert len(blocks.blocks[0]) == 3
         assert len(blocks.blocks[2]) == 3
         assert blocks.blocks[2][-1].block_hash is not None
@@ -141,7 +146,11 @@ def test_every_prompt_tail_reuses_exactly_one_more_block():
         if tail:
             assert hits == [BOUNDARY - BLOCK, BOUNDARY]
         else:
-            assert hits == [0, 0]
+            # An exact-edge resend stops one token short of its last block.
+            # EAGLE lookups read the whole prompt before dropping a block, so
+            # the drop mode reaches the checkpoint it keeps one block lower;
+            # the boundary mode keeps only the cold prompt's last full block.
+            assert hits == [BOUNDARY - BLOCK, 0]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -373,9 +382,12 @@ def test_preempted_boundary_prompt_tail_preserves_real_query(monkeypatch, has_ou
     prompt_len = BOUNDARY if has_output else BOUNDARY + 1
     request = make_request("resumed", PREFIX[:prompt_len], BLOCK, sha256)
     scheduler.add_request(request)
-    out = scheduler.schedule()
-    assert out.num_scheduled_tokens["resumed"] == BOUNDARY
-    _complete_step(scheduler, out, request)
+    # A resend recomputes the last prompt token, so a block-aligned prompt
+    # stops one block early to keep the checkpoint that resend can reach.
+    for chunk in [BOUNDARY - BLOCK, BLOCK] if has_output else [BOUNDARY]:
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens["resumed"] == chunk
+        _complete_step(scheduler, out, request)
     assert request.num_output_tokens == int(has_output)
     scheduler.running.remove(request)
     scheduler._preempt_request(request, timestamp=0.0)
