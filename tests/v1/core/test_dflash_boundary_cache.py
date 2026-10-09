@@ -82,6 +82,7 @@ def _manager(enabled=False, *, target_eagle=False, draft_eagle=True):
 
 def _stub(manager):
     return SimpleNamespace(
+        block_size=BLOCK,
         cache_config=SimpleNamespace(block_size=BLOCK),
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         max_num_scheduled_tokens=2 * BLOCK,
