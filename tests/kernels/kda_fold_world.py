@@ -359,7 +359,9 @@ class World:
             if s != PREFILL_SLOT:
                 self.nc_slot[s] = self.reqs[s].nc
         width = max([len(r.cols[0]) for r in self.reqs.values()] + [1]) + 1
-        tables = []
+        # Batch-order tables (the attention metadata's) and the per-request-slot
+        # tables the align state copies read (row = slot; free slots NULL).
+        tables, slot_tables = [], []
         for g in range(self.G):
             t = torch.zeros(nb, width, **i32)
             for b, (kind, s, _, _) in enumerate(batch):
@@ -367,8 +369,12 @@ class World:
                     cg = self.reqs[s].cols[g]
                     t[b, :len(cg)] = torch.tensor(cg, **i32)
             tables.append(t)
+            st = torch.zeros(MAX_SEQS, width, **i32)
+            for s, r in self.reqs.items():
+                st[s, :len(r.cols[g])] = torch.tensor(r.cols[g], **i32)
+            slot_tables.append(st)
         if self.align:
-            self._preprocess(idx_mapping, qsl, tables, nb)
+            self._preprocess(idx_mapping, qsl, slot_tables, nb)
         spec = [(b, s, q, n) for b, (kind, s, q, n) in enumerate(batch) if kind == "spec"]
         n_spec = len(spec)
         mask = torch.tensor([kind == "spec" for kind, _, _, _ in batch])
