@@ -125,8 +125,12 @@ def test_glm_model_state_enables_recoverssm(
 
     monkeypatch.setattr(MambaHybridModelState, "__init__", base_init)
     monkeypatch.setattr(recover, "kda_recover_enabled", lambda config: fork_recover)
+    # The commit fold is not under test: pin it off, so a fold switch set in
+    # the environment does not reach kda_fold_enabled with this bare config.
+    monkeypatch.setenv("VLLM_AMPERE_KDA_FOLD", "0")
     state = Glm5NextModelState(SimpleNamespace(), None, None, None)
     assert isinstance(state.recoverssm, RecoverSSMState) == expected
+    assert state._kda_fold is None
 
 
 @pytest.mark.parametrize("fold", [False, True])
