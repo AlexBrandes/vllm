@@ -422,6 +422,31 @@ def test_flag_off_never_consults_the_registry(monkeypatch):
     assert calls == ["solo", "solo"] and group.slot.stash is None
 
 
+def test_flag_on_dispatch_follows_the_package_impl(monkeypatch):
+    """The flag-on functions resolve ``impl`` through the package at call
+    time, as the base dispatch does, so a re-resolved or patched impl is the
+    one that runs, solo and grouped."""
+    import vllm.sm80.kernels.thin_gemm as pkg
+    concat = _concat()
+    calls = []
+    fake = SimpleNamespace(
+        thin_gemm=lambda x, w: calls.append("solo") or "fake",
+        thin_gemm_group_split=lambda x, ws: calls.append("group") or ("y0", "y1"))
+    monkeypatch.setattr(pkg, "impl", lambda: fake)
+    monkeypatch.setattr(pkg, "use_ampere_thin_gemm", lambda: True)
+    x = torch.zeros(4, 4096, dtype=BF16)
+    w = torch.zeros(1024, 4096, dtype=BF16)
+    assert concat.ampere_thin_gemm(None, x, w, None) == "fake"
+    assert concat.thin_linear(x, w) == "fake"
+    w1 = torch.zeros(1024, 4096, dtype=BF16)
+    group = concat._Group(concat._Slot("qb_wqb"), "l0", (w, w1), [4])
+    monkeypatch.setitem(concat._MEMBERS, w.data_ptr(), (group, 0))
+    monkeypatch.setitem(concat._MEMBERS, w1.data_ptr(), (group, 1))
+    assert concat.ampere_thin_gemm(None, x, w, None) == "y0"
+    assert concat.thin_linear(x, w1) == "y1"
+    assert calls == ["solo", "solo", "group"]
+
+
 _CHILD = """
 import sys
 import types
@@ -603,10 +628,11 @@ def _worker(model, mode=None, device="cpu"):
 
 @pytest.fixture
 def concat_env(monkeypatch):
+    import vllm.sm80.kernels.thin_gemm as pkg
     concat = _concat()
     fake, log = _FakeImpl(), _Log()
-    monkeypatch.setattr(concat, "impl", lambda: fake)
-    monkeypatch.setattr(concat, "use_ampere_thin_gemm", lambda: True)
+    monkeypatch.setattr(pkg, "impl", lambda: fake)
+    monkeypatch.setattr(pkg, "use_ampere_thin_gemm", lambda: True)
     monkeypatch.setattr(concat, "_device_supported", lambda: True)
     monkeypatch.setattr(concat, "logger", log)
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM", True, raising=False)

@@ -41,12 +41,11 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.sm80.kernels import thin_gemm as _tg
 from vllm.sm80.kernels.thin_gemm import (
     _device_supported,
     dispatch_threshold,
-    impl,
     thin_gemm_supported,
-    use_ampere_thin_gemm,
 )
 
 logger = init_logger(__name__)
@@ -92,13 +91,13 @@ def _version(x: torch.Tensor) -> int:
 def _run(group: _Group, i: int, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     slot = group.slot
     if (w.shape, w.stride()) != group.layouts[i]:
-        return impl().thin_gemm(x, w)
+        return _tg.impl().thin_gemm(x, w)
     if x.shape[0] not in group.ms:
         if i == 0:
             slot.stash = None
-        return impl().thin_gemm(x, w)
+        return _tg.impl().thin_gemm(x, w)
     if i == 0:
-        y0, y1 = impl().thin_gemm_group_split(x, (w, group.ws[1]))
+        y0, y1 = _tg.impl().thin_gemm_group_split(x, (w, group.ws[1]))
         slot.stash = (group, x, _version(x), x.shape, x.stride(), y1)
         slot.launches += 1
         return y0
@@ -120,7 +119,7 @@ def _run(group: _Group, i: int, x: torch.Tensor, w: torch.Tensor) -> torch.Tenso
         "group's)",
         slot.name,
     )
-    return impl().thin_gemm(x, w)
+    return _tg.impl().thin_gemm(x, w)
 
 
 def ampere_thin_gemm(
@@ -135,18 +134,18 @@ def ampere_thin_gemm(
             member = _MEMBERS.get(weight.data_ptr())
             if member is not None:
                 return _run(member[0], member[1], x, weight)
-        return impl().thin_gemm(x, weight)
+        return _tg.impl().thin_gemm(x, weight)
     return torch.nn.functional.linear(x, weight, bias)
 
 
 def thin_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """The package's ``thin_linear`` with the group pairing."""
-    if use_ampere_thin_gemm() and thin_gemm_supported(x, weight, None):
+    if _tg.use_ampere_thin_gemm() and thin_gemm_supported(x, weight, None):
         if _MEMBERS and not torch.compiler.is_compiling():
             member = _MEMBERS.get(weight.data_ptr())
             if member is not None:
                 return _run(member[0], member[1], x, weight)
-        return impl().thin_gemm(x, weight)
+        return _tg.impl().thin_gemm(x, weight)
     return torch.nn.functional.linear(x, weight)
 
 
@@ -252,7 +251,7 @@ def register_groups(worker, capture_sizes) -> None:
         key = (tuple(int(w.shape[0]) for w in ws), int(ws[0].shape[1]))
         shapes.setdefault(key, set()).update(group_ms)
     for key, group_ms in sorted(shapes.items()):
-        impl().warmup((), sorted(group_ms), device=worker.device, groups=(key,))
+        _tg.impl().warmup((), sorted(group_ms), device=worker.device, groups=(key,))
 
     for name, prefix, ws, group_ms in groups:
         slot = _SLOTS.get(name)
