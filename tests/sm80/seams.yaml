@@ -155,7 +155,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.add_request
   why: takes the request slot (acceptance count, align-mode state block) and calls nothing that reads the KDA commit fold, so Glm5NextModelState calls the fold's add_request hook after it with new_req_data.req_id and num_computed_tokens
-  sha256: 97199f4878e3a9a66bb2e8730de6183a573faeeb338046e9e6795dce90af7454
+  sha256: f9a0e97f1e0967e9484c51a0a51ba34daffa4ff863ea7fe9c2c6b2373bfcac0d
   signature: '(self, req_index: int, new_req_data: vllm.v1.core.sched.output.NewRequestData) -> None'
 
 - id: glm-mamba-state-remove-request
