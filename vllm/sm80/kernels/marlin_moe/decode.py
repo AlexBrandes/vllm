@@ -1,0 +1,321 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Prebuilt sm_80 W4A16 MoE decode with the released routing/sum contract.
+
+The W13 projection is split four ways along K into fixed-order fp32 partials;
+this is faster than the released kernels and changes the fp32 summation
+order, so decoded text may differ from them while staying within their fp64
+accuracy bounds. The released bf16 rounding points are retained. This
+descriptor is not a universal Marlin auto-selector; equivalence
+admission must bind the ordinary binary and device. ``layer.moe_sum`` retains slot-order sum,
+shared-expert deferral, and the subsequent shared add/all-reduce. Fully masked
+CUDA-graph padding rows remain don't-care; no routing or padding flag changes.
+Persistent buffers are shared by serialized calls on each device, as are the
+released alignment buffers. No CUDA source compilation occurs here.
+"""
+
+import functools
+
+import torch
+
+import vllm.envs as envs
+from vllm.sm80.kernels.marlin_moe.prefill import (
+    E_GATE,
+    K_GATE,
+    TOPK_GATE,
+    _is_sm80,
+    gate_reason as _shape_gate_reason,
+)
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+MAX_TOKENS = 32
+_SCRATCH_TOKENS = {512: MAX_TOKENS, 2048: 8}
+# Whole-expert multi-request rows: VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS ranges.
+PP_MULTI_MIN, PP_MULTI_MAX = 9, 64
+W13_ROWS = 64
+_WORKSPACES: dict = {}
+# W13 fp32 partial planes (the kernel splits K four ways).
+_W13_PLANES = 4
+_RETIRED: list = []
+# The decode scratch (TP4 shards N=512 and whole experts N=2048) is created only
+# after the KV cache is sized (kernel_warmup opens it). Earlier calls -- the
+# profile run and the CUDA-graph memory profiling, which runs capture warmups
+# before KV sizing -- take the released kernels, so the scratch is never
+# charged against the KV cache.
+_LATE_SCRATCH_N = (512, 2048)
+_late_scratch_open = False
+
+
+def open_late_scratch() -> None:
+    """Allow the decode scratch from now on (called after KV sizing)."""
+    global _late_scratch_open
+    _late_scratch_open = True
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_ranges(raw: str) -> tuple[tuple[int, int], ...] | None:
+    """"lo-hi[,lo-hi...]" -> ranges inside PP_MULTI_MIN..PP_MULTI_MAX; None if
+    malformed (the gate then stays closed); () if empty."""
+    out = []
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        try:
+            a, b = int(lo), int(hi if sep else lo)
+        except ValueError:
+            return None
+        if not PP_MULTI_MIN <= a <= b <= PP_MULTI_MAX:
+            return None
+        out.append((a, b))
+    return tuple(out)
+
+
+def pp_multi_ranges() -> tuple[tuple[int, int], ...]:
+    if not envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI:
+        return ()
+    return _parse_ranges(envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS) or ()
+
+
+def _scratch_tokens(N: int) -> int:
+    """Rows the persistent scratch of width N is sized for."""
+    base = _SCRATCH_TOKENS.get(N, 0)
+    if N == 2048:
+        base = max([base] + [hi for _, hi in pp_multi_ranges()])
+    return base
+
+
+def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
+    """TP4 small batches and the measured whole-expert PP4 decode batches
+    (4 and 8 rows; 5-7 rows too with VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS; the
+    multi-request row ranges of VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS)."""
+    return (
+        intermediate_size == 512 and 1 <= num_tokens <= MAX_TOKENS
+        or intermediate_size == 2048 and (
+            num_tokens in (4, 8)
+            or 5 <= num_tokens <= 7 and envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS
+            or num_tokens >= PP_MULTI_MIN and any(
+                lo <= num_tokens <= hi for lo, hi in pp_multi_ranges())
+        )
+    )
+
+
+def _config(num_tokens: int) -> tuple[int, int]:
+    return (49 if num_tokens >= 16 else 0, 49 if num_tokens > 16 else 0)
+
+
+def _workspaces(device, N: int, max_tokens: int, *, create: bool):
+    key = (str(device), torch.cuda.current_stream(device).cuda_stream, N)
+    ws = _WORKSPACES.get(key)
+    if ws is not None and ws["max_tokens"] >= max_tokens:
+        return ws
+    if not create:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Marlin decode scratch must be warmed before CUDA capture")
+    capacity = max(_scratch_tokens(N), max_tokens)
+    rows = capacity * TOPK_GATE
+    padded = (rows + E_GATE * 7 + 7) // 8 * 8
+    if ws is not None:
+        _RETIRED.append(ws)  # Existing graphs may still reference these tensors.
+    ws = {
+        "max_tokens": capacity,
+        "part": torch.zeros(
+            _W13_PLANES * rows * 2 * N,
+            device=device, dtype=torch.float32,
+        ),
+        "h": torch.zeros(rows * N, device=device, dtype=torch.bfloat16),
+        "c3": torch.zeros(rows * K_GATE, device=device, dtype=torch.bfloat16),
+        "ctr": torch.zeros(2, device=device, dtype=torch.int32),
+        "sorted": torch.empty(padded, device=device, dtype=torch.int32),
+        "experts": torch.empty(padded // 8, device=device, dtype=torch.int32),
+        "ntpp": torch.empty(1, device=device, dtype=torch.int32),
+    }
+    _WORKSPACES[key] = ws
+    return ws
+
+
+def _align(topk_ids, ws):
+    from vllm.sm80.kernels.moe.align import (
+        deterministic_moe_align_mode,
+    )
+
+    if envs.VLLM_AMPERE_DECODE_KERNELS:
+        from vllm.sm80.kernels.moe import take_fused_align
+
+        fused = take_fused_align(topk_ids, 8, E_GATE, None, False)
+        if fused is not None:
+            return fused
+    if deterministic_moe_align_mode() == 1:
+        from vllm.sm80.kernels.moe.align import (
+            kernel_moe_align_block_size as align,
+        )
+    else:
+        from vllm._custom_ops import moe_align_block_size as align
+    align(topk_ids, E_GATE, 8, ws["sorted"], ws["experts"], ws["ntpp"], None, None)
+    return ws["sorted"], ws["experts"], ws["ntpp"]
+
+
+def gate_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
+                activation, global_num_experts, expert_map,
+                apply_router_weight_on_input):
+    N = w2.size(1) * 16
+    if not compiled_regime(hidden_states.size(0), N):
+        return "outside the compiled decode token/width regime"
+    if getattr(layer, "_lora_context", None) is not None:
+        return "LoRA"
+    if (
+        tuple(w1.shape) != (E_GATE, K_GATE // 16, N * 4)
+        or tuple(w2.shape) != (E_GATE, N // 16, K_GATE * 2)
+    ):
+        return "unsupported packed weight layout"
+    tensors = (w1, w2, layer.w1_scale, layer.w2_scale, topk_weights, topk_ids)
+    if any(t is None or not t.is_contiguous() for t in tensors):
+        return "noncontiguous weights, scales, or routing"
+    if any(t.device != hidden_states.device for t in tensors):
+        return "weights and routing must be on the activation device"
+    if topk_ids.dtype != torch.int32 or w1.dtype != torch.int32 or w2.dtype != torch.int32:
+        return "packed weights and routing must be int32"
+    if tuple(topk_weights.shape) != tuple(topk_ids.shape):
+        return "routing shape mismatch"
+    if topk_ids.size(0) != hidden_states.size(0):
+        return "routing token count mismatch"
+    return _shape_gate_reason(
+        layer, hidden_states, w1, w2, topk_weights, topk_ids, activation,
+        global_num_experts, expert_map, apply_router_weight_on_input,
+        allowed_n=(512, 2048),
+    )
+
+
+def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
+                topk_ids, activation, global_num_experts, expert_map,
+                apply_router_weight_on_input) -> bool:
+    if not envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:
+        return False
+    why = gate_reason(
+        layer, hidden_states, w1, w2, topk_weights, topk_ids, activation,
+        global_num_experts, expert_map, apply_router_weight_on_input,
+    )
+    if why is None:
+        N = w2.size(1) * 16
+        early = N in _LATE_SCRATCH_N and not _late_scratch_open
+        ws = _workspaces(
+            hidden_states.device, N, hidden_states.size(0),
+            create=not early and not torch.cuda.is_current_stream_capturing(),
+        )
+        if ws is None:
+            why = ("decode scratch is allocated after KV-cache sizing"
+                   if early else "scratch not warmed before CUDA capture")
+    if why is not None:
+        logger.info_once(
+            "VLLM_AMPERE_MARLIN_DECODE_CUDA is set but the gate is closed (%s); "
+            "using released Marlin kernels.", why,
+        )
+        return False
+    logger.info_once(
+        "Compiled Marlin MoE decode active (VLLM_AMPERE_MARLIN_DECODE_CUDA): "
+        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in %s%s.",
+        "4..8" if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS else "{4, 8}",
+        "".join(", %d..%d" % r for r in pp_multi_ranges()),
+    )
+    run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids, activation)
+    return True
+
+
+def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
+        activation):
+    """Run into caller storage; direct calls also support N=2048 and M<=64.
+
+    Call ``warmup`` first.
+    """
+    from vllm.sm80.kernels.marlin_moe.extension import require_extension
+
+    ops = require_extension()
+    M, K = hidden_states.shape
+    N = w2.size(1) * 16
+    ws = _workspaces(hidden_states.device, N, M, create=False)
+    if ws is None:
+        raise RuntimeError("Call Marlin decode warmup before run/capture")
+    sorted_ids, expert_ids, ntpp = _align(topk_ids, ws)
+    slots = M * TOPK_GATE
+    h = ws["h"][:slots * N].view(slots, N)
+    c3 = ws["c3"][:slots * K].view(slots, K)
+    tw = topk_weights.view(-1)
+    c13, c2 = _config(M)
+    ksplit = ops.decode_gemm_orig(
+        hidden_states, w1, layer.w1_scale, sorted_ids, expert_ids, ntpp, tw,
+        TOPK_GATE, slots, K, 2 * N, True, W13_ROWS, c13, ws["ctr"], ws["part"],
+    )
+    ops.decode_act_orig(ws["part"], topk_ids.view(-1), ksplit, slots, N,
+                        layer.activation_config.clamp_limit, h)
+    ops.decode_gemm_orig(
+        h, w2, layer.w2_scale, sorted_ids, expert_ids, ntpp, tw,
+        TOPK_GATE, slots, N, K, False, N // 16, c2, ws["ctr"], c3,
+    )
+    layer.moe_sum(c3.view(M, TOPK_GATE, K), output, topk_ids, None)
+    return output
+
+
+def warmup(device, N=512, max_tokens=None):
+    """Reserve scratch and warm the selected released alignment implementation."""
+    from vllm.sm80.kernels.marlin_moe.extension import require_extension
+
+    require_extension()
+    if max_tokens is None:
+        max_tokens = _scratch_tokens(N)
+    device = torch.device(device)
+    with torch.cuda.device(device):
+        ws = _workspaces(device, N, max_tokens, create=True)
+        ids = torch.zeros(max_tokens, TOPK_GATE, device=device, dtype=torch.int32)
+        _align(ids, ws)
+
+
+def warmup_from_worker(worker):
+    if not envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:
+        return
+    device = torch.device(worker.device)
+    if device.type != "cuda" or not _is_sm80(device):
+        return
+    model_config = worker.vllm_config.model_config
+    cfg = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+    if (getattr(cfg, "n_routed_experts", 0) != E_GATE
+            or getattr(cfg, "num_experts_per_tok", 0) != TOPK_GATE):
+        return
+    tp = worker.vllm_config.parallel_config.tensor_parallel_size
+    N = int(getattr(cfg, "moe_intermediate_size", 0)) // tp
+    if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS:
+        if N == 2048:
+            logger.info_once(
+                "[ampere-marlin] whole-expert compiled decode at 4..8 rows "
+                "(VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS).",
+            )
+        else:
+            logger.info_once(
+                "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS is set but the gate is closed "
+                "(expert width N=%d per rank, not the whole-expert 2048).", N,
+            )
+    if envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI:
+        raw = envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS
+        ranges = _parse_ranges(raw)
+        if N != 2048 or not ranges:
+            logger.info_once(
+                "VLLM_GLM5_MARLIN_DECODE_PP_MULTI is set but the gate is closed "
+                "(%s).", "expert width N=%d per rank, not the whole-expert 2048" % N
+                if N != 2048 else "%r is not lo-hi ranges within %d..%d"
+                % (raw, PP_MULTI_MIN, PP_MULTI_MAX),
+            )
+        else:
+            logger.info_once(
+                "[ampere-marlin] whole-expert compiled decode for multi-request rows "
+                "%s (VLLM_GLM5_MARLIN_DECODE_PP_MULTI, _ROWS), scratch %d rows.",
+                ",".join("%d..%d" % r for r in ranges), _scratch_tokens(N),
+            )
+    capacity = _scratch_tokens(N)
+    if N in _LATE_SCRATCH_N and _late_scratch_open:
+        logger.info_once(
+            "[ampere-marlin] decode scratch active after KV-cache sizing "
+            "(N=%d, %d rows); profiling used the released kernels.", N, capacity,
+        )
+    if compiled_regime(capacity, N):
+        warmup(device, N, capacity)

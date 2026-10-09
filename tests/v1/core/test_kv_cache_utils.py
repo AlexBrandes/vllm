@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import copy
 import hashlib
 import importlib
@@ -99,6 +100,7 @@ def test_hisparse_steady_state_concurrency_excludes_spilled_resident_pages():
     config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=10 * block_size),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=16),
         max_in_flight_tokens=10 * block_size,
     )
     attn_spec = FullAttentionSpec(

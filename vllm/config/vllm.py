@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import copy
 import getpass
@@ -1109,11 +1110,22 @@ class VllmConfig:
 
     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
         speculative_config = self.speculative_config
-        if (
-            speculative_config is None
-            or not speculative_config.uses_dynamic_speculative_decoding()
-            or self.parallel_config.data_parallel_size <= 1
-        ):
+        if speculative_config is None or self.parallel_config.data_parallel_size <= 1:
+            return
+
+        if speculative_config.uses_adaptive_k():
+            logger.warning_once(
+                "Load-adaptive speculative decoding is not supported "
+                "with data parallelism because data-parallel ranks can select "
+                "different speculative-token counts, causing DP divergence "
+                "and deadlocks. Disabling adaptive_k and falling back to "
+                "static num_speculative_tokens=%d.",
+                speculative_config.num_speculative_tokens,
+            )
+            speculative_config.adaptive_k = None
+            speculative_config.adaptive_k_config = None
+
+        if not speculative_config.uses_dynamic_speculative_decoding():
             return
 
         logger.warning_once(
@@ -1509,6 +1521,10 @@ class VllmConfig:
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
+        # Fail at startup if vLLM loaded its general plugins without the fork's.
+        from vllm.sm80.guard import check_plugin_loaded
+
+        check_plugin_loaded()
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
@@ -2537,6 +2553,32 @@ class VllmConfig:
                             ):
                                 widest_batch[num_spec + 1] = batch_size
                             decode_tiers = list(widest_batch.items())
+                    adaptive_k_config = (
+                        speculative_config.adaptive_k_config
+                        if speculative_config is not None
+                        else None
+                    )
+                    if adaptive_k_config is not None:
+                        # Load-adaptive depth: each draft count is verified
+                        # only up to its request count, and the widest batch
+                        # runs at the last (configured) depth, so size the
+                        # graph ceiling from that depth. This keeps the mixed
+                        # graph set of the configured depth unchanged.
+                        base_query_len = adaptive_k_config.by_load[-1] + 1
+                        max_cudagraph_capture_size = min(
+                            max_num_seqs * base_query_len * 2,
+                            default_max_graph_size,
+                        )
+                        decode_tiers = [
+                            (k + 1, tier_max_reqs)
+                            for k in adaptive_k_config.allowed
+                            if (
+                                tier_max_reqs := adaptive_k_config.max_reqs_for(
+                                    k, max_num_seqs
+                                )
+                            )
+                            > 0
+                        ]
 
                     uniform_decode_sizes = sorted(
                         {

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Fused MoE utilities for GPTQ."""
 
 import math
@@ -8,6 +9,7 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -761,6 +763,39 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     return
                 self.moe_sum(input, output, topk_ids, expert_map)
 
+            if not hooked and envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:
+                from vllm.sm80.kernels.marlin_moe.decode import (
+                    maybe_apply as decode_apply,
+                )
+
+                if decode_apply(
+                    self, output, hidden_states, w1, w2, topk_weights,
+                    topk_ids, activation, global_num_experts, expert_map,
+                    apply_router_weight_on_input,
+                ):
+                    return
+            if not hooked and (
+                envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE
+                or envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW
+            ):
+                from vllm.sm80.kernels.marlin_moe.prefill import maybe_apply
+
+                if maybe_apply(
+                    self,
+                    output,
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation,
+                    global_num_experts,
+                    expert_map,
+                    apply_router_weight_on_input,
+                    workspace13,
+                    workspace2,
+                ):
+                    return
             fused_marlin_moe(
                 hidden_states=hidden_states,
                 w1=w1,
@@ -911,6 +946,38 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
     ) -> None:
+        from vllm.sm80.kernels.moe import use_ampere_moe_routing
+
+        if (
+            envs.VLLM_AMPERE_DECODE_IDX_GLUE
+            and expert_map is None
+            and input.dim() == 3
+        ):
+            # VLLM_AMPERE_DECODE_IDX_GLUE "moesum": when the MoE runner armed the
+            # hand-off it fuses this sum with the shared-expert add (same fp32
+            # slot-order sum as both branches below, then the same add).
+            from vllm.sm80.kernels.moe.sum import MOE_SUM_DEFERRAL
+
+            if MOE_SUM_DEFERRAL.offer(input, output):
+                return
+
+        _moe_cfg = getattr(self, "moe_config", None)
+        if (
+            expert_map is None
+            and _moe_cfg is not None
+            and input.dim() == 3
+            and use_ampere_moe_routing(
+                input.shape[0],
+                getattr(_moe_cfg, "num_experts", 0),
+                input.shape[1],
+            )
+        ):
+            # fp32 accumulation in slot order, same as ops.moe_sum.
+            from vllm.sm80.kernels.moe.routing import moe_sum as ampere_moe_sum
+
+            ampere_moe_sum(input, out=output)
+            return
+
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:

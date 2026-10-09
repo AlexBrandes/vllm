@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Utility methods for model layers."""
 
 import functools
@@ -685,6 +686,17 @@ def dispatch_unquantized_gemm(
         return cpu_unquantized_gemm
     elif not current_platform.is_cuda():
         return default_unquantized_gemm
+
+    # sm_80 thin-M BF16 GEMM (vllm/sm80/kernels/thin_gemm/), for the layers a W4A16
+    # checkpoint leaves unquantized. The env check comes first so that with the
+    # flag unset this costs one bool read and nothing in that package -- triton
+    # included -- is imported. Placed ahead of the FlashInfer backends, which
+    # require sm_100 and so can never co-apply.
+    if envs.VLLM_THIN_GEMM:
+        from vllm.sm80.kernels.thin_gemm import ampere_thin_gemm, use_ampere_thin_gemm
+
+        if use_ampere_thin_gemm():
+            return ampere_thin_gemm
 
     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
     if backend_spec is None:

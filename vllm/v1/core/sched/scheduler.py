@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import itertools
+import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -31,6 +34,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
+from vllm.sm80.spec_decode.adaptive_k import AdaptiveKPolicy
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -312,7 +316,42 @@ class Scheduler(SchedulerInterface):
             self.num_lookahead_tokens > 0 and vllm_config.use_v2_model_runner
         )
         self.dynamic_sd_lookup: list[int] | None = None
+        self.adaptive_k: AdaptiveKPolicy | None = None
+        # Draft count this step verifies. Equals num_spec_tokens unless the
+        # adaptive-k policy lowered it; read by the uniform-decode padding and
+        # the spec-token truncation below so both agree within a step.
+        self.cur_num_spec_tokens = self.num_spec_tokens
+        # Draft count the drafter is asked to produce for the next step. It
+        # can exceed cur_num_spec_tokens while k is climbing back up.
+        self.next_num_spec_tokens = self.num_spec_tokens
         if speculative_config is not None:
+            if speculative_config.uses_adaptive_k():
+                self.adaptive_k = AdaptiveKPolicy(
+                    speculative_config.adaptive_k_config
+                )
+            if self.adaptive_k is not None:
+                by_load = self.adaptive_k.config.by_load
+                logger.info_once(
+                    "GLM-5 load-adaptive DFlash depth active "
+                    "(adaptive_k.by_load): drafts %d per step, "
+                    "verifies %s requests",
+                    self.num_spec_tokens,
+                    ", ".join(
+                        f"{k} at {n}" if n < len(by_load) else f"{k} at >= {n}"
+                        for n, k in enumerate(by_load, start=1)
+                    ),
+                )
+            if self.adaptive_k is not None and self.adaptive_k.config.accept:
+                cfg = self.adaptive_k.config
+                logger.info_once(
+                    "GLM-5 acceptance-aware DFlash depth active "
+                    "(adaptive_k.accept): each step's depth "
+                    "within the load width maximises expected tokens per unit "
+                    "step cost; costs %s for depths %s, hysteresis %.2f",
+                    str(cfg.accept_costs),
+                    str(cfg.allowed),
+                    cfg.accept_hysteresis,
+                )
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -347,6 +386,11 @@ class Scheduler(SchedulerInterface):
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle_block_drop,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+            use_dflash_boundary=(
+                speculative_config is not None
+                and speculative_config.use_dflash()
+                and envs.VLLM_DFLASH_BOUNDARY_CACHE
+            ),
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -371,12 +415,42 @@ class Scheduler(SchedulerInterface):
             for manager in self.kv_cache_manager.coordinator.single_type_managers
             if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
+        coordinator = self.kv_cache_manager.coordinator
+        self.mamba_eagle_block_drop = self.use_eagle_block_drop
+        if coordinator.dflash_boundary_group_ids:
+            # Mamba checkpoints follow the participating groups' replay boundary.
+            self.mamba_eagle_block_drop = bool(coordinator.eagle_group_ids)
+            logger.info_once(
+                "DFlash boundary cache lookup active "
+                "(VLLM_DFLASH_BOUNDARY_CACHE): context blocks matched "
+                "without draft lookahead; local prompt tails stay unpadded; "
+                "target replay safety preserved"
+            )
+        elif envs.VLLM_DFLASH_BOUNDARY_CACHE:
+            logger.info_once(
+                "DFlash boundary cache lookup inactive "
+                "(VLLM_DFLASH_BOUNDARY_CACHE): needs prefix caching "
+                "with explicitly marked DFlash sliding-window groups"
+            )
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # PP decode spreading (VLLM_PP_SPREAD_DECODES): a decode request is not
+        # eligible again until its results return pp_size steps later, so a
+        # step that takes every eligible decode leaves the next pp_size - 1
+        # micro-batches with none and the stages idle in turn. Capping each
+        # step at ceil(decoding / pp_size) decodes keeps every micro-batch
+        # busy with its share instead.
+        self.pp_spread_decodes = self.use_pp and envs.VLLM_PP_SPREAD_DECODES
+        if self.pp_spread_decodes:
+            logger.info(
+                "PP decode spreading on: at most ceil(decoding requests / %d) "
+                "decode requests per micro-batch",
+                self.parallel_config.pipeline_parallel_size,
+            )
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -416,6 +490,17 @@ class Scheduler(SchedulerInterface):
         self.num_executed_steps = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
+        )
+
+        # Fair chunked prefill (opt-in). Both knobs at 0 -> `fair_prefill` is
+        # False and every code path below is bypassed, so the schedule is
+        # identical to upstream.
+        self.prefill_chunk_with_decodes = (
+            self.scheduler_config.prefill_chunk_with_decodes
+        )
+        self.max_num_partial_prefills = self.scheduler_config.max_num_partial_prefills
+        self.fair_prefill = self.scheduler_config.enable_chunked_prefill and bool(
+            self.prefill_chunk_with_decodes or self.max_num_partial_prefills
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
@@ -536,6 +621,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        max_prefill_tokens: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -557,6 +643,9 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
+        drop_eagle_block = getattr(
+            self, "mamba_eagle_block_drop", self.use_eagle_block_drop
+        )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -566,7 +655,7 @@ class Scheduler(SchedulerInterface):
         last_cache_position = get_mamba_prefill_checkpoint_position(
             request.num_tokens,
             block_size,
-            self.use_eagle_block_drop,
+            drop_eagle_block,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
         )
 
@@ -574,7 +663,7 @@ class Scheduler(SchedulerInterface):
         checkpoint_position = get_mamba_prefill_checkpoint_position(
             prefill_end,
             ckpt_block_size,
-            drop_eagle_block=self.use_eagle_block_drop,
+            drop_eagle_block=drop_eagle_block,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
         )
         use_internal_checkpoint = (
@@ -597,10 +686,17 @@ class Scheduler(SchedulerInterface):
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            if max_prefill_tokens is None:
+                # Widest chunk any step could give this request. The caller
+                # passes its own limit when fair chunked prefill narrowed it;
+                # a block too wide for that limit has to advance sub-block or
+                # the request would never be scheduled at all.
+                max_prefill_tokens = self.max_num_scheduled_tokens
+                long_prefill_threshold = (
+                    self.scheduler_config.long_prefill_token_threshold
+                )
+                if long_prefill_threshold > 0:
+                    max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -610,7 +706,7 @@ class Scheduler(SchedulerInterface):
             get_mamba_prefill_checkpoint_position(
                 request.num_prompt_tokens,
                 self.hash_block_size,
-                self.use_eagle_block_drop,
+                drop_eagle_block,
                 num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
             )
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
@@ -683,6 +779,149 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _fair_prefill_budget(self) -> tuple[int, int]:
+        """Fair chunked prefill: this step's prefill budget and per-request cap.
+
+        Returns ``(total, per_request)``, both counted in prefill tokens only.
+        Decode tokens draw on ``token_budget`` / ``input_budget`` as usual and
+        are never charged here, which is what lets a decode stream keep its
+        slot in every step while someone else's prompt is being prefilled.
+
+        * ``total`` is ``max_num_scheduled_tokens``, narrowed to
+          ``prefill_chunk_with_decodes`` whenever at least one running request
+          is past its prefill (i.e. would decode this step). With nothing
+          decoding the full budget is kept, so a solo prompt is unaffected.
+        * ``per_request`` splits ``total`` evenly between up to
+          ``max_num_partial_prefills`` prefill-phase requests (running chunks
+          plus the waiting requests that could be admitted this step), so
+          several prompts advance together instead of one at a time.
+        """
+        total = self.max_num_scheduled_tokens
+        if self.prefill_chunk_with_decodes > 0 and any(
+            not r.is_prefill_chunk for r in self.running
+        ):
+            total = min(total, self.prefill_chunk_with_decodes)
+
+        per_request = total
+        if self.max_num_partial_prefills > 0:
+            num_running_prefills = sum(1 for r in self.running if r.is_prefill_chunk)
+            free_slots = max(
+                0,
+                self.max_num_active_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+            )
+            num_waiting = (
+                min(len(self.waiting), free_slots)
+                if self._pause_state == PauseState.UNPAUSED
+                else 0
+            )
+            num_prefills = min(
+                self.max_num_partial_prefills, num_running_prefills + num_waiting
+            )
+            per_request = total // max(num_prefills, 1)
+
+        # Floor both: `_reserve_prefill_lookahead` refuses to end a chunk within
+        # `num_prefill_lookahead` of the prefill end, so a cap at or below that
+        # would zero every chunk and stall the prefill forever. Non-binding for
+        # any sane setting (the lookahead is a handful of tokens).
+        floor = self.num_prefill_lookahead + 1
+        return max(total, floor), max(per_request, floor)
+
+    def _select_adaptive_k(self) -> tuple[int, int]:
+        """Pick this step's verification width and the next drafting width.
+
+        The width follows the load: the number of requests the server holds,
+        waiting ones included, picks the ``by_load`` entry, and with
+        ``accept`` the step takes the depth within that width that maximises
+        the batch's expected tokens per unit step cost. The drafter is asked
+        for its full block, or with ``draft_by_load`` for exactly the chosen
+        width. What this step can *verify* is additionally capped by the
+        drafts already on hand: every request in a uniform decode batch must
+        present the same number of drafts, so the batch minimum wins, and
+        longer draft lists are truncated here -- before
+        ``num_tokens_with_spec`` is read, so every downstream size follows.
+        Keeping the two separate is what lets the width climb again: a step
+        verifies the drafts it has while asking for more, and gets them on
+        the next step.
+        """
+        assert self.adaptive_k is not None
+        running = self.running
+        if not running:
+            return self.num_spec_tokens, self.num_spec_tokens
+        config = self.adaptive_k.config
+        # The drafter produces its full block (a DFlash block is one
+        # fixed-shape pass), so drafts are never the limit after the first
+        # step -- unless draft_by_load narrows the block to the width verified
+        # next, trading a one-step lag when load drops for a cheaper drafter
+        # under load.
+        num_reqs = len(running) + len(self.waiting) + len(self.kv_holding_waiting)
+        k_want = load_width = config.k_for_load(num_reqs)
+        if config.accept:
+            # Acceptance-aware: within the load width, the depth that
+            # maximises the batch's expected tokens per unit step cost.
+            decoding = [r.request_id for r in running if not r.is_prefill_chunk]
+            if decoding:
+                k_want = self.adaptive_k.select_by_acceptance(decoding, k_want)
+        forced = self._forced_depth()
+        if forced is not None and forced <= load_width:
+            k_want = forced
+        k_draft = k_want if config.draft_by_load else self.num_spec_tokens
+
+        available = min(
+            (len(r.spec_token_ids) for r in running if r.spec_token_ids),
+            default=k_draft,
+        )
+        k_verify = k_want if available >= k_want else self.adaptive_k.snap(available)
+
+        for request in running:
+            if len(request.spec_token_ids) > k_verify:
+                # Rebind rather than mutate: AsyncScheduler hands every
+                # request the same placeholder list object.
+                request.spec_token_ids = request.spec_token_ids[:k_verify]
+
+        if config.log_interval:
+            # The chosen-k histogram exists only for the periodic log line.
+            self.adaptive_k.record_choice(k_verify)
+            self.adaptive_k.maybe_log()
+        return k_verify, k_draft
+
+    def _forced_depth(self) -> int | None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE (diagnostics, step-cost
+        calibration): a depth written in that file, re-read every 64 steps,
+        replaces the chosen one while it is a captured depth."""
+        path = getattr(self, "_force_file", None)
+        if path is None:
+            from vllm import envs as _envs
+
+            path = self._force_file = _envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE
+            self._force_value = None
+            self._force_countdown = 0
+        if not path:
+            return None
+        self._force_countdown -= 1
+        if self._force_countdown <= 0:
+            self._force_countdown = 64
+            try:
+                with open(path) as f:
+                    value = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                value = 0
+            assert self.adaptive_k is not None
+            self._force_value = (
+                value if value in self.adaptive_k.config.allowed else None
+            )
+        return self._force_value
+
+    def _pp_decode_cap(self) -> int | None:
+        """Decode requests this micro-batch may take under PP decode spreading
+        (None: no cap). Counts every running request past its prefill,
+        including those whose previous step is still in flight."""
+        if not self.pp_spread_decodes:
+            return None
+        num_decoding = sum(1 for r in self.running if not r.is_prefill_chunk)
+        return max(1, cdiv(num_decoding, self.parallel_config.pipeline_parallel_size))
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -710,6 +949,16 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        # Fair chunked prefill: a second budget that only prefill tokens draw
+        # on. When the feature is off it equals `token_budget` and can never
+        # bind, so the schedule is unchanged.
+        prefill_token_budget = token_budget
+        prefill_chunk_cap = token_budget
+        if self.fair_prefill:
+            prefill_token_budget, prefill_chunk_cap = self._fair_prefill_budget()
+        # Observability only; refunded when scheduled prefills are preempted.
+        num_prefill_tokens = 0
+        num_prefill_reqs = 0
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -731,6 +980,18 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # Adaptive draft count. Chosen once, on the host, before any
+        # request is sized, so the uniform-decode padding below and the
+        # truncation of already-proposed drafts agree on one width for the
+        # whole step -- which is what keeps the decode batch inside a captured
+        # full CUDA graph.
+        self.cur_num_spec_tokens = self.num_spec_tokens
+        self.next_num_spec_tokens = self.num_spec_tokens
+        if self.adaptive_k is not None and self.num_spec_tokens > 0:
+            self.cur_num_spec_tokens, self.next_num_spec_tokens = (
+                self._select_adaptive_k()
+            )
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -777,6 +1038,8 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        pp_decode_cap = self._pp_decode_cap()
+        num_pp_decodes = 0
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -806,6 +1069,16 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                pp_decode_cap is not None
+                and not request.is_prefill_chunk
+                and num_pp_decodes >= pp_decode_cap
+            ):
+                # This micro-batch has its share of decodes; leave the request
+                # for the next one (it stays eligible).
+                req_index += 1
+                continue
+
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
@@ -830,6 +1103,17 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            # Fair chunked prefill leaves decode work outside this budget.
+            req_is_prefill = request.is_prefill_chunk
+            is_prefill = self.fair_prefill and req_is_prefill
+            prefill_chunk_limit: int | None = None
+            if is_prefill:
+                prefill_chunk_limit = min(prefill_chunk_cap, prefill_token_budget)
+                if long_prefill_token_threshold > 0:
+                    prefill_chunk_limit = min(
+                        prefill_chunk_limit, long_prefill_token_threshold
+                    )
+                num_new_tokens = min(num_new_tokens, prefill_chunk_limit)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -845,8 +1129,9 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
+                # Positional: tests monkeypatch this with a `*args` stub.
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, 0, 0, prefill_chunk_limit
                 )
 
             # Schedule encoder inputs.
@@ -940,6 +1225,11 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            if preempted_req.is_prefill_chunk:
+                                if self.fair_prefill:
+                                    prefill_token_budget += restored
+                                num_prefill_tokens -= restored
+                                num_prefill_reqs -= 1
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -982,12 +1272,19 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            if not request.is_prefill_chunk:
+                num_pp_decodes += 1
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if is_prefill:
+                prefill_token_budget -= num_new_tokens
+            if req_is_prefill:
+                num_prefill_tokens += num_new_tokens
+                num_prefill_reqs += 1
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1264,6 +1561,9 @@ class Scheduler(SchedulerInterface):
                 duplicate_encoder_inputs = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                req_is_prefill = False
+                is_prefill = False
+                prefill_chunk_limit = None
 
                 # SWA bounded replay: recompute the tail of the hit without
                 # rewriting its cached KV. An async load replays once the KV
@@ -1296,13 +1596,25 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (
+                            self.cur_num_spec_tokens > 0
+                            and self.dynamic_sd_lookup is None
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                        # A prompt tail over cached state has no generated token
+                        # or drafts to verify. Keep its real prefill shape for
+                        # every cache source and boundary policy.
+                        # Resumed decodes keep padding.
+                        and not (
+                            num_computed_tokens > 0
+                            and request.num_output_tokens == 0
+                            and num_computed_tokens < request.num_prompt_tokens
+                        )
                     ):
-                        padded_num_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.cur_num_spec_tokens
                         # Pad only when there is room for the sampled token(s).
                         if (
                             num_computed_tokens
@@ -1318,6 +1630,29 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+
+                    # Fair chunked prefill: prefill-phase work draws on the
+                    # (decode-aware) prefill budget, split between concurrent
+                    # prefills. Same predicate the DP prefill throttle uses:
+                    # a request only replaying its last token is a decode, not
+                    # prefill work, so it is left alone. A prefix-cache hit has
+                    # already been folded into num_computed_tokens, so only the
+                    # tokens actually recomputed are charged.
+                    req_is_prefill = num_computed_tokens < request.num_tokens - 1
+                    is_prefill = self.fair_prefill and req_is_prefill
+                    if is_prefill:
+                        prefill_chunk_limit = min(
+                            prefill_chunk_cap, prefill_token_budget
+                        )
+                        if long_prefill_token_threshold > 0:
+                            prefill_chunk_limit = min(
+                                prefill_chunk_limit, long_prefill_token_threshold
+                            )
+                        if prefill_chunk_limit <= 0:
+                            # No prefill budget left this step. Leave the request
+                            # at the head of the queue for the next one.
+                            break
+                        num_new_tokens = min(num_new_tokens, prefill_chunk_limit)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1340,12 +1675,13 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            prefill_chunk_limit,
                         )
                         if num_new_tokens == 0:
                             break
                         if (
                             pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
+                            and num_new_tokens != 1 + self.cur_num_spec_tokens
                         ):
                             # Alignment clipped the placeholder rows. The split
                             # aligns prefill chunks, but the padded tail rows are
@@ -1541,6 +1877,11 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if is_prefill:
+                    prefill_token_budget -= num_new_tokens
+                if req_is_prefill:
+                    num_prefill_tokens += num_new_tokens
+                    num_prefill_reqs += 1
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1548,10 +1889,14 @@ class Scheduler(SchedulerInterface):
                     request, num_computed_tokens, num_new_tokens
                 )
                 if pad_spec_decode:
-                    assert num_new_tokens == 1 + self.num_spec_tokens
+                    assert num_new_tokens == 1 + self.cur_num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
-                    ] * self.num_spec_tokens
+                    ] * self.cur_num_spec_tokens
+                    if self.adaptive_k is not None:
+                        # Placeholder drafts are rejected by construction;
+                        # keep them out of the acceptance counts.
+                        self.adaptive_k.mark_padded(request_id)
                 # Must use the SAME predicate as the deferral gate in the
                 # waiting loop (`num_computed_tokens < num_tokens - 1`).
                 # Stamping on `< num_prompt_tokens` instead let a request with
@@ -1602,6 +1947,25 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert prefill_token_budget >= 0
+
+        if logger.isEnabledFor(logging.DEBUG):
+            # One line per step, enough to answer "did the decode streams ride
+            # along with every prefill chunk?" from a server log. Enable just
+            # this logger (not global DEBUG) via VLLM_LOGGING_CONFIG_PATH.
+            # Use the per-step fields to check decode coverage.
+            logger.debug(
+                "fairprefill step=%d total=%d prefill=%d/%dreq "
+                "decode=%d/%dreq cap=%d left=%d",
+                self.current_step,
+                total_num_scheduled_tokens,
+                num_prefill_tokens,
+                num_prefill_reqs,
+                total_num_scheduled_tokens - num_prefill_tokens,
+                len(num_scheduled_tokens) - num_prefill_reqs,
+                prefill_chunk_cap,
+                prefill_token_budget,
+            )
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
@@ -1679,7 +2043,9 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
+        # This is how many drafts to *produce* during this step (for the next
+        # one); what this step verifies is cur_num_spec_tokens.
+        num_spec_tokens_to_schedule = self.next_num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
@@ -2329,6 +2695,17 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                if self.adaptive_k is not None:
+                    # Grammar-invalidated drafts were never really proposed,
+                    # so they must not count against the acceptance counts.
+                    num_invalid = (
+                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                        if scheduler_output.num_invalid_spec_tokens
+                        else 0
+                    )
+                    self.adaptive_k.observe(
+                        req_id, num_draft_tokens - num_invalid, num_accepted
+                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -2959,6 +3336,8 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        if self.adaptive_k is not None:
+            self.adaptive_k.forget(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

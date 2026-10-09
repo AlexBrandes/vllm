@@ -1,0 +1,30 @@
+# Entry-point distribution of the CMP 170HX (sm_80) fork. It ships no code:
+# it tells vLLM to call vllm.sm80.plugin:register at startup and to select the
+# fork's CUDA platform through vllm.sm80.plugin:platform_plugin. The fork itself
+# provides the vllm.sm80 package. Install it next to the fork in every
+# environment that runs vLLM (image, native install, test environments):
+#   pip install --no-deps plugins/sm80
+# For a source tree used through PYTHONPATH, install the metadata into a
+# directory and add that directory to PYTHONPATH:
+#   pip install --no-deps --target <dir> plugins/sm80
+# vllm/sm80/guard.py stops vLLM at startup when the plugin is missing.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-sm80-plugin"
+version = "0.1.0"
+description = "vLLM plugin entry point of the CMP 170HX (sm_80) fork"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+sm80 = "vllm.sm80.plugin:register"
+
+[project.entry-points."vllm.platform_plugins"]
+sm80 = "vllm.sm80.plugin:platform_plugin"
+
+[tool.setuptools]
+packages = []

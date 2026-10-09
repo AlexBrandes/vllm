@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """GLM-4.7 parser for reasoning and tool calls.
 
 GLM-4.7 uses XML-like tool calls::
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+from vllm import envs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
@@ -234,6 +236,23 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
 
 class Glm47MoeParser(ParserEngine):
     """GLM-4.7 parser backed by the declarative parser engine."""
+
+    adjust_request_when_tool_choice_none = True
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        request = super().adjust_request(request)
+        # VLLM_TOOL_CHOICE_NONE_MASK (off by default; the GLM launcher sets
+        # 1): with tool_choice="none", the tool-call start token is a bad word.
+        # Off, the request is adjusted exactly as upstream adjusts it.
+        if (
+            request.tool_choice == "none"
+            and envs.VLLM_TOOL_CHOICE_NONE_MASK
+            and TOOL_CALL_START not in request.bad_words
+        ):
+            request.bad_words = [*request.bad_words, TOOL_CALL_START]
+        return request
 
     def __init__(
         self,

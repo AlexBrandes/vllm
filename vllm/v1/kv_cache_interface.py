@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from __future__ import annotations
 
@@ -286,6 +287,21 @@ class KVCacheSpec:
 
         """
         raise NotImplementedError
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        """
+        The part of `max_memory_usage_bytes` that is scratch space only a
+        *running* (i.e. currently speculating) request holds, rather than a
+        per-request working set that every resident request keeps.
+
+        Such scratch is bounded by `max_num_seqs`, not by the number of
+        requests the KV cache pool could hold, so capacity planning reserves
+        it once for the whole engine instead of once per concurrency slot.
+
+        Returns:
+            The scratch size in bytes (0 for specs without such scratch).
+        """
+        return 0
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         """The number of block table entries needed per request, i.e. the row
@@ -1135,10 +1151,56 @@ class MambaSpec(KVCacheSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":
             return self.page_size_bytes * (
-                2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+                2
+                + self.num_speculative_blocks
+                + self.num_prefill_checkpoint_blocks
+                + self.inflight_state_blocks(vllm_config)
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
+
+    def inflight_state_blocks(self, vllm_config: VllmConfig) -> int:
+        """Align-mode state blocks held only while prefill chunks are in flight.
+
+        A chunk writes its end state into the block holding its last token,
+        and the block that seeded the oldest in-flight chunk is freed only
+        once the processed-token count passes it. With synchronous scheduling
+        that is the two blocks already reserved (seed + new state). With
+        `max_concurrent_batches` > 1 a prefilling request can have one chunk
+        in each in-flight batch, so it holds one state per distinct block
+        its in-flight chunk ends fall in, plus the seed: at most
+        1 + min(max_concurrent_batches, cdiv(max_in_flight_tokens, block))
+        states. This returns the part beyond the two already reserved, when
+        VLLM_KV_MAMBA_INFLIGHT_STATES is set (0 otherwise).
+        """
+        from vllm import envs
+
+        if (
+            not envs.VLLM_KV_MAMBA_INFLIGHT_STATES
+            or self.mamba_cache_mode != "align"
+            or vllm_config.cache_config.mamba_cache_mode != "align"
+            or self.block_size <= 0
+        ):
+            return 0
+        in_flight_ends = min(
+            vllm_config.max_concurrent_batches,
+            cdiv(vllm_config.max_in_flight_tokens, self.block_size),
+        )
+        return max(0, in_flight_ends - 1)
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        # `num_speculative_blocks` extra state pages are allocated by
+        # `MambaManager` when a request first gets blocks and are then
+        # relocated in place for the rest of its life (never re-allocated),
+        # so at most `max_num_seqs` requests hold them at the same time.
+        # The in-flight states (`inflight_state_blocks`) are likewise held
+        # only by a running request with chunks in flight; waiting and
+        # preempted requests hold no blocks. With a KV connector (async loads,
+        # delayed frees) they stay charged per concurrency slot.
+        scratch = self.num_speculative_blocks
+        if vllm_config.kv_transfer_config is None:
+            scratch += self.inflight_state_blocks(vllm_config)
+        return self.page_size_bytes * scratch
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
@@ -1329,6 +1391,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             for spec in self.kv_cache_specs.values()
         )
         return max_num_pages * self.page_size_bytes
+
+    def speculative_scratch_bytes(self, vllm_config: VllmConfig) -> int:
+        max_scratch_pages = max(
+            cdiv(spec.speculative_scratch_bytes(vllm_config), spec.page_size_bytes)
+            for spec in self.kv_cache_specs.values()
+        )
+        return max_scratch_pages * self.page_size_bytes
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Metadata builders are constructed from the per-layer spec, so the base

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import contextlib
 import json
@@ -113,6 +114,9 @@ class Parser:
     declarative engine; ``DelegatingParser`` composes a legacy
     ``ReasoningParser`` / ``ToolParser`` pair.
     """
+
+    # Some formats need decode constraints even when tool calls are disabled.
+    adjust_request_when_tool_choice_none: bool = False
 
     # Class-level parser classes for compatibility with existing patterns
     # Subclasses should override these if they use specific parser classes

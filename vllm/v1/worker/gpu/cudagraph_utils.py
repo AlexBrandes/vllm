@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import gc
 import itertools
 from collections import defaultdict
@@ -157,6 +158,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        adaptive_k_capture: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -164,8 +166,12 @@ class CudaGraphManager:
         self.compilation_config = vllm_config.compilation_config
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
+        # The graph mode a uniform decode batch is configured to get.
+        self.decode_cg_mode = cudagraph_mode.decode_mode()
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        # Only target verification and autoregressive prefill vary with K.
+        self.adaptive_k_capture = adaptive_k_capture
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
 
@@ -274,6 +280,17 @@ class CudaGraphManager:
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
+        # Adaptive-k SD picks the draft count per step on the host, so
+        # every count it is allowed to pick needs its own uniform decode graph.
+        # Branch on the counts themselves rather than on uses_adaptive_k(), so
+        # a config that reports the feature on but names no counts (and a test
+        # double that answers every predicate truthily) still lands on the
+        # ordinary single-query-length path.
+        adaptive_k_counts = self._adaptive_k_draft_counts()
+        # Query length -> most requests a uniform decode batch of that length
+        # can hold (load-adaptive depth verifies deep drafts only when few
+        # requests run); absent means max_num_reqs.
+        decode_max_reqs: dict[int, int] = {}
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
@@ -296,6 +313,24 @@ class CudaGraphManager:
                     for num_spec in dense_schedule[1:]
                 }
             )
+        elif adaptive_k_counts:
+            # Without a graph per count, dispatch() silently falls back to
+            # eager; warn_on_missing_adaptive_graphs() checks at startup that
+            # the capture sizes actually cover the set.
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            decode_query_lens = sorted(
+                num_spec + num_new_sampled_tokens_per_step
+                for num_spec in adaptive_k_counts
+            )
+            adaptive_k_config = speculative_config.adaptive_k_config
+            decode_max_reqs = {
+                num_spec + num_new_sampled_tokens_per_step: (
+                    adaptive_k_config.max_reqs_for(num_spec, self.max_num_reqs)
+                )
+                for num_spec in adaptive_k_counts
+            }
         else:
             decode_query_lens = [self.decode_query_len]
 
@@ -327,6 +362,8 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                        or rounded_num_reqs
+                        > decode_max_reqs.get(decode_query_len, self.max_num_reqs)
                     ):
                         continue
 
@@ -383,15 +420,40 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
-                for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    for i in range(current_range_start, num_tokens + 1):
-                        key = (i, num_active_loras)
-                        self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
+                # A descriptor only serves its own uniform_token_count, so each
+                # query length gets its own ladder. With several decode query
+                # lengths (dynamic or acceptance/load-adaptive speculative
+                # decoding), one shared ladder can map a token count to a size
+                # that holds only other lengths' graphs, hiding a larger FULL
+                # graph that fits. Each count lists candidates in ascending
+                # num_tokens order (ties in capture order), so the smallest
+                # compatible graph still wins, and every batch the shared
+                # ladder already served keeps the same descriptor.
+                by_token_count: defaultdict[
+                    int | None, list[BatchExecutionDescriptor]
+                ] = defaultdict(list)
+                for desc in lora_descs:
+                    by_token_count[desc.uniform_token_count].append(desc)
+                position = {desc: idx for idx, desc in enumerate(lora_descs)}
+                mode_candidates: defaultdict[int, list[BatchExecutionDescriptor]] = (
+                    defaultdict(list)
+                )
+                for token_count_descs in by_token_count.values():
+                    current_range_start = 0
+                    # Dynamic speculative decoding can produce multiple graphs
+                    # with the same num_tokens. Group them so each graph covers
+                    # the same candidate range.
+                    for num_tokens, group in groupby(
+                        token_count_descs, lambda d: d.num_tokens
+                    ):
+                        matching = list(group)
+                        for i in range(current_range_start, num_tokens + 1):
+                            mode_candidates[i].extend(matching)
+                        current_range_start = num_tokens + 1
+                for i, candidates in mode_candidates.items():
+                    candidates.sort(key=position.__getitem__)
+                    key = (i, num_active_loras)
+                    self._candidates.setdefault(key, []).extend(candidates)
 
     @property
     def dp_size(self) -> int:
@@ -409,6 +471,58 @@ class CudaGraphManager:
         self._graphs_captured = False
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()
+    def _adaptive_k_draft_counts(self) -> tuple[int, ...]:
+        """Draft counts the adaptive-k policy may choose, or ()."""
+        if not self.adaptive_k_capture:
+            return ()
+        speculative_config = self.vllm_config.speculative_config
+        if not (speculative_config and speculative_config.uses_adaptive_k()):
+            return ()
+        return tuple(speculative_config.adaptive_k_draft_counts())
+
+    def warn_on_missing_adaptive_graphs(self) -> None:
+        """Check every adaptive draft count has a single-request decode graph.
+
+        ``dispatch`` returns CUDAGraphMode.NONE on a miss and the step quietly
+        runs eager, which would read as a mysterious slowdown rather than a
+        misconfiguration, so surface it once at startup.
+        """
+        adaptive_k_counts = self._adaptive_k_draft_counts()
+        if not adaptive_k_counts:
+            return
+        if not self.cudagraph_mode or not self.cudagraph_mode.decode_mode():
+            return
+
+        num_new_sampled_tokens_per_step = (
+            self.decode_query_len - self.vllm_config.num_speculative_tokens
+        )
+        covered, missing = [], []
+        for num_spec in adaptive_k_counts:
+            query_len = num_spec + num_new_sampled_tokens_per_step
+            desc = self.dispatch(
+                num_reqs=1,
+                num_tokens=query_len,
+                uniform_token_count=query_len,
+                num_active_loras=0,
+                max_query_len=query_len,
+            )
+            (covered if desc.cg_mode != CUDAGraphMode.NONE else missing).append(
+                num_spec
+            )
+        if missing:
+            logger.warning(
+                "Adaptive SD: no decode CUDA graph for draft count(s) %s "
+                "(need capture sizes that are multiples of %s); steps that "
+                "choose them will run eager. Captured: %s.",
+                missing,
+                [k + num_new_sampled_tokens_per_step for k in missing],
+                covered,
+            )
+        else:
+            logger.info(
+                "Adaptive SD: decode CUDA graphs captured for draft counts %s.",
+                covered,
+            )
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -520,6 +634,12 @@ class CudaGraphManager:
             {desc.num_tokens for desc in self.graphs if desc.num_active_loras == 0}
         )
 
+    def is_decode_graph_miss(self, desc: BatchExecutionDescriptor) -> bool:
+        """Whether a uniform decode batch dispatched below the configured
+        decode mode: PIECEWISE or eager when FULL decode graphs were asked
+        for, eager when PIECEWISE."""
+        return desc.cg_mode != self.decode_cg_mode
+
     def dispatch(
         self,
         num_reqs: int,
@@ -595,6 +715,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        adaptive_k_capture: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -604,6 +725,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             ubatch_runner=ubatch_runner,
+            adaptive_k_capture=adaptive_k_capture,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []

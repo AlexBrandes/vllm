@@ -1,3 +1,5 @@
+<!-- Modified by Morrowmake: load-adaptive draft-count documentation. -->
+
 # Speculative Decoding
 
 This document shows how to use [Speculative Decoding](https://arxiv.org/pdf/2302.01318) with vLLM to reduce inter-token latency under medium-to-low QPS (queries per second), memory-bound workloads.
@@ -20,6 +22,7 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [Dynamic Speculative Decoding](dynamic_speculative_decoding.md)
 - [Adaptive Verification](adaptive_verification.md)
 - [FLy Verification (Lossy)](fly.md)
+- [Load-Adaptive Draft Count](adaptive_k.md)
 - [Per-Request Acceptance Metrics](acceptance_metrics.md)
 
 ## Method Selection at a Glance

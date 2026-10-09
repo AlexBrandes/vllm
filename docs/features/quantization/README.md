@@ -1,3 +1,5 @@
+<!-- Modified by Morrowmake: optional sm_80 Marlin documentation. -->
+
 # Quantization
 
 Quantization trades off model precision for smaller memory footprint, allowing large models to be run on a wider range of devices.
@@ -22,6 +24,67 @@ The following are the supported quantization formats for vLLM:
 - [Quantized KV Cache](quantized_kvcache.md)
 - [TorchAO](torchao.md)
 - [FP8 ViT Encoder Attention](fp8_vit_attn.md)
+
+## Optional compiled Marlin MoE on SM 8.0
+
+The optional `vllm._ampere_marlin_C` extension provides GLM-5.3-Flash W4A16
+MoE kernels for both TP4 and PP4 in one binary. Switching layouts needs a
+restart and warmup, not a rebuild. It does not requantize weights.
+
+Builds are opt-in with `VLLM_AMPERE_MARLIN_BUILD=1`. A CUDA toolkit and the
+matching PyTorch installation are required; a GPU is not required to build
+the SM 8.0 kernels. For an existing source installation:
+
+```bash
+python csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out vllm
+```
+
+The standalone command also accepts `--build-dir DIR` and `--verbose`.
+It writes `_ampere_marlin_C.abi3.so`. Runtime never compiles CUDA source.
+
+The runtime flags default to `0`:
+
+| Flag | Guarded regime |
+| --- | --- |
+| `VLLM_AMPERE_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, 4 or 8 tokens |
+| `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS=1` (with the above) | PP4 width 2048, also 5–7 tokens |
+| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI=1` (with the above) | PP4 width 2048, the token ranges of `VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` (`lo-hi[,lo-hi...]` within 9–64, default `9-32`) |
+
+Decode splits the first projection four ways along K into fixed-order fp32
+partials, which is faster but sums in a different order from the released
+kernels, so decoded text can differ while staying within their accuracy
+bounds.
+
+All paths require SM 8.0, bf16 activations, 288 local/global experts, top-8
+routing, hidden width 4096, uint4b8 group-128 weights, and SiLU with clamp
+10.0. Expert maps, LoRA, activation quantization, zero points, biases,
+global scales and router weighting on input are excluded. Unsupported shapes
+retain the released kernels.
+
+The decode schedule retains routing and padding semantics, slot-order
+summation, shared-expert handling and final reduction. Optional scratch is
+reserved per device and stream before CUDA-graph capture, including PP
+workers: 32 tokens for TP4, and for PP4 8 tokens or the largest row count of
+`VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` when that switch is on.
+Fully masked graph padding rows remain don't-care, as with released kernels.
+
+MoE prefill under TP4 uses the released Marlin kernels (with the split-block
+schedule of `VLLM_AMPERE_MARLIN_PREFILL_NARROW`). Under PP4 the split-block
+prefill of `VLLM_AMPERE_MARLIN_PREFILL_WIDE` runs its list GEMMs through the
+library's `prefill_tile_gemm`: (64,512) tiles for the 32–64-row lists and a
+one-HFMA2 dequant whose tiles with a scale above 2^-5 are recomputed by the
+regular kernel. `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (default `1`)
+selects it; `0` keeps the released kernels. Without a library that exports
+the operator, the released kernels run; the worker log names the reason.
+
+With the decode flag off and no compiled PP4 prefill, the optional extension
+is not imported or loaded. Enabling the decode flag validates the binary at
+worker startup, before model
+loading/serving. A missing binary, mismatched PyTorch/C++ ABI or CUDA major
+version, or missing/incompatible operators raises an actionable
+`RuntimeError`; it never silently disables the requested extension. CUDA
+toolkit minor versions within the same major are accepted. Rebuild against
+the current environment or set the flag to `0` and restart to recover.
 
 ## Selecting Linear Backends per Quantization
 

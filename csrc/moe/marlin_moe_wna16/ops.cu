@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Modified by Morrowmake for CMP 170HX support; see repository history.
 
 /*
  * Adapted from https://github.com/IST-DASLab/marlin
@@ -169,11 +170,20 @@ MarlinFuncPtr get_marlin_kernel(const vllm::ScalarType a_type,
                                 int thread_m_blocks, int thread_n_blocks,
                                 int thread_k_blocks, bool m_block_size_8,
                                 bool has_zp, int group_blocks, int threads,
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+                                bool is_zp_float, int stages,
+                                bool fast_dequant = false) {
+#else
                                 bool is_zp_float, int stages) {
+#endif
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
-#include "kernel_selector.h"
+#ifdef MARLIN_MOE_KERNEL_SELECTOR
+  #include MARLIN_MOE_KERNEL_SELECTOR
+#else
+  #include "kernel_selector.h"
+#endif
 
   return kernel;
 }
@@ -253,7 +263,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                vllm::ScalarType const& s_type, bool has_bias, bool has_zp,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+               bool use_fp32_reduce, bool is_zp_float, int* redo,
+               int64_t redo_numel) {
+#else
                bool use_fp32_reduce, bool is_zp_float) {
+#endif
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -319,8 +334,22 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
+#ifdef MARLIN_MOE_TILE_THREADS_ALONG_N
+    // thread_k 64 tiles put every warp along N (thread_n / 2 threads, at least
+    // 4 warps, at most 8): (64,128) -> 128, (64,256) -> 128, (64,512) -> 256.
+    int nthr = thread_k == 64 ? std::min(256, std::max(128, thread_n / 2))
+                              : std::min(256, thread_k * thread_n / 64);
+    thread_tfg = thread_config_t{thread_k, thread_n, nthr};
+#else
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
+#endif
     if (blocks_per_sm == -1) blocks_per_sm = 1;
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+    // (.,512) 256-thread fast_dequant tiles stage their epilogue in their own
+    // shared memory (marlin_template.h epi_overlap): full opt-in budget.
+    STD_TORCH_CHECK(thread_n != 512 || blocks_per_sm == 1,
+                    "thread_n 512 tiles run at 1 block per SM");
+#endif
     exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
     STD_TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                     " is not divisible by thread_n = ", thread_n);
@@ -339,6 +368,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
+#ifdef MARLIN_MOE_ORDERED_STREAM_K
+  // The start counter sits at locks[blocks]: the wrapper checks sms * 4 + 1.
+  STD_TORCH_CHECK(exec_cfg.blocks_per_sm >= 1 && exec_cfg.blocks_per_sm <= 4,
+                  "blocks_per_sm = ", exec_cfg.blocks_per_sm,
+                  " is outside 1..4");
+#endif
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
@@ -375,6 +410,44 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                     ", num_bits = ", num_bits);
   }
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  // Optimistic dequant (kernel.h): with a redo area, run the fast_dequant
+  // kernel, then the regular kernel on the tiles it listed (it exits at once
+  // if none).  Without a redo area, or without a fast_dequant twin of the
+  // chosen kernel, the regular kernel alone computes everything.
+  MarlinFuncPtr fast_kernel = MarlinDefault;
+  if (redo != nullptr) {
+    fast_kernel = get_marlin_kernel(
+        a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
+        thread_k_blocks, m_block_size_8, has_zp, group_blocks, num_threads,
+        is_zp_float, stages, /*fast_dequant=*/true);
+    // every slice may append once: at most all m-n tiles plus one extra
+    // slice per CTA (stream-K stripes)
+    const int64_t max_tiles =
+        int64_t(div_ceil(prob_m * top_k + num_experts * moe_block_size,
+                         moe_block_size)) *
+            (prob_n / thread_n) +
+        blocks;
+    STD_TORCH_CHECK(redo_numel >= 1 + max_tiles, "redo area too small: ",
+                    redo_numel, " < ", 1 + max_tiles);
+  }
+  if (fast_kernel == MarlinDefault) redo = nullptr;
+
+  for (MarlinFuncPtr k : {fast_kernel, kernel}) {
+    if (k == MarlinDefault) continue;
+    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         max_shared_mem);
+    // avoid ">>>" being formatted to "> > >"
+    // clang-format off
+    k<<<blocks, num_threads, max_shared_mem, stream>>>(
+        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
+        sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+        topk_weights_ptr, top_k, mul_topk_weights, prob_m, prob_n, prob_k, locks,
+        has_bias, use_atomic_add, use_fp32_reduce, redo);
+    // clang-format on
+  }
+}
+#else
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
   // avoid ">>>" being formatted to "> > >"
@@ -386,6 +459,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       has_bias, use_atomic_add, use_fp32_reduce);
   // clang-format on
 }
+#endif
 
 }  // namespace MARLIN_NAMESPACE_NAME
 
@@ -404,7 +478,18 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     bool mul_topk_weights, vllm::ScalarTypeId const& b_type_id, int64_t size_m,
     int64_t size_n, int64_t size_k, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    , torch::stable::Tensor& c_tmp
+#endif
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+    , std::optional<torch::stable::Tensor> const& redo
+#endif
+    ) {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+  STD_TORCH_CHECK(c_or_none.has_value(),
+                  "prefill_tile_gemm requires a preallocated output tensor");
+#endif
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.scalar_type();
@@ -524,7 +609,12 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(a_type.size_bits() == 8,
                     "a_scales can only be used for 8bit activation.");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    // The kernel ignores this pointer for 16-bit activations.
+    a_scales = c_tmp;
+#else
     a_scales = torch::stable::new_empty(a, {0}, kFloat);
+#endif
     STD_TORCH_CHECK(
         a_type.size_bits() != 8,
         "the a_scales parameter must be passed for 8bit activation.");
@@ -551,19 +641,44 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     c = torch::stable::new_empty(a, {size_m * top_k, size_n}, c_dtype);
   }
 
-  // Alloc C tmp buffer that is going to be used for the global reduce
+  // Scratch for the fixed-order global reduction.
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+  STD_TORCH_CHECK(c_tmp.device().is_cuda() &&
+                      c_tmp.get_device() == a.get_device() &&
+                      c_tmp.is_contiguous() && c_tmp.scalar_type() == kFloat,
+                  "c_tmp must be contiguous float32 scratch on A's device");
+#else
   torch::stable::Tensor c_tmp;
+#endif
   if (use_fp32_reduce && !use_atomic_add) {
     // max num of threadblocks is sms * 4
     long max_c_tmp_size = min(
         (long)size_n * sorted_token_ids.size(0),
         (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    STD_TORCH_CHECK(c_tmp.numel() >= max_c_tmp_size,
+                    "c_tmp needs at least ", max_c_tmp_size, " float32 elements");
+#else
     c_tmp = torch::stable::new_empty(a, {max_c_tmp_size}, kFloat);
-  } else {
+#endif
+  }
+#ifndef MARLIN_MOE_PREALLOCATED_SCRATCH
+  else {
     c_tmp = torch::stable::new_empty(a, {0}, kFloat);
   }
+#endif
 
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+  if (redo.has_value()) {
+    STD_TORCH_CHECK(redo->device().is_cuda() &&
+                        redo->get_device() == a.get_device() &&
+                        redo->is_contiguous() &&
+                        redo->scalar_type() ==
+                            torch::headeronly::ScalarType::Int,
+                    "redo must be contiguous int32 on A's device");
+  }
+#endif
   // Detect group size.
   int num_groups = -1;
   int group_size = -1;
@@ -590,7 +705,11 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
                     "global_scale can only be used for nvfp4 format.");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    global_scale = c_tmp;  // Unused for uint4b8 weights.
+#else
     global_scale = torch::stable::new_empty(a, {0}, kFloat);
+#endif
     STD_TORCH_CHECK(
         !(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
         "the global_scale parameter must be passed for nvfp4 format.");
@@ -605,7 +724,11 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(b_bias.size(1) == size_n, "b_bias.size(1) != size_n");
     STD_TORCH_CHECK(b_bias.stride(1) == 1, "b_bias.stride(1) != 1");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    b_bias = c_tmp;  // Unused when has_bias is false.
+#else
     b_bias = torch::stable::new_empty(a, {0}, c_dtype);
+#endif
   }
 
   torch::stable::Tensor b_zeros;
@@ -614,9 +737,17 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
     STD_TORCH_CHECK(b_zeros.device().is_cuda(), "b_zeros is not on GPU");
     STD_TORCH_CHECK(b_zeros.is_contiguous(), "b_zeros is not contiguous");
   } else {
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+    b_zeros = c_tmp;  // Unused when has_zp is false.
+#else
     b_zeros = torch::stable::new_empty(a, {0}, c_dtype);
+#endif
   }
+#ifdef MARLIN_MOE_PREALLOCATED_SCRATCH
+  bool has_zp = b_zeros_or_none.has_value() && b_zeros.size(-1) > 0;
+#else
   bool has_zp = b_zeros.size(-1) > 0;
+#endif
   if (has_zp) {
     STD_TORCH_CHECK(
         b_type == vllm::kU4 || b_type == vllm::kU8,
@@ -670,6 +801,13 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
   STD_TORCH_CHECK(workspace.numel() >= min_workspace_size,
                   "workspace.numel = ", workspace.numel(),
                   " is below min_workspace_size = ", min_workspace_size);
+#ifdef MARLIN_MOE_ORDERED_STREAM_K
+  // Semaphores below the grid size, then the start counter at locks[grid]
+  // (marlin_template.h): zero-initialised, at least sms * 4 + 1 entries.
+  STD_TORCH_CHECK(workspace.numel() > sms * 4, "workspace.numel = ",
+                  workspace.numel(), " must exceed sms * 4 = ", sms * 4,
+                  " (semaphores plus the CTA start counter)");
+#endif
 
   int dev = a.get_device();
 
@@ -696,11 +834,19 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.mutable_data_ptr(),
       a_type, b_type, c_type, s_type, has_bias, has_zp, group_size, dev,
       get_current_cuda_stream(dev), thread_k, thread_n, sms, blocks_per_sm,
+#ifdef MARLIN_MOE_FAST_DEQUANT_REDO
+      use_atomic_add, use_fp32_reduce, is_zp_float,
+      redo.has_value() ? static_cast<int*>(redo->mutable_data_ptr()) : nullptr,
+      redo.has_value() ? redo->numel() : 0);
+#else
       use_atomic_add, use_fp32_reduce, is_zp_float);
+#endif
 
   return c;
 }
 
+#ifndef MARLIN_MOE_NO_MOE_C_IMPL
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_wna16_marlin_gemm", TORCH_BOX(&moe_wna16_marlin_gemm));
 }
+#endif

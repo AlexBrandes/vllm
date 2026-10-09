@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from typing import Literal, overload
 
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.sm80.kernels.moe import align as sm80_align
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
@@ -127,6 +129,24 @@ def moe_align_block_size(
     """
     if return_scatter_idx and expert_map is not None and not ignore_invalid_experts:
         raise ValueError("scatter_idx with expert_map requires ignore_invalid_experts")
+
+    from vllm import envs
+
+    if not return_scatter_idx and envs.VLLM_AMPERE_DECODE_KERNELS:
+        from vllm.sm80.kernels.moe import take_fused_align
+
+        # `fused_route_align` in vllm/sm80/kernels/moe/routing.py produced
+        # this alignment in the same launch as the routing -- the fusion is
+        # exact (count_and_sort is phase 2 of moe_align_block_size and both
+        # consume only topk_ids, which the routing kernel produced, and
+        # nothing reads topk_ids in between). A miss here is harmless: the
+        # upstream path below runs exactly as before.
+        _fused = take_fused_align(
+            topk_ids, block_size, num_experts, expert_map, pad_sorted_ids
+        )
+        if _fused is not None:
+            return _fused
+
     scatter_idx = None
     if return_scatter_idx:
         scatter_idx = torch.empty(
@@ -150,16 +170,28 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-        scatter_idx,
-    )
+    if sm80_align.deterministic_moe_align_mode() == 1:
+        sm80_align.kernel_moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+            scatter_idx,
+        )
+    else:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+            scatter_idx,
+        )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]

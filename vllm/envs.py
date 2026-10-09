@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import functools
 import json
@@ -2486,3 +2487,9 @@ def compile_factors() -> dict[str, object]:
         factors[var] = normalize_value(os.getenv(var))
 
     return factors
+
+
+# Variables of the CMP 170HX (sm_80) fork: vllm/sm80/envs.py.
+from vllm.sm80.envs import register_env_vars  # noqa: E402
+
+register_env_vars(environment_variables)

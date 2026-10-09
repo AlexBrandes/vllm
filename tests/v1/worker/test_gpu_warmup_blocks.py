@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """The V2 warmup must reserve the KV blocks the scheduler would reserve.
 
 `KVCacheManager.allocate_slots` sizes every allocation for
@@ -9,6 +10,7 @@ hand-builds its `SchedulerOutput`s, so it has to reserve the same blocks.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,6 +24,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -62,6 +65,21 @@ def _circular_group() -> KVCacheGroupSpec:
             num_kv_heads=1,
             head_size=1,
             dtype=torch.float32,
+        ),
+    )
+
+
+def _kpool_tail_group() -> KVCacheGroupSpec:
+    """The kpool indexer's tail scratch: one circular block, forever."""
+    return KVCacheGroupSpec(
+        ["kpool_tail"],
+        KpoolTailSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=2,
+            head_size=1,
+            head_size_v=0,
+            dtype=torch.float32,
+            sliding_window=BLOCK_SIZE,
         ),
     )
 
@@ -168,9 +186,14 @@ def _assert_covers_lookahead(
 # 0 covers eagle / MTP / draft models, 1 covers DFlash's extra in-fill query.
 @pytest.mark.parametrize("extra_lookahead", [0, 1])
 @pytest.mark.parametrize("num_spec_steps", [1, 2, 3, 5, 7])
-def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahead):
+def test_warmup_kernels_reserves_lookahead_blocks(
+    monkeypatch, num_spec_steps, extra_lookahead
+):
     num_lookahead_tokens = num_spec_steps + extra_lookahead
     recorder = _StepRecorder()
+    # The recorder executes CPU-only bookkeeping, not accelerator kernels.
+    synchronize = Mock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
 
     warmup_kernels(
         _make_runner([_attention_group()], num_lookahead_tokens, num_spec_steps),
@@ -180,6 +203,7 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
     assert set(recorder.num_spec_tokens_to_schedule) == {num_spec_steps}
+    synchronize.assert_called_once_with()
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():
@@ -242,6 +266,7 @@ def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
         kv_cache_groups=[
             _attention_group(),
             _circular_group(),
+            _kpool_tail_group(),
             _mamba_group("none"),
             _mamba_group("align"),
         ],

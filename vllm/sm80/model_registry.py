@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Model registry entries of the fork's model classes.
+
+vLLM caches the model information of a lazily registered class on disk
+(``$VLLM_CACHE_ROOT/modelinfos``), keyed by a hash of the class's module
+file, or of the whole package when the module is a package ``__init__.py``.
+The fork model classes subclass the upstream ones in another module, so a key
+over their own module alone would keep serving stale information after a
+change to the upstream model code. :class:`PackageHashedLazyModel` keys it
+on the whole model package (``vllm/models/<model>/``), as upstream's own
+package entry does; :class:`UpstreamHashedLazyModel` (fork classes outside a
+model package, e.g. the drafters in ``vllm/sm80/spec_decode/``) on the fork
+module and the upstream module its class extends.
+"""
+
+import importlib.util
+from dataclasses import dataclass
+from pathlib import Path
+
+from vllm.model_executor.models.registry import _LazyRegisteredModel
+from vllm.utils.hashing import safe_hash
+
+
+@dataclass(frozen=True)
+class PackageHashedLazyModel(_LazyRegisteredModel):
+    """A lazy entry for a class in ``vllm/models/<model>/<subpackage>/``."""
+
+    @staticmethod
+    def _get_modelinfo_module_hash(model_path: Path) -> str:
+        # vllm/models/<model>/nvidia/sm80_model.py -> vllm/models/<model>/
+        package_init = model_path.parents[1] / "__init__.py"
+        assert package_init.parent.parent.name == "models", model_path
+        return _LazyRegisteredModel._get_modelinfo_module_hash(package_init)
+
+
+@dataclass(frozen=True)
+class UpstreamHashedLazyModel(_LazyRegisteredModel):
+    """A lazy entry for a fork class that extends the upstream model class in
+    ``upstream_module`` (a module name, located without importing it)."""
+
+    upstream_module: str
+
+    def _get_modelinfo_module_hash(self, model_path: Path) -> str:
+        spec = importlib.util.find_spec(self.upstream_module)
+        assert spec is not None and spec.origin, self.upstream_module
+        hasher = safe_hash(b"", usedforsecurity=False)
+        for name, path in (
+            (self.module_name, model_path),
+            (self.upstream_module, Path(spec.origin)),
+        ):
+            hasher.update(name.encode("utf-8"))
+            hasher.update(b"\0")
+            hasher.update(path.read_bytes())
+            hasher.update(b"\0")
+        return hasher.hexdigest()

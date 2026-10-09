@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """KV-Cache Utilities."""
 
 import copy
@@ -22,8 +23,11 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.sm80.kv_planning import (
+    max_concurrency_for_kv_cache_config,
+    merge_eagle_group_flags,
+)
 from vllm.utils.hashing import xxhash, xxhash_cbor
-from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -1072,25 +1076,12 @@ def get_max_concurrency_for_kv_cache_config(
     call sites agree.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
+
+    Speculative scratch (`KVCacheSpec.speculative_scratch_bytes`) is charged
+    once per running request, not once per resident request; see
+    `vllm.sm80.kv_planning.max_concurrency_for_kv_cache_config`.
     """
-    num_blocks_per_request = 0
-    host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
-        required = cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
-        )
-        if group.host_resident:
-            host_blocks_per_request += required
-        else:
-            num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
-    if host_blocks_per_request:
-        assert kv_cache_config.hisparse_host_num_blocks is not None
-        limits.append(
-            kv_cache_config.hisparse_host_num_blocks / host_blocks_per_request
-        )
-    return min(limits)
+    return max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
 
 
 def generate_scheduler_kv_cache_config(
@@ -1107,6 +1098,9 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    # Groups only some pipeline stages own (a drafter's) keep the
+    # is_eagle_group flag of the stage that owns them.
+    merge_eagle_group_flags(cfg, kv_cache_configs)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,

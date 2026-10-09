@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import copy
 import functools
@@ -528,7 +529,40 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    adaptive_k: dict[str, Any] | None = None
+    """Load-adaptive per-step draft count. ``None`` (the default) disables it
+    and leaves speculative decoding byte-identical.
+
+    When set, the scheduler picks one draft count to verify for the whole
+    step (decode runs as a uniform batch under full CUDA graphs, so a step
+    cannot mix counts) from the number of requests the server holds.
+    ``num_speculative_tokens`` must be at least the deepest count; it sizes
+    the drafter's buffers and the widest captured graph. Recognised keys:
+
+    - ``by_load`` (required): entry ``i`` is the count for ``i + 1`` requests
+      (running, waiting and KV-holding), the last entry covers every larger
+      number. Decode CUDA graphs are captured for each listed count, up to the
+      request count at which it runs.
+    - ``accept``: also weigh recent per-draft acceptance. A mapping with
+      ``costs`` (the relative step cost of every count from the shallowest to
+      the deepest ``by_load`` entry), optional ``costs_multi`` (the same for
+      steps of two or more requests), ``hysteresis`` (default ``0.03``),
+      ``prior`` (default ``0.75``) and ``decay`` (default ``0.9``). Each step
+      then takes the count, at most the load width, that maximises the batch's
+      expected tokens per unit step cost.
+    - ``draft_by_load``: the drafter drafts only the width the next step
+      verifies (greedy DFlash2), with one drafter graph set per width; off,
+      it drafts its full block and only verification narrows.
+    - ``log_interval``: emit a chosen-k histogram every N steps (0 = off).
+
+    All of this runs on the scheduler's CPU thread; unlike
+    ``enable_adaptive_verification`` nothing is trimmed on the device, so it
+    works with backends such as the DSA indexer.
+    """
+
     # params generated in the post-init stage
+    adaptive_k_config: SkipValidation[Any] = None  # AdaptiveKConfig | None
+    """Validated form of ``adaptive_k``; None when the feature is off."""
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
     draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
@@ -1995,6 +2029,24 @@ class SpeculativeConfig:
                 "may degrade model outputs."
             )
 
+        if self.adaptive_k is not None:
+            from vllm.sm80.spec_decode.adaptive_k import AdaptiveKConfig
+
+            if self.uses_dynamic_speculative_decoding():
+                raise ValueError(
+                    "adaptive_k and num_speculative_tokens_per_batch_size both "
+                    "choose the per-step draft count; enable only one."
+                )
+            if self.enable_adaptive_verification:
+                raise ValueError(
+                    "adaptive_k (host-side) and enable_adaptive_verification "
+                    "(device-side) both size the verification budget; enable "
+                    "only one."
+                )
+            self.adaptive_k_config = AdaptiveKConfig.from_dict(
+                self.adaptive_k, self.num_speculative_tokens
+            )
+
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
         return self
@@ -2127,6 +2179,13 @@ class SpeculativeConfig:
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_adaptive_k(self) -> bool:
+        return self.adaptive_k_config is not None
+
+    def adaptive_k_draft_counts(self) -> tuple[int, ...]:
+        """Draft counts the scheduler may pick, so graphs can be captured."""
+        return self.adaptive_k_config.allowed if self.adaptive_k_config else ()
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

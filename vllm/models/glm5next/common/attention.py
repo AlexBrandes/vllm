@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
+from vllm.sm80.kernels.thin_gemm import thin_linear
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -30,6 +32,10 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.models.glm5next.nvidia.ops.idx_glue_gates import (
+    use_idx_glue_fwht,
+    use_idx_glue_weights,
+)
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -302,16 +308,26 @@ class Indexer(nn.Module):
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
+        if use_idx_glue_weights(self, hidden_states):
+            # One thin-GEMM launch stores the k columns bf16 (bitwise the
+            # merged GEMM's) and the weight columns as its fp32 accumulator,
+            # instead of recomputing them with a separate fp32 sgemm.
+            from vllm.models.glm5next.nvidia.ops.idx_glue import thin_gemm_dual
+
+            k, weights = thin_gemm_dual(
+                hidden_states, self.wk_weights_proj.weight, self.head_dim
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
+            if self._wp_fp32 is None:
+                self._wp_fp32 = (
+                    self.wk_weights_proj.weight.data[self.head_dim :, :]
+                    .t()
+                    .contiguous()
+                    .float()
+                )
+            weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -347,18 +363,32 @@ class Indexer(nn.Module):
         assert self.head_dim == 128 and self.quant_block_size == 128
         assert self.scale_fmt == "ue8m0"
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = fwht128_quant_fp8(q)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        wscale = self.softmax_scale * self.n_head**-0.5
+        if use_idx_glue_fwht(self, q, weights, wscale):
+            # Same rotation/quant and the same fp32 (w * q_scale) * wscale,
+            # in one launch with more CTAs; q_scale has no other consumer.
+            from vllm.models.glm5next.nvidia.ops.idx_glue import (
+                fwht128_quant_fp8_wscale,
+            )
 
-        weights = _fused_indexer_weight_scale(
-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
-        )
+            q_fp8, weights = fwht128_quant_fp8_wscale(q, weights, wscale)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+        else:
+            q_fp8, q_scale = fwht128_quant_fp8(q)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+
+            weights = _fused_indexer_weight_scale(weights, q_scale, wscale)
 
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        # thin_linear IS F.linear unless VLLM_THIN_GEMM is on and the call
+        # is inside the measured win region. This site never builds a
+        # LinearBase, so it cannot be reached by the dispatch_unquantized_gemm
+        # hook that covers every other shape (N=128, K=4096, 11 calls/step,
+        # 1.27x vs cuBLAS).
+        gate_score = thin_linear(hidden_states, self.index_kpool_compress_gate)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this

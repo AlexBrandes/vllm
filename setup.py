@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import ctypes
 import importlib.util
@@ -53,6 +54,11 @@ PRECOMPILED_RUST_EXTENSION_MEMBER_REGEX = re.compile(r"vllm/_rust_[^/]*\.so$")
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
+# vllm/envs.py ends by importing vllm.sm80.envs; load that by path too, so
+# no importable vllm package is needed (isolated builds have none).
+load_module_from_path(
+    "vllm.sm80.envs", os.path.join(ROOT_DIR, "vllm", "sm80", "envs.py")
+)
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 rust_build = load_module_from_path(
     "rust_build", os.path.join(ROOT_DIR, "tools", "build_rust.py")
@@ -60,6 +66,13 @@ rust_build = load_module_from_path(
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
+BUILD_AMPERE_MARLIN = envs.VLLM_AMPERE_MARLIN_BUILD
+if BUILD_AMPERE_MARLIN and USE_PRECOMPILED_EXTENSIONS:
+    raise RuntimeError(
+        "To retain precompiled vLLM extensions, build Ampere Marlin separately: "
+        "VLLM_AMPERE_MARLIN_BUILD=1 python "
+        "csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out DIR"
+    )
 # VLLM_USE_PRECOMPILED implies precompiled rust frontend too.
 USE_PRECOMPILED_RUST_FRONTEND = (
     envs.VLLM_USE_PRECOMPILED or envs.VLLM_USE_PRECOMPILED_RUST
@@ -270,6 +283,7 @@ class cmake_build_ext(build_ext):
         cmake_args = [
             f"-DCMAKE_BUILD_TYPE={cfg}",
             f"-DVLLM_TARGET_DEVICE={VLLM_TARGET_DEVICE}",
+            f"-DVLLM_AMPERE_MARLIN_BUILD={'ON' if BUILD_AMPERE_MARLIN else 'OFF'}",
         ]
 
         verbose = envs.VERBOSE
@@ -1547,6 +1561,11 @@ def get_rocm_device_requirements() -> list[str]:
 
 
 ext_modules = []
+
+if BUILD_AMPERE_MARLIN:
+    if not _is_cuda():
+        raise RuntimeError("VLLM_AMPERE_MARLIN_BUILD=1 requires a CUDA build")
+    ext_modules.append(CMakeExtension(name="vllm._ampere_marlin_C"))
 
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))

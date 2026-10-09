@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import torch
 
+from vllm.sm80.kernels import mhc as sm80_mhc
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -42,6 +44,15 @@ def _hc_prenorm_gemm_outputs(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+    elif sm80_mhc.use_ampere_prefill_prenorm(num_tokens) and (
+        sm80_mhc.ampere_prenorm_offsets_fit(x, fn)
+    ):
+        from vllm.sm80.kernels.mhc.prenorm import hc_prenorm_gemm
+
+        # `fn` differs for all 90 (layer, attn|ffn) calls per prefill chunk.
+        # The leased pack is overwritten every call, not memoized weights;
+        # eager streams are ordered and captures use their allocator pool.
+        hc_prenorm_gemm(x, fn, out=out, sqrsum=sqrsum)
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _HC_PRENORM_GEMM_TILELANG_KERNEL,
@@ -875,6 +886,39 @@ def mhc_fused_post_pre_tilelang(
     num_tokens = residual_flat.shape[0]
     x_flat = x.view(num_tokens, hidden_size)
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
+    from vllm.sm80.kernels.mhc import use_ampere_mhc_decode_v3
+
+    if use_ampere_mhc_decode_v3(
+        num_tokens, hc_mult, hidden_size, norm_weight=norm_weight
+    ):
+        # The sm_80 decode kernel for 1 <= M <= VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS:
+        # same signature, same four outputs, same dtypes, and the asserts above
+        # have already run. `n_splits` / `tile_n` are part of the shared MHC
+        # operator API; v3 picks its split from the runtime shape. With the gate
+        # closed the code below runs exactly as before.
+        from vllm.sm80.kernels.mhc.decode import (
+            mhc_fused_post_pre as _mhc_v3,
+        )
+
+        return _mhc_v3(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
+
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     fused_config = mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult)

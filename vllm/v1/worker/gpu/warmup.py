@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -21,6 +22,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     CrossAttentionSpec,
+    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -47,8 +49,9 @@ def _reserved_block_count(
     """
     if isinstance(kvcache_spec, UniformTypeKVCacheSpecs):
         kvcache_spec = kvcache_spec.first_spec
-    if isinstance(kvcache_spec, CircularBufferSpec):
-        # Circular caches keep one physical ring block for the request lifetime.
+    if isinstance(kvcache_spec, (CircularBufferSpec, KpoolTailSpec)):
+        # Circular caches (including the kpool tail scratch) keep one physical
+        # ring block for the request lifetime, whatever the token count.
         return 1
     if isinstance(kvcache_spec, CrossAttentionSpec):
         # Cross-attention blocks cover the encoder sequence only.

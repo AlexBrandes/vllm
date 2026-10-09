@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIMessage
 from openai_harmony import ToolNamespaceConfig
 
+from vllm import envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.generate.base.protocol import validate_request_mm_kwargs
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -193,6 +195,15 @@ class OnlineRenderer:
             is_harmony=self.use_harmony,
             tokenizer=renderer.tokenizer,
         )
+
+        if self.parser is not None and getattr(
+            self.parser, "adjust_request_when_tool_choice_none", False
+        ):
+            logger.info_once(
+                "GLM tool_choice=none decode mask: %s "
+                "(VLLM_TOOL_CHOICE_NONE_MASK)",
+                "enabled" if envs.VLLM_TOOL_CHOICE_NONE_MASK else "disabled",
+            )
 
         self.chat_template = chat_template
         self.chat_template_content_format: ChatTemplateContentFormatOption = (
@@ -852,6 +863,10 @@ class OnlineRenderer:
                 or parser.reasoning_parser_cls is not None
                 or tool_choice != "none"
                 or is_mistral_grammar_eligible
+                or (
+                    parser.adjust_request_when_tool_choice_none
+                    and envs.VLLM_TOOL_CHOICE_NONE_MASK
+                )
             )
             if should_adjust_request:
                 if not isinstance(request, ChatCompletionRequest | ResponsesRequest):

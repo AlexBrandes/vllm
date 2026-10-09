@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Custom Sparse Attention Indexer layers."""
 
 import torch
@@ -29,11 +30,18 @@ from vllm.models.glm5next.common.sparse_indexer import (
     kv_cache_as_quant_view,
 )
 from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+from vllm.models.glm5next.nvidia.ops.idx_glue_gates import use_glue_pos, use_glue_tail
 from vllm.platforms import current_platform
+from vllm.sm80.kernels.indexer.topk_tiefix_gate import (
+    tiefix_decode_topk_,
+    tiefix_topk_,
+    use_sorted_topk,
+    use_tiefix_topk,
+)
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    is_deep_gemm_supported,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
 )
@@ -237,7 +245,7 @@ def sparse_attn_indexer_kpool(
                 )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
-                # ``pos % kpool`` within the request's tail block. Processing
+                # ``pos % ring`` within the request's tail block. Processing
                 # only the batch's trailing tokens would miss all but the last
                 # request in a multi-request prefill.
                 if tail_kv_cache is not None and tail_prefix is not None:
@@ -263,7 +271,21 @@ def sparse_attn_indexer_kpool(
                 "mxfp8" if mqa_logits_use_mx_scales() else scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # VLLM_AMPERE_DECODE_IDX_GLUE "glue": on a pure-decode batch whose rows all
+    # go through the pool expansion, one kernel writes every buffer row this
+    # fill covers (the expanded indices, -1 elsewhere), so the fill, the
+    # int64/int32 casts, the +1 and the copy below are folded into it.
+    fuse_tail = use_glue_tail(
+        attn_metadata_narrowed,
+        has_decode,
+        has_prefill,
+        index_kpool,
+        positions,
+        use_fp4_cache,
+        topk_tokens,
+    )
+    if not fuse_tail:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -355,9 +377,10 @@ def sparse_attn_indexer_kpool(
                 ).squeeze(-1)
 
             num_rows = q_slice.shape[0]
+            row_starts = None
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
-            else:
+            elif is_deep_gemm_supported():
                 q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
                     q_slice_cast, q_scale_slice, weights[row_start:row_end]
                 )
@@ -374,6 +397,26 @@ def sparse_attn_indexer_kpool(
                     ),
                     row_ends,
                 )
+            else:
+                # CUDA without DeepGEMM (e.g. Ampere): Triton kernel that
+                # dequantizes the fp8 bytes in-kernel (bf16 MMA, fp32 accum).
+                from vllm.sm80.kernels.attention.triton_mqa_logits import (
+                    fp8_mqa_logits as triton_fp8_mqa_logits,
+                )
+
+                assert not use_fp4_cache, (
+                    "MXFP4 indexer cache requires DeepGEMM (SM100/SM120)"
+                )
+                logits = triton_fp8_mqa_logits(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                # Not compressed: row i spans K positions [ks[i], ke[i]).
+                row_starts, row_ends = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
+            num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
@@ -392,7 +435,7 @@ def sparse_attn_indexer_kpool(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    torch.zeros_like(row_ends),
+                    torch.zeros_like(row_ends) if row_starts is None else row_starts,
                     row_ends,
                     topk_dst,
                     num_rows,
@@ -400,6 +443,16 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+                if use_tiefix_topk():
+                    # Boundary ties go to the lowest indices whatever the chunk shape.
+                    tiefix_topk_(
+                        logits,
+                        topk_dst,
+                        row_starts=row_starts,
+                        row_ends=row_ends,
+                        relative=True,
+                        sort=use_sorted_topk(),
+                    )
             # Local pool ids -> request-relative global pool ids.
             _merge_dcp_topk_global(
                 logits,
@@ -408,8 +461,15 @@ def sparse_attn_indexer_kpool(
                 dcp_rank,
                 dcp_world_size,
                 pool_cp_interleave,
-                row_starts=None,
+                row_starts=row_starts,
             )
+            # Free the fp32 logits before the next chunk allocates its own.
+            # The buffer is [chunk_rows, compressed_context] and the metadata
+            # builder sizes chunk_rows right up to
+            # VLLM_SPARSE_INDEXER_MAX_LOGITS_MB (512 MiB by default), so
+            # holding two of them live across the loop edge doubles the
+            # transient peak of the indexer at long context.
+            del logits
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -445,7 +505,7 @@ def sparse_attn_indexer_kpool(
         # Spec verification groups tokens by request and preserves position
         # order so each token is stashed before the next completes its pool.
         # Positions must remain token-granular because the kernel derives the
-        # pool phase and tail index from ``pos % kpool``.
+        # pool phase from ``pos % kpool`` and the tail index from ``pos % ring``.
         if (
             index_kpool > 1
             and gate_score is not None
@@ -512,7 +572,13 @@ def sparse_attn_indexer_kpool(
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
                 dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                if use_glue_pos():
+                    # The kpool kernel truncates its position load to int32.
+                    dec_pos = positions[:num_decode_tokens].view(shape2)
+                else:
+                    dec_pos = (
+                        positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                    )
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -521,7 +587,7 @@ def sparse_attn_indexer_kpool(
             # Paged tail cache replaces the transient _DECODE_TAIL ring. Group
             # the tail group's token-granular slot_mapping per-request, mirroring
             # dec_slot / dec_pos, so the kernel gets each request's current-token
-            # tail slot (block * kpool + pos % kpool).
+            # tail slot (block * ring + pos % ring).
             if tail_meta is not None:
                 assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
             if tail_meta is None or tail_kv_cache is None:
@@ -610,12 +676,11 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        padded_q_scale, decode_weights = mqa_logits_mx_inputs(
-            padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
-        )
-        # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
-            fp8_fp4_paged_mqa_logits(
+        if is_deep_gemm_supported():
+            padded_q_scale, decode_weights = mqa_logits_mx_inputs(
+                padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
+            )
+            logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 decode_weights,
@@ -624,9 +689,31 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_pool_len,
                 indices=decode_metadata.indices,
-            ),
-            seq_lens.view(-1),
-        )
+            )
+            # SM100 decode is varlen: one row and context length per token.
+            logits = as_fp32_logits(logits, seq_lens.view(-1))
+        else:
+            # CUDA without DeepGEMM (e.g. Ampere): Triton paged kernel over the
+            # uint8 (D + 4)-byte cache with next_n Q rows per request and the
+            # same (B, next_n) seq_lens layout. No scheduler metadata needed;
+            # max_seq_len (token-granular, so an upper bound on the
+            # pool-granular seq_lens) trims the tile grid.
+            from vllm.sm80.kernels.attention.triton_mqa_logits import (
+                fp8_paged_mqa_logits as triton_fp8_paged_mqa_logits,
+            )
+
+            assert not use_fp4_cache, (
+                "MXFP4 indexer cache requires DeepGEMM (SM100/SM120)"
+            )
+            logits = triton_fp8_paged_mqa_logits(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_pool_len,
+                max_seq_len=attn_metadata_narrowed.max_seq_len,
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -651,6 +738,8 @@ def sparse_attn_indexer_kpool(
             select_k,
             attn_metadata_narrowed.max_seq_len,
         )
+        # Boundary ties go to the lowest indices, as after the prefill top-k.
+        tiefix_decode_topk_(logits, topk_dst, seq_lens, next_n)
         _merge_dcp_topk_global(
             logits,
             topk_dst,
@@ -661,6 +750,20 @@ def sparse_attn_indexer_kpool(
         )
 
         # Resolve to token-level indices in the output buffer.
+        if fuse_tail:
+            from vllm.models.glm5next.nvidia.ops.idx_glue import (
+                expand_pools_into_buffer,
+            )
+
+            assert positions is not None and not decode_metadata.requires_padding
+            expand_pools_into_buffer(
+                pool_topk,
+                positions[: pool_topk.shape[0]],
+                topk_indices_buffer,
+                hidden_states.shape[0],
+                index_kpool,
+            )
+            return topk_indices_buffer
         if index_kpool > 1:
             pool_ids = pool_topk.to(torch.int64)
             n = pool_topk.shape[0]
@@ -733,9 +836,15 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "Sparse Attention Indexer MXFP4 cache requires DeepGEMM "
+                    "(SM100/SM120)."
+                )
+            logger.info_once(
+                "DeepGEMM is not usable on this device; the sparse attention "
+                "indexer will use the Triton fp8 MQA-logits kernels."
             )
         _cfg = get_current_vllm_config_or_none()
         self.topk_backend = (
