@@ -14,8 +14,8 @@ that use them run:
 * every block-table gather: each batch row names a request slot;
 * the align-mode state pre-copy (before the forward) and post-copy (after
   sampling): for every request that will copy, the block-table columns lie in
-  the row and the block ids they hold lie in ``[0, num_blocks)``; a copy from
-  or into the null block is reported as a warning.
+  its request-slot row and the block ids they hold lie in ``[0, num_blocks)``;
+  a copy from or into the null block is reported as a warning.
 
 A violation raises ``StateIndexError`` with the step's numbers instead of
 letting a kernel address memory outside the pool. Every check synchronizes
@@ -211,47 +211,44 @@ def check_gather_mapping(idx_mapping: torch.Tensor, max_num_reqs: int) -> None:
             f"{v.tolist()}")
 
 
-def _full_table(bt: torch.Tensor, rows: int) -> torch.Tensor:
-    """The persistent batch-order table behind a leading-rows slice (as many
-    of ``rows`` as its storage holds)."""
-    elems = bt.untyped_storage().nbytes() // bt.element_size() - bt.storage_offset()
-    fit = (elems - (bt.shape[1] - 1) * bt.stride(1)) // bt.stride(0) + 1
-    return torch.as_strided(bt, (max(0, min(rows, fit)), bt.shape[1]), bt.stride())
-
-
-def check_align_copies(kind: str, block_tables: list[torch.Tensor], max_rows: int,
-                       num_blocks: int, idx_mapping: torch.Tensor, src_col, dst_col,
-                       bias, needs) -> None:
-    """Shared range check of one align copy pass. ``src_col`` / ``dst_col`` /
+def check_align_copies(kind: str, block_tables: list[torch.Tensor], num_blocks: int,
+                       idx_mapping: torch.Tensor, src_col, dst_col, bias, needs) -> None:
+    """Shared range check of one align copy pass. ``block_tables`` are the
+    per-request-slot tables the copy kernels read (row = request slot), so a
+    batch row reads row ``idx_mapping[row]``. ``src_col`` / ``dst_col`` /
     ``bias`` / ``needs`` are per batch row (host int64 / bool); rows whose
     ``idx_mapping`` is negative or whose ``needs`` is False do not copy."""
     req = _host(idx_mapping)
     problems: list[str] = []
     warnings: list[str] = []
     for g, bt in enumerate(block_tables):
-        table = _host(_full_table(bt, max_rows))
+        table = _host(bt)
         width = int(table.shape[1])
         for row in range(req.numel()):
-            if int(req[row]) < 0 or not bool(needs[row]):
+            r = int(req[row])
+            if r < 0 or not bool(needs[row]):
                 continue
             s, d, b = int(src_col[row]), int(dst_col[row]), int(bias[row])
             cols = {"src": s, "src+bias": s + b, "dst": d}
             for name, c in cols.items():
                 if not 0 <= c < width:
-                    problems.append(f"{kind} group {g} row {row} (req slot {int(req[row])}): "
+                    problems.append(f"{kind} group {g} row {row} (req slot {r}): "
                                     f"{name} column {c} outside [0, {width})")
                     continue
-                if row >= table.shape[0]:
-                    problems.append(f"{kind} group {g}: row {row} beyond {table.shape[0]} rows")
+                if r >= table.shape[0]:
+                    problems.append(f"{kind} group {g} row {row}: req slot {r} beyond "
+                                    f"{table.shape[0]} rows")
                     continue
-                bid = int(table[row, c])
+                bid = int(table[r, c])
                 if not 0 <= bid < num_blocks:
-                    problems.append(f"{kind} group {g} row {row} (req slot {int(req[row])}): "
+                    problems.append(f"{kind} group {g} row {row} (req slot {r}): "
                                     f"{name} column {c} holds block {bid} outside [0, {num_blocks})")
                 elif bid == NULL_BLOCK_ID and name != "src":
-                    warnings.append(f"{kind} group {g} row {row}: {name} column {c} is the null block")
+                    warnings.append(f"{kind} group {g} row {row} (req slot {r}): "
+                                    f"{name} column {c} is the null block")
                 elif bid == NULL_BLOCK_ID:
-                    warnings.append(f"{kind} group {g} row {row}: copies from the null block (column {c})")
+                    warnings.append(f"{kind} group {g} row {row} (req slot {r}): "
+                                    f"copies from the null block (column {c})")
     if warnings:
         logger.warning("state index check (%s): %s", kind, "; ".join(warnings[:16]))
     if problems:

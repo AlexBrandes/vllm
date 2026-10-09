@@ -155,7 +155,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.postprocess_state
   why: commits the RecoverSSM step through self.recoverssm when it is set
-  sha256: f581d70d6392742d05033727fa97c65b9810f735e7bb68fe0621f2202b0e6012
+  sha256: b5ce81f79b711589a9027f71f17da20b72f60a1c9e937bce83a7f514864d5175
   signature: '(self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor | int, num_computed_tokens: torch.Tensor | None = None) -> None'
 
 - id: glm-recoverssm-state-init

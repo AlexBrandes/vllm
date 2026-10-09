@@ -163,28 +163,51 @@ def test_recover_metadata_class_is_checked(monkeypatch):
                                 __import__("dataclasses").fields(Glm5KDARecoverMetadata)}
 
 
+def _align(kind, table, idx, src, dst, bias, needs=None):
+    sic.check_align_copies(kind, [table], 415, t(idx), torch.tensor(src),
+                           torch.tensor(dst), torch.tensor(bias),
+                           torch.tensor(needs or [True] * len(idx)))
+
+
 def test_align_copy_columns_and_block_ids():
     table = torch.zeros(4, 64, dtype=torch.int32)
     table[0, :3] = t([0, 12, 13])
     table[1, :2] = t([20, 414])
-    idx = t([0, 1])
+    idx = [0, 1]
     # in range: row 0 copies col 1 -> col 2, row 1 col 0 -> col 1
-    sic.check_align_copies("pre-copy", [table], 4, 415, idx, torch.tensor([1, 0]),
-                           torch.tensor([2, 1]), torch.tensor([0, 0]),
-                           torch.tensor([True, True]))
+    _align("pre-copy", table, idx, [1, 0], [2, 1], [0, 0])
     with pytest.raises(sic.StateIndexError, match="dst column -1"):
-        sic.check_align_copies("post-copy", [table], 4, 415, idx, torch.tensor([1, 0]),
-                               torch.tensor([-1, 1]), torch.tensor([0, 0]),
-                               torch.tensor([True, True]))
+        _align("post-copy", table, idx, [1, 0], [-1, 1], [0, 0])
     with pytest.raises(sic.StateIndexError, match="src\\+bias column 64"):
-        sic.check_align_copies("post-copy", [table], 4, 415, idx, torch.tensor([60, 0]),
-                               torch.tensor([2, 1]), torch.tensor([4, 0]),
-                               torch.tensor([True, True]))
+        _align("post-copy", table, idx, [60, 0], [2, 1], [4, 0])
     table[1, 1] = 415
     with pytest.raises(sic.StateIndexError, match="holds block 415"):
-        sic.check_align_copies("pre-copy", [table], 4, 415, idx, torch.tensor([1, 0]),
-                               torch.tensor([2, 1]), torch.tensor([0, 0]),
-                               torch.tensor([True, True]))
+        _align("pre-copy", table, idx, [1, 0], [2, 1], [0, 0])
+
+
+def test_align_copy_null_block_warns(monkeypatch):
+    seen = []
+    monkeypatch.setattr(sic.logger, "warning", lambda *a: seen.append(a[-1]))
+    table = torch.zeros(4, 64, dtype=torch.int32)
+    table[0, :3] = t([0, 12, 13])
+    _align("pre-copy", table, [0], [0], [2], [0])
+    assert "copies from the null block (column 0)" in seen[-1]
+    _align("post-copy", table, [0], [1], [5], [0])
+    assert "dst column 5 is the null block" in seen[-1]
+
+
+def test_align_copy_rows_are_request_slots():
+    """The copy kernels read the per-request-slot tables: batch row ``i`` reads
+    row ``idx_mapping[i]``, not row ``i`` (under PP the batch order of a step
+    has been replaced by a later step's when its post-copy runs)."""
+    table = torch.zeros(4, 64, dtype=torch.int32)
+    table[0, :3] = t([0, 500, 501])   # batch row 0's own row: out of the pool
+    table[3, :3] = t([0, 12, 13])     # request slot 3: in range
+    _align("pre-copy", table, [3, -1], [1, 1], [2, 2], [0, 0])
+    with pytest.raises(sic.StateIndexError, match=r"row 0 \(req slot 0\).*holds block 500"):
+        _align("pre-copy", table, [0], [1], [2], [0])
+    with pytest.raises(sic.StateIndexError, match="req slot 4 beyond 4 rows"):
+        _align("post-copy", table, [4], [1], [2], [0])
 
 
 def _post_kernel_ref(acc, st, new, bs):
@@ -225,12 +248,6 @@ def test_plans_match_kernel_decisions():
             r = int(idx[row])
             want = r >= 0 and int(src_slots[r]) >= 0 and int(src_slots[r]) != int(dst_slots[r])
             assert bool(nd[row]) == want
-
-
-def test_full_table_view_never_exceeds_storage():
-    base = torch.zeros(4, 64, dtype=torch.int32)
-    v = sic._full_table(base[:2], 8)
-    assert v.shape == (4, 64)
 
 
 # ---------------------------------------------------------------- gather kernel

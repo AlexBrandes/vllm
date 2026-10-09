@@ -158,7 +158,7 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         if not self._align_mode:
             return
-        mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+        mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         if self._mamba_state_copy_funcs is None:
             mamba_groups = get_mamba_groups(kv_cache_config)
             mamba_types = {spec.mamba_type for spec in mamba_groups}
@@ -189,6 +189,13 @@ class MambaHybridModelState(DefaultModelState):
             [block_tables.block_tables[gid].gpu for gid in mamba_group_ids],
             [block_tables.input_block_tables[gid] for gid in mamba_group_ids],
         )
+        if _state_index_check():
+            # Debug check of the state copies: the same per-request-slot tables.
+            self._sic_tables = [
+                block_tables.block_tables[gid].gpu for gid in mamba_group_ids
+            ]
+            self._sic_num_blocks = kv_cache_config.num_blocks
+            self._sic_block_size = mamba_spec.block_size
 
     def preprocess_state(
         self,
@@ -235,13 +242,9 @@ class MambaHybridModelState(DefaultModelState):
         if _state_index_check():
             from vllm.sm80.worker import state_index_check as sic
 
-            self._sic_tables = [block_tables[gid] for gid in mamba_group_ids]
-            self._sic_num_blocks = kv_cache_config.num_blocks
-            self._sic_block_size = mamba_spec.block_size
             idx = input_batch.idx_mapping[:num_reqs]
             sic.check_align_copies(
-                "pre-copy", self._sic_tables, self.max_num_reqs,
-                kv_cache_config.num_blocks, idx,
+                "pre-copy", self._sic_tables, self._sic_num_blocks, idx,
                 *sic.precopy_plan(self._mamba_src_col_gpu, self._mamba_state_idx_gpu,
                                   self._mamba_src_off_gpu, idx),
             )
@@ -423,12 +426,11 @@ class MambaHybridModelState(DefaultModelState):
             and num_computed_tokens is not None
             and self._mamba_ctx is not None
         ):
-            if _state_index_check() and getattr(self, "_sic_tables", None):
+            if _state_index_check():
                 from vllm.sm80.worker import state_index_check as sic
 
                 sic.check_align_copies(
-                    "post-copy", self._sic_tables, self.max_num_reqs,
-                    self._sic_num_blocks, idx_mapping,
+                    "post-copy", self._sic_tables, self._sic_num_blocks, idx_mapping,
                     *sic.postcopy_plan(self.num_accepted_tokens_gpu,
                                        self._mamba_state_idx_gpu,
                                        num_computed_tokens, idx_mapping,
