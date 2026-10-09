@@ -76,7 +76,7 @@ says which layout each serves):
 - Fused decode kernels for mHC mixing, MoE routing and alignment, and the KDA
   decode step (gate projections, convolution, delta rule and gated norm in one
   kernel, one KDA state per request under TP4) — `VLLM_AMPERE_DECODE_KERNELS`;
-  its TP4 verify (the commit fold's included) with at most 8 rows per warp,
+  its TP4 verify (the commit fold's included) with at most 16 rows per warp,
   less stack and more KV cache, bitwise the same
   (not yet validated, off unless set) — `VLLM_AMPERE_KDA_SMALL_STACK`;
   the KDA step for PP4 decode batches beyond one short request (where it

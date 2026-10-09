@@ -126,8 +126,12 @@ _WS_T = 8                  # token rows per head in the workspace
 # out of the KV cache. The small-stack config keeps one warp per CTA with
 # SMALL_STACK_ROWS_MAX rows (more CTAs): the warp's layouts, hence every
 # reduction order, stay those of the 32-row config (two warps would sum the
-# q / k norms across warps), and the stack stays under 1,024 B.
-SMALL_STACK_ROWS_MAX = 8
+# q / k norms across warps), so 16 and 8 rows give bitwise the same outputs,
+# records and states. At 16 rows the stack is at most 872 B per thread (the
+# commit fold's verify, T 7-8 SKIP_NORM, sm_80), under the 1,024 B default, so
+# nothing beyond the default is reserved; against 8 rows (twice the CTAs) the
+# verify at 8 requests, T 4, measured 53.5 -> 39.9 us per call on a CMP 170HX.
+SMALL_STACK_ROWS_MAX = 16
 
 
 def _kda_tile(step_bound: int | None, window: int, keep_same_rows: bool = False) -> int:

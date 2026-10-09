@@ -22,9 +22,9 @@ Kernels used by one model only. Each model keeps its own copy.
 |---|---:|
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
-| `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,049 |
+| `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,053 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **4 files** | **3,082** |
+| **4 files** | **3,086** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -191,7 +191,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_kda_fold.py` | 1,030 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
 | `tests/kernels/test_ampere_kda_recover.py` | 867 |
-| `tests/kernels/test_ampere_kda_small_stack.py` | 310 |
+| `tests/kernels/test_ampere_kda_small_stack.py` | 504 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 193 |
 | `tests/kernels/test_ampere_marlin_optional.py` | 231 |
 | `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 412 |
@@ -267,7 +267,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **98 files** | **34,023** |
+| **98 files** | **34,217** |
 
 #### `tools/`
 
@@ -469,11 +469,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 85 |
-| Fork-added product lines | 24,049 |
+| Fork-added product lines | 24,053 |
 | Patched upstream files | 83 |
 | Patched upstream lines | +4,807 / -814 |
 | Patched upstream product files | 60 |
 | Patched upstream product lines | +3,766 / -253 |
-| Product lines added (new files and patches) | 27,815 |
+| Product lines added (new files and patches) | 27,819 |
 | Fork environment variables (flags) | 63 |
 | Unreferenced fork definitions | 0 (0 lines) |

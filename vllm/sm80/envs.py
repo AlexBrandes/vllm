@@ -346,14 +346,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))
     ),
     # RecoverSSM verify of the fused KDA decode (TP4, kda_decode.py; the commit
-    # fold's included): nseq 7-8 take one 8-row warp per CTA (four times the
+    # fold's included): nseq 7-8 take one 16-row warp per CTA (twice the
     # CTAs) instead of one 32-row warp that spills 2,184 B of stack per thread
-    # (2,624 B with the fold). The driver reserves the largest
-    # stack launched (at least its default 1,024 B) for every thread an SM can
-    # hold and the verify's first launch falls in the CUDA-graph memory
-    # profile, so the smaller stack leaves that memory to the KV cache. The
-    # same warp layouts, hence bitwise the same outputs and states. Off by
-    # default; no effect where RecoverSSM is off.
+    # (2,624 B with the fold; at most 872 B at 16 rows). The driver reserves
+    # the largest stack launched (at least its default 1,024 B) for every
+    # thread an SM can hold and the verify's first launch falls in the
+    # CUDA-graph memory profile, so the smaller stack leaves that memory to
+    # the KV cache. The same warp layouts, hence bitwise the same outputs and
+    # states. Off by default; no effect where RecoverSSM is off.
     "VLLM_AMPERE_KDA_SMALL_STACK": lambda: bool(
         int(os.getenv("VLLM_AMPERE_KDA_SMALL_STACK", "0"))
     ),
