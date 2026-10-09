@@ -1039,7 +1039,7 @@ seams:
   kind: method
   target: vllm.model_executor.model_loader.base_loader:BaseModelLoader.load_model
   why: Exl3ModelLoader relies on create_model, then load_weights, then process_weights_after_loading, in that order
-  sha256: 62172ee4f85c6cf6c94b7e5b129a8234f7e86419d8fa8b1711c8f0a08c21e9f7
+  sha256: 103e1a533be26717389d41b43327ca11f572c40db46def4204b0cd9afef56581
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, model_config: vllm.config.model.ModelConfig, prefix: str = '''') -> torch.nn.modules.module.Module'
 
 - id: loader-base-create-model
