@@ -627,6 +627,7 @@ def _real_config_build(monkeypatch, fold, cache_mode, query_lens, prefill):
 
     kr.FoldState._states.clear()
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "1")
+    monkeypatch.setenv("VLLM_AMPERE_KDA_RECOVER_OFF", "0")
     # FoldState allocates with zeros/full (the fixture redirects empty/ones)
     for fn in ("zeros", "full"):
         def allocate(*args, _original=getattr(torch, fn), **kwargs):

@@ -42,11 +42,13 @@ def env(fold: bool):
 
     from vllm.sm80.kernels import _platform
 
-    keys = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_AMPERE_KDA_FOLD")
+    keys = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_AMPERE_KDA_FOLD",
+            "VLLM_AMPERE_KDA_RECOVER_OFF")
     saved = {k: os.environ.get(k) for k in keys}
     sm80 = _platform._SM80_CACHE
     os.environ["VLLM_AMPERE_DECODE_KERNELS"] = "1"
     os.environ["VLLM_AMPERE_KDA_FOLD"] = "1" if fold else "0"
+    os.environ["VLLM_AMPERE_KDA_RECOVER_OFF"] = "0"
     _platform._SM80_CACHE = True
 
     def undo():

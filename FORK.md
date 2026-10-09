@@ -175,7 +175,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/distributed/test_pcie_p2p_gate.py` | 510 |
 | `tests/kernels/ampere_sass.py` | 81 |
 | `tests/kernels/interpreter_child.py` | 107 |
-| `tests/kernels/kda_fold_world.py` | 612 |
+| `tests/kernels/kda_fold_world.py` | 614 |
 | `tests/kernels/kda_recover_reference.py` | 20 |
 | `tests/kernels/moe/test_moe_mask_padding.py` | 200 |
 | `tests/kernels/moe/test_moe_mask_padding_route_v2.py` | 415 |
@@ -188,7 +188,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_idx_glue.py` | 838 |
 | `tests/kernels/test_ampere_indexer_decode_raw_k.py` | 270 |
 | `tests/kernels/test_ampere_kda_dispatch.py` | 836 |
-| `tests/kernels/test_ampere_kda_fold.py` | 1,030 |
+| `tests/kernels/test_ampere_kda_fold.py` | 1,031 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
 | `tests/kernels/test_ampere_kda_recover.py` | 1,000 |
 | `tests/kernels/test_ampere_kda_small_stack.py` | 504 |
@@ -267,7 +267,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **98 files** | **34,374** |
+| **98 files** | **34,377** |
 
 #### `tools/`
 
