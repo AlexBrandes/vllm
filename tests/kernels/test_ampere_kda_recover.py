@@ -308,6 +308,11 @@ def _recovery_control_path(dev):
 
     def precopy(table, rec, conv, cols, accepted, computed, query):
         mapping = tensor([2])
+        # The copy kernels read the per-request-slot tables: the request's
+        # batch row 0 sits at its state slot, the other slots are NULL.
+        slot_table = torch.zeros(cols.numel(), table.shape[1], dtype=table.dtype,
+                                 device=dev)
+        slot_table[mapping[0]] = table[0]
         src_col, src_off = torch.full_like(cols, -9), torch.full_like(cols, -9)
         preprocess_mamba_align_fused_kernel[(1,)](
             mapping, cols, tensor([0, 0, computed]), tensor([0, query]), accepted,
@@ -316,7 +321,7 @@ def _recovery_control_path(dev):
         states = (conv, rec)
         precopy_mamba_align_fused_kernel[(1, 2)](
             cols, src_col, src_off,
-            tensor([table.data_ptr()], torch.int64), table.stride(0),
+            tensor([slot_table.data_ptr()], torch.int64), slot_table.stride(0),
             tensor([s.data_ptr() for s in states], torch.int64),
             tensor([s.stride(0) * s.element_size() for s in states], torch.int64),
             tensor([s.element_size() for s in states]),
