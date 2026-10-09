@@ -12,6 +12,15 @@ shared-expert deferral, and the subsequent shared add/all-reduce. Fully masked
 CUDA-graph padding rows remain don't-care; no routing or padding flag changes.
 Persistent buffers are shared by serialized calls on each device, as are the
 released alignment buffers. No CUDA source compilation occurs here.
+
+VLLM_AMPERE_MARLIN_DECODE_V2 swaps decode_gemm_orig for decode_gemm_v2 on the
+tensor-parallel shard (N=512): the same partial planes and per-output order,
+an exact one-FMA dequant and per-row-count tiles. Its dequant is exact for
+weight scales 0 or in [2^-110, 2^10) (checked; up to the sign of zero
+weights); it carries the fp32 sums at 2^-16 scale, so the output equals
+decode_gemm_orig's bit for bit as long as no nonzero weight-activation
+product falls below 2^-110 in magnitude (a subnormal there, which the mma is
+assumed to keep unflushed): far below production magnitudes.
 """
 
 import functools
@@ -38,6 +47,12 @@ _WORKSPACES: dict = {}
 # W13 fp32 partial planes (the kernel splits K four ways).
 _W13_PLANES = 4
 _RETIRED: list = []
+# decode_gemm_v2: the expert width it is built and validated for, and its
+# exact-dequant scale range as bf16 magnitude bits (2^-110 = 0x0880,
+# 2^10 = 0x4480); scales are checked in chunks of _V2_SCALE_CHUNK.
+_V2_N = 512
+_V2_SCALE_MIN_BITS, _V2_SCALE_END_BITS = 0x0880, 0x4480
+_V2_SCALE_CHUNK = 1 << 20
 # The decode scratch (TP4 shards N=512 and whole experts N=2048) is created only
 # after the KV cache is sized (kernel_warmup opens it). Earlier calls -- the
 # profile run and the CUDA-graph memory profiling, which runs capture warmups
@@ -103,6 +118,71 @@ def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
 
 def _config(num_tokens: int) -> tuple[int, int]:
     return (49 if num_tokens >= 16 else 0, 49 if num_tokens > 16 else 0)
+
+
+def _config_v2(num_tokens: int) -> tuple[int, int]:
+    """decode_gemm_v2 cfg codes (w13, w2): index into its AMPERE_MARLIN_CFGS +
+    16 * max CTAs per SM. 2-3 rows: 4-row chunks (cfg 2); 4-7 rows: 4-row
+    chunks x two tiles (cfg 3); 32 rows: cfg 9 (cfg 1 with zero activation
+    fragments for padding tokens), at most 3 CTAs per SM; otherwise
+    ``_config``'s codes."""
+    if 4 <= num_tokens < 8:
+        return (3, 3)
+    if 2 <= num_tokens < 4:
+        return (2, 2)
+    if num_tokens >= 32:
+        return (57, 57)
+    return _config(num_tokens)
+
+
+def _scales_in_v2_range(scale: torch.Tensor) -> bool:
+    """True when every bf16 scale is 0 or 2^-110 <= |s| < 2^10, where
+    decode_gemm_v2's dequant is exact. One host sync; chunked so the
+    temporaries stay small."""
+    if scale.dtype != torch.bfloat16:
+        return False
+    bad = []
+    for chunk in scale.reshape(-1).split(_V2_SCALE_CHUNK):
+        mag = chunk.view(torch.int16) & 0x7FFF
+        bad.append(((mag != 0) & ((mag < _V2_SCALE_MIN_BITS)
+                                  | (mag >= _V2_SCALE_END_BITS))).any())
+    return not bool(torch.stack(bad).any())
+
+
+def _v2_gemm(layer, N: int):
+    """decode_gemm_v2 for this layer, or None (decode_gemm_orig runs; the
+    reason is logged once). The scale range is checked on the first call
+    outside CUDA capture and cached on the layer per scale tensor object:
+    scales rewritten in place afterwards are not rechecked."""
+    from vllm.sm80.kernels.marlin_moe.extension import decode_v2_op
+
+    op, why = decode_v2_op()
+    if op is not None and N != _V2_N:
+        op, why = None, "expert width N=%d per rank; validated for N=%d" % (N, _V2_N)
+    if op is not None:
+        s1, s2 = layer.w1_scale, layer.w2_scale
+        checked = getattr(layer, "_ampere_marlin_decode_v2_scales", None)
+        if checked is None or checked[0] is not s1 or checked[1] is not s2:
+            if torch.cuda.is_current_stream_capturing():
+                checked = None
+                op, why = None, "weight scales not checked before CUDA capture"
+            else:
+                checked = (s1, s2, _scales_in_v2_range(s1)
+                           and _scales_in_v2_range(s2))
+                layer._ampere_marlin_decode_v2_scales = checked
+        if checked is not None and not checked[2]:
+            op, why = None, "a weight scale lies outside [2^-110, 2^10)"
+    if op is None:
+        logger.info_once(
+            "VLLM_AMPERE_MARLIN_DECODE_V2 is set but the gate is closed (%s); "
+            "using decode_gemm_orig.", why,
+        )
+        return None
+    logger.info_once(
+        "Compiled Marlin MoE decode v2 active (VLLM_AMPERE_MARLIN_DECODE_V2): "
+        "sm_80, N=%d, 1 <= M <= %d.", _V2_N, MAX_TOKENS,
+    )
+    return op
 
 
 def _workspaces(device, N: int, max_tokens: int, *, create: bool):
@@ -219,13 +299,19 @@ def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
         "4..8" if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS else "{4, 8}",
         "".join(", %d..%d" % r for r in pp_multi_ranges()),
     )
-    run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids, activation)
+    gemm_v2 = None
+    if envs.VLLM_AMPERE_MARLIN_DECODE_V2:
+        gemm_v2 = _v2_gemm(layer, w2.size(1) * 16)
+    run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
+        gemm_v2=gemm_v2)
     return True
 
 
 def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
-        activation):
+        activation, gemm_v2=None):
     """Run into caller storage; direct calls also support N=2048 and M<=64.
+    ``gemm_v2`` (from ``_v2_gemm``) replaces decode_gemm_orig and its configs
+    for both GEMMs.
 
     Call ``warmup`` first.
     """
@@ -242,14 +328,19 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     h = ws["h"][:slots * N].view(slots, N)
     c3 = ws["c3"][:slots * K].view(slots, K)
     tw = topk_weights.view(-1)
-    c13, c2 = _config(M)
-    ksplit = ops.decode_gemm_orig(
+    if gemm_v2 is None:
+        gemm = ops.decode_gemm_orig
+        c13, c2 = _config(M)
+    else:
+        gemm = gemm_v2
+        c13, c2 = _config_v2(M)
+    ksplit = gemm(
         hidden_states, w1, layer.w1_scale, sorted_ids, expert_ids, ntpp, tw,
         TOPK_GATE, slots, K, 2 * N, True, W13_ROWS, c13, ws["ctr"], ws["part"],
     )
     ops.decode_act_orig(ws["part"], topk_ids.view(-1), ksplit, slots, N,
                         layer.activation_config.clamp_limit, h)
-    ops.decode_gemm_orig(
+    gemm(
         h, w2, layer.w2_scale, sorted_ids, expert_ids, ntpp, tw,
         TOPK_GATE, slots, N, K, False, N // 16, c2, ws["ctr"], c3,
     )
@@ -257,8 +348,35 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
     return output
 
 
+def _warm_v2(device, ws) -> None:
+    """Launch every decode_gemm_v2 variant ``_config_v2`` can pick once with
+    no work items (ntpp = 0), so kernel loading and the per-variant attribute
+    setup happen before CUDA-graph capture. Writes nothing but the zeroed
+    work counters."""
+    from vllm.sm80.kernels.marlin_moe.extension import decode_v2_op
+
+    op, _ = decode_v2_op()
+    if op is None:
+        return
+    K, N = K_GATE, _V2_N
+    w = torch.zeros(4, device=device, dtype=torch.int32)
+    s = torch.zeros(8, device=device, dtype=torch.bfloat16)
+    a13 = torch.zeros(1, K, device=device, dtype=torch.bfloat16)
+    a2 = torch.zeros(1, N, device=device, dtype=torch.bfloat16)
+    ntpp = torch.zeros(1, device=device, dtype=torch.int32)
+    tw = torch.zeros(MAX_TOKENS * TOPK_GATE, device=device, dtype=torch.float32)
+    for m in (1, 2, 4, 16, 17, MAX_TOKENS):
+        c13, c2 = _config_v2(m)
+        slots = m * TOPK_GATE
+        op(a13, w, s, ws["sorted"], ws["experts"], ntpp, tw, TOPK_GATE, slots,
+           K, 2 * N, True, W13_ROWS, c13, ws["ctr"], ws["part"])
+        op(a2, w, s, ws["sorted"], ws["experts"], ntpp, tw, TOPK_GATE, slots,
+           N, K, False, N // 16, c2, ws["ctr"], ws["c3"])
+
+
 def warmup(device, N=512, max_tokens=None):
-    """Reserve scratch and warm the selected released alignment implementation."""
+    """Reserve scratch and warm the selected released alignment implementation
+    (and decode_gemm_v2's variants when VLLM_AMPERE_MARLIN_DECODE_V2 is set)."""
     from vllm.sm80.kernels.marlin_moe.extension import require_extension
 
     require_extension()
@@ -269,6 +387,8 @@ def warmup(device, N=512, max_tokens=None):
         ws = _workspaces(device, N, max_tokens, create=True)
         ids = torch.zeros(max_tokens, TOPK_GATE, device=device, dtype=torch.int32)
         _align(ids, ws)
+        if envs.VLLM_AMPERE_MARLIN_DECODE_V2 and N == _V2_N:
+            _warm_v2(device, ws)
 
 
 def warmup_from_worker(worker):

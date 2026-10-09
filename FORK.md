@@ -60,8 +60,8 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/kda/__init__.py` | 11 |
 | `vllm/sm80/kernels/kda/recover.py` | 1,054 |
 | `vllm/sm80/kernels/marlin_moe/__init__.py` | 13 |
-| `vllm/sm80/kernels/marlin_moe/decode.py` | 321 |
-| `vllm/sm80/kernels/marlin_moe/extension.py` | 138 |
+| `vllm/sm80/kernels/marlin_moe/decode.py` | 441 |
+| `vllm/sm80/kernels/marlin_moe/extension.py` | 169 |
 | `vllm/sm80/kernels/marlin_moe/prefill.py` | 492 |
 | `vllm/sm80/kernels/marlin_moe/split_align.py` | 224 |
 | `vllm/sm80/kernels/mhc/__init__.py` | 114 |
@@ -80,7 +80,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 138 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **36 files** | **11,413** |
+| **36 files** | **11,564** |
 
 ### `vllm/sm80/`
 
@@ -96,7 +96,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 640 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 838 |
+| `vllm/sm80/envs.py` | 851 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
@@ -110,7 +110,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/layers/moe/shared_experts.py` | 134 |
 | `vllm/sm80/model_registry.py` | 56 |
 | `vllm/sm80/platform.py` | 139 |
-| `vllm/sm80/plugin.py` | 253 |
+| `vllm/sm80/plugin.py` | 273 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
 | `vllm/sm80/spec_decode/aux_fc_fold.py` | 173 |
@@ -121,7 +121,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **33 files** | **7,958** |
+| **33 files** | **7,991** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -132,11 +132,12 @@ An optional native library for the Marlin MoE kernels. vLLM runs without it.
 | `csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py` | 101 |
 | `csrc/libtorch_stable/moe/ampere_marlin/common_tiles.h` | 26 |
 | `csrc/libtorch_stable/moe/ampere_marlin/decode_orig.cu` | 416 |
+| `csrc/libtorch_stable/moe/ampere_marlin/decode_v2.cu` | 404 |
 | `csrc/libtorch_stable/moe/ampere_marlin/kernel_selector_tiles.h` | 35 |
 | `csrc/libtorch_stable/moe/ampere_marlin/kernels_tiles_sm80.cu` | 25 |
 | `csrc/libtorch_stable/moe/ampere_marlin/module.cpp` | 28 |
 | `csrc/libtorch_stable/moe/ampere_marlin/prefill_tiles.cu` | 34 |
-| **7 files** | **665** |
+| **8 files** | **1,069** |
 
 ### Other fork-owned files
 
@@ -193,9 +194,10 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_kda_recover.py` | 1,000 |
 | `tests/kernels/test_ampere_kda_small_stack.py` | 504 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 193 |
+| `tests/kernels/test_ampere_marlin_decode_v2.py` | 625 |
 | `tests/kernels/test_ampere_marlin_optional.py` | 231 |
 | `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 412 |
-| `tests/kernels/test_ampere_marlin_prefill_tiles.py` | 859 |
+| `tests/kernels/test_ampere_marlin_prefill_tiles.py` | 860 |
 | `tests/kernels/test_ampere_moe_route.py` | 393 |
 | `tests/kernels/test_ampere_pp_kda_prefill.py` | 454 |
 | `tests/kernels/test_ampere_pp_marlin_prefill.py` | 691 |
@@ -267,7 +269,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **98 files** | **34,377** |
+| **99 files** | **35,003** |
 
 #### `tools/`
 
@@ -284,7 +286,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Path | Change | + | - | Hunks |
 |---|---|---:|---:|---:|
-| `CMakeLists.txt` | modified | 46 | 0 | 3 |
+| `CMakeLists.txt` | modified | 47 | 0 | 3 |
 | `csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h` | modified | 46 | 0 | 6 |
 | `csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h` | modified | 320 | 11 | 37 |
 | `csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu` | modified | 150 | 4 | 34 |
@@ -344,7 +346,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 5 | 2 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **60 files** | | **3,766** | **253** | **481** |
+| **60 files** | | **3,767** | **253** | **481** |
 
 ### Tests, docs and .github
 
@@ -379,9 +381,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 60 | 3,766 | 253 | 481 |
+| Product code | 60 | 3,767 | 253 | 481 |
 | Tests, docs and .github | 23 | 1,045 | 561 | 78 |
-| All | 83 | 4,811 | 814 | 559 |
+| All | 83 | 4,812 | 814 | 559 |
 
 ## 3. Fork environment variables
 
@@ -400,6 +402,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_KDA_SMALL_STACK` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_BUILD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_CUDA` | `bool` | `False` | `'0'` |
+| `VLLM_AMPERE_MARLIN_DECODE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_NARROW` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` | `bool` | `True` | `'1'` |
@@ -455,7 +458,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **64 variables** | | | |
+| **65 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -469,12 +472,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 85 |
-| Fork-added product lines | 24,091 |
+| Fork-added product files | 86 |
+| Fork-added product lines | 24,679 |
 | Patched upstream files | 83 |
-| Patched upstream lines | +4,811 / -814 |
+| Patched upstream lines | +4,812 / -814 |
 | Patched upstream product files | 60 |
-| Patched upstream product lines | +3,766 / -253 |
-| Product lines added (new files and patches) | 27,857 |
-| Fork environment variables (flags) | 64 |
+| Patched upstream product lines | +3,767 / -253 |
+| Product lines added (new files and patches) | 28,446 |
+| Fork environment variables (flags) | 65 |
 | Unreferenced fork definitions | 0 (0 lines) |

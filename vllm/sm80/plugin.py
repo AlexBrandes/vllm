@@ -140,11 +140,31 @@ def register() -> None:
     _registered = True
     register_triton_mla_sparse_backend()
     register_moe_layers()
+    log_marlin_decode_v2_gate()
 
 
 def is_registered() -> bool:
     """Whether :func:`register` ran in this process."""
     return _registered
+
+
+def log_marlin_decode_v2_gate() -> None:
+    """Log once per process why ``VLLM_AMPERE_MARLIN_DECODE_V2`` alone has no
+    effect: decode_gemm_v2 runs only inside the compiled Marlin decode
+    (``VLLM_AMPERE_MARLIN_DECODE_CUDA``), which is not reached while that
+    switch is off. With it on, ``vllm/sm80/kernels/marlin_moe/decode.py`` logs
+    the v2 gate itself.
+    """
+    import vllm.envs as envs
+
+    if envs.VLLM_AMPERE_MARLIN_DECODE_CUDA or not envs.VLLM_AMPERE_MARLIN_DECODE_V2:
+        return
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info_once(
+        "VLLM_AMPERE_MARLIN_DECODE_V2 is set but the gate is closed "
+        "(VLLM_AMPERE_MARLIN_DECODE_CUDA=0); using released Marlin kernels."
+    )
 
 
 def _log_registered() -> None:

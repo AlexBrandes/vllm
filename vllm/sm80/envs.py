@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     VLLM_AMPERE_MARLIN_PREFILL_NARROW: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_AMPERE_MARLIN_DECODE_CUDA: bool = False
+    VLLM_AMPERE_MARLIN_DECODE_V2: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
@@ -589,6 +590,18 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # incompatible.
     "VLLM_AMPERE_MARLIN_DECODE_CUDA": lambda: bool(
         int(os.getenv("VLLM_AMPERE_MARLIN_DECODE_CUDA", "0"))
+    ),
+    # With VLLM_AMPERE_MARLIN_DECODE_CUDA=1: run the tensor-parallel (N=512)
+    # decode GEMMs through the library's decode_gemm_v2 (one-FMA exact
+    # dequant, 4-row chunks at 2-7 rows, zero padding fragments at 32 rows).
+    # Same per-output summation order as decode_gemm_orig, so the output is
+    # bitwise equal to it while every weight scale lies in [2^-110, 2^10) or
+    # is zero (checked once per layer) and no nonzero weight-activation
+    # product is below 2^-110 (vllm/sm80/kernels/marlin_moe/decode.py).
+    # Without the op, at other widths, or out of that scale range,
+    # decode_gemm_orig runs. Off by default.
+    "VLLM_AMPERE_MARLIN_DECODE_V2": lambda: bool(
+        int(os.getenv("VLLM_AMPERE_MARLIN_DECODE_V2", "0"))
     ),
     # Whole-expert (pipeline-parallel, N=2048) compiled decode also at 5-7
     # rows (draft depths 4-6 of one request), not only at 4 and 8. Needs
