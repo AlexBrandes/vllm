@@ -4,7 +4,7 @@
 
 This repository is Morrowmake's fork of vLLM for the NVIDIA CMP 170HX and other sm_80 (GA100-class) GPUs. It is a general vLLM: it serves the same models as upstream. The license is Apache-2.0, as upstream.
 
-Upstream base: efd141047d8e879536806a86e3f93c02e6164add
+Upstream base: 81c993658e0bbdbf9d30c92cfc52baa73853b242
 
 All numbers compare the working tree with this commit. A fork-owned path does not exist at the base. An upstream-owned path does. This file is not listed in its own tables.
 
