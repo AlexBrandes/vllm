@@ -59,9 +59,12 @@ def test_glm_model_info_matches_upstream(architecture):
     info = _ModelInfo.from_model_cls(fork_cls)
     assert info == _ModelInfo.from_model_cls(upstream_cls)
     assert info.supports_pp and info.is_hybrid and info.has_inner_state
-    # The drafters read auxiliary hidden states from the fork classes only.
+    # Drafters read auxiliary hidden states from the registered classes, whose
+    # backbone (the fork one, see adopt) also carries them across PP stages.
     assert supports_eagle3(fork_cls)
-    assert not supports_eagle3(upstream_cls)
+    fork_backbone = importlib.import_module(fork_cls.__module__).Glm5NextModel
+    assert issubclass(fork_backbone, upstream.Glm5NextModel)
+    assert fork_backbone.supports_aux_hidden_states_over_pp
 
 
 

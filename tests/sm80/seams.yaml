@@ -35,15 +35,15 @@ seams:
 - id: glm-model-init
   kind: method
   target: vllm.models.glm5next.common.model:Glm5NextModel.__init__
-  why: fork Glm5NextModel.adopt takes the upstream-built backbone; it reads config (mhc, hc_mult, hidden_size, aux_hidden_state_tensor) and replaces the embed_tokens PPMissingLayer in place; the copied forward reads layers/_active_layers, norm, is_sequence_parallel, device
-  sha256: b9516f97fa30b71d17f17c6360b153f0dccb5ae6daa16bb4c6fe09cb633510a9
+  why: fork Glm5NextModel.adopt takes the upstream-built backbone; it reads config (mhc, hc_mult, hidden_size, aux_hidden_state_tensor) and replaces the embed_tokens PPMissingLayer in place; the copied forward reads layers/_active_layers, norm, is_sequence_parallel, device; upstream's _aux_post_op is built but unused by the copied forward
+  sha256: db6257e0d27aedc6374d0e8b250f0db41a7c621dfae27d488a518606aa78c393
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: glm-model-forward
   kind: method
   target: vllm.models.glm5next.common.model:Glm5NextModel.forward
-  why: fork Glm5NextModel.forward is this method plus the pipeline boundary and aux hidden state code; an upstream change here must be carried into the copy
-  sha256: 51c7547878c942777d0b1c5855fcfff27c99f4225b996f588e964a719671d43f
+  why: fork Glm5NextModel.forward is this method plus the pipeline boundary, the aux_hidden_state_tensor choice and the drafter fc fold; its aux capture replaces upstream's _aux_hidden_state at the same positions (aux layer id i = the state after layer i - 1, plus end_layer) but contracts by hc_mult; an upstream change here must be carried into the copy
+  sha256: 7617754e7c91e47f0a3ba90aa487af709126cece024b6b26a72925a6ff944aba
   signature: '(self, input_ids: torch.Tensor | None, positions: torch.Tensor, intermediate_tensors: vllm.sequence.IntermediateTensors | None, inputs_embeds: torch.Tensor | None = None, **kwargs) -> torch.Tensor'
 
 - id: glm-causal-lm-init
@@ -279,15 +279,15 @@ seams:
 - id: glm-upstream-causal-lm-class
   kind: function
   target: vllm.models.glm5next.common.model:Glm5NextForCausalLM
-  why: whole upstream class the fork Glm5NextForCausalLM extends (bases, class attributes and methods it inherits)
-  sha256: 9f9972f8f621deb9d4130016cb0f1f9ad672b48eab652b3ebc5337cda62ff2e2
+  why: whole upstream class the fork Glm5NextForCausalLM extends (bases, including SupportsEagle3, class attributes and methods it inherits)
+  sha256: 95a9dac847940609beda9b087d337fb76d783cbbe732f808f4f375cdf633593f
   signature: '(*, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: glm-upstream-conditional-class
   kind: function
   target: vllm.models.glm5next.common.model:Glm5NextForConditionalGeneration
-  why: whole upstream class the fork Glm5NextForConditionalGeneration extends (bases, class attributes and methods it inherits)
-  sha256: 787070d71f3aabe1166407a9a880b0cdb4eb56eeb190ca063ded2775d74a596a
+  why: whole upstream class the fork Glm5NextForConditionalGeneration extends (bases, including SupportsEagle3, class attributes and methods it inherits)
+  sha256: 0424e61bc7429deba96bb92874e7e542cb6310d8c03f9c9d94138654d66ccc7c
   signature: '(*, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: envs-getattr

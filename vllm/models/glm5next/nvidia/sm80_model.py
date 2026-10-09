@@ -12,8 +12,9 @@ What the subclasses add:
 
 - pipeline parallelism: the boundary tensors (the mHC residual streams) and
   ``make_empty_intermediate_tensors``;
-- auxiliary hidden states for EAGLE3/DFlash drafters, also across pipeline
-  stages, and the drafter fc fold (``vllm/sm80/spec_decode/aux_fc_fold.py``);
+- auxiliary hidden states for EAGLE3/DFlash drafters across pipeline stages,
+  the choice of the captured tensor (``aux_hidden_state_tensor``) and the
+  drafter fc fold (``vllm/sm80/spec_decode/aux_fc_fold.py``);
 - the target embedding on the last pipeline stage when a drafter there
   shares it;
 - ``compute_logits_local`` for ``--enable-batch-sharded-sampling``;
@@ -38,7 +39,6 @@ from vllm.model_executor.layers.mhc import hc_contract
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
@@ -105,7 +105,7 @@ def _drafter_target_embedding(
     )
 
 
-class Glm5NextModel(glm_model.Glm5NextModel, EagleModelMixin):
+class Glm5NextModel(glm_model.Glm5NextModel):
     """Backbone with pipeline-parallel mHC boundaries and drafter aux states.
 
     Auxiliary hidden states for EAGLE3/DFlash drafters cross pipeline stages
@@ -118,6 +118,12 @@ class Glm5NextModel(glm_model.Glm5NextModel, EagleModelMixin):
     order exactly as with PP=1. Each captured state is already the
     contracted [num_tokens, hidden_size] tensor, which is the width the
     relay slots reserve (reserve_aux_intermediate_tensor_slots).
+
+    ``forward`` replaces upstream's, including its aux capture
+    (``_aux_hidden_state``): that one has no pipeline boundary, ignores
+    ``aux_hidden_state_tensor``, and contracts the streams by
+    ``config.mhc_num_residual_streams``, which the GLM-5.3-Flash text config
+    does not carry (the stream count is ``config.hc_mult``).
     """
 
     supports_aux_hidden_states_over_pp: ClassVar[bool] = True
@@ -395,7 +401,7 @@ class Glm5NextModel(glm_model.Glm5NextModel, EagleModelMixin):
         return hidden_states
 
 
-class Glm5NextForCausalLM(glm_model.Glm5NextForCausalLM, SupportsEagle3):
+class Glm5NextForCausalLM(glm_model.Glm5NextForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         embed_tokens = _drafter_target_embedding(
             vllm_config, maybe_prefix(prefix, "model")
@@ -424,9 +430,7 @@ class Glm5NextForCausalLM(glm_model.Glm5NextForCausalLM, SupportsEagle3):
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
 
-class Glm5NextForConditionalGeneration(
-    glm_model.Glm5NextForConditionalGeneration, SupportsEagle3
-):
+class Glm5NextForConditionalGeneration(glm_model.Glm5NextForConditionalGeneration):
     """The multimodal wrapper. Its ``language_model`` is built through the
     registry under ``Glm5NextForCausalLM``, so it is this module's text model
     whenever the fork plugin has registered it."""
