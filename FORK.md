@@ -22,9 +22,9 @@ Kernels used by one model only. Each model keeps its own copy.
 |---|---:|
 | `vllm/models/glm5next/nvidia/ops/idx_glue.py` | 538 |
 | `vllm/models/glm5next/nvidia/ops/idx_glue_gates.py` | 99 |
-| `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 889 |
+| `vllm/models/glm5next/nvidia/ops/kda_decode.py` | 1,049 |
 | `vllm/models/glm5next/nvidia/ops/kda_prefill.py` | 1,396 |
-| **4 files** | **2,922** |
+| **4 files** | **3,082** |
 
 ### `vllm/models/<model>/nvidia/`
 
@@ -32,11 +32,11 @@ Model code of one model that the fork plugin registers in place of the upstream 
 
 | Path | Lines |
 |---|---:|
-| `vllm/models/glm5next/nvidia/model_state.py` | 55 |
+| `vllm/models/glm5next/nvidia/model_state.py` | 113 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
 | `vllm/models/glm5next/nvidia/sm80_model.py` | 464 |
-| **4 files** | **881** |
+| **4 files** | **939** |
 
 ### `vllm/sm80/kernels/`
 
@@ -58,7 +58,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/indexer/topk_tiefix.py` | 526 |
 | `vllm/sm80/kernels/indexer/topk_tiefix_gate.py` | 145 |
 | `vllm/sm80/kernels/kda/__init__.py` | 11 |
-| `vllm/sm80/kernels/kda/recover.py` | 453 |
+| `vllm/sm80/kernels/kda/recover.py` | 1,026 |
 | `vllm/sm80/kernels/marlin_moe/__init__.py` | 13 |
 | `vllm/sm80/kernels/marlin_moe/decode.py` | 321 |
 | `vllm/sm80/kernels/marlin_moe/extension.py` | 138 |
@@ -75,11 +75,12 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/moe/routing.py` | 709 |
 | `vllm/sm80/kernels/moe/sum.py` | 84 |
 | `vllm/sm80/kernels/moe/warmup.py` | 110 |
-| `vllm/sm80/kernels/thin_gemm/__init__.py` | 179 |
-| `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 680 |
-| `vllm/sm80/kernels/thin_gemm/warmup.py` | 131 |
+| `vllm/sm80/kernels/thin_gemm/__init__.py` | 189 |
+| `vllm/sm80/kernels/thin_gemm/concat.py` | 275 |
+| `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
+| `vllm/sm80/kernels/thin_gemm/warmup.py` | 138 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **35 files** | **10,163** |
+| **36 files** | **11,385** |
 
 ### `vllm/sm80/`
 
@@ -95,7 +96,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 640 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 797 |
+| `vllm/sm80/envs.py` | 828 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
@@ -120,7 +121,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **33 files** | **7,917** |
+| **33 files** | **7,948** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -174,6 +175,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/distributed/test_pcie_p2p_gate.py` | 510 |
 | `tests/kernels/ampere_sass.py` | 81 |
 | `tests/kernels/interpreter_child.py` | 107 |
+| `tests/kernels/kda_fold_world.py` | 612 |
 | `tests/kernels/kda_recover_reference.py` | 20 |
 | `tests/kernels/moe/test_moe_mask_padding.py` | 200 |
 | `tests/kernels/moe/test_moe_mask_padding_route_v2.py` | 415 |
@@ -186,8 +188,10 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_idx_glue.py` | 838 |
 | `tests/kernels/test_ampere_indexer_decode_raw_k.py` | 270 |
 | `tests/kernels/test_ampere_kda_dispatch.py` | 836 |
+| `tests/kernels/test_ampere_kda_fold.py` | 1,030 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
 | `tests/kernels/test_ampere_kda_recover.py` | 867 |
+| `tests/kernels/test_ampere_kda_small_stack.py` | 310 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 193 |
 | `tests/kernels/test_ampere_marlin_optional.py` | 231 |
 | `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 412 |
@@ -200,6 +204,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_prefill_pack_bf16x2.py` | 149 |
 | `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 429 |
 | `tests/kernels/test_ampere_thin_gemm.py` | 233 |
+| `tests/kernels/test_ampere_thin_gemm_concat.py` | 963 |
 | `tests/kernels/test_ampere_thin_gemm_v74.py` | 282 |
 | `tests/kernels/test_ampere_tp4_kda_prefill.py` | 365 |
 | `tests/kernels/test_ampere_tp4_marlin_prefill.py` | 417 |
@@ -227,10 +232,10 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/test_native_checkpoint_wrapper_meta.py` | 256 |
 | `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
 | `tests/plugins_tests/conftest.py` | 17 |
-| `tests/sm80/seams.yaml` | 987 |
+| `tests/sm80/seams.yaml` | 1,001 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_fork_map.py` | 55 |
-| `tests/sm80/test_glm_registrations.py` | 233 |
+| `tests/sm80/test_glm_registrations.py` | 305 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_plugin_banner.py` | 35 |
@@ -262,7 +267,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **94 files** | **31,022** |
+| **98 files** | **34,023** |
 
 #### `tools/`
 
@@ -354,7 +359,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `.github/ISSUE_TEMPLATE/700-performance-discussion.yml` | deleted | 0 | 59 | 1 |
 | `.github/ISSUE_TEMPLATE/750-RFC.yml` | deleted | 0 | 52 | 1 |
 | `.github/ISSUE_TEMPLATE/config.yml` | modified | 6 | 2 | 3 |
-| `README.md` | modified | 180 | 86 | 20 |
+| `README.md` | modified | 185 | 86 | 20 |
 | `docs/features/quantization/README.md` | modified | 63 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 3 | 1 | 1 |
@@ -368,15 +373,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 120 | 2 | 7 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 26 | 1 | 8 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **23 files** | | **1,036** | **561** | **78** |
+| **23 files** | | **1,041** | **561** | **78** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
 | Product code | 60 | 3,766 | 253 | 481 |
-| Tests, docs and .github | 23 | 1,036 | 561 | 78 |
-| All | 83 | 4,802 | 814 | 559 |
+| Tests, docs and .github | 23 | 1,041 | 561 | 78 |
+| All | 83 | 4,807 | 814 | 559 |
 
 ## 3. Fork environment variables
 
@@ -388,8 +393,10 @@ The default is the value the accessor uses when the variable is unset, as writte
 |---|---|---|---|
 | `VLLM_AMPERE_DECODE_IDX_GLUE` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_DECODE_KERNELS` | `bool` | `False` | `'0'` |
+| `VLLM_AMPERE_KDA_FOLD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_PREFILL_NARROW` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
+| `VLLM_AMPERE_KDA_SMALL_STACK` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_BUILD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_CUDA` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_NARROW` | `bool` | `False` | `'0'` |
@@ -444,9 +451,10 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
+| `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **60 variables** | | | |
+| **63 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -460,12 +468,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 84 |
-| Fork-added product lines | 22,578 |
+| Fork-added product files | 85 |
+| Fork-added product lines | 24,049 |
 | Patched upstream files | 83 |
-| Patched upstream lines | +4,802 / -814 |
+| Patched upstream lines | +4,807 / -814 |
 | Patched upstream product files | 60 |
 | Patched upstream product lines | +3,766 / -253 |
-| Product lines added (new files and patches) | 26,344 |
-| Fork environment variables (flags) | 60 |
+| Product lines added (new files and patches) | 27,815 |
+| Fork environment variables (flags) | 63 |
 | Unreferenced fork definitions | 0 (0 lines) |
