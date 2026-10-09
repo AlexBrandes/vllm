@@ -148,7 +148,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.prepare_attn
   why: records the RecoverSSM step through self.recoverssm when it is set
-  sha256: ec8fd9de540091a759ffd0fd4565c3f31ee17f0b167b1f10a78a0b410de7b9da
+  sha256: 0a09be223419a915c85bd6aaf685d9bba883bbf79362a06ff0c2de9cca371d35
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, cudagraph_mode: vllm.config.compilation.CUDAGraphMode, block_tables: tuple[torch.Tensor, ...], slot_mappings: torch.Tensor, attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, for_capture: bool = False, ubatch_idx: int = 0, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None) -> dict[str, typing.Any]'
 
 - id: glm-mamba-state-postprocess
@@ -231,14 +231,14 @@ seams:
   kind: method
   target: vllm.v1.attention.backends.gdn_attn:GDNAttentionMetadataBuilder.__init__
   why: the fork builder creates the RecoverSSM state after it, where the base did; reads use_spec_decode and sets supports_update_block_table
-  sha256: 044b7a3e27fc68396cb4588f31415d140681b6cfec3cf0bca0a8ae2d3a8ea477
+  sha256: 0a421eb2cff744540a77baf9274213cde33724ae4a869a68c207b5b0b31191f5
   signature: '(self, kv_cache_spec: vllm.v1.kv_cache_interface.MambaSpec, layer_names: list[str], vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
 
 - id: glm-gdn-builder-build
   kind: method
   target: vllm.v1.attention.backends.gdn_attn:GDNAttentionMetadataBuilder.build
   why: returns a new GDNAttentionMetadata and leaves common_attn_metadata as passed; num_spec_decodes and spec_sequence_masks_cpu are its fields, so the fork builder can copy it into the GLM metadata, add the bound and wrap RecoverSSM
-  sha256: 34d311c83ad6fb6918296a9c770820d504f008f5bf2f767b3909adab6d629788
+  sha256: a7d1507b82c31d34a1cd0821e1c509f5ea1f40e7fc51fbe8f829f12b36d55782
   signature: '(self, common_prefix_len: int, common_attn_metadata: vllm.v1.attention.backend.CommonAttentionMetadata, num_accepted_tokens: torch.Tensor | None = None, num_decode_draft_tokens_cpu: torch.Tensor | None = None, fast_build: bool = False) -> vllm.v1.attention.backends.gdn_attn.GDNAttentionMetadata'
 
 - id: glm-gdn-builder-capture
@@ -411,7 +411,7 @@ seams:
   kind: method
   target: vllm.config.vllm:VllmConfig.__post_init__
   why: calls the fork plugin guard, which checks that the fork plugin was loaded
-  sha256: cadc8d3c7dbe1eea57a2b4c1324a2bd997566c77d427d35e9e0224fa88b1b6ac
+  sha256: 6a457a49ee7d10dcae933e7ac099751700c2f85fb8fddcf954007314e8692c15
   signature: (self)
 
 - id: platform-plugins-group
@@ -507,8 +507,8 @@ seams:
   kind: function
   target: vllm.v1.attention.backends.registry:register_backend
   why: puts the Triton sparse-MLA backend path into the CUSTOM slot
-  sha256: 731950f67c3e08233734b91d2dcfac1da132e2af211261de10a2a6c80ef04541
-  signature: '(backend: vllm.v1.attention.backends.registry.AttentionBackendEnum | vllm.v1.attention.backends.registry.MambaAttentionBackendEnum, class_path: str | None = None, is_mamba: bool = False) -> collections.abc.Callable[[type], type]'
+  sha256: 86320b69bbd639ad880a9b05f63f399ce7b72cb2a9e0b206d034b25b08e83465
+  signature: '(backend: vllm.v1.attention.backends.registry.AttentionBackendEnum | vllm.v1.attention.backends.registry.MambaAttentionBackendEnum | str, class_path: str | None = None, is_mamba: bool = False) -> collections.abc.Callable[[type], type]'
 
 - id: attn-get-attn-backend-cls
   kind: method
@@ -521,7 +521,7 @@ seams:
   kind: method
   target: vllm.distributed.device_communicators.cuda_communicator:CudaCommunicator.__init__
   why: Sm80CudaCommunicator runs it, then swaps ca_comm to Sm80CustomAllreduce (flags) and builds the host-staged all-reduce; relies on the attribute names ca_comm, qr_comm, fi_ar_comm, fi_pcie_ipc_ar_comm, aiter_ar_comm, use_aiter_allreduce, symm_mem_comm, pynccl_comm and on it calling _log_all_reduce_backend_selection last
-  sha256: ff351951793083a4b5f4f7d1842fc4d3485aebbcc4340be19aea6d856d2326fb
+  sha256: 045ed7c3d32f550dce9ba3b6b1d6397577c113381eb262d0c7d1385999a56072
   signature: '(self, cpu_group: torch.distributed.distributed_c10d.ProcessGroup, device: torch.device | None = None, device_group: torch.distributed.distributed_c10d.ProcessGroup | None = None, unique_name: str = '''', global_ranks: list[int] | None = None, global_world_size: int | None = None, tcp_store_group: vllm.distributed.utils.StatelessProcessGroup | None = None, use_all2all: bool = False)'
 
 - id: comm-cuda-communicator-all-reduce
@@ -619,8 +619,8 @@ seams:
   kind: function
   target: vllm.model_executor.layers.fused_moe.layer:FusedMoEFactory
   why: instantiates MoERunner and RoutedExperts by their upstream names unless a model passes its own classes
-  sha256: c15e2a85d4141151edeaf5be054812d32d8e0cbda41e85c213a52521c0cae69a
-  signature: '(num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, intermediate_pad: int | None = None, params_dtype: torch.dtype | None = None, renormalize: bool = True, use_grouped_topk: bool = False, num_expert_group: int | None = None, topk_group: int | None = None, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, tp_size: int | None = None, dp_size: int | None = None, pcp_size: int | None = None, prefix: str = '''', custom_routing_function: collections.abc.Callable | None = None, router: vllm.model_executor.layers.fused_moe.router.fused_moe_router.FusedMoERouter | None = None, scoring_func: str = ''softmax'', routed_scaling_factor: float = 1.0, swiglu_limit: float | None = None, swiglu_alpha: float | None = None, swiglu_beta: float | None = None, activation_situ_beta: float | None = None, activation_situ_linear_beta: float | None = None, e_score_correction_bias: torch.Tensor | None = None, apply_router_weight_on_input: bool = False, activation: str = ''silu'', enable_eplb: bool = False, num_redundant_experts: int = 0, has_bias: bool = False, is_sequence_parallel: bool = False, reduce_results: bool = True, ckpt_names: tuple[str, str, str | None] = (''gate_proj'', ''down_proj'', ''up_proj''), is_fused_checkpoint_transposed: bool = False, n_shared_experts: int | None = None, fuse_shared_experts: bool = False, router_logits_dtype: torch.dtype | None = None, gate: torch.nn.modules.module.Module | None = None, shared_experts: torch.nn.modules.module.Module | None = None, shared_expert_gate: torch.nn.modules.module.Module | None = None, routed_input_transform: torch.nn.modules.module.Module | None = None, routed_output_transform: torch.nn.modules.module.Module | None = None, apply_routed_scale_to_output: bool = False, zero_expert_type: str | None = None, hash_indices_table: torch.Tensor | None = None, bias_vl: torch.Tensor | None = None, image_sentinel_lo: int = 0, runner_cls: type[vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner] | None = None, runner_args: dict[str, typing.Any] | None = None, routed_experts_cls: type[vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts] | None = None, routed_experts_args: dict[str, typing.Any] | None = None, skip_padding: bool = False) -> vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner'
+  sha256: bfb66f6e9d986fdd7831ea3664b5421495d8ce5a25697cb2298dafae4817a0e6
+  signature: '(num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, intermediate_pad: int | None = None, params_dtype: torch.dtype | None = None, renormalize: bool = True, use_grouped_topk: bool = False, num_expert_group: int | None = None, topk_group: int | None = None, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, tp_size: int | None = None, dp_size: int | None = None, pcp_size: int | None = None, prefix: str = '''', custom_routing_function: collections.abc.Callable | None = None, router: vllm.model_executor.layers.fused_moe.router.fused_moe_router.FusedMoERouter | None = None, scoring_func: str = ''softmax'', routed_scaling_factor: float = 1.0, swiglu_limit: float | None = None, swiglu_alpha: float | None = None, swiglu_beta: float | None = None, activation_situ_beta: float | None = None, activation_situ_linear_beta: float | None = None, e_score_correction_bias: torch.Tensor | None = None, apply_router_weight_on_input: bool = False, activation: str = ''silu'', enable_eplb: bool = False, num_redundant_experts: int = 0, has_bias: bool = False, is_sequence_parallel: bool = False, reduce_results: bool = True, ckpt_names: tuple[str, str, str | None] = (''gate_proj'', ''down_proj'', ''up_proj''), is_fused_checkpoint_transposed: bool = False, n_shared_experts: int | None = None, fuse_shared_experts: bool = False, shared_expert_prefix: str | None = None, router_logits_dtype: torch.dtype | None = None, gate: torch.nn.modules.module.Module | None = None, shared_experts: torch.nn.modules.module.Module | None = None, shared_expert_gate: torch.nn.modules.module.Module | None = None, routed_input_transform: torch.nn.modules.module.Module | None = None, routed_output_transform: torch.nn.modules.module.Module | None = None, apply_routed_scale_to_output: bool = False, zero_expert_type: str | None = None, hash_indices_table: torch.Tensor | None = None, bias_vl: torch.Tensor | None = None, image_sentinel_lo: int = 0, runner_cls: type[vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner] | None = None, runner_args: dict[str, typing.Any] | None = None, routed_experts_cls: type[vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts] | None = None, routed_experts_args: dict[str, typing.Any] | None = None, skip_padding: bool = False) -> vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner'
 
 - id: moe-runner-init
   kind: method
@@ -794,8 +794,8 @@ seams:
   kind: function
   target: vllm.v1.attention.backends.gdn_attn:GDNAttentionMetadata
   why: plain dataclass without slots that the GDN builder creates fresh per build; Glm5NextGDNAttentionMetadataBuilder.build sets its __class__ to the GLM subclass (one extra defaulted field) in place
-  sha256: edc69d0165c2dbf56b86f7450758808fe1c970380bae074305a02e2555e51bb9
-  signature: '(num_prefills: int, num_prefill_tokens: int, num_decodes: int, num_decode_tokens: int, num_spec_decodes: int, num_spec_decode_tokens: int, num_actual_tokens: int, checkpoint: vllm.model_executor.layers.mamba.checkpoint.MambaPrefillCheckpointMetadata | None = None, has_initial_state: torch.Tensor | None = None, spec_query_start_loc: torch.Tensor | None = None, non_spec_query_start_loc: torch.Tensor | None = None, spec_state_indices_tensor: torch.Tensor | None = None, non_spec_state_indices_tensor: torch.Tensor | None = None, spec_sequence_masks: torch.Tensor | None = None, spec_sequence_masks_cpu: torch.Tensor | None = None, spec_token_indx: torch.Tensor | None = None, non_spec_token_indx: torch.Tensor | None = None, num_accepted_tokens: torch.Tensor | None = None, uniform_spec_sequence_length: int | None = None, chunk_indices: torch.Tensor | None = None, chunk_offsets: torch.Tensor | None = None, prefill_query_start_loc: torch.Tensor | None = None, prefill_state_indices: torch.Tensor | None = None, prefill_has_initial_state: torch.Tensor | None = None, nums_dict: dict | None = None, batch_ptr: torch.Tensor | None = None, token_chunk_offset_ptr: torch.Tensor | None = None) -> None'
+  sha256: 675536f5b158268ac73271c249d0f4c32602616633ad17b5bfda37c5fa011aa7
+  signature: '(num_prefills: int, num_prefill_tokens: int, num_decodes: int, num_decode_tokens: int, num_spec_decodes: int, num_spec_decode_tokens: int, num_actual_tokens: int, checkpoint: vllm.model_executor.layers.mamba.checkpoint.MambaPrefillCheckpointMetadata | None = None, has_initial_state: torch.Tensor | None = None, spec_query_start_loc: torch.Tensor | None = None, non_spec_query_start_loc: torch.Tensor | None = None, spec_state_indices_tensor: torch.Tensor | None = None, non_spec_state_indices_tensor: torch.Tensor | None = None, spec_sequence_masks: torch.Tensor | None = None, spec_sequence_masks_cpu: torch.Tensor | None = None, spec_token_indx: torch.Tensor | None = None, non_spec_token_indx: torch.Tensor | None = None, num_accepted_tokens: torch.Tensor | None = None, uniform_spec_sequence_length: int | None = None, chunk_indices: torch.Tensor | None = None, chunk_offsets: torch.Tensor | None = None, prefill_query_start_loc: torch.Tensor | None = None, prefill_state_indices: torch.Tensor | None = None, prefill_has_initial_state: torch.Tensor | None = None, aiter_prefill_metadata: object | None = None, nums_dict: dict | None = None, batch_ptr: torch.Tensor | None = None, token_chunk_offset_ptr: torch.Tensor | None = None) -> None'
 
 - id: idx-topk-forward
   kind: method
@@ -829,7 +829,7 @@ seams:
   kind: method
   target: vllm.model_executor.layers.attention.mla_attention:MLAAttention.update_kv_cache
   why: the GLM MLAAttention override defers the latent cache write or calls this unchanged; it relies on the early return (no slot mapping, HiSparse dummy batch) and on the write being impl.do_kv_cache_update of the gathered inputs, which the deferred write replaces on decode-only, non-PCP, non-HiSparse batches
-  sha256: 830216b4fb8265bf9bed83ee6aa9a6b379cff647cbec6bf18ab7ecef0e13fa8d
+  sha256: ca3b4d6ad22acf0d1d5dd88d1a988d9c4f370e382dc3fdce40f25214f59d7809
   signature: '(self, kv_c_normed: torch.Tensor, k_pe: torch.Tensor, kv_cache: torch.Tensor, slot_mapping: torch.Tensor | None, attn_metadata: ''MLACommonMetadata | None'', kv_cache_dtype: str, k_scale: torch.Tensor) -> None'
 
 - id: mla-forward
