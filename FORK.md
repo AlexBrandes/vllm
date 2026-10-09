@@ -4,7 +4,7 @@
 
 This repository is Morrowmake's fork of vLLM for the NVIDIA CMP 170HX and other sm_80 (GA100-class) GPUs. It is a general vLLM: it serves the same models as upstream. The license is Apache-2.0, as upstream.
 
-Upstream base: 31e2443c90542a33a4a4a293ea7186fba2796c67
+Upstream base: efd141047d8e879536806a86e3f93c02e6164add
 
 All numbers compare the working tree with this commit. A fork-owned path does not exist at the base. An upstream-owned path does. This file is not listed in its own tables.
 
@@ -35,8 +35,8 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/glm5next/nvidia/model_state.py` | 55 |
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
-| `vllm/models/glm5next/nvidia/sm80_model.py` | 460 |
-| **4 files** | **877** |
+| `vllm/models/glm5next/nvidia/sm80_model.py` | 464 |
+| **4 files** | **881** |
 
 ### `vllm/sm80/kernels/`
 
@@ -119,8 +119,8 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/mem_attribution.py` | 276 |
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
-| `vllm/sm80/worker/state_index_check.py` | 302 |
-| **33 files** | **7,920** |
+| `vllm/sm80/worker/state_index_check.py` | 299 |
+| **33 files** | **7,917** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -187,7 +187,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_indexer_decode_raw_k.py` | 270 |
 | `tests/kernels/test_ampere_kda_dispatch.py` | 836 |
 | `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
-| `tests/kernels/test_ampere_kda_recover.py` | 862 |
+| `tests/kernels/test_ampere_kda_recover.py` | 867 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 193 |
 | `tests/kernels/test_ampere_marlin_optional.py` | 231 |
 | `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 412 |
@@ -230,7 +230,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/seams.yaml` | 987 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_fork_map.py` | 55 |
-| `tests/sm80/test_glm_registrations.py` | 230 |
+| `tests/sm80/test_glm_registrations.py` | 233 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_plugin_banner.py` | 35 |
@@ -245,7 +245,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/attention/test_indexer_prefill_chunk_budget.py` | 177 |
 | `tests/v1/attention/test_kpool_tail_padding_invariant.py` | 118 |
 | `tests/v1/attention/test_sm80_triton_mla_sparse_decode.py` | 76 |
-| `tests/v1/core/test_dflash_boundary_cache.py` | 465 |
+| `tests/v1/core/test_dflash_boundary_cache.py` | 478 |
 | `tests/v1/core/test_fair_prefill.py` | 688 |
 | `tests/v1/core/test_mamba_inflight_states.py` | 292 |
 | `tests/v1/core/test_pp_spread_decodes.py` | 79 |
@@ -255,14 +255,14 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
 | `tests/v1/spec_decode/test_glm5_dflash_draft_width.py` | 560 |
 | `tests/v1/worker/test_gumbel_vocab_clamp.py` | 129 |
-| `tests/v1/worker/test_mamba_block_size_resolution.py` | 62 |
+| `tests/v1/worker/test_mamba_block_size_resolution.py` | 92 |
 | `tests/v1/worker/test_mem_attribution.py` | 70 |
 | `tests/v1/worker/test_pp_deferred_block_tables.py` | 124 |
 | `tests/v1/worker/test_pp_draft_tail.py` | 1,204 |
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
-| `tests/v1/worker/test_state_index_check.py` | 334 |
-| **94 files** | **30,954** |
+| `tests/v1/worker/test_state_index_check.py` | 351 |
+| **94 files** | **31,022** |
 
 #### `tools/`
 
@@ -323,23 +323,23 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/core/kv_cache_coordinator.py` | modified | 23 | 1 | 8 |
 | `vllm/v1/core/kv_cache_manager.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/core/kv_cache_utils.py` | modified | 320 | 8 | 28 |
-| `vllm/v1/core/sched/scheduler.py` | modified | 395 | 15 | 42 |
+| `vllm/v1/core/sched/scheduler.py` | modified | 394 | 14 | 41 |
 | `vllm/v1/kv_cache_interface.py` | modified | 70 | 1 | 5 |
 | `vllm/v1/worker/gpu/block_table.py` | modified | 11 | 3 | 4 |
 | `vllm/v1/worker/gpu/cudagraph_utils.py` | modified | 131 | 9 | 12 |
 | `vllm/v1/worker/gpu/model_runner.py` | modified | 200 | 13 | 31 |
-| `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` | modified | 41 | 0 | 5 |
+| `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` | modified | 44 | 1 | 7 |
 | `vllm/v1/worker/gpu/model_states/recoverssm.py` | modified | 26 | 13 | 8 |
 | `vllm/v1/worker/gpu/pp_utils.py` | modified | 222 | 8 | 15 |
 | `vllm/v1/worker/gpu/sample/gumbel.py` | modified | 9 | 1 | 2 |
-| `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | modified | 102 | 20 | 5 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/utils.py` | modified | 13 | 3 | 4 |
 | `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` | modified | 282 | 0 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
+| `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 5 | 2 | 3 |
-| `vllm/v1/worker/gpu_worker.py` | modified | 86 | 5 | 10 |
-| **60 files** | | **3,765** | **254** | **480** |
+| `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
+| **60 files** | | **3,766** | **253** | **481** |
 
 ### Tests, docs and .github
 
@@ -374,9 +374,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 60 | 3,765 | 254 | 480 |
+| Product code | 60 | 3,766 | 253 | 481 |
 | Tests, docs and .github | 23 | 1,036 | 561 | 78 |
-| All | 83 | 4,801 | 815 | 558 |
+| All | 83 | 4,802 | 814 | 559 |
 
 ## 3. Fork environment variables
 
@@ -461,11 +461,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 84 |
-| Fork-added product lines | 22,577 |
+| Fork-added product lines | 22,578 |
 | Patched upstream files | 83 |
-| Patched upstream lines | +4,801 / -815 |
+| Patched upstream lines | +4,802 / -814 |
 | Patched upstream product files | 60 |
-| Patched upstream product lines | +3,765 / -254 |
-| Product lines added (new files and patches) | 26,342 |
+| Patched upstream product lines | +3,766 / -253 |
+| Product lines added (new files and patches) | 26,344 |
 | Fork environment variables (flags) | 60 |
 | Unreferenced fork definitions | 0 (0 lines) |
