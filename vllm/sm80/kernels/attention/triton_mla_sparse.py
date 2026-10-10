@@ -451,72 +451,6 @@ def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
     return current_platform.is_cuda() and current_platform.is_device_capability(80)
 
 
-@functools.cache
-def _sm80(index: int | None) -> bool:
-    return torch.cuda.get_device_capability(index) == (8, 0)
-
-
-def _decode_v2_closed(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    block_dpe: int,
-    d_v: int,
-    out: torch.Tensor | None = None,
-) -> str:
-    """Why triton_mla_sparse_decode_v2.py does not take this call ("" when it
-    does): it is validated for 1..64 query rows, 16 or 64 heads, bf16, the
-    512-wide NoPE layout with one KV head, 2048 or 2176 index slots and
-    contiguous last dimensions, on sm_80."""
-    num_tokens, num_heads_q, dim_qk = q.shape
-    if not 1 <= num_tokens <= 64:
-        return "query rows outside 1..64"
-    if num_heads_q not in (16, 64):
-        return "query heads not 16 or 64"
-    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
-        return "not bfloat16"
-    if (dim_qk != 512 or d_v != 512 or block_dpe != 0 or kv.shape[1] != 1
-            or indices.shape[1] != 1):
-        return "not the 512-wide NoPE layout with one KV head"
-    if indices.shape[2] not in (2048, 2176):
-        return "index width not 2048 or 2176"
-    if (q.stride(-1) != 1 or kv.stride(-1) != 1 or indices.stride(-1) != 1
-            or (out is not None and out.stride(-1) != 1)):
-        return "last dimension not contiguous"
-    if not _sm80(q.device.index):
-        return "device not sm_80"
-    return ""
-
-
-def _use_decode_v2(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    block_dpe: int,
-    d_v: int,
-    out: torch.Tensor | None = None,
-) -> bool:
-    """Gate for vllm/sm80/kernels/attention/triton_mla_sparse_decode_v2.py
-    (VLLM_AMPERE_SPARSE_MLA_DECODE_V2). Logs once why not when the flag is set."""
-    from vllm import envs
-
-    if not envs.VLLM_AMPERE_SPARSE_MLA_DECODE_V2:
-        return False
-    from vllm.logger import init_logger
-
-    logger = init_logger(__name__)
-    why = _decode_v2_closed(q, kv, indices, block_dpe, d_v, out)
-    if why:
-        logger.info_once(
-            "VLLM_AMPERE_SPARSE_MLA_DECODE_V2=1 but sparse MLA decode v2 is off "
-            "for this call: %s; using the Triton kernel", why)
-        return False
-    logger.info_once(
-        "sm_80 sparse MLA decode v2 active for <= 64 query rows "
-        "[VLLM_AMPERE_SPARSE_MLA_DECODE_V2=1]")
-    return True
-
-
 def triton_mla_sparse_fwd(
     q: torch.Tensor,  # [num_tokens, num_heads_q, dim_qk]
     kv: torch.Tensor,  # [num_rows, num_heads_kv, dim_qk]
@@ -554,15 +488,6 @@ def triton_mla_sparse_fwd(
         from vllm.sm80.kernels.attention.sparse_prefill_mla import sparse_mla_fwd
 
         return sparse_mla_fwd(
-            q, kv, indices, sm_scale, d_v=d_v, block_dpe=block_dpe, out=out
-        )
-
-    if _use_decode_v2(q, kv, indices, block_dpe, d_v, out):
-        from vllm.sm80.kernels.attention.triton_mla_sparse_decode_v2 import (
-            triton_mla_sparse_fwd as decode_v2_fwd,
-        )
-
-        return decode_v2_fwd(
             q, kv, indices, sm_scale, d_v=d_v, block_dpe=block_dpe, out=out
         )
 

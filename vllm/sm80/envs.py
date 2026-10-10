@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S: float = 60.0
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE: bool = False
-    VLLM_AMPERE_SPARSE_MLA_DECODE_V2: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
@@ -193,16 +192,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
     "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": lambda: bool(
         int(os.getenv("VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE", "0"))
-    ),
-    # Sparse-MLA decode on sm_80 through
-    # vllm/sm80/kernels/attention/triton_mla_sparse_decode_v2.py: each CTA walks
-    # only the tiles between its index row's first and last valid entry and
-    # sparse rows are spread over every split. Taken only with 1..64 query rows,
-    # 16 or 64 heads, bf16, the 512-wide NoPE layout (d_v 512, one KV head),
-    # 2048 or 2176 index slots and contiguous last dimensions; everything else
-    # keeps the Triton kernel. Off by default.
-    "VLLM_AMPERE_SPARSE_MLA_DECODE_V2": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_SPARSE_MLA_DECODE_V2", "0"))
     ),
     # Token threshold. Below it the upstream kernels win (they are tuned for
     # decode shapes) and every captured CUDA graph keeps the upstream kernel.

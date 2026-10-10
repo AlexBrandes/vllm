@@ -84,10 +84,7 @@ says which layout each serves):
   generation `VLLM_MOE_DECODE_ROUTE_V2`, `VLLM_GLM5_DECODE_MHC_V2`,
   `VLLM_AMPERE_DECODE_IDX_GLUE`; under TP4, the KDA state commit after
   sampling folded into the next decode step, same state bit for bit
-  (not yet validated, off unless set) — `VLLM_AMPERE_KDA_FOLD`; sparse
-  attention decode at up to 64 query rows, 16 or 64 heads, that walks only
-  each index row's valid span (not yet validated, off unless set) —
-  `VLLM_AMPERE_SPARSE_MLA_DECODE_V2`.
+  (not yet validated, off unless set) — `VLLM_AMPERE_KDA_FOLD`.
   A diagnostic, never for serving: under TP4, one KDA state per draft
   position instead of one per request (the reference without state
   recovery, as wherever that path's limits are not met) —

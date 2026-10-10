@@ -46,14 +46,12 @@ Kernels shared by several models on sm_80, one directory per family.
 |---|---:|
 | `vllm/sm80/kernels/__init__.py` | 11 |
 | `vllm/sm80/kernels/_platform.py` | 33 |
-| `vllm/sm80/kernels/attention/__init__.py` | 9 |
-| `vllm/sm80/kernels/attention/sparse_mla_decode_gluon.py` | 290 |
+| `vllm/sm80/kernels/attention/__init__.py` | 8 |
 | `vllm/sm80/kernels/attention/sparse_prefill_mla.py` | 476 |
 | `vllm/sm80/kernels/attention/sparse_prefill_mla_pp.py` | 380 |
 | `vllm/sm80/kernels/attention/triton_e4m3.py` | 142 |
 | `vllm/sm80/kernels/attention/triton_mla_remap_cache.py` | 168 |
-| `vllm/sm80/kernels/attention/triton_mla_sparse.py` | 668 |
-| `vllm/sm80/kernels/attention/triton_mla_sparse_decode_v2.py` | 854 |
+| `vllm/sm80/kernels/attention/triton_mla_sparse.py` | 593 |
 | `vllm/sm80/kernels/attention/triton_mqa_logits.py` | 628 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
 | `vllm/sm80/kernels/indexer/__init__.py` | 7 |
@@ -82,7 +80,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 138 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **38 files** | **12,784** |
+| **36 files** | **11,564** |
 
 ### `vllm/sm80/`
 
@@ -98,7 +96,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 640 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 862 |
+| `vllm/sm80/envs.py` | 851 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
@@ -123,7 +121,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **33 files** | **8,002** |
+| **33 files** | **7,991** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -207,7 +205,6 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_prefill.py` | 912 |
 | `tests/kernels/test_ampere_prefill_pack_bf16x2.py` | 149 |
 | `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 429 |
-| `tests/kernels/test_ampere_sparse_mla_decode_v2.py` | 525 |
 | `tests/kernels/test_ampere_thin_gemm.py` | 233 |
 | `tests/kernels/test_ampere_thin_gemm_concat.py` | 963 |
 | `tests/kernels/test_ampere_thin_gemm_v74.py` | 282 |
@@ -272,7 +269,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **100 files** | **35,528** |
+| **99 files** | **35,003** |
 
 #### `tools/`
 
@@ -364,7 +361,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `.github/ISSUE_TEMPLATE/700-performance-discussion.yml` | deleted | 0 | 59 | 1 |
 | `.github/ISSUE_TEMPLATE/750-RFC.yml` | deleted | 0 | 52 | 1 |
 | `.github/ISSUE_TEMPLATE/config.yml` | modified | 6 | 2 | 3 |
-| `README.md` | modified | 192 | 86 | 20 |
+| `README.md` | modified | 189 | 86 | 20 |
 | `docs/features/quantization/README.md` | modified | 63 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 3 | 1 | 1 |
@@ -378,15 +375,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 120 | 2 | 7 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 26 | 1 | 8 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **23 files** | | **1,048** | **561** | **78** |
+| **23 files** | | **1,045** | **561** | **78** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
 | Product code | 60 | 3,767 | 253 | 481 |
-| Tests, docs and .github | 23 | 1,048 | 561 | 78 |
-| All | 83 | 4,815 | 814 | 559 |
+| Tests, docs and .github | 23 | 1,045 | 561 | 78 |
+| All | 83 | 4,812 | 814 | 559 |
 
 ## 3. Fork environment variables
 
@@ -409,7 +406,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_MARLIN_PREFILL_NARROW` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` | `bool` | `True` | `'1'` |
-| `VLLM_AMPERE_SPARSE_MLA_DECODE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `str` | `''` | `None` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS` | `bool` | `False` | `'0'` |
@@ -462,7 +458,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **66 variables** | | | |
+| **65 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -476,12 +472,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 88 |
-| Fork-added product lines | 25,910 |
+| Fork-added product files | 86 |
+| Fork-added product lines | 24,679 |
 | Patched upstream files | 83 |
-| Patched upstream lines | +4,815 / -814 |
+| Patched upstream lines | +4,812 / -814 |
 | Patched upstream product files | 60 |
 | Patched upstream product lines | +3,767 / -253 |
-| Product lines added (new files and patches) | 29,677 |
-| Fork environment variables (flags) | 66 |
+| Product lines added (new files and patches) | 28,446 |
+| Fork environment variables (flags) | 65 |
 | Unreferenced fork definitions | 0 (0 lines) |
