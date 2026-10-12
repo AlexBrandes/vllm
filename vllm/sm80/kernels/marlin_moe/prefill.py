@@ -40,7 +40,7 @@ VLLM_AMPERE_MARLIN_PREFILL_NARROW.  Everything else falls through to
 ``fused_marlin_moe`` unchanged.
 
 COMPILED TILES.  At N=2048 (PP whole experts,
-VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED, default on) with the optional
+VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED, default off) with the optional
 library's ``prefill_tile_gemm`` present, every list GEMM runs through that op
 (the same Marlin template, its own instantiations) with the per-GEMM tile
 table ``TILE_TABLES[N]``: both GEMMs use the (64,512) tile on the

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compiled Marlin MoE prefill tiles for PP whole experts
-(VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED, on by default; 0 is the kill
-switch): the split-list GEMMs of the N=2048 Marlin prefill
+(VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED, off by default; the serving
+defaults turn it on at PP4): the split-list GEMMs of the N=2048 Marlin prefill
 (VLLM_AMPERE_MARLIN_PREFILL_WIDE) through the optional library's
 prefill_tile_gemm, with the optimistic fast dequant and its per-GEMM redo
 areas. The TP4 (N=512) lists have no tile table and run on the released
@@ -70,10 +70,10 @@ def _clean(monkeypatch):
 
 # ------------------------------------------------------------------ CPU ----
 
-def test_switch_defaults_on_and_kill_switch(monkeypatch):
+def test_switch_defaults_off_and_turns_on(monkeypatch):
     import vllm.envs as envs
 
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is True
+    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is False
     monkeypatch.setenv(SWITCH, "0")
     assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is False
     monkeypatch.setenv(SWITCH, "1")
@@ -81,16 +81,19 @@ def test_switch_defaults_on_and_kill_switch(monkeypatch):
     from vllm.sm80 import envs as fork_envs  # typed declarations
 
     src = open(fork_envs.__file__).read()
-    assert f"    {SWITCH}: bool = True\n" in src
+    assert f"    {SWITCH}: bool = False\n" in src
 
 
 def test_retired_name_is_ignored(monkeypatch):
     """The earlier name of the switch only warns; it never turns the tiles
-    off, and the TP4 switch has no successor."""
+    on or off, and the TP4 switch has no successor."""
     import vllm.envs as envs
     from vllm.sm80 import envs as fork_envs
 
+    monkeypatch.setenv(RETIRED_SWITCH, "1")
+    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is False
     monkeypatch.setenv(RETIRED_SWITCH, "0")
+    monkeypatch.setenv(SWITCH, "1")
     assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is True
     assert fork_envs.RETIRED_ENV_VARS[RETIRED_SWITCH] == f"renamed to {SWITCH}"
     assert fork_envs.RETIRED_ENV_VARS[
@@ -423,6 +426,7 @@ def test_open_gate_hands_the_tiles_and_redo_area_to_run(monkeypatch, capturing):
 def test_missing_op_keeps_the_released_kernels_and_says_why(monkeypatch):
     from vllm.sm80.kernels.marlin_moe import extension
 
+    monkeypatch.setenv(SWITCH, "1")
     ran, banners = _open_gate(monkeypatch)
     monkeypatch.setattr(extension, "prefill_tile_op", lambda: (None, "absent"))
     monkeypatch.setattr(pmp, "_tile_redo", lambda *a, **k: pytest.fail("redo"))

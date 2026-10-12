@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
     VLLM_AMPERE_MARLIN_PREFILL_WIDE: bool = False
     VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED: bool = True
+    VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED: bool = False
     VLLM_AMPERE_MARLIN_PREFILL_NARROW: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_AMPERE_MARLIN_DECODE_CUDA: bool = False
@@ -578,10 +578,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # 64/48/32-row lists in both GEMMs) and the optimistic fast dequant (tiles
     # with a scale above 2^-5 recomputed by the regular kernel). Without the
     # library or its op, the released kernels run. The TP4 (N=512) lists
-    # always run on the released kernels. On by default; 0 is the kill switch
-    # (released split path unchanged).
+    # always run on the released kernels. Off by default (the released split
+    # path); serving defaults turn it on where validated.
     "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED", "1"))
+        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED", "0"))
     ),
     # The same split-block Marlin MoE prefill under tensor parallel 4 (each
     # card holds all 288 experts sharded to N=512): taken only for M >=

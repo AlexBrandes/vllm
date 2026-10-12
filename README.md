@@ -143,8 +143,9 @@ silently. The decode kernels split the first projection along K: faster, and
 the fp32 summation order differs from the released Marlin kernels. Under PP4
 the split-block prefill (`VLLM_AMPERE_MARLIN_PREFILL_WIDE`) also runs on the
 library's (64,512) tiles with a one-HFMA2 dequant —
-`VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED`, on by default, the released kernels
-without the library; TP4 prefill uses the released kernels.
+`VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (engine default off, on in the PP4
+serving defaults), the released kernels without the library; TP4 prefill uses
+the released kernels.
 
 **Correctness fixes (always on).** 64-bit KV row offsets in the
 sparse-attention kernels and a vocabulary clamp in the sampler kernels.

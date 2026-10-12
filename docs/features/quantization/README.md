@@ -73,9 +73,10 @@ schedule of `VLLM_AMPERE_MARLIN_PREFILL_NARROW`). Under PP4 the split-block
 prefill of `VLLM_AMPERE_MARLIN_PREFILL_WIDE` runs its list GEMMs through the
 library's `prefill_tile_gemm`: (64,512) tiles for the 32–64-row lists and a
 one-HFMA2 dequant whose tiles with a scale above 2^-5 are recomputed by the
-regular kernel. `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (default `1`)
-selects it; `0` keeps the released kernels. Without a library that exports
-the operator, the released kernels run; the worker log names the reason.
+regular kernel. `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (default `0`; the
+PP4 serving defaults set `1`) selects it; `0` keeps the released kernels.
+Without a library that exports the operator, the released kernels run; the
+worker log names the reason.
 
 With the decode flag off and no compiled PP4 prefill, the optional extension
 is not imported or loaded. Enabling the decode flag validates the binary at
