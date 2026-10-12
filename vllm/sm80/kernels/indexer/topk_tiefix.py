@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tie-consistent repair of a sparse-indexer top-k (VLLM_GLM5_TOPK_TIEFIX).
+"""Tie-consistent repair of a sparse-indexer top-k (VLLM_GLM5_TOPK_TIEFIX for
+the GLM kpool indexer, VLLM_QWEN4_QSA_TOPK_CANONICAL for the Qwen QSA indexer).
 
 The stock top-k kernels (persistent_topk and its FilteredTopK/sampled_topk
 branches for decode, topKPerRowJob for prefill) all return an exact top-k by
@@ -430,10 +431,11 @@ _WARM_KS = (512, 2048)
 
 
 def warm_tiefix() -> None:
-    """Compile the kernel variants the indexer uses (K 512 for kpool 4 and 2048
-    for kpool 1; decode = absolute, prefill = relative with starts) before any
-    CUDA graph capture; Triton otherwise compiles on first launch. A no-op
-    without CUDA or inside a capture."""
+    """Compile the kernel variants the indexers use (GLM: K 512 for kpool 4
+    and 2048 for kpool 1, decode = absolute, prefill = relative with starts;
+    Qwen QSA: K 512, absolute for both) before any CUDA graph capture; Triton
+    otherwise compiles on first launch. A no-op without CUDA or inside a
+    capture."""
     if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return
     dev = torch.device("cuda", torch.cuda.current_device())

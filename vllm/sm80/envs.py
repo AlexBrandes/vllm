@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_EXL3: bool = False
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
+    VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -672,6 +673,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Set 0 to retain native traversal order without changing selection.
     "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(
         int(os.getenv("VLLM_QWEN_QSA_TOPK_SORTED", "1"))
+    ),
+    # Make Qwen QSA's selected block SET a function of the scores alone: after
+    # the prefill and decode top-k, entries tied with the k-th score that
+    # straddle the selection boundary go to the lowest block indices (the
+    # shared indexer tie fix, vllm/sm80/kernels/indexer/topk_tiefix.py; with
+    # VLLM_QWEN_QSA_TOPK_SORTED the sort runs in the same launch). The stock
+    # top-k places tied entries by atomic arrival order, so identical scores
+    # can otherwise select a different set from run to run and rank to rank.
+    # Default OFF: unset, the QSA top-k path is unchanged.
+    "VLLM_QWEN4_QSA_TOPK_CANONICAL": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_QSA_TOPK_CANONICAL", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
