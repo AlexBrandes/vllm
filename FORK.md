@@ -262,6 +262,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/qwen4_exp/test_exl3_construction.py` | 273 |
 | `tests/models/qwen4_exp/test_exl3_ple_decode.py` | 232 |
 | `tests/models/qwen4_exp/test_exl3_ple_reader.py` | 384 |
+| `tests/models/qwen4_exp/test_mtp_local_argmax.py` | 224 |
 | `tests/models/qwen4_exp/test_precision_switches.py` | 161 |
 | `tests/models/qwen4_exp/test_qsa_sorted_selection.py` | 165 |
 | `tests/models/test_glm5next_local_logits.py` | 73 |
@@ -308,7 +309,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **112 files** | **38,501** |
+| **113 files** | **38,725** |
 
 #### `tools/`
 
@@ -363,7 +364,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/models/kimi_k3/nvidia/ops/recoverssm.py` | modified | 37 | 6 | 8 |
 | `vllm/models/qwen4_exp/common/ngram_embedding.py` | modified | 3 | 0 | 1 |
 | `vllm/models/qwen4_exp/nvidia/model.py` | modified | 12 | 0 | 5 |
-| `vllm/models/qwen4_exp/nvidia/mtp.py` | modified | 40 | 5 | 9 |
+| `vllm/models/qwen4_exp/nvidia/mtp.py` | modified | 50 | 5 | 10 |
 | `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` | modified | 1 | 0 | 1 |
 | `vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py` | modified | 45 | 0 | 4 |
 | `vllm/parser/abstract_parser.py` | modified | 4 | 0 | 2 |
@@ -403,7 +404,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu/warmup.py` | modified | 5 | 2 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **68 files** | | **3,906** | **258** | **514** |
+| **68 files** | | **3,916** | **258** | **515** |
 
 ### Tests, docs and .github
 
@@ -438,9 +439,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 68 | 3,906 | 258 | 514 |
+| Product code | 68 | 3,916 | 258 | 515 |
 | Tests, docs and .github | 23 | 1,045 | 561 | 78 |
-| All | 91 | 4,951 | 819 | 592 |
+| All | 91 | 4,961 | 819 | 593 |
 
 ## 3. Fork environment variables
 
@@ -539,9 +540,9 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Fork-added product files | 107 |
 | Fork-added product lines | 29,659 |
 | Patched upstream files | 91 |
-| Patched upstream lines | +4,951 / -819 |
+| Patched upstream lines | +4,961 / -819 |
 | Patched upstream product files | 68 |
-| Patched upstream product lines | +3,906 / -258 |
-| Product lines added (new files and patches) | 33,565 |
+| Patched upstream product lines | +3,916 / -258 |
+| Product lines added (new files and patches) | 33,575 |
 | Fork environment variables (flags) | 72 |
 | Unreferenced fork definitions | 0 (0 lines) |
