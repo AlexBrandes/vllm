@@ -124,6 +124,48 @@ def copy_masking_failed(rows: torch.Tensor, output: torch.Tensor) -> torch.Tenso
     return failed
 
 
+class Exl3PLETiming:
+    """Host time of each SSD prefetch (VLLM_EXL3_PLE_TIMING): the wait for the
+    token ids on the host, then the row reads; one log line per window."""
+
+    WINDOW = 256
+
+    def __init__(self, label: str):
+        self.label = label
+        self.samples: list[tuple[int, int, int]] = []
+
+    def add(self, rows: int, wait_ns: int, read_ns: int) -> None:
+        self.samples.append((rows, wait_ns, read_ns))
+        if len(self.samples) >= self.WINDOW:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.samples:
+            return
+        rows, wait, read = (np.array(c, dtype=np.float64) for c in zip(*self.samples))
+        wait_us = np.percentile(wait / 1e3, [50, 90])
+        read_us = np.percentile(read / 1e3, [50, 90])
+        logger.info(
+            "EXL3 PLE timing %s: %d prefetches, rows mean %.1f max %d; "
+            "ids wait us p50 %.0f p90 %.0f max %.0f; "
+            "row reads us p50 %.0f p90 %.0f max %.0f mean %.0f; us per row %.2f",
+            self.label,
+            len(rows),
+            rows.mean(),
+            rows.max(),
+            wait_us[0],
+            wait_us[1],
+            wait.max() / 1e3,
+            read_us[0],
+            read_us[1],
+            read.max() / 1e3,
+            read.mean() / 1e3,
+            read.sum() / 1e3 / max(rows.sum(), 1.0),
+        )
+        self.samples.clear()
+
+
+
 class Exl3PLERowReader:
     """Read owned rows of a validated compressed PLE table into caller storage."""
 
@@ -331,6 +373,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._pool = None
         self._slot: Exl3PLESlot | None = None
         self._failed_tokens: torch.Tensor | None = None
+        self._timing: Exl3PLETiming | None = None
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
@@ -425,6 +468,11 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 self._pool = ThreadPoolExecutor(
                     max_workers=self._workers, thread_name_prefix="ple-read"
                 )
+                if envs.VLLM_EXL3_PLE_TIMING:
+                    self._timing = Exl3PLETiming(
+                        f"owner=[{reader.owner_lo},{reader.owner_hi}) "
+                        f"workers={self._workers}"
+                    )
             else:
                 self._local_ids = torch.empty_like(self._ids)
                 count = reader.owner_hi - reader.owner_lo
@@ -511,6 +559,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
+        if self._timing is not None:
+            self._timing.flush()
         if self._reader is not None and self._reader.fd >= 0:
             self._log_residency("at close")
             self._reader.close()
@@ -538,7 +588,12 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     self._host_ids[:count].copy_(self._ids[:count], non_blocking=True)
                     self._ids_ready.record(stream)
             if self.placement == "ssd":
+                timing = self._timing
+                if timing is not None:
+                    t0 = time.perf_counter_ns()
                 self._ids_ready.synchronize()
+                if timing is not None:
+                    t1 = time.perf_counter_ns()
                 ids = self._host_ids_np[:count]
                 step = (count + self._workers - 1) // self._workers
                 futures = []
@@ -575,6 +630,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                         int(ids[index]),
                         error,
                     )
+                if timing is not None:
+                    timing.add(count, t1 - t0, time.perf_counter_ns() - t1)
             with torch.cuda.stream(stream):
                 packed = self._packed[:count]
                 if self.placement == "ssd":

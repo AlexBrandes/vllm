@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The EXL3 PLE row reader: positional reads, retries, truncation, read
-faults, failed-token masks, page-cache residency and slot reuse."""
+faults, failed-token masks, page-cache residency, slot reuse and the
+prefetch timing summary."""
 
 import errno
 import json
+import logging
 import mmap
 import os
 import struct
@@ -19,6 +21,7 @@ from vllm.models.qwen4_exp.common import exl3_ple
 from vllm.models.qwen4_exp.common.exl3_ple import (
     Exl3PLERowReader,
     Exl3PLESlot,
+    Exl3PLETiming,
     copy_masking_failed,
     poison_rows,
     pread_exact_into,
@@ -382,3 +385,47 @@ def test_exl3_ple_slot_waits_for_copy_before_reuse():
     assert acquired.is_set()
     slot.ready()
     slot.release()
+
+
+def test_exl3_ple_timing_switch_defaults_off(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_EXL3_PLE_TIMING", raising=False)
+    assert envs.VLLM_EXL3_PLE_TIMING is False
+    monkeypatch.setenv("VLLM_EXL3_PLE_TIMING", "1")
+    assert envs.VLLM_EXL3_PLE_TIMING is True
+
+
+def test_exl3_ple_timing_logs_one_line_per_window():
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    log = logging.getLogger(exl3_ple.__name__)
+    handler, level = Capture(logging.INFO), log.level
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    try:
+        timing = Exl3PLETiming("owner=[0,10) workers=8")
+        timing.WINDOW = 4
+        timing.flush()  # nothing yet: no line
+        for i in range(3):
+            timing.add(64, 10_000, 800_000 + 100_000 * i)
+        assert messages == []
+        timing.add(64, 50_000, 1_200_000)  # fourth: the window is full
+        assert len(messages) == 1 and timing.samples == []
+        line = messages[0]
+        # reads 800/900/1000/1200 us over 4 x 64 rows; waits 10/10/10/50 us
+        for part in ("EXL3 PLE timing owner=[0,10) workers=8", "4 prefetches",
+                     "rows mean 64.0 max 64", "ids wait us p50 10 p90 38 max 50;",
+                     "row reads us p50 950 ", "max 1200 mean 975",
+                     "us per row 15.23"):
+            assert part in line, (part, line)
+        timing.add(512, 1_000, 2_400_000)
+        timing.flush()  # a partial window at close
+        assert len(messages) == 2 and "1 prefetches" in messages[1]
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)

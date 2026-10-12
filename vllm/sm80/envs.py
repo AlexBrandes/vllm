@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
+    VLLM_EXL3_PLE_TIMING: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
 
@@ -679,6 +680,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # before the requests using that row are finished with an error.
     "VLLM_EXL3_PLE_READ_RETRIES": lambda: int(
         os.getenv("VLLM_EXL3_PLE_READ_RETRIES", "3")
+    ),
+    # Diagnostic: time the host side of every SSD PLE prefetch (the wait for
+    # the token ids copied to the host, then the row reads) and log a summary
+    # per rank every 256 prefetches and at close. Off by default.
+    "VLLM_EXL3_PLE_TIMING": lambda: bool(
+        int(os.getenv("VLLM_EXL3_PLE_TIMING", "0"))
     ),
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
