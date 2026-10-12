@@ -4,12 +4,13 @@
 
 Why this exists
 ---------------
-On four PCIe-only GPUs with peer access (the NVIDIA CMP 170HX on PCIe Gen2 x16
+On PCIe-only GPUs with peer access (the NVIDIA CMP 170HX on PCIe Gen2 x16
 is the case this was built for), `cross_device_reduce_2stage` spends most of a
 small decode all-reduce in its two flag barriers: each barrier is a fenced
 flag write to every peer and a poll, and a fenced round trip costs ~8 us on this
-link. A 4096-wide bf16 row (8 KiB) took ~20 us, of which the barriers alone
-were ~10 us.
+link. At four ranks a 4096-wide bf16 row (8 KiB) took ~20 us, of which the
+barriers alone were ~10 us. Upstream's default kernel at two ranks,
+`cross_device_reduce_1stage`, has the same two barriers.
 
 Here no separate flag exists. Each rank pushes its data into the peers'
 receive buffers with plain 16-byte stores, and a receiver knows a 16-byte pack
@@ -30,20 +31,30 @@ Measured on 4x CMP 170HX against `cross_device_reduce_2stage` at 512 threads,
 block limit 36, CUDA-graph replay of back-to-back calls, this launch rule
 (256 threads, one per pack of the largest partition, at most 36 blocks):
 8 KiB 20.5 -> 10.1 us, 32 KiB 23.9 -> 13.2, 64 KiB 30.9 -> 20.3,
-128 KiB 48.4 -> 36.0, 256 KiB 86.4 -> 66.3.
+128 KiB 48.4 -> 36.0, 256 KiB 86.4 -> 66.3. Two ranks use the same protocol
+and launch rule; they have not been timed.
 
 Exactness
 ---------
-Bitwise identical to `cross_device_reduce_2stage`: the element in partition p
-is accumulated in fp32 in the order p, p+1, p+2, p+3 and rounded once, as
-there, and the partitions are the same. The sentinel is a pair of negative
-NaNs with full payload. An input word equal to it is sent as a pair of
-canonical NaNs; any NaN input makes the fp32 sum the canonical NaN, so the
-result bits do not change. A reduced word can never be the sentinel (bf16
-rounding of a NaN gives the canonical NaN), and is sanitised anyway.
+Four ranks: bitwise identical to `cross_device_reduce_2stage`: the element in
+partition p is accumulated in fp32 in the order p, p+1, p+2, p+3 and rounded
+once, as there, and the partitions are the same.
 
-Only bf16, four ranks, compute capability 8.0 and the opt-in PCIe peer-to-peer
-custom all-reduce: the configuration this was validated on. Messages above
+Two ranks: bitwise identical to `cross_device_reduce_1stage`, which upstream
+runs at world size 2 unless VLLM_CUSTOM_ALLREDUCE_ALGO forces a kernel, and to
+`cross_device_reduce_2stage`. Every kernel converts both bf16 inputs to fp32
+exactly, adds them once in fp32 and rounds once to bf16; only the operand
+order differs (partition p adds x_p + x_(1-p), the one-stage kernel x_0 + x_1),
+and a single IEEE fp32 addition is commutative.
+
+The sentinel is a pair of negative NaNs with full payload. An input word equal
+to it is sent as a pair of canonical NaNs; any NaN input makes the fp32 sum the
+canonical NaN, so the result bits do not change. A reduced word can never be
+the sentinel (bf16 rounding of a NaN gives the canonical NaN), and is
+sanitised anyway.
+
+Only bf16, two or four ranks, compute capability 8.0 and the opt-in PCIe
+peer-to-peer custom all-reduce. Messages above
 VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES (default 256 KiB, the largest measured)
 and other dtypes keep the incumbent kernel.
 
@@ -79,7 +90,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-WORLD_SIZE = 4
+WORLD_SIZES = (2, 4)  # ranks the kernel is instantiated for
 THREADS = 256  # launch rule chosen from a threads x blocks sweep (1..32 rows)
 MAX_BLOCKS = 36
 EPOCH_WORDS = 16
@@ -92,12 +103,13 @@ KERNEL_SRC = r"""
 
 namespace arflags {
 
-constexpr int kRanks = 4;
+constexpr int kMaxRanks = 4;
 constexpr uint32_t kSentinel = 0xFFFFFFFFu;
 constexpr uint32_t kCanonicalPair = 0x7FFF7FFFu;
 
+// Peer buffers; at two ranks p[2] and p[3] are null and never selected.
 struct __align__(16) Ptrs {
-  void* p[kRanks];
+  void* p[kMaxRanks];
 };
 
 // w[0] stage (0..2), w[1] CTAs that read w[0] this call, w[2..4] packs last
@@ -107,11 +119,13 @@ struct __align__(16) Epoch {
   uint32_t w[16];
 };
 
-// Owner of pack idx in cross_device_reduce_2stage: part = size / 4, ranks 0..2
-// own [r*part, (r+1)*part), rank 3 the rest (all of it when part == 0).
+// Owner of pack idx in cross_device_reduce_2stage with R ranks: part = size / R,
+// ranks 0..R-2 own [r*part, (r+1)*part), rank R-1 the rest (all of it when
+// part == 0).
+template <int R>
 __host__ __device__ __forceinline__ int part_len(int q, int size) {
-  int part = size / kRanks;
-  return q == kRanks - 1 ? size - (kRanks - 1) * part : part;
+  int part = size / R;
+  return q == R - 1 ? size - (R - 1) * part : part;
 }
 
 __host__ __device__ __forceinline__ uint32_t sanitize_word(uint32_t w) {
@@ -217,20 +231,31 @@ __device__ __noinline__ void wait_failed(WaitCtx c, int phase, int peer,
 
 // Buffer pointers in registers, selected by static index only (a dynamically
 // indexed kernel parameter would be copied to local memory).
-struct Regs4 {
+template <int R>
+struct Regs {
+  static_assert(R == 2 || R == 4, "two or four ranks");
   void* p0;
   void* p1;
   void* p2;
   void* p3;
-  AFD explicit Regs4(const Ptrs& b)
+  AFD explicit Regs(const Ptrs& b)
       : p0(b.p[0]), p1(b.p[1]), p2(b.p[2]), p3(b.p[3]) {}
   AFD void* operator[](int q) const {
-    return q == 0 ? p0 : (q == 1 ? p1 : (q == 2 ? p2 : p3));
+    if constexpr (R == 2) {
+      return q == 0 ? p0 : p1;
+    } else {
+      return q == 0 ? p0 : (q == 1 ? p1 : (q == 2 ? p2 : p3));
+    }
   }
 };
 
-AFD uint4 pick4(const uint4 (&v)[kRanks], int q) {
-  return q == 0 ? v[0] : (q == 1 ? v[1] : (q == 2 ? v[2] : v[3]));
+template <int R>
+AFD uint4 pick(const uint4 (&v)[R], int q) {
+  if constexpr (R == 2) {
+    return q == 0 ? v[0] : v[1];
+  } else {
+    return q == 0 ? v[0] : (q == 1 ? v[1] : (q == 2 ? v[2] : v[3]));
+  }
 }
 
 union Pack {
@@ -239,15 +264,16 @@ union Pack {
 };
 
 // The incumbent's packed_reduce over pointers rotated to the owner.
-AFD uint4 reduce_owner_order(const uint4 (&v)[kRanks], int owner) {
+template <int R>
+AFD uint4 reduce_owner_order(const uint4 (&v)[R], int owner) {
   float acc[8];
   Pack x;
-  x.u = pick4(v, owner);
+  x.u = pick<R>(v, owner);
 #pragma unroll
   for (int e = 0; e < 8; e++) acc[e] = __bfloat162float(x.h[e]);
 #pragma unroll
-  for (int j = 1; j < kRanks; j++) {
-    x.u = pick4(v, (owner + j) & (kRanks - 1));
+  for (int j = 1; j < R; j++) {
+    x.u = pick<R>(v, (owner + j) & (R - 1));
 #pragma unroll
     for (int e = 0; e < 8; e++) acc[e] += __bfloat162float(x.h[e]);
   }
@@ -256,16 +282,18 @@ AFD uint4 reduce_owner_order(const uint4 (&v)[kRanks], int owner) {
   return x.u;
 }
 
-AFD void wait3(const uint4* base, int rank_stride, int rank,
-               uint4 (&v)[kRanks], const WaitCtx& c) {
-  bool ready[kRanks];
+// Waits for the R - 1 peer packs of one owned index.
+template <int R>
+AFD void wait_peers(const uint4* base, int rank_stride, int rank,
+                    uint4 (&v)[R], const WaitCtx& c) {
+  bool ready[R];
 #pragma unroll
-  for (int s = 0; s < kRanks; s++) ready[s] = (s == rank);
-  int remaining = kRanks - 1;
+  for (int s = 0; s < R; s++) ready[s] = (s == rank);
+  int remaining = R - 1;
   const unsigned long long t0 = now_ns();
   while (remaining) {
 #pragma unroll
-    for (int s = 0; s < kRanks; s++) {
+    for (int s = 0; s < R; s++) {
       if (!ready[s]) {
         uint4 x = ld_volatile16(base + s * rank_stride);
         if (!dirty(x)) {
@@ -280,7 +308,7 @@ AFD void wait3(const uint4* base, int rank_stride, int rank,
       if (waited > c.limit_ns) {
         int peer = 0;
 #pragma unroll
-        for (int s = kRanks - 1; s >= 0; s--)
+        for (int s = R - 1; s >= 0; s--)
           if (!ready[s]) peer = s;
         wait_failed(c, 1, peer, waited);
       }
@@ -299,9 +327,10 @@ AFD uint4 wait1(const uint4* ptr, int peer, const WaitCtx& c) {
   return x;
 }
 
-// size: message length in 16-byte packs. Layout per stage (L = largest
-// partition): reduce-scatter slot s at s*L, all-gather slot q at (4+q)*L.
-// stage_packs >= 8*L.
+// R ranks, R a power of two. size: message length in 16-byte packs. Layout per
+// stage (L = largest partition): reduce-scatter slot s at s*L, all-gather
+// slot q at (R+q)*L. stage_packs >= 2*R*L.
+template <int R>
 __global__ void __launch_bounds__(512, 1)
     two_shot(Ptrs bufs, const uint4* __restrict__ in, uint4* __restrict__ out,
              Epoch* ep, int rank, int size, int stage_packs,
@@ -313,17 +342,17 @@ __global__ void __launch_bounds__(512, 1)
   const int dirty_size = ep->w[2 + dirty_stage];
   __syncthreads();
   if (threadIdx.x == 0) atomicAdd(&ep->w[1], 1u);
-  const Regs4 b(bufs);
+  const Regs<R> b(bufs);
   const WaitCtx wc{ep, err, limit_ns, rank, stage, size};
 
-  const int part = size / kRanks;
-  const int L = part_len(kRanks - 1, size);
+  const int part = size / R;
+  const int L = part_len<R>(R - 1, size);
 
   for (int idx = tid; idx < L; idx += stride) {
 #pragma unroll
-    for (int i = 1; i < kRanks; i++) {
-      int q = (rank + i) & (kRanks - 1);
-      if (idx < part_len(q, size)) {
+    for (int i = 1; i < R; i++) {
+      int q = (rank + i) & (R - 1);
+      if (idx < part_len<R>(q, size)) {
         uint4* dst = reinterpret_cast<uint4*>(b[q]) + stage * stage_packs +
                      rank * L + idx;
         st_volatile16(dst, sanitize(in[q * part + idx]));
@@ -337,28 +366,30 @@ __global__ void __launch_bounds__(512, 1)
   for (int idx = tid; idx < dirty_size; idx += stride) dirty_base[idx] = sent;
 
   const uint4* cur = self + stage * stage_packs;
-  const int mine = part_len(rank, size);
+  const int mine = part_len<R>(rank, size);
   for (int idx = tid; idx < mine; idx += stride) {
     uint4 own = sanitize(in[rank * part + idx]);
-    uint4 v[kRanks] = {own, own, own, own};
-    wait3(cur + idx, L, rank, v, wc);
-    uint4 red = sanitize(reduce_owner_order(v, rank));
+    uint4 v[R];
+#pragma unroll
+    for (int s = 0; s < R; s++) v[s] = own;
+    wait_peers<R>(cur + idx, L, rank, v, wc);
+    uint4 red = sanitize(reduce_owner_order<R>(v, rank));
     out[rank * part + idx] = red;
 #pragma unroll
-    for (int i = 1; i < kRanks; i++) {
-      int q = (rank + i) & (kRanks - 1);
+    for (int i = 1; i < R; i++) {
+      int q = (rank + i) & (R - 1);
       uint4* dst = reinterpret_cast<uint4*>(b[q]) + stage * stage_packs +
-                   (kRanks + rank) * L + idx;
+                   (R + rank) * L + idx;
       st_volatile16(dst, red);
     }
   }
 
   for (int idx = tid; idx < L; idx += stride) {
 #pragma unroll
-    for (int i = 1; i < kRanks; i++) {
-      int q = (rank + i) & (kRanks - 1);
-      if (idx < part_len(q, size))
-        out[q * part + idx] = wait1(cur + (kRanks + q) * L + idx, q, wc);
+    for (int i = 1; i < R; i++) {
+      int q = (rank + i) & (R - 1);
+      if (idx < part_len<R>(q, size))
+        out[q * part + idx] = wait1(cur + (R + q) * L + idx, q, wc);
     }
   }
 
@@ -366,12 +397,19 @@ __global__ void __launch_bounds__(512, 1)
     volatile uint32_t* arrived = &ep->w[1];
     while (*arrived < gridDim.x) {
     }
-    ep->w[2 + stage] = 2 * kRanks * L;
+    ep->w[2 + stage] = 2 * R * L;
     ep->w[1] = 0;
     ep->w[8] += 1;
     ep->w[0] = (stage + 1) % 3;
   }
 }
+
+template __global__ void two_shot<2>(Ptrs, const uint4* __restrict__,
+                                     uint4* __restrict__, Epoch*, int, int, int,
+                                     unsigned long long, long long*);
+template __global__ void two_shot<4>(Ptrs, const uint4* __restrict__,
+                                     uint4* __restrict__, Epoch*, int, int, int,
+                                     unsigned long long, long long*);
 
 #undef AFD
 
@@ -390,17 +428,23 @@ void all_reduce(torch::Tensor inp, torch::Tensor out, std::vector<int64_t> bufs,
               out.scalar_type() == at::kBFloat16);
   TORCH_CHECK(inp.numel() == out.numel());
   TORCH_CHECK(inp.nbytes() % 16 == 0 && inp.nbytes() > 0);
-  TORCH_CHECK(bufs.size() == 4);
+  const int ranks = static_cast<int>(bufs.size());
+  TORCH_CHECK(ranks == 2 || ranks == 4, "flags all-reduce: 2 or 4 ranks");
+  TORCH_CHECK(0 <= rank && rank < ranks);
   TORCH_CHECK(limit_ns > 0 && err_dev_ptr != 0);
   int size = static_cast<int>(inp.nbytes() / 16);
-  int L = arflags::part_len(3, size);
-  TORCH_CHECK(8 * L <= stage_packs, "message larger than the flags buffer");
+  int L = ranks == 2 ? arflags::part_len<2>(1, size)
+                     : arflags::part_len<4>(3, size);
+  TORCH_CHECK(2 * ranks * L <= stage_packs,
+              "message larger than the flags buffer");
   int blocks = static_cast<int>(
       std::min<int64_t>(max_blocks, (L + threads - 1) / threads));
   blocks = std::max(blocks, 1);
   arflags::Ptrs p;
-  for (int i = 0; i < 4; i++) p.p[i] = reinterpret_cast<void*>(bufs[i]);
-  arflags::two_shot<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  for (int i = 0; i < arflags::kMaxRanks; i++)
+    p.p[i] = i < ranks ? reinterpret_cast<void*>(bufs[i]) : nullptr;
+  auto kernel = ranks == 2 ? arflags::two_shot<2> : arflags::two_shot<4>;
+  kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       p, reinterpret_cast<const uint4*>(inp.data_ptr()),
       reinterpret_cast<uint4*>(out.data_ptr()),
       reinterpret_cast<arflags::Epoch*>(epoch_ptr), static_cast<int>(rank), size,
@@ -553,13 +597,22 @@ def _report(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def largest_part_packs(nbytes: int) -> int:
+def largest_part_packs(nbytes: int, world_size: int) -> int:
+    """Packs in the largest partition: the last rank's, as in the kernel."""
     size = nbytes // 16
-    return size - 3 * (size // WORLD_SIZE)
+    return size - (world_size - 1) * (size // world_size)
 
 
-def launch_blocks(nbytes: int) -> int:
-    return max(1, min(MAX_BLOCKS, math.ceil(largest_part_packs(nbytes) / THREADS)))
+def stage_packs(max_bytes: int, world_size: int) -> int:
+    """Packs per buffer stage: a reduce-scatter and an all-gather slot per rank."""
+    return 2 * world_size * largest_part_packs(max_bytes, world_size)
+
+
+def launch_blocks(nbytes: int, world_size: int) -> int:
+    return max(
+        1,
+        min(MAX_BLOCKS, math.ceil(largest_part_packs(nbytes, world_size) / THREADS)),
+    )
 
 
 def gate_reason(
@@ -572,8 +625,8 @@ def gate_reason(
     """Why the flags path stays off for this communicator (None: it may run)."""
     if not is_cuda:
         return "not a CUDA platform"
-    if world_size != WORLD_SIZE:
-        return f"world size {world_size} (validated at {WORLD_SIZE} only)"
+    if world_size not in WORLD_SIZES:
+        return f"world size {world_size} (the kernel serves 2 or 4 ranks)"
     if not same_node:
         return "the group spans nodes"
     if capability != (8, 0):
@@ -592,13 +645,14 @@ class FlagsAllreduce:
     Construction is collective over `group` (IPC handle exchange, barrier).
     """
 
-    def __init__(self, group, device: torch.device, rank: int, max_bytes: int,
-                 create_shared_buffer, free_shared_buffer):
+    def __init__(self, group, device: torch.device, rank: int, world_size: int,
+                 max_bytes: int, create_shared_buffer, free_shared_buffer):
         self.module = load_module()
         self.group = group
         self.rank = rank
+        self.world_size = world_size
         self.max_bytes = int(max_bytes)
-        self.stage_packs = 8 * largest_part_packs(self.max_bytes)
+        self.stage_packs = stage_packs(self.max_bytes, world_size)
         self.buffer_bytes = 3 * self.stage_packs * 16
         self._free = free_shared_buffer
         self.ptrs = create_shared_buffer(self.buffer_bytes, group=group)
@@ -624,7 +678,7 @@ class FlagsAllreduce:
             self.rank,
             self.stage_packs,
             THREADS,
-            launch_blocks(inp.nbytes),
+            launch_blocks(inp.nbytes, self.world_size),
             self.limit_ns,
             self.errors.dev_ptr,
         )

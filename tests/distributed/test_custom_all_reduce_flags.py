@@ -3,9 +3,11 @@
 """Tests for the flags-in-data two-shot all-reduce
 (vllm/sm80/distributed/custom_all_reduce_flags.py).
 
-The bitwise and timing checks against cross_device_reduce_2stage need four
-peer-connected GPUs and run outside pytest. Everything here runs without a GPU
-except the overrun test, which needs one sm_80 GPU; the compile tests need nvcc.
+The bitwise and timing checks against cross_device_reduce_2stage at four ranks
+need four peer-connected GPUs and run outside pytest. The two-rank bitwise check
+against upstream's custom all-reduce needs two peer-connected sm_80 GPUs and
+nvcc. Everything else runs without a GPU except the overrun test, which needs
+one sm_80 GPU; the compile tests need nvcc.
 """
 
 import ctypes
@@ -55,7 +57,9 @@ def test_build_dir_follows_vllm_cache_root(monkeypatch, tmp_path):
     "kw,expect",
     [
         (dict(), None),
-        (dict(world_size=2), "world size 2"),
+        (dict(world_size=2), None),
+        (dict(world_size=3), "world size 3"),
+        (dict(world_size=6), "world size 6"),
         (dict(world_size=8), "world size 8"),
         (dict(same_node=False), "spans nodes"),
         (dict(capability=(9, 0)), "compute capability (9, 0)"),
@@ -83,15 +87,37 @@ def test_gate(kw, expect):
 
 def test_sizes_and_launch():
     # one 4096-wide bf16 row = 8 KiB = 512 packs; partitions 128 x 4
-    assert flags.largest_part_packs(8192) == 128
-    assert flags.largest_part_packs(16) == 1  # one pack: rank 3 owns it
-    assert flags.largest_part_packs(48) == 3
-    assert flags.largest_part_packs(80) == 2  # 5 packs: 1,1,1,2
-    assert flags.launch_blocks(16) == 1
-    assert flags.launch_blocks(8192) == 1
-    assert flags.launch_blocks(65536) == 4
-    assert flags.launch_blocks(262144) == 16
-    assert flags.launch_blocks(8 << 20) == flags.MAX_BLOCKS
+    assert flags.largest_part_packs(8192, 4) == 128
+    assert flags.largest_part_packs(16, 4) == 1  # one pack: rank 3 owns it
+    assert flags.largest_part_packs(48, 4) == 3
+    assert flags.largest_part_packs(80, 4) == 2  # 5 packs: 1,1,1,2
+    assert flags.launch_blocks(16, 4) == 1
+    assert flags.launch_blocks(8192, 4) == 1
+    assert flags.launch_blocks(65536, 4) == 4
+    assert flags.launch_blocks(262144, 4) == 16
+    assert flags.launch_blocks(8 << 20, 4) == flags.MAX_BLOCKS
+    # four ranks keep the buffer they had: 8 slots of the largest partition
+    assert flags.stage_packs(262144, 4) == 8 * 4096
+
+
+def test_sizes_and_launch_two_ranks():
+    # 8 KiB = 512 packs; partitions 256 x 2
+    assert flags.largest_part_packs(8192, 2) == 256
+    assert flags.largest_part_packs(16, 2) == 1  # one pack: rank 1 owns it
+    assert flags.largest_part_packs(48, 2) == 2  # 3 packs: 1,2
+    assert flags.launch_blocks(16, 2) == 1
+    assert flags.launch_blocks(8192, 2) == 1
+    assert flags.launch_blocks(65536, 2) == 8
+    assert flags.launch_blocks(262144, 2) == 32
+    assert flags.launch_blocks(8 << 20, 2) == flags.MAX_BLOCKS
+    # 2 reduce-scatter + 2 all-gather slots of 8192 packs: the same 1.5 MiB
+    # (three stages) as at four ranks
+    assert flags.stage_packs(262144, 2) == 4 * 8192
+    assert 3 * flags.stage_packs(262144, 2) * 16 == 3 * flags.stage_packs(262144, 4) * 16
+    for nbytes in range(16, 4096, 16):
+        size = nbytes // 16
+        parts = [size // 2, size - size // 2]
+        assert sum(parts) == size and max(parts) == flags.largest_part_packs(nbytes, 2)
 
 
 # ------------------------------------------------------------------- dispatch
@@ -114,16 +140,17 @@ class FakeFlags:
         return torch.full_like(inp, 7)
 
 
-def _fake_ca(monkeypatch, with_flags):
+def _fake_ca(monkeypatch, with_flags, world_size=4):
     ca = object.__new__(_CA)
     ca.disabled = False
-    ca.world_size = 4
-    ca.fully_connected = True
+    ca.world_size = world_size
+    # Two PCIe ranks are not "fully connected"; upstream serves them anyway.
+    ca.fully_connected = world_size != 2
     ca.max_size = 8192 * 1024
     ca._IS_CAPTURING = False
     ca.rank = 0
     ca._ptr = 1234
-    ca.buffer_ptrs = [11, 12, 13, 14]
+    ca.buffer_ptrs = [11, 12, 13, 14][:world_size]
     ca._flags = FakeFlags() if with_flags else None
     ops_calls = []
 
@@ -136,14 +163,16 @@ def _fake_ca(monkeypatch, with_flags):
     return ca, ops_calls
 
 
-def test_off_path_unchanged(monkeypatch):
-    ca, ops_calls = _fake_ca(monkeypatch, with_flags=False)
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_off_path_unchanged(monkeypatch, world_size):
+    ca, ops_calls = _fake_ca(monkeypatch, with_flags=False, world_size=world_size)
     x = torch.zeros(4096, dtype=torch.bfloat16)
     out = ca.custom_all_reduce(x)
     assert ops_calls == [(1234, 8192, 11, 8192 * 1024)]  # staging buffer as before
     assert torch.all(out == 3)
 
 
+@pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize(
     "dtype,numel,flagged",
     [
@@ -155,8 +184,8 @@ def test_off_path_unchanged(monkeypatch):
         (torch.float32, 4096, False),
     ],
 )
-def test_dispatch(monkeypatch, dtype, numel, flagged):
-    ca, ops_calls = _fake_ca(monkeypatch, with_flags=True)
+def test_dispatch(monkeypatch, dtype, numel, flagged, world_size):
+    ca, ops_calls = _fake_ca(monkeypatch, with_flags=True, world_size=world_size)
     x = torch.zeros(numel, dtype=dtype)
     out = ca.custom_all_reduce(x)
     if flagged:
@@ -164,6 +193,16 @@ def test_dispatch(monkeypatch, dtype, numel, flagged):
         assert torch.all(out == 7)
     else:
         assert not ca._flags.calls and len(ops_calls) == 1
+
+
+def test_dispatch_two_ranks_qwen_rows(monkeypatch):
+    """Qwen TP2 decode messages (2560-wide bf16 rows, 4 per request at MTP k=3)
+    take the flags path up to 256 KiB, i.e. up to 51 rows; larger ones stay on
+    upstream's kernel."""
+    for rows, flagged in ((4, True), (32, True), (51, True), (52, False), (800, False)):
+        ca, ops_calls = _fake_ca(monkeypatch, with_flags=True, world_size=2)
+        ca.custom_all_reduce(torch.zeros(rows, 2560, dtype=torch.bfloat16))
+        assert bool(ca._flags.calls) is flagged and len(ops_calls) == (not flagged)
 
 
 def test_dispatch_respects_should_custom_ar(monkeypatch):
@@ -245,7 +284,8 @@ def _init_ca(monkeypatch, world_size=4, capability=(8, 0), p2p=True, load_ok=Tru
     made = []
 
     class FakeFA:
-        def __init__(self, group, device, rank, max_bytes, create, free):
+        def __init__(self, group, device, rank, world_size, max_bytes, create, free):
+            self.world_size = world_size
             self.max_bytes = max_bytes
             self.limit_ns = int(60e9)
             made.append(self)
@@ -254,13 +294,17 @@ def _init_ca(monkeypatch, world_size=4, capability=(8, 0), p2p=True, load_ok=Tru
     return ca, made
 
 
-def test_init_on_banner(monkeypatch, log_capture):
-    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", "131072")
-    ca, made = _init_ca(monkeypatch)
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_init_on_banner(monkeypatch, log_capture, world_size):
+    # distinct sizes per case: info_once would drop a repeated banner
+    max_bytes = 65536 * world_size
+    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", str(max_bytes))
+    ca, made = _init_ca(monkeypatch, world_size=world_size)
     ca._init_flags(same_node=True)
-    assert ca._flags is made[0] and made[0].max_bytes == 131072
+    assert ca._flags is made[0] and made[0].max_bytes == max_bytes
+    assert made[0].world_size == world_size
     assert any(
-        "flags-in-data two-shot kernel on" in m and "131072" in m and "60 s" in m
+        "flags-in-data two-shot kernel on" in m and str(max_bytes) in m and "60 s" in m
         for m in log_capture.messages
     ), log_capture.messages
 
@@ -268,7 +312,7 @@ def test_init_on_banner(monkeypatch, log_capture):
 @pytest.mark.parametrize(
     "kw,why",
     [
-        (dict(world_size=2), "world size 2"),
+        (dict(world_size=8), "world size 8"),
         (dict(capability=(8, 6)), "compute capability (8, 6)"),
         (dict(p2p=False), "VLLM_CUSTOM_ALLREDUCE_PCIE_P2P"),
         (dict(load_ok=False), "did not build on every rank"),
@@ -331,9 +375,9 @@ static int fails = 0;
 static uint16_t bits(__nv_bfloat16 v) { uint16_t b; memcpy(&b, &v, 2); return b; }
 static __nv_bfloat16 frombits(uint16_t b) { __nv_bfloat16 v; memcpy(&v, &b, 2); return v; }
 // One element, the incumbent's arithmetic: fp32 sum from the owner onwards.
-static __nv_bfloat16 sum4_owner_order(const __nv_bfloat16 v[kRanks], int owner) {
+static __nv_bfloat16 sum4_owner_order(const __nv_bfloat16 v[4], int owner) {
   float acc = __bfloat162float(v[owner]);
-  for (int j = 1; j < kRanks; j++) acc += __bfloat162float(v[(owner + j) % kRanks]);
+  for (int j = 1; j < 4; j++) acc += __bfloat162float(v[(owner + j) % 4]);
   return __float2bfloat16(acc);
 }
 // cross_device_reduce_2stage, written out from its loop bounds and packed_reduce
@@ -349,13 +393,26 @@ static __nv_bfloat16 incumbent(const __nv_bfloat16* x, int idx, int size) {
   }
   return frombits(0xdead);
 }
+// Two ranks: the flags kernel adds x_owner + x_other over the partitions of
+// part_len<2>; cross_device_reduce_1stage (upstream's kernel at world size 2)
+// adds x_0 + x_1 for every element.
+static __nv_bfloat16 sum2_owner_order(const __nv_bfloat16 v[2], int owner) {
+  float acc = __bfloat162float(v[owner]);
+  acc += __bfloat162float(v[owner ^ 1]);
+  return __float2bfloat16(acc);
+}
+static __nv_bfloat16 one_stage2(const __nv_bfloat16 v[2]) {
+  float acc = __bfloat162float(v[0]);
+  acc += __bfloat162float(v[1]);
+  return __float2bfloat16(acc);
+}
 int main() {
   std::mt19937 rng(7);
   std::normal_distribution<float> nd(0.f, 1.f);
   long checked = 0, control = 0;
   for (int size = 1; size <= 20000; size += (size < 2048 ? 1 : 97)) {
-    int sum = 0, L = part_len(3, size);
-    for (int q = 0; q < 4; q++) { sum += part_len(q, size); if (part_len(q, size) > L) fails++; }
+    int sum = 0, L = part_len<4>(3, size);
+    for (int q = 0; q < 4; q++) { sum += part_len<4>(q, size); if (part_len<4>(q, size) > L) fails++; }
     if (sum != size) fails++;
     for (int k = 0; k < 8; k++) {
       int idx = (int)(rng() % size);
@@ -371,13 +428,35 @@ int main() {
       checked++;
     }
   }
+  // Two ranks, finite and special values (signed zeros, infinities, subnormals,
+  // the largest finite value); NaN results are the GPU test's.
+  const uint16_t specials[] = {0x0000, 0x8000, 0x7F80, 0xFF80, 0x0001, 0x8001, 0x7F7F, 0xFF7F};
+  long checked2 = 0;
+  for (int size = 1; size <= 20000; size += (size < 2048 ? 1 : 97)) {
+    int L = part_len<2>(1, size);
+    if (part_len<2>(0, size) + L != size || part_len<2>(0, size) > L) fails++;
+    for (int k = 0; k < 8; k++) {
+      int idx = (int)(rng() % size);
+      int part = size / 2;
+      int owner = part == 0 ? 1 : (idx < part ? 0 : 1);
+      __nv_bfloat16 x[2];
+      float B = ldexpf(nd(rng), 20);
+      x[0] = __float2bfloat16((k & 1) ? B : nd(rng));
+      x[1] = __float2bfloat16((k & 1) ? -B * (1.f + ldexpf(nd(rng), -9)) : nd(rng));
+      if (k == 6) x[1] = __float2bfloat16(-__bfloat162float(x[0]));
+      if (k == 7) { x[0] = frombits(specials[rng() % 8]); x[1] = frombits(specials[rng() % 8]); }
+      if (bits(sum2_owner_order(x, owner)) != bits(one_stage2(x))) fails++;
+      checked2++;
+    }
+  }
   if (sanitize_word(0xFFFFFFFFu) != 0x7FFF7FFFu) fails++;
   if (sanitize_word(0x80000000u) != 0x80000000u) fails++;
   if (sanitize_word(0u) != 0u) fails++;
   // the replacement keeps both halves NaN
   if (!std::isnan(__bfloat162float(frombits(0x7FFF))) || !std::isnan(__bfloat162float(frombits(0xFFFF)))) fails++;
-  printf("HOST_ORDER %s checked=%ld control=%ld\n", fails ? "FAIL" : "PASS", checked, control);
-  return fails || control == 0;
+  printf("HOST_ORDER %s checked=%ld checked2=%ld control=%ld\n", fails ? "FAIL" : "PASS",
+         checked, checked2, control);
+  return fails || control == 0 || checked2 == 0;
 }
 """
 
@@ -517,6 +596,7 @@ def test_all_reduce_passes_limit_and_record(monkeypatch):
     m = _FakeModule()
     fa = object.__new__(flags.FlagsAllreduce)
     fa.module, fa.ptrs, fa.rank, fa.stage_packs = m, [1, 2, 3, 4], 0, 32768
+    fa.world_size = 4
     fa.epoch = torch.zeros(16, dtype=torch.int32)
     fa.limit_ns = 1234
     seen = []
@@ -640,7 +720,7 @@ from vllm.sm80.distributed import custom_all_reduce_flags as f
 m = f.load_module()
 rec = f.ErrorRecord(m)
 size_bytes = 8192
-stage = 8 * f.largest_part_packs(262144)
+stage = f.stage_packs(262144, 4)
 bufs = [torch.full((3 * stage * 16,), 0xFF, dtype=torch.uint8, device="cuda") for _ in range(4)]
 epoch = torch.zeros(16, dtype=torch.int32, device="cuda")
 x = torch.randn(size_bytes // 2, device="cuda").bfloat16()
@@ -673,3 +753,117 @@ def test_gpu_overrun_kills_process_with_message(tmp_path):
     assert "flags-in-data wait timed out on rank 1" in r.stderr, r.stderr[-2000:]
     assert "limit 2.0 s" in r.stderr and "wait for rank 0" in r.stderr
     print("child exit", r.returncode, "after %.1f s" % took)
+
+
+# ------------------------------------------------------- GPU: two-rank bitwise
+def _tp2_inputs(nbytes: int, seed: int) -> torch.Tensor:
+    """Both ranks' bf16 inputs, shape (2, n): normals over 2^-20..2^20, exactly
+    cancelling pairs, and special words (signed zeros, infinities, subnormals,
+    NaNs including 0xFFFF halves and whole sentinel words)."""
+    g = torch.Generator().manual_seed(seed)
+    n = nbytes // 2
+    scale = torch.exp2(torch.randint(-20, 21, (2, n), generator=g).float())
+    x = (torch.randn(2, n, generator=g) * scale).bfloat16()
+    cancel = torch.rand(n, generator=g) < 0.1
+    x[1][cancel] = -x[0][cancel]
+    special = [0x0000, 0x8000, 0x7F80, 0xFF80, 0x0001, 0x8001, 0x7FC0, 0xFFC1, 0xFFFF,
+               0x7FFF]
+    special = torch.tensor([s - 65536 if s >= 32768 else s for s in special],
+                           dtype=torch.int16)
+    bits = x.view(torch.int16)
+    pick = torch.rand(2, n, generator=g) < 0.02
+    bits[pick] = special[torch.randint(0, len(special), (2, n), generator=g)[pick]]
+    x.view(torch.int32)[0, ::97] = -1  # sentinel words on rank 0
+    x.view(torch.int32)[1, 5::101] = -1  # and on rank 1
+    return x
+
+
+@pytest.mark.skipif(
+    not HAVE_NVCC
+    or not torch.cuda.is_available()
+    or torch.cuda.device_count() < 2
+    or any(torch.cuda.get_device_capability(d) != (8, 0) for d in range(2)),
+    reason="needs nvcc and two sm_80 GPUs",
+)
+@pytest.mark.parametrize("algo", ["", "2stage"])
+def test_gpu_two_ranks_bitwise_vs_custom_allreduce(monkeypatch, algo):
+    """One process drives both ranks (cards 0 and 1, peer access on): the flags
+    kernel at two ranks against upstream's custom all-reduce with its default
+    kernel at world size 2 (one-stage) and with the two-stage kernel forced.
+    Every size runs twice so that each of the three stages is reused."""
+    from vllm import _custom_ops as ops
+
+    if not (torch.cuda.can_device_access_peer(0, 1)
+            and torch.cuda.can_device_access_peer(1, 0)):
+        pytest.skip("cards 0 and 1 have no peer access")
+    if algo:
+        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", algo)
+    else:
+        monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raising=False)
+    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "20")
+    devs = [torch.device("cuda", r) for r in range(2)]
+    # a device-to-device copy makes torch enable peer access, one direction each
+    for a, b in ((0, 1), (1, 0)):
+        torch.zeros(1, device=devs[b]).copy_(torch.zeros(1, device=devs[a]))
+
+    max_bytes = 262144
+    reg_bytes = 1 << 20
+    meta = [torch.zeros(ops.meta_size() + reg_bytes, dtype=torch.uint8, device=d)
+            for d in devs]
+    reg = [torch.empty(reg_bytes, dtype=torch.uint8, device=d) for d in devs]
+    rank_data = [torch.empty(1 << 20, dtype=torch.uint8, device=d) for d in devs]
+    fa = []
+    for r, d in enumerate(devs):
+        with torch.cuda.device(d):
+            fa.append(ops.init_custom_ar([t.data_ptr() for t in meta], rank_data[r],
+                                         r, True))
+            ops.register_buffer(fa[r], [t.data_ptr() for t in reg])
+
+    m = flags.load_module()
+    sp = flags.stage_packs(max_bytes, 2)
+    nbuf = 3 * sp * 16
+    fbuf = [torch.empty(nbuf, dtype=torch.uint8, device=d) for d in devs]
+    epoch = [torch.zeros(flags.EPOCH_WORDS, dtype=torch.int32, device=d) for d in devs]
+    errors = []
+    recs = []
+    for r, d in enumerate(devs):
+        with torch.cuda.device(d):
+            m.fill_sentinel(fbuf[r].data_ptr(), nbuf)
+            recs.append(flags.ErrorRecord(m, on_error=errors.append,
+                                          exit_fn=lambda code: None))
+
+    def run(x, launch):
+        outs = [torch.empty_like(x[r]) for r in range(2)]
+        for r, d in enumerate(devs):  # both launched before either is awaited
+            with torch.cuda.device(d):
+                launch(r, x[r], outs[r])
+        for d in devs:
+            torch.cuda.synchronize(d)
+        return [o.view(torch.int16).cpu() for o in outs]
+
+    def upstream(r, inp, out):
+        ops.all_reduce(fa[r], inp, out, reg[r].data_ptr(), reg_bytes)
+
+    def flagged(r, inp, out):
+        m.all_reduce(inp, out, [t.data_ptr() for t in fbuf], epoch[r].data_ptr(), r,
+                     sp, flags.THREADS, flags.launch_blocks(inp.nbytes, 2),
+                     flags.wait_limit_ns(), recs[r].dev_ptr)
+
+    sizes = [16, 48, 4096, 5120, 20480, 24592, 65536, 163840, 262144]
+    try:
+        for call, nbytes in enumerate(sizes * 2):
+            host = _tp2_inputs(nbytes, seed=call)
+            x = [host[r].to(devs[r]) for r in range(2)]
+            want = run(x, upstream)
+            got = run(x, flagged)
+            assert not errors, errors
+            assert torch.equal(want[0], want[1]), nbytes
+            for r in range(2):
+                diff = (got[r] != want[r]).nonzero()
+                assert diff.numel() == 0, (nbytes, r, diff[:8].flatten().tolist())
+    finally:
+        for r, d in enumerate(devs):
+            with torch.cuda.device(d):
+                ops.dispose(fa[r])
+        for rec in recs:
+            rec._stop.set()

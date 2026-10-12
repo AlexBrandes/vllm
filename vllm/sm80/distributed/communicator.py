@@ -137,6 +137,7 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
             self.group,
             self.device,
             self.rank,
+            self.world_size,
             envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES,
             self.create_shared_buffer,
             self.free_shared_buffer,

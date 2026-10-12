@@ -167,9 +167,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # throws at its first all-reduce.
     "VLLM_CUSTOM_ALLREDUCE_ALGO": lambda: _custom_allreduce_algo(),
     # Flags-in-data two-shot all-reduce for bf16 messages up to
-    # VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES at TP4 over PCIe peer-to-peer
+    # VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES at TP2 or TP4 over PCIe peer-to-peer
     # (vllm/sm80/distributed/custom_all_reduce_flags.py). Bitwise identical to
-    # the two-stage kernel. Off unless set.
+    # the kernel it replaces: the two-stage kernel at TP4, upstream's one-stage
+    # (or forced two-stage) kernel at TP2. Off unless set.
     "VLLM_CUSTOM_ALLREDUCE_FLAGS": lambda: bool(
         int(os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", "0"))
     ),
