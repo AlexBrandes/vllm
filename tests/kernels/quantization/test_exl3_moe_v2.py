@@ -160,12 +160,14 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
     assert "local expert 3" in closed[0]
 
 
-def _experts(moe_v2_rows, max_rows=4096, workspace=0):
+def _experts(moe_v2_rows, max_rows=4096, workspace=0, expert_map="layer map"):
+    """Exl3Experts without its constructor. The CPU tests keep a placeholder
+    expert map, which they only compare; GPU tests pass the real one."""
     from vllm.sm80.kernels.exl3.quant import Exl3Experts
 
     experts = object.__new__(Exl3Experts)
     experts.intermediate_size = INTERMEDIATE
-    experts.expert_map = "layer map"
+    experts.expert_map = expert_map
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
@@ -399,7 +401,7 @@ def test_off_path_is_moe_out_and_the_scalar_reference(served, rows):
     _bitwise(expected, reference, f"moe_out vs scalar reference rows={rows}")
     for moe_v2_rows in (0, 64) if rows > 64 else (0,):
         size = exl3_ops.moe_workspace_size(rows, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
-        experts = _experts(moe_v2_rows, workspace=size)
+        experts = _experts(moe_v2_rows, workspace=size, expert_map=served.expert_map)
         out = torch.full_like(x, float("nan"))
         workspace2 = torch.empty(2 * size, dtype=torch.bfloat16, device=x.device)
         _apply(experts, x, ids, weights, served.pointers, served.meta, out, workspace2)
