@@ -365,6 +365,13 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         )
         if max_total_tokens <= 0:
             raise ValueError("EXL3 PLE needs a positive staging token capacity")
+        if not self.reduce_results:
+            # Sequence parallelism defers the ETP sum to a reduce-scatter, but
+            # read-failure masking needs the summed rows of every token here.
+            raise NotImplementedError(
+                "EXL3 PLE does not support sequence parallelism "
+                "(reduce_results=False)"
+            )
         self.placement = self.embedding_method.placement
         self._heads = num_ngram_heads
         self._capacity = max_total_tokens * self.etp_data_parallel_size * self._heads
@@ -567,7 +574,7 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._slot = None
 
     @eager_break_during_capture
-    def start_prefetch(self, hidden_states, ngram_ids):
+    def start_prefetch(self, ngram_ids):
         self.check_ready()
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("EXL3 PLE requires eager or split CUDA graphs")
@@ -686,7 +693,13 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         failed, self._failed_tokens = self._failed_tokens, None
         return failed
 
-    def forward(self, hidden_states):
-        output = self._decoded.new_empty((hidden_states.shape[0], self._output_dim))
+    def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:
+        """Finish the prefetched lookup into new output storage."""
+        output = self._decoded.new_empty((total_tokens, self._output_dim))
         self._finalize_prefetch(output)
         return output
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "EXL3 PLE embedding requires start_prefetch() and finalize_prefetch()."
+        )

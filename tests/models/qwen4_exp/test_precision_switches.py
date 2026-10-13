@@ -127,7 +127,9 @@ def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, 
     monkeypatch.setenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", str(int(enabled)))
     config = SimpleNamespace(vocab_size=8, hidden_size=2560, hc_count=4, num_hidden_layers=48,
                              mtp_num_hidden_layers=1, rms_norm_eps=1e-6, hc_lowrank=4)
-    cfg = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config), quant_config=None)
+    parallel = SimpleNamespace(tensor_parallel_size=1, enable_hc_sp=False, use_sequence_parallel_moe=False)
+    cfg = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config), parallel_config=parallel,
+                          quant_config=None)
     monkeypatch.setattr(mtp_module, "_make_draft_vllm_config", lambda *args: cfg)
     monkeypatch.setattr(mtp_module, "set_current_vllm_config", lambda *args, **kw: nullcontext())
     monkeypatch.setattr(mtp_module, "ColumnParallelLinear", lambda *args, **kw: nn.Identity())
