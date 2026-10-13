@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.router import gate_linear
 from vllm.model_executor.models import qwen3_next
 from vllm.models.qwen4_exp.nvidia import model as model_module
 from vllm.models.qwen4_exp.nvidia import mtp as mtp_module
+from vllm.models.qwen4_exp.nvidia import precision as precision_module
 
 
 @pytest.mark.parametrize("name", ["VLLM_QWEN4_ROUTER_FP32", "VLLM_QWEN4_MTP_PER_STREAM_NORM"])
@@ -67,7 +68,7 @@ def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, default
                                enable_eplb=False, eplb_config=SimpleNamespace(num_redundant_experts=0))
     cfg = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config), parallel_config=parallel, quant_config=None)
     banners = []
-    monkeypatch.setattr(model_module, "logger", SimpleNamespace(info_once=lambda *args: banners.append(args)), raising=False)
+    monkeypatch.setattr(precision_module, "logger", SimpleNamespace(info_once=lambda *args: banners.append(args)))
     with torch.device("cpu"):
         old_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
@@ -139,7 +140,7 @@ def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, 
     monkeypatch.setattr(mtp_module, "GatedResidual", lambda *args, **kw: _Mixer())
     monkeypatch.setattr(mtp_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
     banners = []
-    monkeypatch.setattr(mtp_module, "logger", SimpleNamespace(info_once=lambda *args: banners.append(args)), raising=False)
+    monkeypatch.setattr(precision_module, "logger", SimpleNamespace(info_once=lambda *args: banners.append(args)))
     predictor = mtp_module.Qwen4ExpMultiTokenPredictor(vllm_config=cfg).to(dtype)
     # Different stream scales distinguish one stack RMS from four stream RMSs.
     x = torch.linspace(-1.0, 1.0, 2560).repeat(2, 4, 1)
@@ -154,7 +155,7 @@ def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, 
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
     assert predictor.pre_fc_norm_hidden.weight.shape == (10240,)
     assert got.dtype == dtype and got.shape == (2, 10240)
-    assert predictor.per_stream_hidden_norm is enabled
+    assert predictor.hidden_norm.per_stream is enabled
     assert banners and banners[0][1:] == (("per-stream" if enabled else "flat"), int(enabled))
     # The selection is fixed at construction, as it must be for graph replay.
     monkeypatch.setenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", str(int(not enabled)))
