@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
     VLLM_EXL3_PLE_OVERLAP: bool = False
+    VLLM_EXL3_MOE_V2: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
 
@@ -705,6 +706,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_OVERLAP", "0"))
     ),
+    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
+    # of at most 64 rows when every local expert matrix is bits_x2 10 /
+    # codebook 2 with hidden 2560, intermediate 640, top-10 and 256 of 512
+    # experts local, on sm_80 (vllm/sm80/kernels/exl3/quant.py). Results
+    # differ from the default kernels in the last bits. Default OFF: unset,
+    # every call takes moe_out.
+    "VLLM_EXL3_MOE_V2": lambda: bool(int(os.getenv("VLLM_EXL3_MOE_V2", "0"))),
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
         int(os.getenv("VLLM_QWEN4_ROUTER_FP32", "0"))

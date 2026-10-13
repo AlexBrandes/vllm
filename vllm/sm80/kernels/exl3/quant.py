@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -33,6 +34,8 @@ from vllm.sm80.kernels.exl3.utils import (
     PackedMatrix,
     aligned_shard,
 )
+
+logger = init_logger(__name__)
 
 # Qwen4Exp QSA projects Q/gate, K, V and the replicated indexer Q/K in one
 # layer. It first builds a three-output QKV layer, then replaces it with the
@@ -583,6 +586,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.top_k,
             self.local_experts,
         )
+        moe_v2_rows = 0
+        if envs.VLLM_EXL3_MOE_V2:
+            moe_v2_rows, workspace = self._moe_v2(layer, metadata, max_rows, workspace)
         experts = Exl3Experts(
             self.moe,
             self.moe_quant_config,
@@ -590,8 +596,59 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_expert_map,
             workspace,
             max_rows,
+            moe_v2_rows,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
+
+    def _moe_v2(self, layer, metadata, max_rows: int, workspace: int):
+        """Rows up to which this layer's calls take moe_out_v2, and a workspace
+        size that fits both operators (0 rows: the gate is closed)."""
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
+
+        device = layer.exl3_ptrs.device
+        reason = exl3_ops.moe_v2_closed_reason(
+            tuple(torch.cuda.get_device_capability(device)),
+            self.moe.in_dtype,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+            self.local_experts,
+            layer.global_num_experts,
+            metadata,
+        )
+        if reason is not None:
+            logger.info_once(
+                "VLLM_EXL3_MOE_V2 is set but the gate is closed: %s; these MoE "
+                "layers keep moe_out.",
+                reason,
+            )
+            return 0, workspace
+        rows = min(max_rows, exl3_ops.MOE_V2_MAX_ROWS)
+        workspace = max(
+            workspace,
+            exl3_ops.moe_workspace_size_v2(
+                rows,
+                self.hidden_size,
+                self.intermediate_size,
+                layer.top_k,
+                self.local_experts,
+            ),
+        )
+        exl3_ops.warmup_moe_v2(
+            layer.exl3_ptrs,
+            layer.exl3_meta,
+            layer.exl3_expert_map,
+            self.global_expert_ids,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+        )
+        logger.info_once(
+            "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
+            "experts for MoE calls of 1..%d rows; larger calls keep moe_out.",
+            rows,
+        )
+        return rows, workspace
 
     def apply(
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
@@ -613,12 +670,23 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
 
 class Exl3Experts(mk.FusedMoEExpertsModular):
-    def __init__(self, moe, quant, intermediate_size, expert_map, workspace, max_rows):
+    def __init__(
+        self,
+        moe,
+        quant,
+        intermediate_size,
+        expert_map,
+        workspace,
+        max_rows,
+        moe_v2_rows=0,
+    ):
         super().__init__(moe, quant)
         self.intermediate_size = intermediate_size
         self.expert_map = expert_map
         self.workspace_elements = workspace
         self.max_rows = max_rows
+        # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2).
+        self.moe_v2_rows = moe_v2_rows
 
     @staticmethod
     def activation_format():
@@ -694,9 +762,10 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         expert_tokens_meta,
         apply_router_weight_on_input,
     ):
-        from vllm.sm80.kernels.exl3.ops import moe_out
+        from vllm.sm80.kernels.exl3.ops import moe_out, moe_out_v2
 
-        if hidden_states.shape[0] > self.max_rows:
+        rows = hidden_states.shape[0]
+        if rows > self.max_rows:
             raise ValueError("EXL3 MoE exceeds configured dispatched row capacity")
         if (
             apply_router_weight_on_input
@@ -704,7 +773,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             or a2_scale is not None
         ):
             raise ValueError("EXL3 MoE requires unquantized, unweighted BF16 inputs")
-        moe_out(
+        operator = moe_out_v2 if 0 < rows <= self.moe_v2_rows else moe_out
+        operator(
             hidden_states,
             topk_ids,
             topk_weights,

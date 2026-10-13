@@ -1,3 +1,4 @@
+#include "moe_v2.h"
 #include "ops.h"
 #include "ple.h"
 #include <Python.h>
@@ -12,6 +13,9 @@ TORCH_LIBRARY(_exl3_C, m) {
   m.def("moe_out(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
         "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace) -> ()");
+  m.def("moe_out_v2(Tensor x, Tensor topk_ids, Tensor topk_weights, "
+        "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
+        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace) -> ()");
   m.def("ple_decode_out(Tensor packed_rows, Tensor global_ids, Tensor head_bias, "
         "Tensor head_offsets, Tensor head_vocab_sizes, int owner_lo, "
         "int owner_hi, int bits, Tensor(a!) out) -> ()");
@@ -21,6 +25,8 @@ TORCH_LIBRARY(_exl3_C, m) {
         &exl3::linear_workspace_size);
   m.def("moe_workspace_size(int max_rows, int hidden_size, int intermediate_size, "
         "int topk, int local_experts) -> int", &exl3::moe_workspace_size);
+  m.def("moe_workspace_size_v2(int max_rows, int hidden_size, int intermediate_size, "
+        "int topk, int local_experts) -> int", &exl3::moe_workspace_size_v2);
   // Test-only: today's scalar kernels as the bit-exact oracle, and a block
   // shape override so a test can run every shape at every row count.
   m.def("linear_out_reference(Tensor x, Tensor trellis, Tensor suh, Tensor svh, "
@@ -35,6 +41,7 @@ TORCH_LIBRARY(_exl3_C, m) {
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("linear_out", &exl3::linear_out);
   m.impl("moe_out", &exl3::moe_out);
+  m.impl("moe_out_v2", &exl3::moe_out_v2);
   m.impl("ple_decode_out", &ple_decode_out);
   m.impl("linear_out_reference", &exl3::linear_out_reference);
   m.impl("moe_out_reference", &exl3::moe_out_reference);

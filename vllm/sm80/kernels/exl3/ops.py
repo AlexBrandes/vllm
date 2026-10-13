@@ -15,6 +15,22 @@ _loaded = False
 # Each matrix processes rows in chunks whose native workspace fits it.
 LINEAR_SCRATCH_ELEMENTS = 8 << 20
 
+# moe_out_v2 (csrc/exl3/moe_v2.cu) covers exactly one configuration: calls of
+# 1..MOE_V2_MAX_ROWS rows, hidden 2560, intermediate 640, top-10, 256 of 512
+# experts local, and every routed matrix stored as below.
+MOE_V2_MAX_ROWS = 64
+MOE_V2_HIDDEN = 2560
+MOE_V2_INTERMEDIATE = 640
+MOE_V2_TOP_K = 10
+MOE_V2_LOCAL_EXPERTS = 256
+MOE_V2_GLOBAL_EXPERTS = 512
+# [padded_in, padded_out, bits_x2, codebook] of gate, up and down.
+MOE_V2_EXPERT_META = [
+    [MOE_V2_HIDDEN, MOE_V2_INTERMEDIATE, 10, 2],
+    [MOE_V2_HIDDEN, MOE_V2_INTERMEDIATE, 10, 2],
+    [MOE_V2_INTERMEDIATE, MOE_V2_HIDDEN, 10, 2],
+]
+
 
 def _linear_fake(
     x, trellis, suh, svh, bits_x2, codebook, logical_in, logical_out, out, workspace
@@ -67,9 +83,11 @@ _ABI_VERSION = 1
 _OPERATORS = (
     "linear_out",
     "moe_out",
+    "moe_out_v2",
     "ple_decode_out",
     "linear_workspace_size",
     "moe_workspace_size",
+    "moe_workspace_size_v2",
 )
 
 
@@ -117,6 +135,7 @@ def ensure_extension() -> None:
     for name, fake in (
         ("linear_out", _linear_fake),
         ("moe_out", _moe_fake),
+        ("moe_out_v2", _moe_fake),
         ("ple_decode_out", _ple_fake),
     ):
         torch.library.register_fake(f"_exl3_C::{name}")(fake)
@@ -158,6 +177,64 @@ def moe_workspace_size(
     return torch.ops._exl3_C.moe_workspace_size(
         max_rows, hidden_size, intermediate_size, topk, local_experts
     )
+
+
+@lru_cache(maxsize=None)
+def moe_workspace_size_v2(
+    max_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    local_experts: int,
+) -> int:
+    ensure_extension()
+    return torch.ops._exl3_C.moe_workspace_size_v2(
+        max_rows, hidden_size, intermediate_size, topk, local_experts
+    )
+
+
+def moe_v2_closed_reason(
+    capability: tuple[int, int] | None,
+    dtype: torch.dtype,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    local_experts: int,
+    global_experts: int,
+    metadata: list[list[list[int]]],
+) -> str | None:
+    """Why moe_out_v2 must not serve this layer, or None when it may.
+
+    Checked once per layer from host-side values (``metadata`` is the
+    per-expert [padded_in, padded_out, bits_x2, codebook] list the layer's
+    ``exl3_meta`` buffer is built from), never from device tensors.
+    """
+    if capability != (8, 0):
+        return f"device capability {capability}, not (8, 0)"
+    if dtype != torch.bfloat16:
+        return f"activation dtype {dtype}, not bfloat16"
+    shape = (hidden_size, intermediate_size, top_k, local_experts, global_experts)
+    expected = (
+        MOE_V2_HIDDEN,
+        MOE_V2_INTERMEDIATE,
+        MOE_V2_TOP_K,
+        MOE_V2_LOCAL_EXPERTS,
+        MOE_V2_GLOBAL_EXPERTS,
+    )
+    if shape != expected:
+        return (
+            f"(hidden, intermediate, top_k, local experts, global experts) = "
+            f"{shape}, not {expected}"
+        )
+    if len(metadata) != local_experts:
+        return f"{len(metadata)} expert entries for {local_experts} local experts"
+    for local, meta in enumerate(metadata):
+        if [list(m) for m in meta] != MOE_V2_EXPERT_META:
+            return (
+                f"local expert {local} stores [padded_in, padded_out, bits_x2, "
+                f"codebook] {[list(m) for m in meta]}, not {MOE_V2_EXPERT_META}"
+            )
+    return None
 
 
 def linear_out(
@@ -210,6 +287,79 @@ def moe_out(
         out,
         workspace,
     )
+
+
+def moe_out_v2(
+    x,
+    topk_ids,
+    topk_weights,
+    packed_ptrs,
+    packed_meta,
+    expert_map,
+    intermediate_size: int,
+    out,
+    workspace,
+) -> None:
+    ensure_extension()
+    torch.ops._exl3_C.moe_out_v2(
+        x,
+        topk_ids,
+        topk_weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        out,
+        workspace,
+    )
+
+
+_moe_v2_warm_devices: set[torch.device] = set()
+
+
+def warmup_moe_v2(
+    packed_ptrs: torch.Tensor,
+    packed_meta: torch.Tensor,
+    expert_map: torch.Tensor,
+    global_expert_ids: list[int],
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+) -> None:
+    """Run moe_out_v2 once per device before any CUDA graph capture.
+
+    Each launch configuration's first call queries the SM count and the
+    kernel's occupancy and keeps them (moe_v2.cu launch_lane); one call with
+    local routes launches every kernel of the operator, so no capture is the
+    first call. Its few temporary buffers are freed again.
+    """
+    device = packed_ptrs.device
+    if device in _moe_v2_warm_devices:
+        return
+    ids = torch.tensor([global_expert_ids[:top_k]], dtype=torch.int32, device=device)
+    weights = torch.full((1, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+    x = torch.ones((1, hidden_size), dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x)
+    workspace = torch.empty(
+        moe_workspace_size_v2(
+            1, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+    moe_out_v2(
+        x,
+        ids,
+        weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        out,
+        workspace,
+    )
+    torch.cuda.synchronize(device)
+    _moe_v2_warm_devices.add(device)
 
 
 def ple_decode_out(

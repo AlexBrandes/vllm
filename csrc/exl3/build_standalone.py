@@ -23,7 +23,9 @@ HERE = Path(__file__).resolve().parent
 CSRC = HERE.parent
 ROOT = CSRC.parent
 NAME = "_exl3_C"
-SOURCES = ("dense.cu", "gemm.cu", "moe.cu", "ple.cu", "reference.cu", "module.cpp")
+SOURCES = (
+    "dense.cu", "gemm.cu", "moe.cu", "moe_v2.cu", "ple.cu", "reference.cu", "module.cpp"
+)
 
 
 def build(out: Path, build_dir: Path, verbose: bool) -> None:
