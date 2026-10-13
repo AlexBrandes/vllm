@@ -155,7 +155,7 @@ def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, 
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
     assert predictor.pre_fc_norm_hidden.weight.shape == (10240,)
     assert got.dtype == dtype and got.shape == (2, 10240)
-    assert predictor.hidden_norm.per_stream is enabled
+    assert isinstance(predictor.pre_fc_norm_hidden, precision_module.PerStreamGemmaRMSNorm) is enabled
     assert banners and banners[0][1:] == (("per-stream" if enabled else "flat"), int(enabled))
     # The selection is fixed at construction, as it must be for graph replay.
     monkeypatch.setenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", str(int(not enabled)))

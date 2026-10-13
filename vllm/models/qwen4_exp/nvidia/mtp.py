@@ -63,7 +63,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
-from .precision import MTPHiddenNorm
+from .precision import mtp_hidden_norm
 
 
 def _remap_ignored_layers(
@@ -246,11 +246,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = GemmaRMSNorm(
-            self.hidden_size * self.hc_count, eps=config.rms_norm_eps
-        )
-        self.hidden_norm = MTPHiddenNorm(
-            self.pre_fc_norm_hidden, self.hc_count, self.hidden_size
+        self.pre_fc_norm_hidden = mtp_hidden_norm(
+            self.hidden_size, self.hc_count, eps=config.rms_norm_eps
         )
         # HC final mixer collapses the multi stream into [T, H] for the LM head.
         hc_config = HyperConnectionConfig(
@@ -324,7 +321,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             # step's multi stream).
             num_tokens = hidden_states.shape[0]
             hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-            hidden_states = self.hidden_norm(hidden_states)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+                num_tokens, hc_count, hidden_size
+            )
             hidden_states = self.fc_hidden(hidden_states)
             hidden_states = hidden_states.flatten(-2)
             prev_block_output = inputs_embeds
