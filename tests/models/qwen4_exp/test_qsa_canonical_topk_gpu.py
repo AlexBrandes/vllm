@@ -8,10 +8,18 @@ top-k 512) plus a 4-row decode batch over the same width. Scores are
 ReLU-floored on a coarse grid, so each row's k-th score is an exact tie that
 straddles the selection boundary (at the 0.0 floor or at a positive level).
 
+These two shapes reach two of the ``persistent_topk`` branches Qwen uses:
+FilteredTopK (more than 32 rows) and histogram_2048 (at most 8,192 visible
+blocks). Long-context decode batches of at most 32 rows reach the other two,
+by each row's visible count: histogram_256 up to 32,768 and the multi-CTA
+radix path above it. They run as 4-row decode batches at 16,384 and 40,000
+columns.
+
 ``persistent_topk`` alone may return a different set for identical scores;
 the count of distinct native outputs is printed, not asserted (it depends on
 timing). With VLLM_QWEN4_QSA_TOPK_CANONICAL the set must be identical on
 every call and equal to the (score descending, block index ascending) choice.
+Without ties the tie fix must leave the native output byte for byte.
 Needs a CUDA device and the compiled _C ops; skipped otherwise.
 """
 
@@ -19,11 +27,18 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
+from vllm.sm80.kernels.indexer import qsa_topk_gate
 
 COMPRESS_RATIO = 4
 BLOCK_TOPK = 512
 WIDTH = 4032
 REPEATS = 20
+
+# persistent_topk branch -> (logits columns, visible blocks of the 4 rows).
+LONG_DECODE = {
+    "histogram_256": (16384, (16384, 15000, 12289, 8193)),
+    "radix": (40000, (40000, 38000, 35000, 32769)),
+}
 
 
 def _has_persistent_topk() -> bool:
@@ -44,23 +59,37 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _chunk4_case(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _tied_logits(visible: torch.Tensor, width: int, seed: int) -> torch.Tensor:
     g = torch.Generator(device="cuda").manual_seed(seed)
+    rows = visible.shape[0]
+    logits = torch.zeros(rows, width, device="cuda")
+    # 256..767 positive blocks per row on 8 levels; the rest is the 0.0 floor.
+    positives = torch.randint(256, 768, (rows, 1), device="cuda", generator=g)
+    rank = torch.rand(rows, width, device="cuda", generator=g).argsort(dim=1)
+    level = torch.randint(1, 9, (rows, width), device="cuda", generator=g)
+    logits = torch.where(rank < positives, level.float() / 8, logits)
+    return _mask_unwritten(logits, visible)
+
+
+def _mask_unwritten(logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+    # Never written by the score kernels: must never be selected.
+    columns = torch.arange(logits.shape[1], device="cuda")
+    logits.masked_fill_(columns >= visible[:, None].long(), 1e30)
+    return logits.contiguous()
+
+
+def _chunk4_case(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     if rows == 3200:
         positions = torch.arange(12800, 16000, device="cuda")
         visible = ((positions + 1) // COMPRESS_RATIO).to(torch.int32)
     else:
         visible = torch.full((rows,), 4000, dtype=torch.int32, device="cuda")
-    logits = torch.zeros(rows, WIDTH, device="cuda")
-    # 256..767 positive blocks per row on 8 levels; the rest is the 0.0 floor.
-    positives = torch.randint(256, 768, (rows, 1), device="cuda", generator=g)
-    rank = torch.rand(rows, WIDTH, device="cuda", generator=g).argsort(dim=1)
-    level = torch.randint(1, 9, (rows, WIDTH), device="cuda", generator=g)
-    logits = torch.where(rank < positives, level.float() / 8, logits)
-    # Never written by the score kernels: must never be selected.
-    columns = torch.arange(WIDTH, device="cuda")
-    logits.masked_fill_(columns >= visible[:, None].long(), 1e30)
-    return logits.contiguous(), visible
+    return _tied_logits(visible, WIDTH, seed), visible
+
+
+def _long_decode_visible(branch: str) -> tuple[int, torch.Tensor]:
+    width, counts = LONG_DECODE[branch]
+    return width, torch.tensor(counts, dtype=torch.int32, device="cuda")
 
 
 def _reference(logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
@@ -118,10 +147,7 @@ def _time_ms(fn, *args) -> float:
     return start.elapsed_time(end) / 10
 
 
-@pytest.mark.parametrize("sort", [True, False])
-@pytest.mark.parametrize("rows", [3200, 4])
-def test_canonical_set_is_identical_every_call(monkeypatch, rows, sort):
-    logits, visible = _chunk4_case(rows, seed=rows)
+def _check_canonical_every_call(monkeypatch, logits, visible, sort, label) -> None:
     workspace = _workspace()
     want = _reference(logits, visible)
 
@@ -132,7 +158,7 @@ def test_canonical_set_is_identical_every_call(monkeypatch, rows, sort):
         native_variants.add(native.cpu().numpy().tobytes())
 
     monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_SORTED", sort)
-    monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_CANONICAL", True)
+    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", True)
     first = None
     for _ in range(REPEATS):
         got = _qsa_topk(logits, visible, workspace)
@@ -145,11 +171,50 @@ def test_canonical_set_is_identical_every_call(monkeypatch, rows, sort):
         elif sort:
             assert torch.equal(got, first)
     canonical_ms = _time_ms(_qsa_topk, logits, visible, workspace)
-    monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_CANONICAL", False)
+    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", False)
     stock_ms = _time_ms(_qsa_topk, logits, visible, workspace)
     print(
-        f"QSA_TIE rows={rows} sort={int(sort)} k={BLOCK_TOPK} width={WIDTH} "
+        f"QSA_TIE {label} sort={int(sort)} k={BLOCK_TOPK} width={logits.shape[1]} "
         f"repeats={REPEATS} native_set_variants={len(native_variants)} "
         f"canonical_set_variants=1 stock_ms={stock_ms:.3f} "
         f"canonical_ms={canonical_ms:.3f}"
     )
+
+
+@pytest.mark.parametrize("sort", [True, False])
+@pytest.mark.parametrize("rows", [3200, 4])
+def test_canonical_set_is_identical_every_call(monkeypatch, rows, sort):
+    logits, visible = _chunk4_case(rows, seed=rows)
+    _check_canonical_every_call(monkeypatch, logits, visible, sort, f"rows={rows}")
+
+
+@pytest.mark.parametrize("sort", [True, False])
+@pytest.mark.parametrize("branch", sorted(LONG_DECODE))
+def test_long_decode_canonical_set_is_identical_every_call(monkeypatch, branch, sort):
+    width, visible = _long_decode_visible(branch)
+    logits = _tied_logits(visible, width, seed=width)
+    _check_canonical_every_call(
+        monkeypatch, logits, visible, sort, f"rows=4 branch={branch}"
+    )
+
+
+@pytest.mark.parametrize("branch", sorted(LONG_DECODE))
+def test_long_decode_without_ties_is_a_no_op(monkeypatch, branch):
+    """Distinct scores: the native output is already the canonical set, and
+    the tie fix keeps every byte of it (sort off) or only sorts it (sort on)."""
+    width, visible = _long_decode_visible(branch)
+    g = torch.Generator(device="cuda").manual_seed(width + 1)
+    # A permutation of 0..width-1 per row: exact in fp32, no two scores equal.
+    distinct = torch.rand(4, width, device="cuda", generator=g).argsort(dim=1)
+    logits = _mask_unwritten(distinct.float(), visible)
+    native = _native(logits, visible, _workspace())
+    assert torch.equal(_row_sets_sorted(native), _reference(logits, visible))
+
+    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", True)
+    for sort in (False, True):
+        got = native.clone()
+        ran = qsa_topk_gate.canonical_qsa_topk_(
+            logits, got, row_ends=visible, sort=sort
+        )
+        assert ran
+        assert torch.equal(got, _row_sets_sorted(native) if sort else native)

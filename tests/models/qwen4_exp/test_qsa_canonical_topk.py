@@ -5,11 +5,12 @@
 The QSA top-k (``persistent_topk`` on sm_80) returns an exact top-k by score
 but places the blocks tied with the k-th score by atomic arrival order, so
 identical scores can select a different block set. With the switch on,
-``_topk`` passes the selection through the shared indexer tie fix
-(``vllm/sm80/kernels/indexer/topk_tiefix.py``), which makes the set (score
-descending, block index ascending). The stock kernel is modelled here by an
-exact top-k that breaks ties at random and returns the set in a random order:
-what it guarantees, no more.
+``_topk`` passes the selection, through its gate
+(``vllm/sm80/kernels/indexer/qsa_topk_gate.py``), to the shared indexer tie
+fix (``topk_tiefix.py``), which makes the set (score descending, block index
+ascending). The stock kernel is modelled here by an exact top-k that breaks
+ties at random and returns the set in a random order: what it guarantees, no
+more.
 
 Runs on CPU through the Triton interpreter (in a child process when Triton was
 imported without it); no CUDA, no engine. The real kernel under ties is
@@ -25,6 +26,7 @@ import torch
 from tests.kernels.interpreter_child import run_in_interpreter_child
 from tests.kernels.topk_reference import sorted_rows
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
+from vllm.sm80.kernels.indexer import qsa_topk_gate
 
 COMPRESS_RATIO = 4
 BLOCK_TOPK = 512  # the shipped config: indexer_budget 2048 / ratio 4
@@ -106,7 +108,7 @@ def run_topk(logits, lengths, k=BLOCK_TOPK, out=None):
 
 
 def set_switches(monkeypatch, *, canonical: bool, sort: bool) -> None:
-    monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_CANONICAL", canonical)
+    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", canonical)
     monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_SORTED", sort)
 
 
@@ -120,10 +122,10 @@ def test_switch_is_read_from_the_environment(monkeypatch, value, expected):
     else:
         monkeypatch.setenv("VLLM_QWEN4_QSA_TOPK_CANONICAL", value)
     try:
-        assert importlib.reload(qsa_indexer_ops)._QSA_TOPK_CANONICAL is expected
+        assert importlib.reload(qsa_topk_gate)._QSA_TOPK_CANONICAL is expected
     finally:
         monkeypatch.undo()
-        importlib.reload(qsa_indexer_ops)
+        importlib.reload(qsa_topk_gate)
 
 
 def test_switch_is_part_of_the_compile_key():
@@ -141,7 +143,7 @@ def test_switch_off_keeps_todays_path(monkeypatch, fake_topk, sort):
     def forbidden():
         raise AssertionError("tie fix requested with the switch off")
 
-    monkeypatch.setattr(qsa_indexer_ops, "_canonical_topk_fix", forbidden)
+    monkeypatch.setattr(qsa_topk_gate, "_canonical_topk_fix", forbidden)
     sorts = []
     monkeypatch.setattr(
         qsa_indexer_ops, "_sort_qsa_selected_indices_", lambda b: sorts.append(b)
@@ -175,14 +177,14 @@ def test_switch_on_runs_the_tie_fix_once_and_sorts_inside_it(
         "_sort_qsa_selected_indices_",
         lambda b: pytest.fail("separate sort ran with the tie fix on"),
     )
-    qsa_indexer_ops._canonical_topk_fix.cache_clear()
+    qsa_topk_gate._canonical_topk_fix.cache_clear()
     try:
         logits = tied_logits(3, 700, seed=1)
         lengths = torch.tensor([700, 600, 3], dtype=torch.int32)
         out = run_topk(logits, lengths)
         run_topk(logits, lengths)
     finally:
-        qsa_indexer_ops._canonical_topk_fix.cache_clear()
+        qsa_topk_gate._canonical_topk_fix.cache_clear()
     assert warms == [1] and len(calls) == 2
     args, kwargs = calls[0]
     assert args[0] is logits and args[1] is out

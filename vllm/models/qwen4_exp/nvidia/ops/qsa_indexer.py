@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for Qwen4Exp QSA index selection."""
 
-import functools
-
 import torch
 
 import vllm.envs as envs
@@ -12,6 +10,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
 )
 from vllm.platforms import current_platform
+from vllm.sm80.kernels.indexer.qsa_topk_gate import canonical_qsa_topk_
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
@@ -26,13 +25,6 @@ init_logger(__name__).info_once(
     "ascending, -1 padding last" if _QSA_TOPK_SORTED else "native order",
     int(_QSA_TOPK_SORTED),
 )
-_QSA_TOPK_CANONICAL = bool(envs.VLLM_QWEN4_QSA_TOPK_CANONICAL)
-if _QSA_TOPK_CANONICAL:
-    init_logger(__name__).info_once(
-        "Qwen QSA canonical top-k active: blocks tied with the k-th score go "
-        "to the lowest block index (VLLM_QWEN4_QSA_TOPK_CANONICAL=1; set 0 "
-        "to disable)"
-    )
 
 
 @triton.jit
@@ -526,18 +518,6 @@ def _sort_qsa_selected_indices_(block_indices: torch.Tensor) -> None:
     )
 
 
-@functools.cache
-def _canonical_topk_fix():
-    """The shared indexer tie fix (``topk_tiefix_``), imported on first use so
-    that with VLLM_QWEN4_QSA_TOPK_CANONICAL unset nothing new is loaded. The
-    first call is the first QSA top-k (the profiling run, eager): compile the
-    kernel variants there, before any CUDA graph capture."""
-    from vllm.sm80.kernels.indexer.topk_tiefix import topk_tiefix_, warm_tiefix
-
-    warm_tiefix()
-    return topk_tiefix_
-
-
 def _topk(
     logits: torch.Tensor,
     visible_blocks: torch.Tensor,
@@ -567,18 +547,12 @@ def _topk(
         block_topk,
         logits.shape[1],
     )
-    if _QSA_TOPK_CANONICAL:
-        # The top-k places blocks tied with the k-th score by atomic arrival
-        # order; give the contested slots to the lowest block indices, and
-        # sort in the same launch when the sort is on (same bytes as
-        # _sort_qsa_selected_indices_).
-        _canonical_topk_fix()(
-            logits,
-            block_indices,
-            row_ends=visible_blocks,
-            sort=_QSA_TOPK_SORTED,
+    if (
+        not canonical_qsa_topk_(
+            logits, block_indices, row_ends=visible_blocks, sort=_QSA_TOPK_SORTED
         )
-    elif _QSA_TOPK_SORTED:
+        and _QSA_TOPK_SORTED
+    ):
         _sort_qsa_selected_indices_(block_indices)
 
 
