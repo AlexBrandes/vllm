@@ -179,6 +179,20 @@ seams:
   sha256: 2d1f22e96d183dccf267fe9a8075c38fad2829208b065246534e2bea94c601ef
   signature: (self) -> None
 
+- id: kda-recoverssm-commit-plan-kernel
+  kind: function
+  target: vllm.models.kimi_k3.nvidia.ops.recoverssm:_prepare_commit_plan_kernel.fn.fn
+  why: vllm/sm80/kernels/kda/commit_plan.py _prepare_commit_plan_kernel is this kernel (same heuristics and parameters, launched at its call site in KDARecoverSSMCommitContext.commit with the upstream argument list) plus the null/filtered and zero-commit early exits and the masked, unclamped final-state column; recover.py's _kda_fold_plan_kernel replicates it; an upstream change here must be ported to both
+  sha256: e5ab5c4b8333c2098c0a75f8878b4e8af62b7065d6273aeec58520f2a9860906
+  signature: '(num_accepted_ptr, request_indices_ptr, state_indices_ptr, query_start_loc_ptr, block_table_ptr, num_computed_ptr, commit_lens_ptr, final_state_indices_ptr, boundary_state_indices_ptr, boundary_recovery_lens_ptr, null_block_id, mamba_block_size, block_table_width, stride_num_accepted, stride_request_indices, stride_state_indices, stride_query_start_loc, stride_block_table_row, stride_block_table_col, stride_num_computed, SPEC_QUERY_LEN: triton.language.core.constexpr, HAS_REQUEST_INDICES: triton.language.core.constexpr, ALIGN_MODE: triton.language.core.constexpr)'
+
+- id: kda-recoverssm-align-postprocess-kernel
+  kind: function
+  target: vllm.v1.worker.gpu.model_states.recoverssm:_postprocess_recoverssm_align_kernel.fn.fn
+  why: vllm/sm80/kernels/kda/commit_plan.py _postprocess_recoverssm_align_kernel replaces this kernel at its RecoverSSMState.commit_step launch; it takes the plan's commit lengths and source states instead of num_sampled and the block-table width and must track any upstream change to the running-column rule
+  sha256: f0987e4b1eb3a0b91209be6e697ab9b896b23de298d0340e57c96a051c5422d1
+  signature: '(idx_mapping_ptr, num_sampled_ptr, request_indices_ptr, num_computed_ptr, state_idx_ptr, num_accepted_ptr, HAS_REQUEST_INDICES: triton.language.core.constexpr, MAMBA_BLOCK_SIZE: triton.language.core.constexpr, BLOCK_TABLE_WIDTH: triton.language.core.constexpr)'
+
 - id: glm-pluggable-layer-new
   kind: method
   target: vllm.model_executor.custom_op:PluggableLayer.__new__

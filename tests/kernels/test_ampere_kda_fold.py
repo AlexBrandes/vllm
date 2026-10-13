@@ -101,7 +101,7 @@ def _plan_vs_upstream():
     rows owe it in pend and commit nothing now; the split is the documented
     rule."""
     from vllm.sm80.kernels.kda import recover as kr
-    from vllm.models.kimi_k3.nvidia.ops.recoverssm import _prepare_commit_plan_kernel
+    from vllm.sm80.kernels.kda.commit_plan import _prepare_commit_plan_kernel
 
     B, sql = 16, 8
     i32 = dict(dtype=torch.int32)
@@ -455,8 +455,8 @@ def _host_step(fold):
     from torch.utils._python_dispatch import TorchDispatchMode
 
     from vllm.sm80.kernels.kda import recover as kr
+    from vllm.sm80.kernels.kda import commit_plan as cp
     from vllm.models.kimi_k3.nvidia.ops import recoverssm as up
-    from vllm.v1.worker.gpu.model_states import recoverssm as rs
 
     launches, ops = [], []
 
@@ -474,9 +474,11 @@ def _host_step(fold):
     with stack:
         for n in names:
             stack.enter_context(_patched(kr, n, _Launch(n, launches)))
-        for n in ("_prepare_commit_plan_kernel", "_compact_conv_state_kernel"):
-            stack.enter_context(_patched(up, n, _Launch(n, launches)))
-        stack.enter_context(_patched(rs, "_postprocess_recoverssm_align_kernel",
+        stack.enter_context(_patched(cp, "_prepare_commit_plan_kernel",
+                                     _Launch("_prepare_commit_plan_kernel", launches)))
+        stack.enter_context(_patched(up, "_compact_conv_state_kernel",
+                                     _Launch("_compact_conv_state_kernel", launches)))
+        stack.enter_context(_patched(cp, "_postprocess_recoverssm_align_kernel",
                                      _Launch("_postprocess_recoverssm_align_kernel", launches)))
         stack.enter_context(_patched(world, "verify", lambda *a: None))
         stack.enter_context(_patched(world, "_preprocess", lambda *a: None))

@@ -19,8 +19,9 @@ serving):
   * after sampling, `KDARecoverCommitContext.commit` replays the accepted
     tokens over the state with the same fma sequence (bitwise the per-token
     state) and writes it once, compacts the conv window and, in align mode,
-    also writes the block-boundary state, using the commit-plan and
-    conv-compaction kernels of the upstream RecoverSSM implementation.
+    also writes the block-boundary state, using the RecoverSSM commit-plan
+    kernel (commit_plan.py) and the conv-compaction kernel of the upstream
+    RecoverSSM implementation.
 
 Accepted-token bookkeeping follows upstream RecoverSSM: the verify always
 sees num_accepted = 1 (the committed state and conv window are already at the
@@ -571,8 +572,8 @@ def _kda_fold_plan_kernel(
     HAS_REQUEST_INDICES: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
 ):
-    """_prepare_commit_plan_kernel (kimi_k3/nvidia/ops/recoverssm.py) line for
-    line, plus the eager / deferred split of the commit fold."""
+    """_prepare_commit_plan_kernel (commit_plan.py) line for line, plus the
+    eager / deferred split of the commit fold."""
     spec_idx = tl.program_id(0)
     slot = tl.load(record_rows_ptr + spec_idx)
     source_state_idx = tl.load(state_indices_ptr + spec_idx * stride_state_indices).to(
@@ -778,10 +779,8 @@ class KDARecoverCommitContext:
         only the eager rows are replayed here; the deferred rows' lengths go
         to FoldState.pend for their next verify, and `true_lens` holds every
         row's commit length."""
-        from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-            _compact_conv_state_kernel,
-            _prepare_commit_plan_kernel,
-        )
+        from vllm.models.kimi_k3.nvidia.ops.recoverssm import _compact_conv_state_kernel
+        from vllm.sm80.kernels.kda.commit_plan import _prepare_commit_plan_kernel
 
         batch = state_indices.shape[0]
         if batch == 0:
