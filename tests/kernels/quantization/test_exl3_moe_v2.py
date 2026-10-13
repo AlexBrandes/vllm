@@ -222,12 +222,13 @@ def test_operator_list_and_workspace_contract():
     assert {"moe_out_v2", "moe_workspace_size_v2"} <= set(exl3_ops._OPERATORS)
     _extension_or_skip()
     size = torch.ops._exl3_C.moe_workspace_size_v2
-    # 640 assignments: slice partials (gate/up 2 x 10 x 640, down 5 x 2560),
+    # 640 assignments: slice partials (gate/up 2 x 8 x 640, down 2 x 2560),
     # FP16 hi/lo operands (2 x 2560 + 640 floats), 2^-e per (row, slice)
     # rounded to 4, then the routing table (header, sorted, tiles, the expert
-    # of each sorted entry and of each assignment).
-    lane = 640 * (2 * 10 * 640 + 5 * 2560 + 2 * 2560 + 640) + 640 * 25
-    table = 4 + 640 + 4 * 640 + 640 + 640
+    # of each sorted entry and of each assignment, then per row tile and
+    # projection the int64 trellis address and the tile columns).
+    lane = 640 * (2 * 8 * 640 + 2 * 2560 + 2 * 2560 + 640) + 640 * 18
+    table = 4 + 640 + 4 * 640 + 640 + 640 + 2 * 3 * 640 + 3 * 640
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + table
     assert size(1, 2500, 600, TOPK, LOCAL) == size(1, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, 0) == 0
@@ -503,7 +504,8 @@ def _allocations():
 
 
 @needs_sm80
-def test_v2_graph_replay_is_bitwise_eager_without_allocations(served):
+@pytest.mark.parametrize("rows", [4, 32])  # short and long K slices
+def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     exl3_ops.warmup_moe_v2(
         served.pointers,
         served.meta,
@@ -513,7 +515,6 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served):
         INTERMEDIATE,
         TOPK,
     )
-    rows = 32
     x, ids, weights = _case(served, "uniform", rows, 11)
     out = torch.empty_like(x)
     workspace = torch.empty(

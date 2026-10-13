@@ -326,38 +326,44 @@ def warmup_moe_v2(
     intermediate_size: int,
     top_k: int,
 ) -> None:
-    """Run moe_out_v2 once per device before any CUDA graph capture.
+    """Run moe_out_v2 per device before any CUDA graph capture.
 
     Each launch configuration's first call queries the SM count and the
-    kernel's occupancy and keeps them (moe_v2.cu launch_lane); one call with
-    local routes launches every kernel of the operator, so no capture is the
-    first call. Its few temporary buffers are freed again.
+    kernel's occupancy and keeps them (moe_v2.cu launch_lane). The operator
+    picks short or long K slices from rows x top_k (160 routed assignments),
+    so one call of one row and one of MOE_V2_MAX_ROWS rows, all with local
+    routes, launch every kernel it can pick, and no capture is a first call.
+    The temporary buffers are freed again.
     """
     device = packed_ptrs.device
     if device in _moe_v2_warm_devices:
         return
-    ids = torch.tensor([global_expert_ids[:top_k]], dtype=torch.int32, device=device)
-    weights = torch.full((1, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
-    x = torch.ones((1, hidden_size), dtype=torch.bfloat16, device=device)
+    rows = MOE_V2_MAX_ROWS
+    ids = torch.tensor(
+        [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
+    )
+    weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+    x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
     out = torch.empty_like(x)
     workspace = torch.empty(
         moe_workspace_size_v2(
-            1, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
+            rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
         ),
         dtype=torch.float32,
         device=device,
     )
-    moe_out_v2(
-        x,
-        ids,
-        weights,
-        packed_ptrs,
-        packed_meta,
-        expert_map,
-        intermediate_size,
-        out,
-        workspace,
-    )
+    for count in (1, rows):
+        moe_out_v2(
+            x[:count],
+            ids[:count],
+            weights[:count],
+            packed_ptrs,
+            packed_meta,
+            expert_map,
+            intermediate_size,
+            out[:count],
+            workspace,
+        )
     torch.cuda.synchronize(device)
     _moe_v2_warm_devices.add(device)
 
