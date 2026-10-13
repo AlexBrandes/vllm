@@ -172,6 +172,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 )
             self.failed_tokens: np.ndarray | None = None
             if failed_tokens is not None:
+                # The runner drops its reference at once; the copy may still
+                # wait behind the copies above.
+                self.failed_tokens_gpu = failed_tokens
                 self.failed_tokens = async_copy_to_np(failed_tokens)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()

@@ -315,7 +315,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
 | `tests/v1/spec_decode/test_glm5_dflash_draft_width.py` | 560 |
-| `tests/v1/worker/test_gpu_async_failed_tokens.py` | 20 |
+| `tests/v1/worker/test_gpu_async_failed_tokens.py` | 69 |
 | `tests/v1/worker/test_gumbel_vocab_clamp.py` | 129 |
 | `tests/v1/worker/test_mamba_block_size_resolution.py` | 92 |
 | `tests/v1/worker/test_mem_attribution.py` | 70 |
@@ -324,7 +324,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **119 files** | **41,449** |
+| **119 files** | **41,498** |
 
 #### `tools/`
 
@@ -406,7 +406,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/core/sched/scheduler.py` | modified | 404 | 14 | 45 |
 | `vllm/v1/kv_cache_interface.py` | modified | 70 | 1 | 5 |
 | `vllm/v1/outputs.py` | modified | 5 | 0 | 1 |
-| `vllm/v1/worker/gpu/async_utils.py` | modified | 17 | 0 | 5 |
+| `vllm/v1/worker/gpu/async_utils.py` | modified | 20 | 0 | 5 |
 | `vllm/v1/worker/gpu/block_table.py` | modified | 11 | 3 | 4 |
 | `vllm/v1/worker/gpu/cudagraph_utils.py` | modified | 131 | 9 | 12 |
 | `vllm/v1/worker/gpu/model_runner.py` | modified | 203 | 13 | 33 |
@@ -420,7 +420,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **68 files** | | **3,515** | **246** | **478** |
+| **68 files** | | **3,518** | **246** | **478** |
 
 ### Tests, docs and .github
 
@@ -455,9 +455,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 68 | 3,515 | 246 | 478 |
+| Product code | 68 | 3,518 | 246 | 478 |
 | Tests, docs and .github | 23 | 508 | 562 | 71 |
-| All | 91 | 4,023 | 808 | 549 |
+| All | 91 | 4,026 | 808 | 549 |
 
 ## 3. Fork environment variables
 
@@ -560,9 +560,9 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Fork-added product files | 116 |
 | Fork-added product lines | 32,869 |
 | Patched upstream files | 91 |
-| Patched upstream lines | +4,023 / -808 |
+| Patched upstream lines | +4,026 / -808 |
 | Patched upstream product files | 68 |
-| Patched upstream product lines | +3,515 / -246 |
-| Product lines added (new files and patches) | 36,384 |
+| Patched upstream product lines | +3,518 / -246 |
+| Product lines added (new files and patches) | 36,387 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |
