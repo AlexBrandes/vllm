@@ -229,6 +229,12 @@ def _inputs(seed, rows, logical_in):
 
 
 def _run(operator, m, x, bits_x2, logical_out, codebook=2):
+    return _run_core(operator, m, x, bits_x2, logical_out, codebook)[0]
+
+
+def _run_core(operator, m, x, bits_x2, logical_out, codebook=2):
+    """(BF16 output, FP32 GEMM result rows): both operators leave the GEMM's
+    rows x padded_out result after the transformed input in the workspace."""
     trellis = m["trellis"]
     padded_in, padded_out = trellis.shape[0] * 16, trellis.shape[1] * 16
     out = torch.full(
@@ -252,7 +258,7 @@ def _run(operator, m, x, bits_x2, logical_out, codebook=2):
         workspace,
     )
     torch.cuda.synchronize()
-    return out
+    return out, workspace[x.shape[0] * padded_in :].clone()
 
 
 def _bitwise(actual, expected, name):
@@ -336,17 +342,25 @@ def test_splitk_holds_linear_outs_error_against_fp64(
             == 2
         ), rows
         pool = _Pool()
+        split_seeds = 0
         for seed in range(3):
             x = _inputs(100 * rows + seed, rows, logical_in)
-            cand = _run(
+            cand, cand_core = _run_core(
                 exl3_ops.linear_out_splitk, m, x, bits_x2, logical_out, codebook
             )
             again = _run(
                 exl3_ops.linear_out_splitk, m, x, bits_x2, logical_out, codebook
             )
             _bitwise(again, cand, f"rows {rows}: repeat call")
-            inc = _run(exl3_ops.linear_out, m, x, bits_x2, logical_out, codebook)
+            inc, inc_core = _run_core(
+                exl3_ops.linear_out, m, x, bits_x2, logical_out, codebook
+            )
+            # The split path ran: its FP32 GEMM sums (blocked, two halves) differ
+            # from linear_out's single chain. BF16 outputs rarely differ at
+            # these sizes, so the FP32 result rows are the witness.
+            split_seeds += int(not torch.equal(cand_core, inc_core))
             pool.add(cand, inc, x.double() @ weight)
+        assert split_seeds > 0, f"rows {rows}: split-K path never ran"
         pool.check(f"bits_x2={bits_x2} {padded_in}x{padded_out} rows {rows}")
 
 
@@ -401,6 +415,8 @@ def _allocations():
 @pytest.mark.parametrize("rows", [4, 32])  # tiny and small blocks
 def test_splitk_graph_replay_is_bitwise_eager_without_allocations(rows):
     _extension_or_skip()
+    # The captured call must be the split-K path, not linear_out.
+    assert exl3_ops.linear_splitk_splits(rows, 640, _sms(), 14, 2) == 2
     m = _matrix(21, 2560, 640, 14)
     x = _inputs(22, rows, 2560)
     out = torch.empty(rows, 640, dtype=torch.bfloat16, device=x.device)
