@@ -7,9 +7,16 @@ from functools import lru_cache
 
 import torch
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+logger = init_logger(__name__)
+
 _loaded = False
+# VLLM_EXL3_DENSE_SPLITK with its gate open: _linear calls linear_out_splitk.
+# Fixed by ensure_extension, before any launch or graph capture.
+_dense_splitk = False
 
 # One fixed FP32 scratch (32 MiB) per stream role, whatever the batch size.
 # Each matrix processes rows in chunks whose native workspace fits it.
@@ -82,10 +89,12 @@ _ABI_VERSION = 1
 # Operators this tree calls; a library without one of them is refused.
 _OPERATORS = (
     "linear_out",
+    "linear_out_splitk",
     "moe_out",
     "moe_out_v2",
     "ple_decode_out",
     "linear_workspace_size",
+    "linear_splitk_splits",
     "moe_workspace_size",
     "moe_workspace_size_v2",
 )
@@ -119,8 +128,44 @@ def _validate_extension(module) -> None:
         torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
 
 
+def dense_splitk_closed_reason(capability: tuple[int, int] | None) -> str | None:
+    """Why linear_out_splitk must not serve this process, or None when it may.
+
+    The operator itself keeps linear_out for every launch outside the
+    configuration its kernels cover (formats, block shapes, grid sizes).
+    """
+    if capability != (8, 0):
+        return f"device capability {capability}, not (8, 0)"
+    return None
+
+
+def _resolve_dense_splitk() -> bool:
+    """VLLM_EXL3_DENSE_SPLITK for this process, with its log line."""
+    if not envs.VLLM_EXL3_DENSE_SPLITK:
+        return False
+    capability = (
+        tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+    )
+    reason = dense_splitk_closed_reason(capability)
+    if reason is not None:
+        logger.info_once(
+            "VLLM_EXL3_DENSE_SPLITK is set but the gate is closed: %s; every "
+            "dense EXL3 call keeps linear_out.",
+            reason,
+            scope="process",
+        )
+        return False
+    logger.info_once(
+        "EXL3 dense split-K active (VLLM_EXL3_DENSE_SPLITK): dense launches of "
+        "at most 1024 tiny or small blocks (bits_x2 10/12/14, codebook 2) split "
+        "K in two on warp-specialized blocks; other launches keep linear_out.",
+        scope="process",
+    )
+    return True
+
+
 def ensure_extension() -> None:
-    global _loaded
+    global _loaded, _dense_splitk
     if _loaded:
         return
     try:
@@ -134,11 +179,13 @@ def ensure_extension() -> None:
         ) from exc
     for name, fake in (
         ("linear_out", _linear_fake),
+        ("linear_out_splitk", _linear_fake),
         ("moe_out", _moe_fake),
         ("moe_out_v2", _moe_fake),
         ("ple_decode_out", _ple_fake),
     ):
         torch.library.register_fake(f"_exl3_C::{name}")(fake)
+    _dense_splitk = _resolve_dense_splitk()
     _loaded = True
 
 
@@ -261,6 +308,46 @@ def linear_out(
         logical_out,
         out,
         workspace,
+    )
+
+
+def linear_out_splitk(
+    x,
+    trellis,
+    suh,
+    svh,
+    bits_x2: int,
+    codebook: int,
+    logical_in: int,
+    logical_out: int,
+    out,
+    workspace,
+) -> None:
+    """linear_out's contract (arguments, checks, workspace); see
+    csrc/exl3/dense_splitk.h for the launches it changes."""
+    ensure_extension()
+    torch.ops._exl3_C.linear_out_splitk(
+        x,
+        trellis,
+        suh,
+        svh,
+        bits_x2,
+        codebook,
+        logical_in,
+        logical_out,
+        out,
+        workspace,
+    )
+
+
+def linear_splitk_splits(
+    rows: int, padded_out: int, sms: int, bits_x2: int, codebook: int
+) -> int:
+    """K split factor linear_out_splitk uses for this launch: 2 on the
+    split-K path, 1 where it runs linear_out."""
+    ensure_extension()
+    return torch.ops._exl3_C.linear_splitk_splits(
+        rows, padded_out, sms, bits_x2, codebook
     )
 
 
@@ -429,8 +516,9 @@ def _linear(
 ) -> torch.Tensor:
     workspace = _linear_scratch(x.device)
     out = torch.empty((x.shape[0], logical_out), dtype=x.dtype, device=x.device)
+    operator = linear_out_splitk if _dense_splitk else linear_out
     for start in range(0, x.shape[0], row_chunk):
-        linear_out(
+        operator(
             x[start : start + row_chunk],
             trellis,
             suh,

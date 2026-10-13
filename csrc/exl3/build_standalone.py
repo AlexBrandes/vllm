@@ -24,7 +24,8 @@ CSRC = HERE.parent
 ROOT = CSRC.parent
 NAME = "_exl3_C"
 SOURCES = (
-    "dense.cu", "gemm.cu", "moe.cu", "moe_v2.cu", "ple.cu", "reference.cu", "module.cpp"
+    "dense.cu", "dense_splitk.cu", "gemm.cu", "moe.cu", "moe_v2.cu", "ple.cu",
+    "reference.cu", "module.cpp",
 )
 
 

@@ -1,6 +1,7 @@
 #include "moe_v2.h"
 #include "ops.h"
 #include "ple.h"
+#include "dense_splitk.h"
 #include <Python.h>
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
@@ -8,6 +9,9 @@
 
 TORCH_LIBRARY(_exl3_C, m) {
   m.def("linear_out(Tensor x, Tensor trellis, Tensor suh, Tensor svh, "
+        "int bits_x2, int codebook, int logical_in, int logical_out, "
+        "Tensor(a!) out, Tensor(b!) workspace) -> ()");
+  m.def("linear_out_splitk(Tensor x, Tensor trellis, Tensor suh, Tensor svh, "
         "int bits_x2, int codebook, int logical_in, int logical_out, "
         "Tensor(a!) out, Tensor(b!) workspace) -> ()");
   m.def("moe_out(Tensor x, Tensor topk_ids, Tensor topk_weights, "
@@ -23,6 +27,8 @@ TORCH_LIBRARY(_exl3_C, m) {
   // CUDA-dispatched ops, and never inspect a device or initialize CUDA.
   m.def("linear_workspace_size(int max_rows, int padded_in, int padded_out) -> int",
         &exl3::linear_workspace_size);
+  m.def("linear_splitk_splits(int rows, int padded_out, int sms, int bits_x2, "
+        "int codebook) -> int", &exl3::linear_splitk_splits);
   m.def("moe_workspace_size(int max_rows, int hidden_size, int intermediate_size, "
         "int topk, int local_experts) -> int", &exl3::moe_workspace_size);
   m.def("moe_workspace_size_v2(int max_rows, int hidden_size, int intermediate_size, "
@@ -40,6 +46,7 @@ TORCH_LIBRARY(_exl3_C, m) {
 
 TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("linear_out", &exl3::linear_out);
+  m.impl("linear_out_splitk", &exl3::linear_out_splitk);
   m.impl("moe_out", &exl3::moe_out);
   m.impl("moe_out_v2", &exl3::moe_out_v2);
   m.impl("ple_decode_out", &ple_decode_out);

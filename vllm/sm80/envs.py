@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
+    VLLM_EXL3_DENSE_SPLITK: bool = False
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
@@ -664,6 +665,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # the pairing module is never imported.
     "VLLM_THIN_GEMM_CONCAT": lambda: bool(
         int(os.getenv("VLLM_THIN_GEMM_CONCAT", "0"))
+    ),
+    # Dense EXL3 launches of the tiny or small block shape with at most 1024
+    # blocks, for bits_x2 10/12/14 with codebook 2 on sm_80, take
+    # linear_out_splitk (csrc/exl3/dense_splitk.cu): K split in two halves
+    # added atomically on blocks with separate decode warps, and an FP64
+    # output transform. Results are deterministic but differ from
+    # linear_out's in the last bits. Set once per process before any launch
+    # (vllm/sm80/kernels/exl3/ops.py). Default OFF: unset, every dense call
+    # takes linear_out.
+    "VLLM_EXL3_DENSE_SPLITK": lambda: bool(
+        int(os.getenv("VLLM_EXL3_DENSE_SPLITK", "0"))
     ),
     # Qwen EXL3 checkpoints (vllm/sm80/kernels/exl3/quant.py).
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
