@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The EXL3 PLE row reader: positional reads, retries, truncation, read
-faults, failed-token masks, page-cache residency, slot reuse and the
-prefetch timing summary."""
+faults, failed-token masks, page-cache residency, slot reuse, the
+prefetch timing summary and the SSD read overlapped with the layer ahead."""
 
 import errno
 import json
@@ -11,14 +11,18 @@ import mmap
 import os
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from itertools import accumulate
 
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from vllm.models.qwen4_exp.common import exl3_ple
 from vllm.models.qwen4_exp.common.exl3_ple import (
+    Exl3PLEEmbedding,
     Exl3PLERowReader,
     Exl3PLESlot,
     Exl3PLETiming,
@@ -429,3 +433,266 @@ def test_exl3_ple_timing_logs_one_line_per_window():
     finally:
         log.removeHandler(handler)
         log.setLevel(level)
+
+
+def test_exl3_ple_overlap_switch_defaults_off(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_EXL3_PLE_OVERLAP", raising=False)
+    assert envs.VLLM_EXL3_PLE_OVERLAP is False
+    monkeypatch.setenv("VLLM_EXL3_PLE_OVERLAP", "1")
+    assert envs.VLLM_EXL3_PLE_OVERLAP is True
+
+
+class _Event:
+    """A CUDA event stand-in that writes what the host asks of it to a trace;
+    CPU tensors finish their work at once."""
+
+    def __init__(self, name, trace):
+        self.name, self.trace = name, trace
+
+    def record(self, stream=None):
+        self.trace.append(f"record {self.name}")
+
+    def synchronize(self):
+        self.trace.append(f"sync {self.name}")
+
+
+class _Stream(_Event):
+    def wait_stream(self, other):
+        self.trace.append(f"{self.name} waits {other.name}")
+
+    def wait_event(self, event):
+        self.trace.append(f"{self.name} waits {event.name}")
+
+
+_HEADS, _TOKENS = 2, 8
+_REAL_PREADV = os.preadv
+
+
+def _ssd_embedding(tmp_path, monkeypatch, trace, *, overlap, owner_lo=3):
+    """An SSD PLE embedding over a small real table, on the host: streams and
+    events trace the host's calls, the decoder records the rows it gets."""
+    path, key, _, _ = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, owner_lo, 10, retries=0)
+    read_rows = reader.read_rows
+
+    def traced_read_rows(*args):
+        trace.append("read")
+        return read_rows(*args)
+
+    reader.read_rows = traced_read_rows
+    current = _Stream("current", trace)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "stream", contextmanager(lambda stream: (yield)))
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+    decoded = []
+
+    def decode(packed, ids, bias, offsets, sizes, lo, hi, bits, out):
+        trace.append("decode")
+        decoded.append((packed.clone(), ids.clone()))
+        # Any function of the packed bytes; a poisoned scale gives NaN.
+        scale = packed[:, :1].view(torch.float16).float()
+        out.copy_((scale * packed[:, 1:].float().sum(-1, keepdim=True)).expand_as(out))
+
+    from vllm.sm80.kernels.exl3 import ops
+
+    monkeypatch.setattr(ops, "ple_decode_out", decode)
+    layout = reader.layout
+    capacity = _TOKENS * _HEADS
+    module = object.__new__(Exl3PLEEmbedding)
+    nn.Module.__init__(module)
+    module.placement = "ssd"
+    module.overlap_reads = overlap
+    module._deferred = None
+    module.tp_size = module.etp_data_parallel_size = 1
+    module.embedding_dim = layout.dim
+    module._heads = _HEADS
+    module._output_dim = _HEADS * layout.dim
+    module._capacity = capacity
+    module._reader = reader
+    module._workers = 2
+    module._pool = ThreadPoolExecutor(max_workers=2)
+    module._timing = None
+    module._failed_tokens = None
+    module.head_bias = torch.zeros(_HEADS, layout.dim, dtype=torch.float16)
+    module.head_offsets = torch.tensor(layout.head_offsets)
+    module.head_vocab_sizes = torch.tensor(layout.head_vocab_sizes)
+    module._stream = _Stream("side", trace)
+    module._ids_ready = _Event("ids", trace)
+    module._ready = _Event("ready", trace)
+    module._released = _Event("released", trace)
+    # Zeroed, so a failed row's unread bytes match between modules.
+    module._ids = torch.zeros(capacity, dtype=torch.int64)
+    module._packed = torch.zeros(capacity, layout.words, dtype=torch.int16)
+    module._decoded = torch.zeros(capacity, layout.dim, dtype=torch.bfloat16)
+    module._host_ids = torch.zeros(capacity, dtype=torch.int64)
+    module._host_rows = torch.zeros(capacity, layout.words, dtype=torch.int16)
+    module._host_ids_np = module._host_ids.numpy()
+    module._host_rows_np = module._host_rows.numpy()
+    module._host_bytes = memoryview(module._host_rows_np).cast("B")
+    module._slot = exl3_ple.Exl3PLESlot(capacity, module._released)
+    return module, decoded
+
+
+def _step(module, ids, trace):
+    """One forward's PLE part: prefetch, the layer ahead, finalize."""
+    module.start_prefetch(None, torch.tensor(ids, dtype=torch.int64))
+    trace.append("layer ahead")
+    output = module.forward(torch.empty(len(ids), 1))
+    return output, module.take_failed_tokens()
+
+
+def _reads_once(trace):
+    """Pool workers each trace their chunk; keep one entry per read."""
+    return [e for i, e in enumerate(trace) if e != "read" or trace[i - 1] != "read"]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_exl3_ple_overlap_keeps_order_and_moves_only_the_layer(
+    tmp_path, monkeypatch, overlap
+):
+    """The deferred step makes the same host calls in the same order; only
+    the layer ahead is queued before the ids wait instead of after the decode.
+    """
+    trace = []
+    module, _ = _ssd_embedding(tmp_path, monkeypatch, trace, overlap=overlap)
+    try:
+        for _ in range(2):  # the second step reuses the slot
+            trace.clear()
+            module.start_prefetch(None, torch.tensor([[3, 6], [4, 9]]))
+            assert module._slot.state == ("reading" if overlap else "ready")
+            trace.append("layer ahead")
+            module.forward(torch.empty(2, 1))
+            assert module._slot.state == "idle"
+            assert module.take_failed_tokens().tolist() == [False, False]
+            calls = [
+                "sync released",  # the slot waits for the previous copy
+                "side waits current",
+                "record ids",
+                "sync ids",
+                "read",
+                "decode",
+                "record ready",
+                "current waits ready",
+                "record released",
+            ]
+            calls.insert(3 if overlap else 7, "layer ahead")
+            assert _reads_once(trace) == calls
+    finally:
+        module.close()
+
+
+def test_exl3_ple_overlap_gives_the_consumer_the_same_bytes(tmp_path, monkeypatch):
+    """Rows, ids, outputs and failure masks match bit for bit across token
+    counts, unowned and padding rows, a failed row, and arms switched between
+    steps as the in-boot A/B does."""
+    monkeypatch.setattr(exl3_ple.time, "sleep", lambda seconds: None)
+    steps = [
+        [[3, 5]],
+        [[4, 8], [0, 9], [3, 6]],  # row 0 is unowned, row 9 padding
+        [[r % 5, 5 + r % 4] for r in range(_TOKENS)],  # rows 4 and 6 fail below
+        [[2, 7]],
+    ]
+    results = {}
+    for arms in ("off", "on", "alternating"):
+        trace = []
+        (tmp_path / arms).mkdir()
+        module, decoded = _ssd_embedding(
+            tmp_path / arms, monkeypatch, trace, overlap=arms == "on"
+        )
+        outputs = []
+        try:
+            for index, ids in enumerate(steps):
+                if arms == "alternating":
+                    module.overlap_reads = bool(index % 2)
+                if index == 2:
+                    _faulty_preadv(
+                        monkeypatch,
+                        errno.EIO,
+                        {4, 6},
+                        module._reader.base,
+                        module._reader.row_bytes,
+                    )
+                output, failed = _step(module, ids, trace)
+                if index == 2:
+                    monkeypatch.setattr(os, "preadv", _REAL_PREADV)
+                outputs.append((output.view(torch.int16).clone(), failed.clone()))
+        finally:
+            module.close()
+        results[arms] = (decoded, outputs)
+    reference_decoded, reference_outputs = results["off"]
+    assert reference_outputs[2][1].tolist() == [
+        r % 5 == 4 or 5 + r % 4 == 6 for r in range(_TOKENS)
+    ]
+    assert not any(failed.any() for _, failed in reference_outputs[:2])
+    for arms in ("on", "alternating"):
+        decoded, outputs = results[arms]
+        assert len(decoded) == len(outputs) == len(steps)
+        for (packed, ids), (ref_packed, ref_ids) in zip(decoded, reference_decoded):
+            assert torch.equal(packed, ref_packed) and torch.equal(ids, ref_ids)
+        for (output, failed), (ref_output, ref_failed) in zip(
+            outputs, reference_outputs
+        ):
+            assert torch.equal(output, ref_output)
+            assert torch.equal(failed, ref_failed)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_exl3_ple_overlap_read_error_fails_the_slot(tmp_path, monkeypatch, overlap):
+    """A read that raises fails the slot after every chunk is joined; with the
+    overlap it surfaces at finalize instead of at the prefetch."""
+    trace = []
+    module, decoded = _ssd_embedding(tmp_path, monkeypatch, trace, overlap=overlap)
+    joined = []
+
+    def broken(ids, target, begin, end):
+        joined.append(begin)
+        if begin == 0:
+            raise RuntimeError("storage gone")
+        return []
+
+    module._reader.read_rows = broken
+    ids = torch.tensor([[3, 5], [4, 6], [3, 7], [4, 8]])
+    try:
+        if overlap:
+            module.start_prefetch(None, ids)
+            assert joined == [] and module._slot.state == "reading"
+            with pytest.raises(RuntimeError, match="storage gone"):
+                module.forward(torch.empty(4, 1))
+        else:
+            with pytest.raises(RuntimeError, match="storage gone"):
+                module.start_prefetch(None, ids)
+        assert sorted(joined) == [0, 4]  # both chunks ran before the failure
+        assert module._slot.state == "failed" and decoded == []
+        assert module._deferred is None
+        with pytest.raises(RuntimeError, match="slot is failed"):
+            module.start_prefetch(None, ids)
+        with pytest.raises(RuntimeError, match="no matching"):
+            module.forward(torch.empty(4, 1))
+    finally:
+        module.close()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_exl3_ple_overlap_cancelled_step_reads_nothing(tmp_path, monkeypatch, overlap):
+    """A forward that ends between prefetch and finalize leaves the slot held:
+    the next prefetch is refused as before. With the overlap no row was read
+    and nothing is queued, so close has nothing to wait for."""
+    trace = []
+    module, decoded = _ssd_embedding(tmp_path, monkeypatch, trace, overlap=overlap)
+    try:
+        with pytest.raises(RuntimeError, match="no matching"):
+            module.forward(torch.empty(1, 1))  # finalize before any prefetch
+        assert module._slot.state == "idle"
+        module.start_prefetch(None, torch.tensor([[3, 5]]))
+        state = "reading" if overlap else "ready"
+        with pytest.raises(RuntimeError, match=f"slot is {state}"):
+            module.start_prefetch(None, torch.tensor([[4, 6]]))
+        assert ("read" in trace) is not overlap
+        assert len(decoded) == (0 if overlap else 1)
+        assert module._slot.state == state
+    finally:
+        module.close()
+    assert module._pool is None and module._reader.fd == -1

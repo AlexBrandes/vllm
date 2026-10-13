@@ -381,6 +381,9 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._slot: Exl3PLESlot | None = None
         self._failed_tokens: torch.Tensor | None = None
         self._timing: Exl3PLETiming | None = None
+        # SSD reads run at finalize, after the layers before this one queue.
+        self.overlap_reads = envs.VLLM_EXL3_PLE_OVERLAP
+        self._deferred: int | None = None
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
@@ -534,6 +537,11 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 reader.row_bytes,
                 self._capacity,
             )
+            if self.overlap_reads and self.placement == "ssd":
+                logger.info(
+                    "EXL3 PLE: SSD row reads overlap the preceding decoder "
+                    "layer ON (VLLM_EXL3_PLE_OVERLAP=1; same rows and kernels)"
+                )
             return consumed
         except BaseException:
             reader.close()
@@ -594,6 +602,23 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 if self.placement == "ssd":
                     self._host_ids[:count].copy_(self._ids[:count], non_blocking=True)
                     self._ids_ready.record(stream)
+        except BaseException:
+            self._slot.fail()
+            raise
+        if self.overlap_reads and self.placement == "ssd":
+            # The read waits for the ids on the host; at finalize that wait
+            # no longer holds back the layers queued in between.
+            self._deferred = count
+            return
+        self._read_and_decode(count)
+
+    def _read_and_decode(self, count):
+        """Read the staged rows (SSD), then queue their copy and decode.
+
+        The slot is reading on entry and ready on return, or failed.
+        """
+        try:
+            stream = self._stream
             if self.placement == "ssd":
                 timing = self._timing
                 if timing is not None:
@@ -674,6 +699,9 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
     def _finalize_prefetch(self, output):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("EXL3 PLE finalize requires an eager graph break")
+        count, self._deferred = self._deferred, None
+        if count is not None:
+            self._read_and_decode(count)
         if self._slot.state != "ready" or output.shape[0] != self._local_tokens:
             raise RuntimeError("PLE finalize has no matching prefetched rows")
         current = torch.cuda.current_stream()

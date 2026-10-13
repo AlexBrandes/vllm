@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
+    VLLM_EXL3_PLE_OVERLAP: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
 
@@ -696,6 +697,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # per rank every 256 prefetches and at close. Off by default.
     "VLLM_EXL3_PLE_TIMING": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_TIMING", "0"))
+    ),
+    # Read the SSD PLE rows at the PLE layer instead of before the layer
+    # ahead of it, so the host wait for the token ids and the row reads
+    # overlap that layer on the GPU. Same rows, kernels and stream order for
+    # the consumer. Off by default.
+    "VLLM_EXL3_PLE_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_EXL3_PLE_OVERLAP", "0"))
     ),
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
