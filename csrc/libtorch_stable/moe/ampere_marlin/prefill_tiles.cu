@@ -10,7 +10,7 @@
 
 #define MARLIN_MOE_NO_MOE_C_IMPL
 #define moe_wna16_marlin_gemm ampere_marlin_prefill_tile_gemm
-#include "libtorch_stable/moe/marlin_moe_wna16/ops.cu"
+#include "moe/marlin_moe_wna16/ops.cu"
 #undef moe_wna16_marlin_gemm
 
 STABLE_TORCH_LIBRARY(_ampere_marlin_C, m) {

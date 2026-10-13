@@ -3,8 +3,8 @@
 // clang-format off
 // The Marlin instantiations of prefill_tile_gemm (kernel_selector_tiles.h).
 #include "libtorch_stable/moe/ampere_marlin/common_tiles.h"
-#include "libtorch_stable/moe/marlin_moe_wna16/kernel.h"
-#include "libtorch_stable/moe/marlin_moe_wna16/marlin_template.h"
+#include "moe/marlin_moe_wna16/kernel.h"
+#include "moe/marlin_moe_wna16/marlin_template.h"
 
 namespace MARLIN_NAMESPACE_NAME {
 
