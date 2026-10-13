@@ -1054,9 +1054,9 @@ def test_mamba_speculative_scratch_bounded_by_running_requests(
     """Runtime scratch never exceeds max_num_seqs * num_speculative_blocks.
 
     Capacity planning reserves exactly that many blocks per Mamba group
-    (see `_pool_concurrency_limit`), so the allocator must not let the
-    scratch footprint grow with the number of requests *served*, only with
-    the number of requests running at once.
+    (see `vllm.sm80.kv_planning.pool_concurrency_limit`), so the allocator
+    must not let the scratch footprint grow with the number of requests
+    *served*, only with the number of requests running at once.
     """
     block_size = 1152
     max_num_seqs = 8

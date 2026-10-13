@@ -1139,3 +1139,24 @@ seams:
   why: failed_inputs.handle_failed_inputs finds running requests that reused evicted blocks with it
   sha256: 2550895d3b06f2c947b9dd88e76aa37edd546480f2ccf824ab695bbcf08f42f9
   signature: '(self, request_id: str) -> tuple[list[int], ...]'
+
+- id: kv-planning-project-groups-to-worker
+  kind: function
+  target: vllm.v1.core.kv_cache_planning:_project_kv_cache_groups_to_worker
+  why: kv_planning.merge_eagle_group_flags restores is_eagle_group in the scheduler config because this projection clears it on a worker that owns none of a group's layers and keeps every worker's group list index-aligned
+  sha256: 6750fb8e9748f841018fcfc711a4a505781d0677737b2abdb7030862ea3c5e93
+  signature: '(global_kv_cache_groups: list[vllm.v1.kv_cache_interface.KVCacheGroupSpec], worker_spec: dict[str, vllm.v1.kv_cache_interface.KVCacheSpec]) -> list[vllm.v1.kv_cache_interface.KVCacheGroupSpec]'
+
+- id: kv-planning-bytes-per-block
+  kind: function
+  target: vllm.v1.core.kv_cache_planning:_get_kv_cache_bytes_per_block
+  why: kv_planning.fit_packed_kv_cache_groups keeps every drafter and state group within the widest attention group's page sum, which costs no bytes only while a block-outermost block is the largest group's page sum (rounded to the stride alignment)
+  sha256: 01d688a809ef1c060786dc236cd8b103a2617fa29c163d5a12a1de39e20c78d8
+  signature: '(kv_cache_groups: list[vllm.v1.kv_cache_interface.KVCacheGroupSpec], layout: vllm.v1.kv_cache_layout.KVCacheLayout) -> int'
+
+- id: model-utils-extract-layer-index
+  kind: function
+  target: vllm.model_executor.models.utils:extract_layer_index
+  why: kv_planning._layer_stages maps KV cache layers to pipeline stages with it; a layer name it rejects turns the pipeline-parallel group refit off without an error
+  sha256: f35c5bac4f8104225cede5a4303b94a3faee829ad781eca5a1e56442ebe5f49d
+  signature: '(layer_name: str, num_attn_module: int = 1) -> int'

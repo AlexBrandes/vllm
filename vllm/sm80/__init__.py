@@ -13,6 +13,9 @@ can reach.
 - ``spec_decode``: adaptive draft depth and the PP drafter fc fold.
 - ``worker``: the PP draft tail and packed hop, and the memory attribution
   and state-index diagnostics.
+- ``kv_planning``: KV cache planning rules: packed-group refit for MLA +
+  Mamba hybrids (DFlash drafter fit, PP-aware state groups), speculative
+  scratch in KV capacity, and the scheduler's eagle-group flags.
 - ``envs``: the fork's environment variables; ``vllm/envs.py`` registers
   them at the end of its own import.
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point

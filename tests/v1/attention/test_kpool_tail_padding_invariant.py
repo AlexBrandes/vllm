@@ -8,8 +8,8 @@ untouched*.  That is only safe because of a chain of facts elsewhere in the
 tree, and the failure it would cause is an illegal memory access under FULL
 cudagraph replay -- not a wrong answer -- so it is worth pinning:
 
-1. ``KpoolTailSpec.uses_slot_mapping`` is False, so the generic slot-mapping
-   kernel never writes real slots for this group;
+1. ``CircularBufferSpec.uses_slot_mapping`` is False, so the generic
+   slot-mapping kernel never writes real slots for the tail group;
 2. that kernel writes ``PAD_SLOT_ID`` for mapping-disabled groups and clears
    the rest of the buffer to ``PAD_SLOT_ID``;
 3. ``PAD_SLOT_ID`` is negative;
@@ -29,20 +29,19 @@ import torch
 from vllm.models.glm5next.nvidia.ops import kpool_compress
 from vllm.v1.attention.backends.mla.indexer import compute_kpool_tail_slot_mapping
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KpoolTailSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec
 from vllm.v1.worker.gpu import block_table
 
 KPOOL = 4
 
 
 def tail_spec():
-    return KpoolTailSpec(
+    return CircularBufferSpec(
         block_size=KPOOL,
         num_kv_heads=2,
         head_size=128,
         head_size_v=0,
         dtype=torch.bfloat16,
-        sliding_window=KPOOL,
     )
 
 

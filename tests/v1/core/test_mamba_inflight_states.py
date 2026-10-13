@@ -8,14 +8,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.sm80 import kv_planning
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
-    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -129,13 +129,12 @@ def _config(num_blocks, block, num_mamba, num_swa):
         ),
         KVCacheGroupSpec(
             ["tail"],
-            KpoolTailSpec(
+            CircularBufferSpec(
                 block_size=4,
                 num_kv_heads=2,
                 head_size=128,
                 head_size_v=0,
                 dtype=torch.bfloat16,
-                sliding_window=4,
             ),
         ),
     ]
@@ -277,7 +276,7 @@ def test_real_manager_pipelined_prefill(
 def test_banner_lines(monkeypatch):
     seen = []
     monkeypatch.setattr(
-        kv_cache_utils.logger, "info_once", lambda msg, *args, **kw: seen.append(msg)
+        kv_planning.logger, "info_once", lambda msg, *args, **kw: seen.append(msg)
     )
     config = _config(1017, PP4[2], 5, 2)
     monkeypatch.setenv(FLAG, "1")
