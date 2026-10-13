@@ -84,7 +84,7 @@ def test_zero_draft_rows_stay_speculative(
     monkeypatch,
 ):
     # CPU metadata construction must not initialize CUDA's pinned allocator.
-    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    monkeypatch.setattr("vllm.utils.torch_utils.is_pin_memory_available", lambda: False)
     draft_tokens = torch.tensor(num_decode_draft_tokens, dtype=torch.int32)
     accepted = torch.tensor(num_accepted_tokens, dtype=torch.int32, device=DEVICE)
     common_attn_metadata = create_common_attn_metadata(

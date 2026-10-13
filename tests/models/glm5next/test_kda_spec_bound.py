@@ -112,7 +112,7 @@ def test_glm_kda_builder_adds_the_spec_bound(
     monkeypatch,
 ):
     # CPU metadata construction must not initialize CUDA's pinned allocator.
-    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    monkeypatch.setattr("vllm.utils.torch_utils.is_pin_memory_available", lambda: False)
     kwargs: dict[str, torch.Tensor] = {}
     if num_decode_draft_tokens is not None:
         assert num_accepted_tokens is not None

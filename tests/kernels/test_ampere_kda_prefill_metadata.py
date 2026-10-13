@@ -50,7 +50,7 @@ GUARD = 4096
 def _no_pin(monkeypatch):
     import vllm.utils.torch_utils as tu
 
-    monkeypatch.setattr(tu, "PIN_MEMORY", False)
+    monkeypatch.setattr(tu, "is_pin_memory_available", lambda: False)
 
 
 def cu_from(seqlens, device="cpu"):
@@ -574,6 +574,6 @@ def test_gpu_upstream_resumed_batches(H, seqlens):
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--interp":
     import vllm.utils.torch_utils as _tu
 
-    _tu.PIN_MEMORY = False
+    _tu.is_pin_memory_available = lambda: False
     out = _interp_child(json.loads(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
     print("RESULT " + json.dumps(out))
