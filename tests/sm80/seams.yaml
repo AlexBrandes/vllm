@@ -29,7 +29,7 @@ seams:
   kind: method
   target: vllm.model_executor.models.registry:_ModelInfo.from_model_cls
   why: model information is read from the registered class (architecture = class name, interface flags); the fork GLM classes keep the upstream names and bases so it stays the same
-  sha256: 8a7552442685b80f233c128f071a5d0c14361dd78b68b76e0b0f62f70d4527b9
+  sha256: d374687ec0482c29ddeffdf2a91060cbaa868c92690d0786aa3f7c40a11b476e
   signature: '(model: type[torch.nn.modules.module.Module]) -> ''_ModelInfo'''
 
 - id: glm-model-init
@@ -148,7 +148,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_states.mamba_hybrid:MambaHybridModelState.prepare_attn
   why: records the RecoverSSM step through self.recoverssm when it is set and returns the attention metadata it built; Glm5NextModelState hands that dict to the KDA commit fold's step hook after it, with input_batch.idx_mapping
-  sha256: 0a09be223419a915c85bd6aaf685d9bba883bbf79362a06ff0c2de9cca371d35
+  sha256: 9593d783475eb87f44a29bcc70f329f44910a86ccf623b92d85f558bde4494f4
   signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, cudagraph_mode: vllm.config.compilation.CUDAGraphMode, block_tables: tuple[torch.Tensor, ...], slot_mappings: torch.Tensor, attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, for_capture: bool = False, ubatch_idx: int = 0, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None) -> dict[str, typing.Any]'
 
 - id: glm-mamba-state-add-request
@@ -294,7 +294,7 @@ seams:
   kind: function
   target: vllm.models.glm5next.common.model:Glm5NextForCausalLM
   why: whole upstream class the fork Glm5NextForCausalLM extends (bases, including SupportsEagle3, class attributes and methods it inherits)
-  sha256: 95a9dac847940609beda9b087d337fb76d783cbbe732f808f4f375cdf633593f
+  sha256: 6f33f59e4430c0b150b13ee2c0d5dbd54b6bdb82296b5ef7828c913eecc1ad14
   signature: '(*, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: glm-upstream-conditional-class
@@ -404,7 +404,7 @@ seams:
   kind: method
   target: vllm.v1.engine.core:EngineCore.__init__
   why: loads general plugins (running the fork register()) in the engine core process
-  sha256: e76ff40971a0c917797d85ab4b9d4564a2c206d1af72afe65ad78cd226b87d3d
+  sha256: 324b51e19fe3caa5ec54235a74b56a91b19511ca093cc0585ce5aa7564108be4
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, executor_class: type[vllm.v1.executor.abstract.Executor], log_stats: bool, executor_fail_callback: collections.abc.Callable | None = None, include_finished_set: bool = False)'
 
 - id: caller-worker-init-worker
@@ -425,7 +425,7 @@ seams:
   kind: method
   target: vllm.config.vllm:VllmConfig.__post_init__
   why: calls the fork plugin guard, which checks that the fork plugin was loaded
-  sha256: 6a457a49ee7d10dcae933e7ac099751700c2f85fb8fddcf954007314e8692c15
+  sha256: 4176dbb32652e4c96111eab72f5b46cfc8b539dfd7f2387dc5db4e859192f8b1
   signature: (self)
 
 - id: platform-plugins-group
@@ -542,7 +542,7 @@ seams:
   kind: method
   target: vllm.distributed.device_communicators.cuda_communicator:CudaCommunicator.all_reduce
   why: the fork tries host-shm before calling it; the backends it tries before ca_comm are checked off at construction
-  sha256: b8950bcd9a01f24c0081ce3fb3d27fcb5f1b5ffc01620be4bdb2e0148c63e342
+  sha256: 7ac43e827d94fd6d2c9db635bced97cc0c1802334ab95c107c89b1ab9ddf61ab
   signature: (self, input_)
 
 - id: comm-cuda-communicator-destroy
@@ -633,7 +633,7 @@ seams:
   kind: function
   target: vllm.model_executor.layers.fused_moe.layer:FusedMoEFactory
   why: instantiates MoERunner and RoutedExperts by their upstream names unless a model passes its own classes
-  sha256: bfb66f6e9d986fdd7831ea3664b5421495d8ce5a25697cb2298dafae4817a0e6
+  sha256: 90a83ca2bf0fadb6658c970a512deec4e3edaac432e546eb7ed000cafecd3b08
   signature: '(num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, intermediate_pad: int | None = None, params_dtype: torch.dtype | None = None, renormalize: bool = True, use_grouped_topk: bool = False, num_expert_group: int | None = None, topk_group: int | None = None, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, tp_size: int | None = None, dp_size: int | None = None, pcp_size: int | None = None, prefix: str = '''', custom_routing_function: collections.abc.Callable | None = None, router: vllm.model_executor.layers.fused_moe.router.fused_moe_router.FusedMoERouter | None = None, scoring_func: str = ''softmax'', routed_scaling_factor: float = 1.0, swiglu_limit: float | None = None, swiglu_alpha: float | None = None, swiglu_beta: float | None = None, activation_situ_beta: float | None = None, activation_situ_linear_beta: float | None = None, e_score_correction_bias: torch.Tensor | None = None, apply_router_weight_on_input: bool = False, activation: str = ''silu'', enable_eplb: bool = False, num_redundant_experts: int = 0, has_bias: bool = False, is_sequence_parallel: bool = False, reduce_results: bool = True, ckpt_names: tuple[str, str, str | None] = (''gate_proj'', ''down_proj'', ''up_proj''), is_fused_checkpoint_transposed: bool = False, n_shared_experts: int | None = None, fuse_shared_experts: bool = False, shared_expert_prefix: str | None = None, router_logits_dtype: torch.dtype | None = None, gate: torch.nn.modules.module.Module | None = None, shared_experts: torch.nn.modules.module.Module | None = None, shared_expert_gate: torch.nn.modules.module.Module | None = None, routed_input_transform: torch.nn.modules.module.Module | None = None, routed_output_transform: torch.nn.modules.module.Module | None = None, apply_routed_scale_to_output: bool = False, zero_expert_type: str | None = None, hash_indices_table: torch.Tensor | None = None, bias_vl: torch.Tensor | None = None, image_sentinel_lo: int = 0, runner_cls: type[vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner] | None = None, runner_args: dict[str, typing.Any] | None = None, routed_experts_cls: type[vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts] | None = None, routed_experts_args: dict[str, typing.Any] | None = None, skip_padding: bool = False) -> vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner'
 
 - id: moe-runner-init
@@ -1039,7 +1039,7 @@ seams:
   kind: method
   target: vllm.model_executor.model_loader.base_loader:BaseModelLoader.load_model
   why: Exl3ModelLoader relies on create_model, then load_weights, then process_weights_after_loading, in that order
-  sha256: 103e1a533be26717389d41b43327ca11f572c40db46def4204b0cd9afef56581
+  sha256: c765bc56d75ede6b5990639ffa20c84a291cdcd55b0100fc47bc1eba8b25d7fd
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, model_config: vllm.config.model.ModelConfig, prefix: str = '''') -> torch.nn.modules.module.Module'
 
 - id: loader-base-create-model
@@ -1053,7 +1053,7 @@ seams:
   kind: method
   target: vllm.model_executor.model_loader.default_loader:DefaultModelLoader.load_weights
   why: Exl3ModelLoader.load_weights replaces it for EXL3 and sets counter_before/after_loading_weights the same way
-  sha256: e5f56d174cc3a796192c519e09c2826f443a290d41c7da61ab81a1fbb2c293a2
+  sha256: 8a2ae3c15b516c187b49934606bf949926bb505d320f823d795f8077b7cd020c
   signature: '(self, model: ''nn.Module'', model_config: ''ModelConfig'') -> ''None'''
 
 - id: loader-default-download-model
@@ -1067,7 +1067,7 @@ seams:
   kind: function
   target: vllm.model_executor.model_loader.utils:initialize_model
   why: builds the model inside set_current_vllm_config, so Exl3Config.get_quant_method can check the launch options of the current config
-  sha256: 5facc9b6e86d78553b927bc2d3d8755ad256905983c4de3e150ae31a5e246b3a
+  sha256: a4180e8e9bb7a6ef14933f14a9d54be13fdcffe96d033ce91d050073a5086778
   signature: '(vllm_config: vllm.config.vllm.VllmConfig, *, prefix: str = '''', model_class: type[torch.nn.modules.module.Module] | None = None, model_config: vllm.config.model.ModelConfig | None = None) -> torch.nn.modules.module.Module'
 
 - id: config-current-vllm-config-or-none
@@ -1095,8 +1095,8 @@ seams:
   kind: method
   target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpNGramEmbedding.__init__
   why: exl3.loader._setup_ple_file reads ngram_embedding, ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers set here
-  sha256: c723c423fda12aaa99fb9a66454948541908c74206fb5ccac500a96fe4cbeabf
-  signature: '(self, config: transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig, embedding_dim: int, ple_dense_layer_id: int, max_total_tokens: int, *, data_parallel_rank: int, prefix: str, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, params_dtype: torch.dtype | None = None) -> None'
+  sha256: 03af3d024944a17c69742cfda273c691928f8604a7e01bbcb72af5fccca04d8c
+  signature: '(self, config: transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig, embedding_dim: int, ple_dense_layer_id: int, max_total_tokens: int, *, data_parallel_rank: int, prefix: str, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, params_dtype: torch.dtype | None = None, use_sequence_parallel: bool = False) -> None'
 
 - id: kv-coordinator-init
   kind: method
