@@ -124,6 +124,9 @@ def _vllm_config(name, tp_size, pp_size=1, *, with_dflash=False):
         quant_config=None,
     )
     config.kernel_config.enable_jit_warmup = False
+    # VllmConfig.__post_init__ (not run here) resolves the sparse MLA prefill
+    # workspace factor from max_model_len: 5 up to 256K tokens.
+    config.attention_config.sparse_mla_prefill_workspace_factor = 5
     if with_dflash:
         draft_model_config = _model_config("glm53_dflash2")
         config.speculative_config = _runtime_defaults(
