@@ -81,6 +81,7 @@ def _cfg(tp=4, pp=1, num_spec=7, max_seqs=8, mode="align", arch="Glm5NextForCond
                                            mamba_block_size=1152,
                                            mamba_page_size_padded=1152 * 1024,
                                            mamba_cache_dtype="auto",
+                                           mamba_ssm_cache_dtype="auto",
                                            use_kda_recoverssm=False),
         num_speculative_tokens=num_spec, max_concurrent_batches=2,
         max_in_flight_tokens=6926, kv_transfer_config=None)

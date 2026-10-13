@@ -677,7 +677,7 @@ def _real_config_build(monkeypatch, fold, cache_mode, query_lens, prefill):
         is_prefilling=torch.tensor([i in prefill for i in range(len(query_lens))]),
         num_accepted_tokens=torch.ones(batch.batch_size, dtype=torch.int32),
         num_decode_draft_tokens_cpu=drafts)
-    groups = [AttentionGroup(backend, b.layer_names, spec, g, [b])
+    groups = [AttentionGroup(backend, b.layer_names, spec, g, metadata_builders=[b])
               for g, b in enumerate(builders)]
     kv_config = KVCacheConfig(10000, [], [KVCacheGroupSpec(g.layer_names, spec)
                                           for g in groups])

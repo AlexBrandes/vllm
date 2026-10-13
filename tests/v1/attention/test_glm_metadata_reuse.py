@@ -59,7 +59,7 @@ def cpu_cuda_allocations(monkeypatch, meta_platform):
     from vllm.utils import torch_utils
 
     monkeypatch.setattr(_platform, "_SM80_CACHE", True)
-    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    monkeypatch.setattr(torch_utils, "is_pin_memory_available", lambda: False)
     for name in ("empty", "ones"):
         original = getattr(torch, name)
 
@@ -159,7 +159,7 @@ def test_glm_metadata_group_ownership(
         num_decode_draft_tokens_cpu=drafts,
     )
     groups = [
-        AttentionGroup(backend, b.layer_names, spec, i, [b])
+        AttentionGroup(backend, b.layer_names, spec, i, metadata_builders=[b])
         for i, b in enumerate(builders)
     ]
     if cache_mode == "align":
