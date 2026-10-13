@@ -87,7 +87,7 @@ def _summary(model):
 
 
 def _build(rank, port, checkpoint, out):
-    os.environ.update(VLLM_EXL3="1", HF_HUB_OFFLINE="1", CUDA_VISIBLE_DEVICES="")
+    os.environ.update(HF_HUB_OFFLINE="1", CUDA_VISIBLE_DEVICES="")
     try:
         from vllm.config import set_current_vllm_config
         from vllm.distributed import (

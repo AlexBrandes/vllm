@@ -10,10 +10,10 @@ EXL3 runs on the extension `vllm._exl3_C`, built for SM 8.0 only; selecting EXL3
 
 EXL3 is registered by the fork's vLLM plugin (`vllm/sm80/plugin.py`, entry point `sm80` of the `vllm-sm80-plugin` distribution in `plugins/sm80/`): the quantization method `exl3`, which a checkpoint whose `quant_method` is `exl3` selects, and the load format `exl3`. Without the plugin such a checkpoint is an unknown quantization method at startup, never an unquantized model.
 
-`VLLM_EXL3` defaults to `0`. Set it to `1` to select EXL3; a selected EXL3 checkpoint with the switch disabled is an error, not a fallback to another quantization method. A missing or incompatible compiled extension is also an error. EXL3 needs `--load-format exl3`, and models with a vision tower also need `--mm-encoder-tp-mode data`; building the model without them is an error. Off the CUDA platform, model configuration refuses EXL3 checkpoints.
+An EXL3 checkpoint always loads with EXL3; there is no switch and no fallback to another quantization method. A missing or incompatible compiled extension is also an error. EXL3 needs `--load-format exl3`, and models with a vision tower also need `--mm-encoder-tp-mode data`; building the model without them is an error. Off the CUDA platform, model configuration refuses EXL3 checkpoints.
 
 ```bash
-VLLM_EXL3=1 vllm serve ./exl3-checkpoint \
+vllm serve ./exl3-checkpoint \
   --quantization exl3 --load-format exl3 --dtype bfloat16
 ```
 
@@ -31,7 +31,6 @@ For the two-card configuration:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-VLLM_EXL3=1 \
 VLLM_EXL3_PLE_PLACEMENT=ssd \
 VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
 vllm serve ./qwen-exl3-checkpoint \

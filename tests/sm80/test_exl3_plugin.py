@@ -9,10 +9,13 @@ import pytest
 from torch import nn
 
 import vllm.config
+import vllm.envs
 from vllm.config.load import LoadConfig
 from vllm.model_executor.layers import quantization
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.platforms import current_platform
+from vllm.sm80 import envs as sm80_envs
 from vllm.sm80 import plugin
 from vllm.sm80.kernels.exl3 import quant as exl3
 from vllm.sm80.kernels.exl3.loader import Exl3ModelLoader
@@ -49,6 +52,28 @@ def test_exl3_checkpoints_are_refused_off_cuda(monkeypatch, is_cuda):
                 override({"quant_method": "exl3"}, user_quant)
 
 
+@pytest.mark.parametrize("retired_switch", [None, "0", "1"])
+def test_exl3_checkpoint_selects_exl3_without_a_switch(
+    registered, monkeypatch, retired_switch
+):
+    # VLLM_EXL3 is retired: unset or set to anything, an EXL3 checkpoint's
+    # quantization config builds Exl3Config through the regular load path.
+    if retired_switch is None:
+        monkeypatch.delenv("VLLM_EXL3", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXL3", retired_switch)
+    model_config = SimpleNamespace(
+        quantization="exl3",
+        quantization_config=None,
+        hf_config=SimpleNamespace(quantization_config={"quant_method": "exl3"}),
+    )
+    config = get_quant_config(model_config, LoadConfig(load_format="exl3"))
+    assert type(config) is exl3.Exl3Config
+    assert config.get_name() == "exl3"
+    assert "VLLM_EXL3" not in vllm.envs.environment_variables
+    assert "VLLM_EXL3" in sm80_envs.RETIRED_ENV_VARS
+
+
 def _config(load_format="exl3", mode="data", runner_type="generate", vision=True):
     multimodal = SimpleNamespace(mm_encoder_tp_mode=mode) if vision else None
     return SimpleNamespace(
@@ -75,7 +100,6 @@ def test_launch_options_are_required():
 
 
 def test_method_selection_checks_the_current_config(monkeypatch):
-    monkeypatch.setenv("VLLM_EXL3", "1")
     config = exl3.Exl3Config()
     monkeypatch.setattr(
         vllm.config,

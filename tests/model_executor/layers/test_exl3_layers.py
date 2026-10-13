@@ -107,7 +107,6 @@ def _write_sparse(path, tensors):
 
 @pytest.fixture
 def exl3_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("VLLM_EXL3", "1")
     monkeypatch.setattr(
         current_platform,
         "get_device_capability",

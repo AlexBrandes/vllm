@@ -97,10 +97,6 @@ class Exl3Config(QuantizationConfig):
 
     def __init__(self):
         super().__init__()
-        if not envs.VLLM_EXL3:
-            raise ValueError(
-                "EXL3 is disabled; set VLLM_EXL3=1 to load this checkpoint"
-            )
         self.ple_placement = envs.VLLM_EXL3_PLE_PLACEMENT
         self.manifest: Exl3Manifest | None = None
         self.mtp_start_layer_idx = 0

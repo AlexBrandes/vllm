@@ -12,8 +12,8 @@ when that switch is on.
 
 ``exl3`` is different: it is the quantization method and load format "exl3",
 registered by vllm/sm80/plugin.py. Its ``quant``, ``loader`` and ``utils``
-modules are imported at plugin load in every process, whatever VLLM_EXL3 is;
-VLLM_EXL3 is checked when an EXL3 checkpoint builds ``Exl3Config``. ``ops``,
+modules are imported at plugin load in every process, and a checkpoint
+quantized with EXL3 always selects it (there is no switch). ``ops``,
 which loads the compiled ``vllm._exl3_C``, is imported only when
 Exl3ModelLoader builds an EXL3 model or an EXL3 layer processes its weights.
 """

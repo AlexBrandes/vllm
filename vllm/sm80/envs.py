@@ -82,7 +82,6 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
-    VLLM_EXL3: bool = False
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
@@ -665,7 +664,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_THIN_GEMM_CONCAT", "0"))
     ),
     # Qwen EXL3 checkpoints (vllm/sm80/kernels/exl3/quant.py).
-    "VLLM_EXL3": lambda: bool(int(os.getenv("VLLM_EXL3", "0"))),
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
         "VLLM_EXL3_PLE_PLACEMENT", "ssd", ["ssd", "ram", "device"]
     )(),
@@ -874,6 +872,9 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_HOST_ALLREDUCE_TEST_FAIL_RANK": (
         "removed; the host-staged all-reduce no longer has a forced "
         "registration failure for testing"
+    ),
+    "VLLM_EXL3": (
+        "removed; an EXL3 checkpoint always loads with the EXL3 method"
     ),
 }
 _warned_retired_env_vars: set[str] = set()
