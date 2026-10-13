@@ -224,9 +224,10 @@ def test_operator_list_and_workspace_contract():
     size = torch.ops._exl3_C.moe_workspace_size_v2
     # 640 assignments: slice partials (gate/up 2 x 10 x 640, down 5 x 2560),
     # FP16 hi/lo operands (2 x 2560 + 640 floats), 2^-e per (row, slice)
-    # rounded to 4, then the routing table (header, sorted, tiles, experts).
+    # rounded to 4, then the routing table (header, sorted, tiles, the expert
+    # of each sorted entry and of each assignment).
     lane = 640 * (2 * 10 * 640 + 5 * 2560 + 2 * 2560 + 640) + 640 * 25
-    table = 4 + 640 + 4 * 640 + 640
+    table = 4 + 640 + 4 * 640 + 640 + 640
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + table
     assert size(1, 2500, 600, TOPK, LOCAL) == size(1, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, 0) == 0

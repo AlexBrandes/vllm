@@ -24,7 +24,8 @@ namespace moe_v2 {
 namespace {
 
 constexpr int kWarpsPerBlock = 8;
-constexpr int kRouteThreads = 1024;
+// The route + gate/up operand launch (block 0 routes with these threads).
+constexpr int kRouteInputThreads = 256;
 // Route kernel shared memory: three int arrays per local expert.
 constexpr int64_t kMaxRouteExperts = 4096;
 
@@ -32,7 +33,8 @@ constexpr int64_t kMaxRouteExperts = 4096;
 //   [0] local assignment count, [1] row-tile count, [2..3] unused,
 //   sorted[assignments]: local assignment ids grouped by local expert,
 //   tiles[assignments] (16-byte aligned): {expert, first sorted index, rows, 0},
-//   experts[assignments]: the local expert of each sorted entry.
+//   experts[assignments]: the local expert of each sorted entry,
+//   by_assignment[assignments]: the local expert of each assignment (-1: none).
 struct RouteLayout {
   static constexpr int64_t kHeader = 4;
   __host__ __device__ static constexpr int64_t sorted_offset() { return kHeader; }
@@ -42,8 +44,11 @@ struct RouteLayout {
   __host__ __device__ static constexpr int64_t experts_offset(int64_t assignments) {
     return tiles_offset(assignments) + 4 * assignments;
   }
-  __host__ __device__ static constexpr int64_t ints(int64_t assignments) {
+  __host__ __device__ static constexpr int64_t by_assignment_offset(int64_t assignments) {
     return experts_offset(assignments) + assignments;
+  }
+  __host__ __device__ static constexpr int64_t ints(int64_t assignments) {
+    return by_assignment_offset(assignments) + assignments;
   }
 };
 
@@ -135,10 +140,11 @@ __device__ __forceinline__ void block_scan2(int a, int b, int& a_before, int& b_
 
 // Groups the local assignments by local expert into tiles of up to
 // block_rows rows (one block, every call) and records each sorted entry's
-// expert. Order inside an expert is arbitrary: each assignment's result
-// depends only on its own row, never on its position or neighbours.
-__global__ void __launch_bounds__(kRouteThreads)
-route_assignments(Routing routing, int64_t assignments, int block_rows, int* table) {
+// expert and each assignment's expert. Order inside an expert is arbitrary:
+// each assignment's result depends only on its own row, never on its
+// position or neighbours.
+__device__ __forceinline__ void route_block(const Routing& routing, int64_t assignments,
+                                            int block_rows, int* table) {
   extern __shared__ int route_shared[];
   const int experts = static_cast<int>(routing.local_experts);
   int* cursor = route_shared;              // counts, then fill cursors
@@ -146,8 +152,10 @@ route_assignments(Routing routing, int64_t assignments, int block_rows, int* tab
   int* tile_begin = row_begin + experts;   // experts + 1 entries
   for (int e = threadIdx.x; e < experts; e += blockDim.x) cursor[e] = 0;
   __syncthreads();
+  int* by_assignment = table + RouteLayout::by_assignment_offset(assignments);
   for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
     const int64_t e = local_expert(routing, a);
+    by_assignment[a] = static_cast<int>(e);
     if (e >= 0) atomicAdd(&cursor[e], 1);
   }
   __syncthreads();
@@ -243,8 +251,10 @@ __device__ __forceinline__ void store_lane_halves(const float (&v)[kVals], int l
 // in FP64, rounded once to FP32 and written as the down GEMM's B operand
 // (per assignment [hi | lo] FP16 rows of ipad halves, one 2^-e per
 // (assignment, 128-column slice)). Gate and up arrive as kSlices K-slice
-// partials (slice_stride apart), summed in increasing slice order; every
-// load is issued before the first sum (one memory round trip).
+// partials (slice_stride apart), summed in increasing slice order. Three
+// dependent memory round trips per task: the routing table (count, sorted
+// entry and its expert together), then all partials with the expert's
+// pointers, then the svh/suh values.
 template <int kSlices>
 __global__ void activate_down_input(Routing routing, const int* table, int64_t assignments,
                                     int64_t intermediate, int64_t ipad, const float* gate,
@@ -254,11 +264,13 @@ __global__ void activate_down_input(Routing routing, const int* table, int64_t a
   const int* sorted = table + RouteLayout::sorted_offset();
   const int* sorted_experts = table + RouteLayout::experts_offset(assignments);
   const int64_t blocks = ipad / 128;
-  const int64_t tasks = int64_t(table[0]) * blocks;
   for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
-       task < tasks; task += int64_t(gridDim.x) * kWarpsPerBlock) {
-    const int64_t assignment = sorted[task / blocks];
-    const int64_t expert = sorted_experts[task / blocks];
+       task < assignments * blocks; task += int64_t(gridDim.x) * kWarpsPerBlock) {
+    const int64_t pos = task / blocks;
+    const int count = __ldg(table);
+    const int64_t assignment = __ldg(sorted + pos);
+    const int64_t expert = __ldg(sorted_experts + pos);
+    if (pos >= count) break;
     const int64_t base = (task % blocks) * 128 + lane;
     const half* gate_svh = expert_svh(routing, expert, 0);
     const half* up_svh = expert_svh(routing, expert, 1);
@@ -272,6 +284,15 @@ __global__ void activate_down_input(Routing routing, const int* table, int64_t a
         gs[s][i] = gate[s * slice_stride + assignment * ipad + base + 32 * i];
         us[s][i] = up[s * slice_stride + assignment * ipad + base + 32 * i];
       }
+    }
+    float gate_scale[4];
+    float up_scale[4];
+    float down_scale[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      gate_scale[i] = __half2float(gate_svh[base + 32 * i]);
+      up_scale[i] = __half2float(up_svh[base + 32 * i]);
+      down_scale[i] = __half2float(down_suh[base + 32 * i]);
     }
     double g[4];
     double u[4];
@@ -291,11 +312,11 @@ __global__ void activate_down_input(Routing routing, const int* table, int64_t a
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int64_t col = base + 32 * i;
-      const double gv = __dmul_rn(g[i], double(__half2float(gate_svh[col])));
-      const double uv = __dmul_rn(u[i], double(__half2float(up_svh[col])));
+      const double gv = __dmul_rn(g[i], double(gate_scale[i]));
+      const double uv = __dmul_rn(u[i], double(up_scale[i]));
       v[i] = 0.0;
       if (col < intermediate) {
-        v[i] = __dmul_rn(__dmul_rn(silu(gv), uv), double(__half2float(down_suh[col])));
+        v[i] = __dmul_rn(__dmul_rn(silu(gv), uv), double(down_scale[i]));
       }
     }
     hadamard128_warp_f64(v, lane);
@@ -308,80 +329,81 @@ __global__ void activate_down_input(Routing routing, const int* table, int64_t a
   }
 }
 
-// One warp per (token, 128-column block): each local route's down output
-// (the sum of kSlices K-slice partials, slice_stride apart, in increasing
-// slice order) transform (H128, svh), then exactly one routing-weight FMA per
-// route in route order, all in FP64, then FP32 rounding and BF16 rounding of
-// that FP32 value. Two local routes are loaded at a time so their memory
-// round trips overlap.
+// One block per (token, 128-column block), one warp per route (blockDim =
+// 32 * min(topk, 32), at least 4 warps). Warp w handles routes w, w + warps,
+// ...: the local route's down output (the sum of kSlices K-slice partials,
+// slice_stride apart, in increasing slice order) transform (H128, svh) in
+// FP64 into shared memory, every route's loads in flight at once. Then
+// threads 0..127 apply exactly one routing-weight FMA per local route in
+// route order (FP64) and round to FP32, then to BF16. Local experts come from
+// the routing table's by-assignment array. Dynamic shared memory:
+// combine_shared_bytes(topk).
+constexpr int kCombineMaxThreads = 1024;
+size_t combine_shared_bytes(int64_t topk) {
+  return size_t(topk) * (128 * sizeof(double) + sizeof(float) + sizeof(int));
+}
 template <int kSlices>
-__global__ void combine_routes(const float* down, const float* weights, Routing routing,
-                               int64_t rows, int64_t hidden, int64_t hpad,
-                               int64_t slice_stride, __nv_bfloat16* out) {
+__global__ void __launch_bounds__(kCombineMaxThreads)
+combine_routes(const float* down, const float* weights, Routing routing, const int* table,
+               int64_t rows, int64_t hidden, int64_t hpad, int64_t slice_stride,
+               __nv_bfloat16* out) {
+  extern __shared__ __align__(16) unsigned char combine_shared[];
+  const int64_t topk = routing.topk;
+  double* values = reinterpret_cast<double*>(combine_shared);      // [topk][128]
+  float* route_weight = reinterpret_cast<float*>(values + topk * 128);
+  int* route_local = reinterpret_cast<int*>(route_weight + topk);
+  const int* by_assignment = table + RouteLayout::by_assignment_offset(rows * topk);
   const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
   const int64_t blocks = hpad / 128;
-  for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
-       task < rows * blocks; task += int64_t(gridDim.x) * kWarpsPerBlock) {
+  for (int64_t task = blockIdx.x; task < rows * blocks; task += gridDim.x) {
     const int64_t row = task / blocks;
-    const int64_t base = (task % blocks) * 128 + lane;
-    double sum[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int64_t first = 0; first < routing.topk; first += 32) {
-      // Lane r looks up route first + r; the warp then walks the local routes
-      // in order, two at a time.
-      const int64_t mine = row * routing.topk + first + lane;
-      const int64_t my_expert = first + lane < routing.topk ? local_expert(routing, mine) : -1;
-      const half* my_svh = my_expert >= 0 ? expert_svh(routing, my_expert, 2) : nullptr;
-      const float my_weight = my_expert >= 0 ? weights[mine] : 0.0f;
-      unsigned local = __ballot_sync(0xffffffffu, my_expert >= 0);
-      auto fetch = [&](int r, float (&v)[kSlices][4], float (&scale)[4]) {
-        const int64_t at = (row * routing.topk + first + r) * hpad + base;
-        const half* svh = reinterpret_cast<const half*>(
-            __shfl_sync(0xffffffffu, reinterpret_cast<uintptr_t>(my_svh), r));
+    const int64_t col0 = (task % blocks) * 128;
+    for (int64_t r = warp; r < topk; r += blockDim.x / 32) {
+      const int64_t assignment = row * topk + r;
+      const int64_t expert = __ldg(by_assignment + assignment);
+      if (lane == 0) {
+        route_local[r] = expert >= 0;
+        route_weight[r] = weights[assignment];
+      }
+      if (expert < 0) continue;
+      const half* svh = expert_svh(routing, expert, 2);
+      float v[kSlices][4];
 #pragma unroll
-        for (int s = 0; s < kSlices; ++s) {
-#pragma unroll
-          for (int i = 0; i < 4; ++i) v[s][i] = down[s * slice_stride + at + 32 * i];
-        }
-#pragma unroll
-        for (int i = 0; i < 4; ++i) scale[i] = __half2float(svh[base + 32 * i]);
-      };
-      auto add_route = [&](int r, const float (&v)[kSlices][4], const float (&scale)[4]) {
-        const double weight = __shfl_sync(0xffffffffu, my_weight, r);
-        double x[4];
+      for (int s = 0; s < kSlices; ++s) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          x[i] = v[0][i];
-#pragma unroll
-          for (int s = 1; s < kSlices; ++s) x[i] = __dadd_rn(x[i], double(v[s][i]));
-        }
-        hadamard128_warp_f64(x, lane);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          sum[i] = __fma_rn(__dmul_rn(x[i], double(scale[i])), weight, sum[i]);
-        }
-      };
-      while (local != 0) {
-        const int r0 = __ffs(local) - 1;
-        local &= local - 1;
-        float v0[kSlices][4], s0[4];
-        fetch(r0, v0, s0);
-        if (local != 0) {
-          const int r1 = __ffs(local) - 1;
-          local &= local - 1;
-          float v1[kSlices][4], s1[4];
-          fetch(r1, v1, s1);
-          add_route(r0, v0, s0);
-          add_route(r1, v1, s1);
-        } else {
-          add_route(r0, v0, s0);
+          v[s][i] = down[s * slice_stride + assignment * hpad + col0 + lane + 32 * i];
         }
       }
-    }
+      float scale[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int64_t col = base + 32 * i;
-      if (col < hidden) out[row * hidden + col] = __float2bfloat16_rn(__double2float_rn(sum[i]));
+      for (int i = 0; i < 4; ++i) scale[i] = __half2float(svh[col0 + lane + 32 * i]);
+      double x[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        x[i] = v[0][i];
+#pragma unroll
+        for (int s = 1; s < kSlices; ++s) x[i] = __dadd_rn(x[i], double(v[s][i]));
+      }
+      hadamard128_warp_f64(x, lane);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        values[r * 128 + lane + 32 * i] = __dmul_rn(x[i], double(scale[i]));
+      }
     }
+    __syncthreads();
+    if (threadIdx.x < 128) {
+      double sum = 0.0;
+      for (int64_t r = 0; r < topk; ++r) {
+        if (route_local[r]) {
+          sum = __fma_rn(values[r * 128 + threadIdx.x], double(route_weight[r]), sum);
+        }
+      }
+      const int64_t col = col0 + threadIdx.x;
+      if (col < hidden) out[row * hidden + col] = __float2bfloat16_rn(__double2float_rn(sum));
+    }
+    __syncthreads();
   }
 }
 
@@ -395,7 +417,7 @@ __global__ void combine_routes(const float* down, const float* weights, Routing 
 // cores (FP16 in, FP32 out, C = 0 per k16 step) with B = 16 k x 8 columns: per
 // group of four route rows, columns 0..3 hold the rows' high FP16 parts and
 // 4..7 the low parts of their activations scaled by 2^e per (row, K slice)
-// (store_lane_halves; produced once per call by lane_gate_up_input and
+// (store_lane_halves; produced once per call by route_and_gate_up_input and
 // activate_down_input, read straight from global memory). The k16 results are
 // summed in FP32 in increasing k per K slice, high and low apart; the slice
 // partial (hi + lo) 2^-e goes to the workspace and the consumer kernel sums
@@ -615,26 +637,33 @@ moe_lane_kernel(LaneProblem p) {
   }
 }
 
-// One warp per (sorted entry, projection, K slice) of gate/up: x * suh and
-// H128 in FP64 per 128 block, rounded once to FP32, then the tensor-core B
-// operand of the slice (store_lane_halves).
+// One launch: block 0 routes (route_block) while the other blocks form the
+// gate/up tensor-core B operand straight from topk_ids (independent of the
+// routing table): one warp per (assignment, projection, K slice) of a local
+// route: x * suh and H128 in FP64 per 128 block, rounded once to FP32, then
+// store_lane_halves.
 template <int kSliceK>
-__global__ void lane_gate_up_input(const __nv_bfloat16* x, Routing routing, const int* table,
-                                   int64_t assignments, int64_t hidden, int64_t hpad,
-                                   __half* halves, float* unscale) {
+__global__ void __launch_bounds__(kRouteInputThreads)
+route_and_gate_up_input(Routing routing, int64_t assignments, int block_rows, int* table,
+                        const __nv_bfloat16* x, int64_t hidden, int64_t hpad, __half* halves,
+                        float* unscale) {
+  if (blockIdx.x == 0) {
+    route_block(routing, assignments, block_rows, table);
+    return;
+  }
   constexpr int kVals = kSliceK / 32;
+  constexpr int kWarps = kRouteInputThreads / 32;
   const int lane = threadIdx.x & 31;
-  const int* sorted = table + RouteLayout::sorted_offset();
-  const int* sorted_experts = table + RouteLayout::experts_offset(assignments);
   const int64_t slices = hpad / kSliceK;
-  const int64_t tasks = int64_t(table[0]) * 2 * slices;
-  for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
-       task < tasks; task += int64_t(gridDim.x) * kWarpsPerBlock) {
-    const int64_t pos = task / (2 * slices);
+  const int64_t tasks = assignments * 2 * slices;
+  for (int64_t task = int64_t(blockIdx.x - 1) * kWarps + (threadIdx.x >> 5); task < tasks;
+       task += int64_t(gridDim.x - 1) * kWarps) {
+    const int64_t assignment = task / (2 * slices);
+    const int64_t expert = local_expert(routing, assignment);
+    if (expert < 0) continue;
     const int projection = static_cast<int>((task / slices) % 2);
     const int64_t slice = task % slices;
-    const int64_t assignment = sorted[pos];
-    const half* suh = expert_suh(routing, sorted_experts[pos], projection);
+    const half* suh = expert_suh(routing, expert, projection);
     const __nv_bfloat16* row = x + (assignment / routing.topk) * hidden;
     float v[kVals];
 #pragma unroll
@@ -783,6 +812,7 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
   float* input = workspace.data_ptr<float>();
   const float* down_out = input;
   int64_t down_stride = 0;
+  const int* route_table = nullptr;   // the routing table combine_routes reads
   if (experts > 0 && assignments > 0) {
     const int64_t gate_up_stride = assignments * ipad;
     down_stride = assignments * hpad;
@@ -798,14 +828,16 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
     // The int4 route tiles need a 16-byte aligned table.
     int* table = reinterpret_cast<int*>(
         gate_up_unscale + (assignments * (2 * kGateUpSlices + kDownSlices) + 3) / 4 * 4);
+    route_table = table;
     down_out = down;
-    route_assignments<<<1, kRouteThreads, (3 * experts + 1) * sizeof(int), stream>>>(
-        routing, assignments, kLaneRows, table);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    lane_gate_up_input<16 * kGateUpSliceTiles>
-        <<<warp_blocks(assignments * 2 * kGateUpSlices), 32 * kWarpsPerBlock, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), routing, table,
-            assignments, hidden, hpad, gate_up_halves, gate_up_unscale);
+    // Routing (block 0) and the gate/up B operand (other blocks) in one launch.
+    constexpr int64_t kInputWarps = kRouteInputThreads / 32;
+    route_and_gate_up_input<16 * kGateUpSliceTiles>
+        <<<launch_blocks(1 + (assignments * 2 * kGateUpSlices + kInputWarps - 1) / kInputWarps),
+           kRouteInputThreads, (3 * experts + 1) * sizeof(int), stream>>>(
+            routing, assignments, kLaneRows, table,
+            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), hidden, hpad,
+            gate_up_halves, gate_up_unscale);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     // Row tiles: sum over experts of ceil(rows_e / kLaneRows).
     const int64_t max_tiles = std::min<int64_t>(
@@ -844,10 +876,14 @@ void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
     // No local expert or no route: every row is exactly zero.
     routing.topk = 0;
   }
+  const size_t shared = combine_shared_bytes(routing.topk);
+  TORCH_CHECK(shared <= 48 * 1024, "EXL3 MoE topk too large for the combine stage");
   combine_routes<kDownSlices>
-      <<<warp_blocks(rows * (hpad / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
-          down_out, topk_weights.data_ptr<float>(), routing, rows, hidden, hpad, down_stride,
-          reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+      <<<launch_blocks(rows * (hpad / 128)),
+         32 * static_cast<int>(std::min<int64_t>(std::max<int64_t>(routing.topk, 4), 32)),
+         shared, stream>>>(
+          down_out, topk_weights.data_ptr<float>(), routing, route_table, rows, hidden, hpad,
+          down_stride, reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
