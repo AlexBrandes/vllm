@@ -4,10 +4,12 @@
 // before any launch or graph capture), linear_out_splitk hands every launch
 // to linear_out_mma first. A launch the tensor-core blocks cover (formats
 // in EXL3_DENSE_MMA_FORMATS, a matrix in kServedShapes, 1..32 rows, a
-// 16-byte aligned trellis; served_plan) runs:
+// 16-byte aligned trellis, room for the block exponents in out; see
+// served_plan and dense_mma_plan) runs:
 // - linear_input_split: x * suh, H128 (linear_input's FP32 values), then
-//   each row scaled by a power of two and split into FP16 hi + lo in the
-//   m16n8k16 B-fragment order; with two K splits it also zeroes the result;
+//   each H128 block of each row scaled by a power of two and split into
+//   FP16 hi + lo in the m16n8k16 B-fragment order; with two K splits it
+//   also zeroes the result;
 // - mma_kernel: trellis tiles decoded in registers straight into m16n8k16 A
 //   fragments, the products on the tensor cores (FP32 accumulate);
 // - linear_output with the output H128 and svh in FP64, rounded once to
@@ -16,20 +18,22 @@
 // with linear_out_splitk (its split-K blocks or linear_out).
 //
 // Arithmetic (not linear_out's; the results differ in the last bits). W is
-// exact in FP16. Each activation row is scaled by 2^(14 - e) (its max |v| in
-// [2^14, 2^15)) and split into hi = rn16(v) and lo = rn16(v - hi). Per k16
-// slice D = W^T lo + 0, then D += W^T hi on the tensor core, then acc += D in
-// FP32 in slice order over a warp's K range. The kw range sums of a block
-// are added in K order in FP32 and multiplied by the row's inverse scale (a
-// power of two: exact); with two splits both halves are added atomically
-// onto the zeroed result: fl(0 + a + b) == fl(0 + b + a), so results are
+// exact in FP16. Each H128 block of each activation row is scaled by
+// 2^(14 - e) (its max |v| in [2^14, 2^15)) and split into hi = rn16(v) and
+// lo = rn16(v - hi). Per k16 slice D = W^T lo + 0, then D += W^T hi on the
+// tensor core, then acc = fma(D, 2^(e - 14) of the slice's block, acc) in
+// FP32 in slice order over a warp's K range (the product by a power of two
+// is exact: one rounding per slice). The kw range sums of a block are added
+// in K order in FP32; with two splits both halves are added atomically onto
+// the zeroed result: fl(0 + a + b) == fl(0 + b + a), so results are
 // deterministic. The plan, and with it a row's result, depends on the row
 // count of the launch.
 //
 // The workspace is linear_out's (linear_workspace_size): the split
 // activations take exactly the transformed input's rows * padded_in floats,
-// the result follows them. The per-row scale exponents live in the first
-// 2 * rows bytes of out until linear_output overwrites it.
+// the result follows them. The block scale exponents (rows rounded up to 8
+// times padded_in / 128 int16) live at the start of out until linear_output
+// overwrites it.
 #include "dense_mma.h"
 
 #include "common.h"
@@ -98,11 +102,12 @@ struct MmaProblem : GemmProblem {
   // zeroes first. 0 or 1: no split.
   int splits;
   // The split activations, one uint4 per (row, k16 slice, q) as
-  // linear_input_split stores them (k / 16 slices per row), per row the
-  // biased FP32 exponent of the inverse scale, and the warps per column
+  // linear_input_split stores them (k / 16 slices per row), per (H128
+  // block, row) the biased FP32 exponent of the block's inverse scale
+  // (block-major, rows rounded up to 8 per block), and the warps per column
   // group (K parts inside a block; splits: across blocks).
   const uint4* split;
-  const int16_t* row_exp;
+  const int16_t* block_exp;
   int mma_kw;
 };
 
@@ -173,8 +178,6 @@ constexpr int kMmaWarps = 8;
 constexpr int kMmaMinBlockWarps = 4;
 constexpr int kMmaThreads = 32 * kMmaWarps;
 constexpr int kMmaMaxRows = 32;
-// linear_input_split runs one block of padded_in / 4 threads per row.
-constexpr int kMmaMaxK = 4096;
 
 __device__ __forceinline__ void mma_f16_16816(float (&d)[4], const uint32_t (&a)[4],
                                               uint32_t b0, uint32_t b1) {
@@ -187,7 +190,8 @@ __device__ __forceinline__ void mma_f16_16816(float (&d)[4], const uint32_t (&a)
 
 // Each warp streams its k16 slices through a private ring of kMmaStages
 // stages (cp.async, kMmaStages - 1 slices in flight): the MT trellis tiles
-// (contiguous in memory) and the lane-ordered split activations.
+// (contiguous in memory), the lane-ordered split activations and the lanes'
+// block scale exponents.
 constexpr int kMmaStages = 4;
 
 template <int kBitsX2, int NT, int MT>
@@ -195,6 +199,9 @@ struct MmaStage {
   static constexpr int kTileWords = TileRing<kBitsX2>::kWords;
   uint32_t words[MT * kTileWords];
   uint4 act[NT][32];
+  // Per lane the biased exponents of its result rows 2q, 2q + 1 for the
+  // slice's H128 block.
+  uint32_t scale[NT][32];
 };
 
 // Dynamic shared memory of a block of `warps` warps: the warps' rings, reused
@@ -207,6 +214,9 @@ constexpr int mma_smem_bytes(int warps) {
 
 __device__ __forceinline__ void cp_async16(uint32_t smem, const void* gmem) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem) : "memory");
+}
+__device__ __forceinline__ void cp_async4(uint32_t smem, const void* gmem) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem), "l"(gmem) : "memory");
 }
 __device__ __forceinline__ void cp_async_commit() {
   asm volatile("cp.async.commit_group;" ::: "memory");
@@ -250,6 +260,7 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
   const int q = lane & 3;
   constexpr uint32_t kStageBytes = sizeof(Stage);
   constexpr uint32_t kActOffset = offsetof(Stage, act);
+  constexpr uint32_t kScaleOffset = offsetof(Stage, scale);
   // Lane constants as shared addresses into stage 0 of the warp's ring,
   // opaque to the compiler so that they stay in registers instead of being
   // recomputed every slice: the issue targets (trellis piece lane, B values),
@@ -258,6 +269,7 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
                         static_cast<uint32_t>(warp) * S * kStageBytes;
   const uint32_t issue_words = opaque_u32(ring + 16 * lane);
   const uint32_t act_lane = opaque_u32(ring + kActOffset + 16 * lane);
+  const uint32_t scale_lane = opaque_u32(ring + kScaleOffset + 4 * lane);
   uint32_t read_word[Ring::kLoadWords];
   int shift;
   {
@@ -278,13 +290,17 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
   const int last = static_cast<int>(int64_t(part + 1) * steps / (kw * splits));
   const bool active = group < groups;
   static_assert(kActOffset % 16 == 0 && kStageBytes % 16 == 0, "16-byte ring pieces");
-  // This lane's B rows (row g of each fragment).
+  // This lane's B rows (row g of each fragment), and its result rows' scale
+  // exponents: block_exp holds per H128 block one int16 per row of the row
+  // count rounded up to 8, so rows 2q and 2q + 1 of a fragment are one word.
+  const int rows8 = (static_cast<int>(p.rows) + 7) & ~7;
   const uint4* arow[NT];
 #pragma unroll
   for (int nt = 0; nt < NT; ++nt) {
     const int row = nt * 8 + g;
     arow[nt] = row < p.rows ? p.split + int64_t(row) * steps * 4 + q : nullptr;
   }
+  const uint32_t* esrc = reinterpret_cast<const uint32_t*>(p.block_exp) + q;
   const int64_t ct0 = group * MT;
   // Running sources of the next slice to issue and the ring stage it fills.
   const uint16_t* tsrc =
@@ -294,6 +310,7 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
 #pragma unroll
   for (int nt = 0; nt < NT; ++nt) asrc[nt] = arow[nt] != nullptr ? arow[nt] + 4 * first : nullptr;
   uint32_t issue_offset = 0;
+  int issue_slice = first;
   auto issue = [&]() {
 #pragma unroll
     for (int j = 0; j < (kPieces + 31) / 32; ++j) {
@@ -301,13 +318,16 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
         cp_async16(issue_words + issue_offset + 512 * j, tsrc + 256 * j);
       }
     }
+    const uint32_t* eblock = esrc + (issue_slice >> 3) * (rows8 / 2);
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
       if (asrc[nt] != nullptr) {
         cp_async16(act_lane + issue_offset + 512 * nt, asrc[nt]);
         asrc[nt] += 4;
       }
+      cp_async4(scale_lane + issue_offset + 128 * nt, eblock + 4 * nt);
     }
+    ++issue_slice;
     tsrc += tstride;
     issue_offset = issue_offset + kStageBytes == S * kStageBytes ? 0 : issue_offset + kStageBytes;
   };
@@ -337,10 +357,16 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
       const uint32_t offset = read_offset;
       read_offset = read_offset + kStageBytes == S * kStageBytes ? 0 : read_offset + kStageBytes;
       // b[nt]: hi pairs (k 2q.., 2q+8..), then lo pairs; zero past the rows.
+      // inv[nt]: 2^(e - 14) of the slice's H128 block for rows 2q, 2q + 1
+      // (garbage past the rows, whose D columns are zero and never stored).
       uint4 b[NT];
+      float inv[NT][2];
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
         b[nt] = arow[nt] != nullptr ? lds128(act_lane + offset + 512 * nt) : make_uint4(0u, 0u, 0u, 0u);
+        const uint32_t exps = lds32(scale_lane + offset + 128 * nt);
+        inv[nt][0] = __int_as_float(static_cast<int>((exps & 0xffffu) << 23));
+        inv[nt][1] = __int_as_float(static_cast<int>((exps >> 16) << 23));
       }
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
@@ -360,7 +386,7 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
           mma_f16_16816(d, frag, b[nt].z, b[nt].w);
           mma_f16_16816(d, frag, b[nt].x, b[nt].y);
 #pragma unroll
-          for (int i = 0; i < 4; ++i) acc[mt][nt][i] = __fadd_rn(acc[mt][nt][i], d[i]);
+          for (int i = 0; i < 4; ++i) acc[mt][nt][i] = __fmaf_rn(d[i], inv[nt][i & 1], acc[mt][nt][i]);
         }
       }
     }
@@ -393,12 +419,11 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
     for (int j = 0; j < 2; ++j) {
       const int row = nt * 8 + 2 * q + j;
       if (row >= p.rows) continue;
-      const float inv = __int_as_float(int(p.row_exp[row]) << 23);
       float* out = p.c + int64_t(row) * p.c_stride + ct0 * 16 + g;
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
-        const float lo = __fmul_rn(acc[mt][nt][j], inv);
-        const float hi = __fmul_rn(acc[mt][nt][2 + j], inv);
+        const float lo = acc[mt][nt][j];
+        const float hi = acc[mt][nt][2 + j];
         if (splits > 1) {
           atomicAdd(out + 16 * mt, lo);
           atomicAdd(out + 16 * mt + 8, hi);
@@ -503,7 +528,7 @@ int64_t mma_blocks(int64_t n, int mt, int kw, int splits) {
 constexpr int kMmaWideGroupsPerSm = 8;
 constexpr int kMmaMinSteps = 8;
 
-// Every dense launch of 1..32 rows (K <= 4096, 16-byte aligned trellis).
+// Every dense launch of 1..32 rows (16-byte aligned trellis).
 // Wide matrices (>= kMmaWideGroupsPerSm 4-tile groups per SM) run 4-tile
 // groups over all of K. Otherwise 2-tile groups and the most K parts (16 =
 // 8 warps x 2 blocks, then 8, 4, 2) with >= kMmaMinSteps slices per part
@@ -514,7 +539,7 @@ constexpr int kMmaMinSteps = 8;
 MmaPlan dense_mma_plan(int64_t rows, int64_t k, int64_t n, int format, int sms,
                        const void* trellis, int device) {
   MmaPlan plan{};
-  if (rows <= 0 || rows > kMmaMaxRows || k > kMmaMaxK || k % 16 != 0 || n % 64 != 0) return plan;
+  if (rows <= 0 || rows > kMmaMaxRows || k % 128 != 0 || n % 64 != 0) return plan;
   if (reinterpret_cast<uintptr_t>(trellis) % 16 != 0) return plan;
   if (n / 64 >= int64_t(kMmaWideGroupsPerSm) * sms) return MmaPlan{4, 1, 1};
   device = mma_device(device);
@@ -560,30 +585,37 @@ unsigned int warp_blocks(int64_t tasks) {
   return launch_blocks((tasks + kWarpsPerBlock - 1) / kWarpsPerBlock);
 }
 
-// The tensor-core blocks' input: one block of padded_in / 128 warps per row,
-// each warp one 128-column block with linear_input's exact FP32 values. The
-// row's max |v| sets a power-of-two scale 2^(14 - e) (max scaled into
-// [2^14, 2^15)); each scaled value is split into FP16 hi = rn(v) and
-// lo = rn(v - hi) (the residual is exact in FP32). Stored per (row, k16
-// slice, q = 0..3) as one uint4 in the m16n8k16 B-fragment order: hi pairs
-// (k 2q, 2q + 1), (2q + 8, 2q + 9), then the lo pairs. row_exp[row] =
-// 113 + e, the biased FP32 exponent of 2^(e - 14), which the GEMM multiplies
-// its row's sums by. With `zeroed` != nullptr the launch also zeroes
+// Measured (graph replay, rows 1-32, K 2560-3072): 4-warp blocks of one warp
+// per (row, H128 block) take 2.5-3.4 us; one block of K / 128 warps per row
+// with a row-wide max took 4.1-4.9 us.
+constexpr int kSplitWarpsPerBlock = 4;
+
+// The tensor-core blocks' input: one warp per (row, 128-column block),
+// kSplitWarpsPerBlock warps per block, with linear_input's exact FP32
+// values. The block's max |v| sets a power-of-two scale 2^(14 - e) (max
+// scaled into [2^14, 2^15)); each scaled value is split into FP16
+// hi = rn(v) and lo = rn(v - hi) (the residual is exact in FP32). Stored per
+// (row, k16 slice, q = 0..3) as one uint4 in the m16n8k16 B-fragment order:
+// hi pairs (k 2q, 2q + 1), (2q + 8, 2q + 9), then the lo pairs.
+// block_exp[block * rows8 + row] = 113 + e (rows8: rows rounded up to 8),
+// the biased FP32 exponent of 2^(e - 14), which the GEMM multiplies the
+// block's slice sums by. With `zeroed` != nullptr the launch also zeroes
 // zero_vectors float4s there (the split GEMM's accumulation target).
-__global__ void linear_input_split(const __nv_bfloat16* x, const half* suh, int64_t logical_in,
-                                   int64_t padded_in, uint32_t* split, int16_t* row_exp,
-                                   float4* zeroed, int64_t zero_vectors) {
+__global__ void linear_input_split(const __nv_bfloat16* x, const half* suh, int64_t rows,
+                                   int64_t logical_in, int64_t padded_in, uint32_t* split,
+                                   int16_t* block_exp, float4* zeroed, int64_t zero_vectors) {
   if (zeroed != nullptr) {
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < zero_vectors;
          i += int64_t(gridDim.x) * blockDim.x) {
       zeroed[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
   }
-  __shared__ float block_max[32];
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int64_t row = blockIdx.x;
-  const int64_t base = int64_t(warp) * 128 + lane;
+  const int64_t blocks = padded_in / 128;
+  const int64_t task = int64_t(blockIdx.x) * kSplitWarpsPerBlock + (threadIdx.x >> 5);
+  if (task >= rows * blocks) return;
+  const int64_t row = task / blocks;
+  const int64_t base = (task % blocks) * 128 + lane;
   float v[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -598,14 +630,12 @@ __global__ void linear_input_split(const __nv_bfloat16* x, const half* suh, int6
   for (int distance = 16; distance > 0; distance >>= 1) {
     m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, distance));
   }
-  if (lane == 0) block_max[warp] = m;
-  __syncthreads();
-  m = block_max[0];
-  for (int w = 1; w < int(blockDim.x >> 5); ++w) m = fmaxf(m, block_max[w]);
   // Zero and subnormal maxima clamp to e = -112, so that both powers of two stay normal.
   const int e = max((__float_as_int(m) >> 23) - 127, -112);
   const float scale = __int_as_float((141 - e) << 23);
-  if (threadIdx.x == 0) row_exp[row] = static_cast<int16_t>(113 + e);
+  if (lane == 0) {
+    block_exp[(task % blocks) * ((rows + 7) & ~int64_t(7)) + row] = static_cast<int16_t>(113 + e);
+  }
   const int64_t steps = padded_in / 16;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -685,13 +715,19 @@ __global__ void linear_output(const float* result, const half* svh, int64_t rows
 std::atomic<bool> g_enabled{false};
 std::atomic<int> g_override{0};
 
-// dense_mma_plan for a served format and matrix (kServedShapes), with the
+// dense_mma_plan for a served format and matrix (kServedShapes) whose block
+// exponents fit in out ((rows rounded up to 8) * k / 128 int16 within rows *
+// logical_out, out 4-byte aligned: the GEMM copies word pairs), with the
 // diagnostic override applied to every launch the plan puts on the
 // tensor-core blocks.
-MmaPlan served_plan(int64_t rows, int64_t k, int64_t n, int64_t bits_x2, int64_t codebook,
-                    int sms, const void* trellis, int device) {
+MmaPlan served_plan(int64_t rows, int64_t k, int64_t n, int64_t logical_out, int64_t bits_x2,
+                    int64_t codebook, int sms, const void* trellis, const void* out,
+                    int device) {
   if (!served_format(bits_x2, codebook)) return MmaPlan{};
   if (!served_shape(k, n, bits_x2)) return MmaPlan{};
+  const bool fits_exps = (rows + 7) / 8 * 8 * (k / 128) <= rows * logical_out &&
+                         reinterpret_cast<uintptr_t>(out) % 4 == 0;
+  if (!fits_exps) return MmaPlan{};
   const MmaPlan plan = dense_mma_plan(
       rows, k, n, format_key(static_cast<int>(bits_x2), static_cast<int>(codebook)), sms,
       trellis, device);
@@ -734,6 +770,7 @@ void dense_mma_prepare() {
 }
 
 // [mt, kw, splits] of a launch of `rows` rows of a 16-byte aligned matrix
+// whose output is unpadded (logical_out == padded_out) and 4-byte aligned
 // (mt 0: not on the tensor-core blocks). Wide matrices (the LM head) and
 // launches outside the blocks need no device; the 2-tile plans query the
 // occupancy of the current device.
@@ -744,8 +781,8 @@ std::vector<int64_t> linear_mma_plan(int64_t rows, int64_t padded_in, int64_t pa
               "EXL3 multiprocessor count must be a positive int");
   check_padded(padded_in);
   check_padded(padded_out);
-  const MmaPlan plan = served_plan(rows, padded_in, padded_out, bits_x2, codebook,
-                                   static_cast<int>(sms), nullptr, -1);
+  const MmaPlan plan = served_plan(rows, padded_in, padded_out, padded_out, bits_x2, codebook,
+                                   static_cast<int>(sms), nullptr, nullptr, -1);
   return {plan.mt, plan.kw, plan.splits};
 }
 
@@ -763,20 +800,22 @@ bool linear_out_mma(const torch::Tensor& x, const torch::Tensor& trellis,
   const int64_t padded_in = trellis.size(0) * 16;
   const int64_t padded_out = trellis.size(1) * 16;
   const int device = mma_device(x.get_device());
-  const MmaPlan plan = served_plan(rows, padded_in, padded_out, bits_x2, codebook, sms,
-                                   trellis.data_ptr(), device);
+  const MmaPlan plan = served_plan(rows, padded_in, padded_out, logical_out, bits_x2, codebook,
+                                   sms, trellis.data_ptr(), out.data_ptr(), device);
   if (plan.mt == 0) return false;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
   float* transformed = workspace.data_ptr<float>();
   // rows * padded_out floats, 16-byte aligned (padded_in is a multiple of 128).
   float* result = transformed + rows * padded_in;
-  int16_t* row_exp = reinterpret_cast<int16_t*>(out.data_ptr());
+  int16_t* block_exp = reinterpret_cast<int16_t*>(out.data_ptr());
   float4* zeroed = plan.splits > 1 ? reinterpret_cast<float4*>(result) : nullptr;
-  linear_input_split<<<static_cast<unsigned int>(rows), static_cast<unsigned int>(padded_in / 4),
-                       0, stream>>>(
+  const int64_t warps = rows * (padded_in / 128);
+  linear_input_split<<<static_cast<unsigned int>((warps + kSplitWarpsPerBlock - 1) /
+                                                 kSplitWarpsPerBlock),
+                       32 * kSplitWarpsPerBlock, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()), logical_in, padded_in,
-      reinterpret_cast<uint32_t*>(transformed), row_exp, zeroed, rows * padded_out / 4);
+      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()), rows, logical_in, padded_in,
+      reinterpret_cast<uint32_t*>(transformed), block_exp, zeroed, rows * padded_out / 4);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   MmaProblem problem{};
@@ -792,7 +831,7 @@ bool linear_out_mma(const torch::Tensor& x, const torch::Tensor& trellis,
   problem.rows = rows;
   problem.splits = plan.splits;
   problem.split = reinterpret_cast<const uint4*>(transformed);
-  problem.row_exp = row_exp;
+  problem.block_exp = block_exp;
   problem.mma_kw = plan.kw;
   launch_mma(problem, plan.mt, stream, device);
 
