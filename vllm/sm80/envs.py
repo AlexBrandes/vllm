@@ -698,7 +698,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # (N, K): hyper-connection down/up and final down, router, shared-expert
     # gate, GDN in_proj_ba, PLE kv_proj) at M <= 32 that are captured into a
     # CUDA graph to the Gluon thin GEMM (vllm/sm80/kernels/thin_gemm/gluon.py,
-    # thin_gemm_gluon.py); every call outside capture takes F.linear. Needs
+    # thin_gemm_gluon.py); once it is active, every call outside capture, of
+    # any shape, takes F.linear (VLLM_THIN_GEMM's Triton calls too). Needs
     # VLLM_THIN_GEMM, sm_80 with 74 SMs, the Triton Gluon ampere API,
     # compilation mode NONE and CUDA graphs for decode and mixed steps (no
     # enforce_eager); anything else keeps the VLLM_THIN_GEMM path. A warmup

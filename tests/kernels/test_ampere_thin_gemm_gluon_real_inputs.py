@@ -185,10 +185,17 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
                 mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.PIECEWISE),
             model_config=types.SimpleNamespace(enforce_eager=False)))
     assert gluon.warmup_table(worker, list(range(1, 33))) == gluon.SHAPES
+    left, launched = [], []
 
     def shipped(layer, x, w, bias=None):
-        raise AssertionError("a real case left the Gluon path")
+        # Recorded, not raised: an exception inside the capture would surface
+        # as the capture's error instead of this one.
+        left.append(tuple(x.shape))
+        return torch.nn.functional.linear(x, w, bias)
 
+    kernels = gluon.impl()
+    monkeypatch.setattr(gluon, "impl", lambda: types.SimpleNamespace(
+        thin_gemm=lambda x, w: launched.append(x.shape[0]) or kernels.thin_gemm(x, w)))
     dispatch = gluon.wrap_dispatch(shipped)
     stream = torch.cuda.Stream()
 
@@ -213,9 +220,12 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
             if out is not None and not torch.equal(inc.view(torch.int16),
                                                     out.cuda().view(torch.int16)):
                 live_bad.append(case["id"])
+            n_launched = len(launched)
             eager = dispatch(None, x, w)
             assert torch.equal(eager.view(torch.int16), inc.view(torch.int16)), case["id"]
+            assert len(launched) == n_launched, f"{case['id']}: an eager call launched the kernels"
             c1, c2 = captured(x, w)
+            assert len(launched) == n_launched + 1, f"{case['id']}: the captured call missed the kernels"
             assert torch.equal(c1.view(torch.int16), c2.view(torch.int16)), case["id"]
             pool.add(c1, inc, x.double() @ w.double().T)
         name = "%s rows %d %s%s %s" % (key[0], key[1], key[2], " drafter" if key[3] else "", key[4])
@@ -227,5 +237,6 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
             print(f"POOL {name}: FAIL {exc}")
     lines, _ = real.coverage_report(cases, REQUIRED_CELLS)
     print("\n".join(lines))
+    assert not left, f"real cases left the Gluon path: {left[:4]}"
     assert not live_bad, f"F.linear replay differs from the recorded output: {live_bad[:4]}"
     assert not failed, failed[:4]

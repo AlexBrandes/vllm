@@ -22,12 +22,13 @@ CPU (runs anywhere):
   stride that is a multiple of 16 elements and 16-byte aligned operands (what
   the warmup compiled); a row stride of 8 mod 16, an unaligned base or a K
   stride of 2 takes cuBLAS, with one warning; an unaligned weight too.
-  Gate: 74 SMs, compilation mode NONE, CUDA graphs on every step
-  (enforce_eager and graph modes with eager steps close it), Gluon ampere
-  API; a warmup failure fails the boot; VLLM_THIN_GEMM_CONCAT with the flag
-  raises; the banner and the gate-closed line through vLLM's own logger,
-  the shipped warmup's count line. Warmup split:
-  the Gluon module warms its shapes at M <= 32, the shipped kernel the rest.
+  Gate: 74 SMs, compilation mode NONE, CUDA graphs for decode and mixed
+  steps (enforce_eager and graph modes that run either eagerly close it),
+  Gluon ampere API; a warmup failure fails the boot; VLLM_THIN_GEMM_CONCAT
+  with the flag raises; the banner and the gate-closed line through vLLM's
+  own logger, the shipped warmup's count line. Warmup split: the Gluon
+  module warms its shapes at every M from 1 to 32 whatever sizes it is
+  given, the shipped kernel the given sizes above 32.
   Schedule: the table holds every served row count for every (N, K), its rows
   are the measured ones (pinned), an unserved M takes the next served row;
   the forced-schedule diagnostic; the workspace lane is shared with the
@@ -47,7 +48,9 @@ back at zero after every call; the forced schedule makes each row's result
 independent of the call's row count; the dispatch end to end through the
 warmup gate: calls captured into a CUDA graph run the Gluon kernels (replay
 bitwise their direct call), calls outside capture give F.linear's bits and
-launch none of them, a captured call above 32 rows takes the wrapped one.
+launch none of them, a captured call above 32 rows takes the wrapped one; a
+call captured at a row count the warmup was not given compiles no variant
+and allocates nothing but its output inside the capture.
 """
 
 import contextlib
@@ -390,6 +393,15 @@ def test_eager_calls_take_f_linear_first(g, monkeypatch):
     def refused(*args):
         raise AssertionError("an eager call reached a captured-call test")
 
+    class Untouchable:
+        def __contains__(self, item):
+            refused()
+
+        def __ge__(self, other):
+            refused()
+
+    monkeypatch.setattr(g, "SHAPES", Untouchable())
+    monkeypatch.setattr(g, "MAX_M", Untouchable())
     monkeypatch.setattr(g, "thin_gemm_supported", refused)
     monkeypatch.setattr(g, "gluon_layout_ok", refused)
     gen = torch.Generator().manual_seed(0)
@@ -473,12 +485,12 @@ def test_warmup_banner_and_split_through_the_vllm_logger(g, monkeypatch, caplog)
     with _vllm_log(caplog):
         served = g.warmup_table(_worker(), [1, 2, 4, 32, 40])
     assert served == g.SHAPES and g._LIVE[0] is True
-    assert seen == [("gluon", tuple(sorted(g.SHAPES)), (1, 2, 4, 32)),
+    assert seen == [("gluon", tuple(sorted(g.SHAPES)), tuple(range(1, 33))),
                     ("shipped", tuple(sorted(g.SHAPES)), (40,))]
     lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
     assert (logging.INFO, GLUON,
-            "Gluon thin GEMM active [VLLM_THIN_GEMM_GLUON=1]: 7 (N, K) x M in "
-            "(1, 2, 4, 32) (up to 32 rows)") in lines
+            "Gluon thin GEMM active [VLLM_THIN_GEMM_GLUON=1]: 7 (N, K) x M 1-32 "
+            "in captured calls, F.linear outside capture") in lines
 
 
 def test_warmup_gate_closed_lines(g, monkeypatch, caplog):
@@ -785,3 +797,33 @@ def test_gpu_dispatch_end_to_end(g, monkeypatch):
         torch.testing.assert_close(captured(x, w), torch.nn.functional.linear(x, w))
     assert launched == [1, 2, 4, 8, 16, 24, 32] * len(NK)
     assert shipped_calls == [40] * len(NK)
+
+
+@gpu
+def test_gpu_capture_at_unlisted_row_counts(g, monkeypatch):
+    """No eager forward runs the kernels before a capture any more (eager
+    calls take F.linear), so the warmup readies every M up to 32 whatever
+    sizes it is given: a call captured at a row count outside them compiles
+    no variant and allocates nothing but its output inside the capture, and
+    its replay is bitwise the direct call."""
+    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    fn = g.wrap_dispatch(lambda layer, x, w, bias=None: pytest.fail("left the table path"))
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert g.warmup_table(_worker(device=device), [1, 2, 4, 8, 16, 24, 32]) == g.SHAPES
+    k_mod = g.impl()
+    stream = torch.cuda.Stream()
+    for n, k in NK:
+        for m in (3, 5, 12, 20, 28):
+            x, w = _inputs(5 * m, m, n, k)
+            before = _compiled_variants(k_mod)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                start = torch.cuda.memory_stats()["allocation.all.allocated"]
+                out = fn(None, x, w)
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - start
+            assert allocated == 1, (n, k, m, allocated)
+            assert _compiled_variants(k_mod) == before, (n, k, m)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert _bitwise(out, k_mod.thin_gemm(x, w)), (n, k, m)
+            del graph, out

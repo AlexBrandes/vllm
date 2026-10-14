@@ -12,10 +12,12 @@ for N = 1. Against cuBLAS it is ~1.41x on the served mix of these calls.
 This module wraps the ``VLLM_THIN_GEMM`` dispatch (``ampere_thin_gemm``).
 While the gate is open, only calls being captured into a CUDA graph reach the
 Gluon kernels. A call made outside capture takes ``F.linear``, the call the
-dispatch makes with both flags off, and that test comes first: launched
-eagerly (the drafter's decode passes after the first, which run outside
-graphs at exactly the request count; steps larger than the largest graph;
-the warm-up forward before each capture), a Gluon call takes 1.7-3.2x the
+dispatch makes with both flags off, whatever its shape or row count (the
+calls ``VLLM_THIN_GEMM`` alone would send to its Triton kernel included),
+and that test comes first: launched eagerly (the drafter's decode passes
+after the first, which run outside graphs at exactly the request count;
+steps larger than the largest graph; the warm-up forward before each
+capture), a Gluon call takes 1.7-3.2x the
 time of cuBLAS's at 1-8 rows on the 74-SM part, its launch cost being host
 time that a graph pays once, at capture. The test is the current stream's
 capture status (the binding behind ``torch.cuda.is_current_stream_capturing``,
@@ -43,9 +45,12 @@ launches), CUDA graphs for decode and mixed steps (no ``enforce_eager``, no
 graph mode that runs either eagerly at unpadded row counts) and the Triton
 Gluon ampere API importable. Until then, and whenever it stays closed, the
 wrapped dispatch serves every call; a closed gate logs one warning with the
-reason. Once those hold, the warmup compiles every kernel variant and
-allocates its workspace; a failure there fails the boot rather than leaving
-this process on a different kernel from the other ranks.
+reason. Once those hold, the warmup compiles the kernel variant and allocates
+the workspace of every row count up to ``MAX_M``, whatever row counts the
+server captures at: a captured call must find both ready, and no eager
+forward runs the kernels before a capture (the warm-up forward takes
+``F.linear``). A failure there fails the boot rather than leaving this
+process on a different kernel from the other ranks.
 
 ``VLLM_THIN_GEMM_CONCAT`` pairs only the shipped thin GEMM's calls, so the
 two flags do not combine: setting both raises.
@@ -162,18 +167,21 @@ def warmup_table(worker, ms) -> frozenset:
     """Decide the gate and, if it opens, compile and allocate every variant.
 
     -> the (N, K) this module now serves at M <= MAX_M (empty when closed).
-    The shipped thin GEMM is warmed here for those shapes at any M above
-    MAX_M that ``ms`` holds; the caller warms it for everything else. A
-    warmup failure raises: one rank must not serve a different kernel from
-    the others (the replicated router and hyper-connection GEMMs would
-    differ between ranks).
+    The Gluon module is warmed at every M from 1 to MAX_M, not only the ones
+    ``ms`` holds: a captured call at any of them (a capture size the shape
+    sees halved, a capture list this process was not told about) must not
+    compile or allocate inside the capture. The shipped thin GEMM is warmed
+    here for those shapes at any M above MAX_M that ``ms`` holds; the caller
+    warms it for everything else. A warmup failure raises: one rank must not
+    serve a different kernel from the others (the replicated router and
+    hyper-connection GEMMs would differ between ranks).
     """
     _LIVE[0] = False
     reason = closed_reason(worker.device, worker.vllm_config)
     if reason:
         set_but_off(reason)
         return frozenset()
-    table_ms = [m for m in ms if m <= MAX_M]
+    table_ms = list(range(1, MAX_M + 1))
     try:
         impl().warmup(sorted(SHAPES), table_ms, device=worker.device)
     except Exception as exc:
@@ -187,8 +195,8 @@ def warmup_table(worker, ms) -> frozenset:
     _LIVE[0] = True
     pinned = impl()._FORCE_M[0]
     logger.info_once(
-        "Gluon thin GEMM active [VLLM_THIN_GEMM_GLUON=1]: %d (N, K) x M in %s "
-        "(up to %d rows)%s", len(SHAPES), tuple(table_ms), MAX_M,
+        "Gluon thin GEMM active [VLLM_THIN_GEMM_GLUON=1]: %d (N, K) x M 1-%d "
+        "in captured calls, F.linear outside capture%s", len(SHAPES), MAX_M,
         f", schedule pinned to M={pinned} [VLLM_THIN_GEMM_GLUON_FORCE_M]"
         if pinned else "")
     return SHAPES
