@@ -679,6 +679,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         if reason is None and max_rows < exl3_ops.MOE_PREFILL_MIN_ROWS:
             reason = f"MoE calls have at most {max_rows} rows"
+        if reason is None:
+            # Host copy of the layer's pointer table: one device sync, at load.
+            reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
         vllm_config = get_current_vllm_config()
         if reason is None:
             reason = _prefill_layout_closed_reason(vllm_config)
@@ -906,6 +909,20 @@ def _prefill_layout_closed_reason(vllm_config) -> str | None:
         or getattr(spec, "method", None) in ("dflash", "dspark")
     ):
         return f"speculative method {spec.method} drafts with parallel slots"
+    return None
+
+
+def _unaligned_trellis_reason(pointers) -> str | None:
+    """Why moe_out_prefill must not read these experts, or None: it loads
+    every expert trellis in 16-byte units and stops the device on a trellis
+    base that is not 16-byte aligned. ``pointers`` is the layer's pointer
+    table as a host list: per local expert and projection (gate, up, down)
+    the [trellis, suh, svh] addresses."""
+    roles = ("gate_proj", "up_proj", "down_proj")
+    for local, expert in enumerate(pointers):
+        for role, (trellis, _suh, _svh) in zip(roles, expert):
+            if trellis % 16:
+                return f"local expert {local} {role} trellis is not 16-byte aligned"
     return None
 
 

@@ -251,6 +251,12 @@ UNALIGNED_SET = 3  # its trellis bases are only 2-byte aligned
 def served():
     """256 local experts of the served shape over DISTINCT weight sets, with
     their FP64 effective weights (an independent NumPy decoder)."""
+    return served_experts(UNALIGNED_SET)
+
+
+def served_experts(unaligned_set):
+    """The ``served`` expert sets; set ``unaligned_set`` (None: no set) has
+    trellis bases that are only 2-byte aligned."""
     from tests.kernels.quantization.test_exl3_kernels import effective_weight
 
     _extension_or_skip()
@@ -274,7 +280,7 @@ def served():
                 np.float16
             )
             base = torch.empty(trellis.size + 1, dtype=torch.int16, device=device)
-            offset = 1 if index == UNALIGNED_SET else 0
+            offset = 1 if index == unaligned_set else 0
             t = base[offset : offset + trellis.size].view(trellis.shape)
             t.copy_(torch.from_numpy(trellis))
             s, v = torch.from_numpy(suh).to(device), torch.from_numpy(svh).to(device)

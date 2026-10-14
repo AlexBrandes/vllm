@@ -812,7 +812,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
     # calls of 65..3460 rows in prefill steps (some request scheduled more
     # than 1 + num_speculative_tokens tokens), with the configuration
-    # VLLM_EXL3_MOE_V2 covers (vllm/sm80/kernels/exl3/quant.py). Other calls
+    # VLLM_EXL3_MOE_V2 covers and 16-byte-aligned expert trellis bases
+    # (vllm/sm80/kernels/exl3/quant.py). Other calls
     # and every call of a decode step keep their kernels. Results
     # differ from moe_out in the last bits. Default OFF: unset, prefill calls
     # take moe_out.

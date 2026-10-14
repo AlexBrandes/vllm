@@ -7,7 +7,8 @@ and log lines (through vLLM's own logger), the dispatch in Exl3Experts.apply
 by rows and by the scheduler phase of the step (calls of 65..3460 rows in
 prefill steps only; decode steps of any size, calls of at most 64 rows and
 larger calls keep their kernels; with the switch off the base rule), and the
-operator's workspace contract.
+operator's workspace contract. The gate also closes unless every local
+expert's trellis is 16-byte aligned.
 
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
 256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
@@ -15,7 +16,8 @@ moe_out; moe_out_prefill is held to moe_out's error against an FP64 reference
 (pooled mean <= 1.10x, max <= 1.25x, BF16 rounding ties forgiven, exact where
 moe_out is exact) over awkward routings of 65..1001 rows; it is deterministic;
 it refuses calls it does not cover; and a captured call replays bitwise like
-the eager call without any allocator event.
+the eager call without any allocator event. Every weight set's trellis is
+16-byte aligned, as the gate requires.
 """
 
 import logging
@@ -42,7 +44,7 @@ from tests.kernels.quantization.test_exl3_moe_v2 import (
     _run,
     _v1,
     needs_sm80,
-    served,  # noqa: F401 (module fixture)
+    served_experts,
 )
 from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
@@ -235,6 +237,36 @@ def test_gate_says_when_graphs_cover_prefill_sizes(monkeypatch, graph_max, said)
         assert "72 tokens" in graph_lines[0]
 
 
+@pytest.mark.parametrize("projection", [0, 1, 2])
+def test_gate_closes_unless_every_expert_trellis_is_16_byte_aligned(
+    monkeypatch, projection
+):
+    from vllm.sm80.kernels.exl3 import quant
+
+    warmed = []
+    method, layer = _method(monkeypatch, warmed)
+    lines = []
+    monkeypatch.setattr(
+        quant.logger, "info_once", lambda msg, *a: lines.append(msg % a)
+    )
+    # One 1,024,000-byte trellis (or scale vector) per address; the scale
+    # vectors' alignment does not matter.
+    pointers = 0x7F0000000000 + 1024000 * torch.arange(LOCAL * 9).view(LOCAL, 3, 3)
+    pointers[:, :, 1:] += 2
+    layer.exl3_ptrs = pointers.clone()
+    assert method._moe_prefill(layer, SERVED_META, 3460, 7) == (4, 3460000)
+    assert len(warmed) == 1
+    assert not any("gate is closed" in line for line in lines)
+    pointers[37, projection, 0] += 2
+    layer.exl3_ptrs = pointers
+    assert method._moe_prefill(layer, SERVED_META, 3460, 7) == (0, 7)
+    assert len(warmed) == 1
+    role = ("gate_proj", "up_proj", "down_proj")[projection]
+    closed = [line for line in lines if "gate is closed" in line]
+    assert len(closed) == 1
+    assert f"local expert 37 {role} trellis is not 16-byte aligned" in closed[0]
+
+
 def _experts(
     moe_v2_rows, prefill_decode_len, max_rows=8192, workspace=0, expert_map="layer map"
 ):
@@ -320,7 +352,15 @@ def test_operator_list_and_workspace_contract():
 # ---------------------------------------------------------------- GPU tests
 
 
-def _p(served, x, ids, weights):  # noqa: F811
+@pytest.fixture(scope="module")
+def served():
+    """The moe_out_v2 tests' expert sets with every trellis 16-byte aligned:
+    moe_out_prefill requires it (its gate keeps moe_out otherwise). The
+    "single" scenario still routes one assignment to one expert."""
+    return served_experts(None)
+
+
+def _p(served, x, ids, weights):
     return _run(
         exl3_ops.moe_out_prefill,
         served,
@@ -333,7 +373,7 @@ def _p(served, x, ids, weights):  # noqa: F811
 
 @needs_sm80
 @pytest.mark.parametrize("rows", [65, 1906])
-def test_off_path_is_moe_out(served, monkeypatch, rows):  # noqa: F811
+def test_off_path_is_moe_out(served, monkeypatch, rows):
     _phase(monkeypatch, "prefill")
     x, ids, weights = _case(served, "uniform", rows, rows)
     expected = _v1(served, x, ids, weights)
@@ -347,7 +387,7 @@ def test_off_path_is_moe_out(served, monkeypatch, rows):  # noqa: F811
 
 
 @needs_sm80
-def test_on_path_takes_the_prefill_op_only_in_prefill_steps(served, monkeypatch):  # noqa: F811
+def test_on_path_takes_the_prefill_op_only_in_prefill_steps(served, monkeypatch):
     rows = 97
     x, ids, weights = _case(served, "uniform", rows, 5)
     size = max(
@@ -383,7 +423,7 @@ SCENARIOS = [
 
 
 @needs_sm80
-def test_prefill_op_holds_moe_outs_error_against_fp64(served):  # noqa: F811
+def test_prefill_op_holds_moe_outs_error_against_fp64(served):
     pool = _Fp64Pool()
     for index, (scenario, rows) in enumerate(SCENARIOS):
         x, ids, weights = _case(served, scenario, rows, 100 + index)
@@ -402,7 +442,7 @@ def test_prefill_op_holds_moe_outs_error_against_fp64(served):  # noqa: F811
 
 
 @needs_sm80
-def test_prefill_op_refuses_calls_it_does_not_cover(served):  # noqa: F811
+def test_prefill_op_refuses_calls_it_does_not_cover(served):
     x, ids, weights = _case(served, "uniform", 65, 3)
     out = torch.empty_like(x)
     args = (served.pointers, served.meta, served.expert_map)
@@ -431,7 +471,7 @@ def _allocations():
 
 @needs_sm80
 @pytest.mark.parametrize("rows", [65, 1906])
-def test_prefill_graph_replay_is_bitwise_eager_without_allocations(served, rows):  # noqa: F811
+def test_prefill_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     exl3_ops.warmup_moe_prefill(
         served.pointers,
         served.meta,
