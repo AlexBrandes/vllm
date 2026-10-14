@@ -538,9 +538,9 @@ def _ssd_embedding(tmp_path, monkeypatch, trace, *, overlap, owner_lo=3):
 
 def _step(module, ids, trace):
     """One forward's PLE part: prefetch, the layer ahead, finalize."""
-    module.start_prefetch(None, torch.tensor(ids, dtype=torch.int64))
+    module.start_prefetch(torch.tensor(ids, dtype=torch.int64))
     trace.append("layer ahead")
-    output = module.forward(torch.empty(len(ids), 1))
+    output = module.finalize_prefetch(len(ids))
     return output, module.take_failed_tokens()
 
 
@@ -561,10 +561,10 @@ def test_exl3_ple_overlap_keeps_order_and_moves_only_the_layer(
     try:
         for _ in range(2):  # the second step reuses the slot
             trace.clear()
-            module.start_prefetch(None, torch.tensor([[3, 6], [4, 9]]))
+            module.start_prefetch(torch.tensor([[3, 6], [4, 9]]))
             assert module._slot.state == ("reading" if overlap else "ready")
             trace.append("layer ahead")
-            module.forward(torch.empty(2, 1))
+            module.finalize_prefetch(2)
             assert module._slot.state == "idle"
             assert module.take_failed_tokens().tolist() == [False, False]
             calls = [
@@ -657,20 +657,20 @@ def test_exl3_ple_overlap_read_error_fails_the_slot(tmp_path, monkeypatch, overl
     ids = torch.tensor([[3, 5], [4, 6], [3, 7], [4, 8]])
     try:
         if overlap:
-            module.start_prefetch(None, ids)
+            module.start_prefetch(ids)
             assert joined == [] and module._slot.state == "reading"
             with pytest.raises(RuntimeError, match="storage gone"):
-                module.forward(torch.empty(4, 1))
+                module.finalize_prefetch(4)
         else:
             with pytest.raises(RuntimeError, match="storage gone"):
-                module.start_prefetch(None, ids)
+                module.start_prefetch(ids)
         assert sorted(joined) == [0, 4]  # both chunks ran before the failure
         assert module._slot.state == "failed" and decoded == []
         assert module._deferred is None
         with pytest.raises(RuntimeError, match="slot is failed"):
-            module.start_prefetch(None, ids)
+            module.start_prefetch(ids)
         with pytest.raises(RuntimeError, match="no matching"):
-            module.forward(torch.empty(4, 1))
+            module.finalize_prefetch(4)
     finally:
         module.close()
 
@@ -684,12 +684,12 @@ def test_exl3_ple_overlap_cancelled_step_reads_nothing(tmp_path, monkeypatch, ov
     module, decoded = _ssd_embedding(tmp_path, monkeypatch, trace, overlap=overlap)
     try:
         with pytest.raises(RuntimeError, match="no matching"):
-            module.forward(torch.empty(1, 1))  # finalize before any prefetch
+            module.finalize_prefetch(1)  # finalize before any prefetch
         assert module._slot.state == "idle"
-        module.start_prefetch(None, torch.tensor([[3, 5]]))
+        module.start_prefetch(torch.tensor([[3, 5]]))
         state = "reading" if overlap else "ready"
         with pytest.raises(RuntimeError, match=f"slot is {state}"):
-            module.start_prefetch(None, torch.tensor([[4, 6]]))
+            module.start_prefetch(torch.tensor([[4, 6]]))
         assert ("read" in trace) is not overlap
         assert len(decoded) == (0 if overlap else 1)
         assert module._slot.state == state
