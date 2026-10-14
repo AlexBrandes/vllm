@@ -89,12 +89,12 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/moe/warmup.py` | 110 |
 | `vllm/sm80/kernels/thin_gemm/__init__.py` | 199 |
 | `vllm/sm80/kernels/thin_gemm/concat.py` | 275 |
-| `vllm/sm80/kernels/thin_gemm/gluon.py` | 258 |
+| `vllm/sm80/kernels/thin_gemm/gluon.py` | 299 |
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_gluon.py` | 968 |
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **48 files** | **15,948** |
+| **48 files** | **15,989** |
 
 ### `vllm/sm80/`
 
@@ -271,7 +271,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 429 |
 | `tests/kernels/test_ampere_thin_gemm.py` | 233 |
 | `tests/kernels/test_ampere_thin_gemm_concat.py` | 963 |
-| `tests/kernels/test_ampere_thin_gemm_gluon.py` | 859 |
+| `tests/kernels/test_ampere_thin_gemm_gluon.py` | 996 |
 | `tests/kernels/test_ampere_thin_gemm_gluon_real_inputs.py` | 242 |
 | `tests/kernels/test_ampere_thin_gemm_v74.py` | 286 |
 | `tests/kernels/test_ampere_tp4_kda_prefill.py` | 365 |
@@ -357,7 +357,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **137 files** | **47,714** |
+| **137 files** | **47,851** |
 
 #### `tools/`
 
@@ -589,11 +589,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 127 |
-| Fork-added product lines | 38,217 |
+| Fork-added product lines | 38,258 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 41,735 |
+| Product lines added (new files and patches) | 41,776 |
 | Fork environment variables (flags) | 86 |
 | Unreferenced fork definitions | 0 (0 lines) |
