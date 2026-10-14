@@ -58,14 +58,91 @@ exceptions:
     imports in vllm/v1/core/sched/scheduler.py,
     vllm/v1/worker/gpu/model_runner.py and vllm/v1/worker/gpu/async_utils.py.
 - file: vllm/v1/worker/gpu/async_utils.py
-  hunks: [659159ed35de]
+  hunks: [659159ed35de, 2bd7c3af5842]
   reason: >-
-    Bug fix inside the existing failed-inputs hunk of AsyncOutput: the GPU
-    mask of failed tokens stays referenced until its host copy has run, so
-    its memory cannot be reused before the copy reads it. vLLM has no hook
-    for extra host copies in AsyncOutput, so the fix sits where the copy is.
-  owner: Qwen4Exp EXL3 support
+    (659159ed35de) Bug fix inside the existing failed-inputs hunk of
+    AsyncOutput: the GPU mask of failed tokens stays referenced until its host
+    copy has run, so its memory cannot be reused before the copy reads it.
+    vLLM has no hook for extra host copies in AsyncOutput, so the fix sits
+    where the copy is. (2bd7c3af5842) The Apache-2.0 modification notice after
+    the SPDX header, a comment line that every patched upstream file carries
+    (tests/sm80/test_modification_notices.py). It belongs in the file it
+    describes; no extension point can hold it.
+  owner: (659159ed35de) Qwen4Exp EXL3 support; (2bd7c3af5842) fork licence compliance
   removal: >-
-    Remove when the failed-mask copy of AsyncOutput moves into vllm/sm80
-    behind a hook: an AsyncOutput extra-copy hook in vLLM (an upstream
-    candidate), or a runner subclass that wraps AsyncOutput and owns the copy.
+    (659159ed35de) Remove when the failed-mask copy of AsyncOutput moves into
+    vllm/sm80 behind a hook: an AsyncOutput extra-copy hook in vLLM (an
+    upstream candidate), or a runner subclass that wraps AsyncOutput and owns
+    the copy. (2bd7c3af5842) Delete the notice line in the change that removes
+    the last fork edit of this file, so that it no longer differs from
+    upstream.
+- file: vllm/model_executor/models/qwen3_next.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+- file: vllm/models/qwen4_exp/common/ngram_embedding.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+- file: vllm/models/qwen4_exp/nvidia/model.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+- file: vllm/models/qwen4_exp/nvidia/mtp.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+- file: vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+- file: vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.
+- file: vllm/v1/outputs.py
+  hunks: [2bd7c3af5842]
+  reason: >-
+    The Apache-2.0 modification notice after the SPDX header, a comment line
+    that every patched upstream file carries (tests/sm80/test_modification_notices.py).
+    It belongs in the file it describes; no extension point can hold it.
+  owner: fork licence compliance
+  removal: >-
+    Delete the notice line in the change that removes the last fork edit of
+    this file, so that it no longer differs from upstream.

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Inference-only Qwen4Exp MTP (Multi-Token Predictor) model.
 
 The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:

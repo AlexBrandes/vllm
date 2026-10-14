@@ -290,6 +290,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_kv_planning.py` | 479 |
+| `tests/sm80/test_modification_notices.py` | 80 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_mrv2_prepare_inputs_padding.py` | 122 |
 | `tests/sm80/test_plugin_banner.py` | 36 |
@@ -324,15 +325,15 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **119 files** | **41,503** |
+| **120 files** | **41,583** |
 
 #### `tools/`
 
 | Path | Lines |
 |---|---:|
 | `tools/sm80/fork_map.py` | 706 |
-| `tools/sm80/upstream_edit_exceptions.yaml` | 71 |
-| **2 files** | **777** |
+| `tools/sm80/upstream_edit_exceptions.yaml` | 148 |
+| **2 files** | **854** |
 
 #### `vllm/`
 
@@ -369,7 +370,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/model_executor/layers/fused_moe/moe_align_block_size.py` | modified | 42 | 10 | 4 |
 | `vllm/model_executor/layers/utils.py` | modified | 12 | 0 | 2 |
 | `vllm/model_executor/models/qwen3_dflash.py` | modified | 72 | 1 | 5 |
-| `vllm/model_executor/models/qwen3_next.py` | modified | 3 | 0 | 1 |
+| `vllm/model_executor/models/qwen3_next.py` | modified | 4 | 0 | 2 |
 | `vllm/model_executor/warmup/kernel_warmup.py` | modified | 103 | 0 | 2 |
 | `vllm/models/glm5next/common/attention.py` | modified | 46 | 16 | 8 |
 | `vllm/models/glm5next/common/kda.py` | modified | 270 | 14 | 19 |
@@ -378,11 +379,11 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/models/glm5next/nvidia/sparse_indexer.py` | modified | 125 | 16 | 18 |
 | `vllm/models/kimi_k3/nvidia/kda_metadata.py` | modified | 3 | 0 | 2 |
 | `vllm/models/kimi_k3/nvidia/ops/recoverssm.py` | modified | 3 | 1 | 3 |
-| `vllm/models/qwen4_exp/common/ngram_embedding.py` | modified | 3 | 0 | 1 |
-| `vllm/models/qwen4_exp/nvidia/model.py` | modified | 3 | 0 | 3 |
-| `vllm/models/qwen4_exp/nvidia/mtp.py` | modified | 26 | 4 | 6 |
-| `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` | modified | 1 | 0 | 1 |
-| `vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py` | modified | 51 | 0 | 5 |
+| `vllm/models/qwen4_exp/common/ngram_embedding.py` | modified | 4 | 0 | 2 |
+| `vllm/models/qwen4_exp/nvidia/model.py` | modified | 4 | 0 | 4 |
+| `vllm/models/qwen4_exp/nvidia/mtp.py` | modified | 27 | 4 | 7 |
+| `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` | modified | 2 | 0 | 2 |
+| `vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py` | modified | 52 | 0 | 6 |
 | `vllm/parser/abstract_parser.py` | modified | 4 | 0 | 2 |
 | `vllm/parser/glm47_moe.py` | modified | 19 | 0 | 3 |
 | `vllm/parser/parser_manager.py` | modified | 9 | 0 | 2 |
@@ -405,8 +406,8 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/core/kv_cache_utils.py` | modified | 13 | 19 | 6 |
 | `vllm/v1/core/sched/scheduler.py` | modified | 404 | 14 | 45 |
 | `vllm/v1/kv_cache_interface.py` | modified | 70 | 1 | 5 |
-| `vllm/v1/outputs.py` | modified | 5 | 0 | 1 |
-| `vllm/v1/worker/gpu/async_utils.py` | modified | 20 | 0 | 5 |
+| `vllm/v1/outputs.py` | modified | 6 | 0 | 2 |
+| `vllm/v1/worker/gpu/async_utils.py` | modified | 21 | 0 | 6 |
 | `vllm/v1/worker/gpu/block_table.py` | modified | 11 | 3 | 4 |
 | `vllm/v1/worker/gpu/cudagraph_utils.py` | modified | 131 | 9 | 12 |
 | `vllm/v1/worker/gpu/model_runner.py` | modified | 203 | 13 | 33 |
@@ -420,7 +421,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **68 files** | | **3,518** | **246** | **478** |
+| **68 files** | | **3,526** | **246** | **486** |
 
 ### Tests, docs and .github
 
@@ -455,9 +456,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 68 | 3,518 | 246 | 478 |
+| Product code | 68 | 3,526 | 246 | 486 |
 | Tests, docs and .github | 23 | 508 | 562 | 71 |
-| All | 91 | 4,026 | 808 | 549 |
+| All | 91 | 4,034 | 808 | 557 |
 
 ## 3. Fork environment variables
 
@@ -560,9 +561,9 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Fork-added product files | 116 |
 | Fork-added product lines | 32,869 |
 | Patched upstream files | 91 |
-| Patched upstream lines | +4,026 / -808 |
+| Patched upstream lines | +4,034 / -808 |
 | Patched upstream product files | 68 |
-| Patched upstream product lines | +3,518 / -246 |
-| Product lines added (new files and patches) | 36,387 |
+| Patched upstream product lines | +3,526 / -246 |
+| Product lines added (new files and patches) | 36,395 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |

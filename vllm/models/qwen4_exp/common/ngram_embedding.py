@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """Shared Qwen4Exp n-gram embedding storage with device and pinned-host backends.
 
 Both the NVIDIA and AMD Qwen4Exp implementations use these classes so the (large)
