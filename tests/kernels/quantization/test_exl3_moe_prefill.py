@@ -108,9 +108,57 @@ def _method(monkeypatch, warmed, num_speculative_tokens=3):
     monkeypatch.setattr(
         vllm.config,
         "get_current_vllm_config",
-        lambda: SimpleNamespace(num_speculative_tokens=num_speculative_tokens),
+        lambda: _config(num_speculative_tokens=num_speculative_tokens),
     )
     return method, layer
+
+
+def _config(num_speculative_tokens=3, tp=2, pp=1, spec=None, graph_max=None):
+    if spec is None and num_speculative_tokens:
+        spec = SimpleNamespace(method="mtp", parallel_drafting=False)
+    return SimpleNamespace(
+        num_speculative_tokens=num_speculative_tokens,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp, pipeline_parallel_size=pp
+        ),
+        speculative_config=spec,
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=graph_max),
+    )
+
+
+@pytest.mark.parametrize(
+    "config, words",
+    [
+        (dict(tp=4), "(4, 1), not (2, 1)"),
+        (dict(pp=2), "(2, 2), not (2, 1)"),
+        (
+            dict(spec=SimpleNamespace(method="dflash", parallel_drafting=True)),
+            "dflash drafts with parallel slots",
+        ),
+        (
+            dict(spec=SimpleNamespace(method="eagle", parallel_drafting=True)),
+            "eagle drafts with parallel slots",
+        ),
+    ],
+)
+def test_gate_closes_outside_the_validated_layout_and_drafters(
+    monkeypatch, config, words
+):
+    import vllm.config
+    from vllm.sm80.kernels.exl3 import quant
+
+    warmed = []
+    method, layer = _method(monkeypatch, warmed)
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config", lambda: _config(**config)
+    )
+    lines = []
+    monkeypatch.setattr(
+        quant.logger, "info_once", lambda msg, *a: lines.append(msg % a)
+    )
+    assert method._moe_prefill(layer, SERVED_META, 3460, 7) == (0, 7)
+    assert not warmed
+    assert len(lines) == 1 and "gate is closed" in lines[0] and words in lines[0]
 
 
 def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
@@ -174,12 +222,7 @@ def test_gate_says_when_graphs_cover_prefill_sizes(monkeypatch, graph_max, said)
 
     method, layer = _method(monkeypatch, [])
     monkeypatch.setattr(
-        vllm.config,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(
-            num_speculative_tokens=3,
-            compilation_config=SimpleNamespace(max_cudagraph_capture_size=graph_max),
-        ),
+        vllm.config, "get_current_vllm_config", lambda: _config(graph_max=graph_max)
     )
     lines = []
     monkeypatch.setattr(

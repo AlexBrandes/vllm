@@ -679,6 +679,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         if reason is None and max_rows < exl3_ops.MOE_PREFILL_MIN_ROWS:
             reason = f"MoE calls have at most {max_rows} rows"
+        vllm_config = get_current_vllm_config()
+        if reason is None:
+            reason = _prefill_layout_closed_reason(vllm_config)
         if reason is not None:
             logger.info_once(
                 "VLLM_EXL3_MOE_PREFILL_TC is set but the gate is closed: %s; "
@@ -706,7 +709,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.intermediate_size,
             layer.top_k,
         )
-        vllm_config = get_current_vllm_config()
         decode_len = max_decode_query_len(vllm_config)
         logger.info_once(
             "EXL3 MoE prefill kernel active (VLLM_EXL3_MOE_PREFILL_TC): "
@@ -887,6 +889,24 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         ):
             return moe_out_prefill
         return operator
+
+
+def _prefill_layout_closed_reason(vllm_config) -> str | None:
+    """Why moe_out_prefill must not serve this engine, or None: it is
+    validated at tensor parallel size 2 without pipeline parallelism, and its
+    prefill-step rule (step_phase) cannot tell the decode steps of drafters
+    with parallel drafting slots (DFlash, DSpark) from prefill steps."""
+    parallel = vllm_config.parallel_config
+    layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
+    if layout != (2, 1):
+        return f"(tensor, pipeline) parallel size {layout}, not (2, 1)"
+    spec = vllm_config.speculative_config
+    if spec is not None and (
+        getattr(spec, "parallel_drafting", False)
+        or getattr(spec, "method", None) in ("dflash", "dspark")
+    ):
+        return f"speculative method {spec.method} drafts with parallel slots"
+    return None
 
 
 def dispatched_rows(prepare, moe) -> int:
