@@ -15,10 +15,13 @@
   reduction order: BK tiles over a contracted dimension, warp and stage
   counts) is a pure function of the launch shape. On any other device it
   autotunes as usual.
-* ``VLLM_FLA_AUTOTUNE_SKIP_SPILLING=1`` (pinning off): the ``Autotuner``
-  becomes a ``SkipSpillingAutotuner``. On its first launch on sm_80 it drops
-  the configs ``SPILLING`` lists for the kernel and autotunes over the rest;
-  on any other device it autotunes over every config.
+* ``VLLM_FLA_AUTOTUNE_SKIP_SPILLING=1`` (pinning off): every ``Autotuner``
+  becomes a ``SkipSpillingAutotuner``. When it benchmarks on sm_80, it builds
+  each config first and skips (never launches) one whose build needs more
+  than ``LOCAL_BYTES_LIMIT`` bytes of local memory per thread; the skipped
+  config times as infinite. Configs are only built when a benchmark runs, so
+  a boot that reads its timings from Triton's autotune cache builds nothing
+  extra. On any other device it autotunes as usual.
 
 The autotune key is built exactly as ``triton.runtime.autotuner.Autotuner.run``
 builds it: the values of ``key`` in argument order, then ``str(dtype)`` of
@@ -43,21 +46,15 @@ from vllm.triton_utils import HAS_TRITON, triton
 
 logger = init_logger(__name__)
 
-# Configs whose sm_80 build needs far more per-thread stack (local memory)
-# than the CUDA context's default 1,024 B. The driver grows the context's
-# local memory to the largest stack launched, for every thread the device
-# can hold (2,048 per SM), and never shrinks it. Benchmarking one of these
-# configs during the memory profile therefore keeps stack x 2,048 x SMs bytes
-# reserved for the life of the process, and the KV cache loses that much.
-SPILLING: dict[str, tuple[dict, ...]] = {
-    # 11,664 B of stack at two warps for the 128 x 128 tile (sm_80, K = V =
-    # 128, BT = 64, gate and varlen on): about 1.5 GiB on a 74-SM card. Every
-    # other config of the kernel stays at or below 144 B.
-    "fla.chunk_o.chunk_fwd_kernel_o": tuple(
-        {"kwargs": {"BK": 128, "BV": 128}, "num_warps": 2, "num_stages": stages}
-        for stages in (2, 3, 4)
-    ),
-}
+# The CUDA context's default per-thread stack (cudaLimitStackSize). The
+# driver grows the context's local memory to the largest per-thread local
+# size launched, for every thread the device can hold (2,048 per SM), and
+# never shrinks it. Benchmarking a config above this size during the memory
+# profile therefore keeps local size x 2,048 x SMs bytes reserved for the
+# life of the process, and the KV cache loses that much (chunk_fwd_kernel_o
+# at two warps and the 128 x 128 tile: 11,664 B, about 1.5 GiB on a 74-SM
+# card).
+LOCAL_BYTES_LIMIT = 1024
 
 _MODULE_PREFIXES = (
     ("vllm.third_party.flash_linear_attention.ops.", "fla."),
@@ -174,13 +171,12 @@ def _is_sm80() -> bool:
     )
 
 
-def without_spilling(name: str, configs: list) -> list:
-    """``configs`` without the ones ``SPILLING`` lists for kernel ``name``."""
-    dropped = SPILLING.get(name, ())
-    kept = [c for c in configs if config_spec(c) not in dropped]
-    if not kept:
-        raise ValueError(f"every autotune config of {name} is listed as spilling")
-    return kept
+def local_bytes(kernel: Any) -> int:
+    """Local memory per thread of a compiled Triton kernel. Loads its module
+    into the context (``CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES``, which Triton
+    reports in 4-byte words as ``n_spills``); nothing is launched."""
+    kernel._init_handles()
+    return int(kernel.n_spills) * 4
 
 
 _skip_gate: bool | None = None
@@ -192,10 +188,10 @@ def _skip_gate_open() -> bool:
         _skip_gate = _is_sm80()
         if _skip_gate:
             logger.info_once(
-                "fla autotune skips %d spilling configs of %d kernels on sm_80 "
+                "fla autotune on sm_80 skips configs whose build needs more "
+                "than %d B of local memory per thread "
                 "(VLLM_FLA_AUTOTUNE_SKIP_SPILLING=1)",
-                sum(len(v) for v in SPILLING.values()),
-                len(SPILLING),
+                LOCAL_BYTES_LIMIT,
             )
         else:
             logger.info_once(
@@ -277,17 +273,50 @@ if HAS_TRITON:
             return ret
 
     class SkipSpillingAutotuner(_Autotuner):
-        """An Autotuner that never benchmarks a ``SPILLING`` config on sm_80."""
+        """An Autotuner that never launches a config whose sm_80 build needs
+        more than ``LOCAL_BYTES_LIMIT`` bytes of local memory per thread."""
 
         _pin_name: str = ""
-        _spilling_dropped: bool = False
+        _bench_left: int = 0
+        _bench_kept: int = 0
 
-        def run(self, *args, **kwargs):
-            if not self._spilling_dropped:
-                if _skip_gate_open():
-                    self.configs = without_spilling(self._pin_name, self.configs)
-                self._spilling_dropped = True
-            return super().run(*args, **kwargs)
+        def prune_configs(self, kwargs):
+            configs = super().prune_configs(kwargs)
+            # Autotuner.run prunes once per benchmark, then times each config.
+            self._bench_left, self._bench_kept = len(configs), 0
+            return configs
+
+        def _local_bytes(self, args, config, meta) -> int | None:
+            current = {**meta, **config.all_kwargs(), "warmup": True}
+            try:
+                return local_bytes(self.fn.run(*args, **current))
+            except Exception:  # noqa: BLE001
+                # A config that fails to build is left to the benchmark,
+                # which times it as infinite.
+                return None
+
+        def _bench(self, *args, config, **meta):
+            self._bench_left -= 1
+            if _skip_gate_open():
+                size = self._local_bytes(args, config, meta)
+                if size is not None and size > LOCAL_BYTES_LIMIT:
+                    logger.info(
+                        "fla autotune skips %s %s: %d B of local memory per "
+                        "thread on sm_80 (limit %d B)",
+                        self._pin_name,
+                        config,
+                        size,
+                        LOCAL_BYTES_LIMIT,
+                    )
+                    if self._bench_left == 0 and self._bench_kept == 0:
+                        raise RuntimeError(
+                            f"every autotune config of {self._pin_name} needs "
+                            f"more than {LOCAL_BYTES_LIMIT} B of local memory "
+                            "per thread on sm_80"
+                        )
+                    return [float("inf")] * 3
+            self._bench_kept += 1
+            return super()._bench(*args, config=config, **meta)
 
 
 def pinned_autotune(configs, key, **kwargs):
@@ -303,7 +332,7 @@ def pinned_autotune(configs, key, **kwargs):
         if envs.VLLM_FLA_PIN_AUTOTUNE:
             tuner.__class__ = PinnedAutotuner
             tuner._pin_name = name
-        elif envs.VLLM_FLA_AUTOTUNE_SKIP_SPILLING and name in SPILLING:
+        elif envs.VLLM_FLA_AUTOTUNE_SKIP_SPILLING:
             tuner.__class__ = SkipSpillingAutotuner
             tuner._pin_name = name
         return tuner

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """VLLM_FLA_PIN_AUTOTUNE: one pinned config per autotune key.
-VLLM_FLA_AUTOTUNE_SKIP_SPILLING: no spilling config is autotuned on sm_80.
+VLLM_FLA_AUTOTUNE_SKIP_SPILLING: no over-limit build is launched on sm_80.
 
 CPU only. The flag is read when the kernel modules are imported, so every
 case that depends on it runs in a fresh interpreter.
@@ -46,10 +46,23 @@ import vllm.sm80.fla.pinned_autotune as pa
 from vllm.sm80.fla import autotune_pins
 """
 
-_SMEM_TRUE = (
-    "import vllm.third_party.flash_linear_attention.ops.utils as _u\n"
-    "_u.check_shared_mem = lambda *a, **k: True\n"
+# check_shared_mem() is true on a CMP 170HX and false on a CPU-only host. The
+# ops package imports its kernels (and so builds their config lists) as soon
+# as anything under it is imported, so load utils on its own first, patch it,
+# and let the package pick up the patched module.
+_SMEM_TRUE = """
+import importlib.util
+from pathlib import Path
+import vllm.third_party.flash_linear_attention as _fla
+_name = "vllm.third_party.flash_linear_attention.ops.utils"
+_spec = importlib.util.spec_from_file_location(
+    _name, Path(_fla.__file__).parent / "ops" / "utils.py"
 )
+_u = importlib.util.module_from_spec(_spec)
+sys.modules[_name] = _u
+_spec.loader.exec_module(_u)
+_u.check_shared_mem = lambda *a, **k: True
+"""
 
 
 def _run(body: str, flag: str | None, smem: bool = False, extra_env=None):
@@ -373,96 +386,25 @@ def test_banners_and_bad_pin_fallback_log_cleanly():
     assert _run(_BANNER, "1") == [True, "default", True, False]
 
 
-# VLLM_FLA_AUTOTUNE_SKIP_SPILLING: sm_80 autotuning leaves out the configs
-# pinned_autotune.SPILLING lists.
+# VLLM_FLA_AUTOTUNE_SKIP_SPILLING: on sm_80 a benchmarking autotuner builds
+# each config first and never launches one above LOCAL_BYTES_LIMIT bytes of
+# local memory per thread.
 
 _SKIP_NAME = "fla.chunk_o.chunk_fwd_kernel_o"
+_SKIP_ENV = {"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"}
 
-# chunk_fwd_kernel_o's config list on a CMP 170HX: check_shared_mem() is true
-# there (a CPU-only host builds the [32, 64] tiles instead), not Hopper.
-_SM80_CONFIGS = """
-import triton
-SM80_CONFIGS = [
-    triton.Config({"BK": bk, "BV": bv}, num_warps=w, num_stages=s)
-    for bk in (64, 128)
-    for bv in (64, 128)
-    for w in (2, 4, 8)
-    for s in (2, 3, 4)
-]
-"""
-
-_SKIP_RUN = """
-pa._skip_gate = {gate}
-t = pa.REGISTRY[{name!r}]
-t.configs = list(SM80_CONFIGS)
-before = [pa.config_spec(c) for c in t.configs]
-seen = []
-def base_run(self, *a, **k):
-    seen.append([pa.config_spec(c) for c in self.configs])
-Autotuner.run = base_run
-t.run(T=1)
-t.run(T=2)
-print(json.dumps({{
-    "cls": type(t).__qualname__,
-    "before": before,
-    "seen": seen,
-    "spilling": [dict(s) for s in pa.SPILLING[{name!r}]],
-}}))
-"""
-
-
-def test_skip_spilling_flag_default_off(monkeypatch):
-    monkeypatch.delenv("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", raising=False)
-    import vllm.envs as envs
-
-    assert envs.VLLM_FLA_AUTOTUNE_SKIP_SPILLING is False
-
-
-def test_skip_spilling_drops_listed_configs_on_sm80():
-    r = _run(
-        _SM80_CONFIGS + _SKIP_RUN.format(gate=True, name=_SKIP_NAME),
-        None,
-        extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"},
-    )
-    assert r["cls"] == "SkipSpillingAutotuner"
-    # Every listed config is one the kernel really has on a CMP 170HX.
-    assert all(s in r["before"] for s in r["spilling"])
-    kept = [c for c in r["before"] if c not in r["spilling"]]
-    assert len(kept) == len(r["before"]) - len(r["spilling"]) > 1
-    # Both launches autotune over the same reduced list, in the original order.
-    assert r["seen"] == [kept, kept]
-
-
-def test_skip_spilling_gate_closed_keeps_every_config():
-    r = _run(
-        _SM80_CONFIGS + _SKIP_RUN.format(gate=False, name=_SKIP_NAME),
-        None,
-        extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"},
-    )
-    assert r["seen"] == [r["before"], r["before"]]
-
-
-def test_skip_spilling_leaves_other_kernels_and_pinning_alone():
-    skip = _run(_DESCRIBE, None, extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"})
-    off = _run(_DESCRIBE, None)
-    for name, d in skip.items():
-        if name == _SKIP_NAME:
-            assert d["cls"].endswith("pinned_autotune.SkipSpillingAutotuner")
-        else:
-            assert d == off[name], name
-    both = _run(_DESCRIBE, "1", extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"})
-    for name, d in both.items():
-        assert d["cls"].endswith("pinned_autotune.PinnedAutotuner"), name
-
-
-_STACK = _SM80_CONFIGS + """
+# chunk_fwd_kernel_o's configs as an sm_80 build sees them: the local memory
+# per thread of each, from an sm_80 build on the CPU (cuobjdump STACK), at the
+# Qwen3.8 TP2 GDN prefill shape (K = V = 128, BT = 64, 24 value and 8 key
+# heads, gate and varlen on).
+_SM80_STACK = """
 import re, subprocess, tempfile
 import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 from triton.runtime.jit import JITFunction
-from vllm.third_party.flash_linear_attention.ops import chunk_o
-fn = chunk_o.chunk_fwd_kernel_o
+NAME = "fla.chunk_o.chunk_fwd_kernel_o"
+fn = pa.REGISTRY[NAME].fn
 while not isinstance(fn, JITFunction):
     fn = fn.fn
 cuobjdump = os.path.join(
@@ -470,9 +412,9 @@ cuobjdump = os.path.join(
 )
 ptr = {"q": "*bf16", "k": "*bf16", "v": "*bf16", "h": "*bf16", "g": "*fp32",
        "o": "*bf16", "cu_seqlens": "*i32", "chunk_indices": "*i32"}
-out = []
-NAME = "fla.chunk_o.chunk_fwd_kernel_o"
-for c in SM80_CONFIGS:
+
+
+def sm80_local_bytes(c):
     const = dict(H=24, Hg=8, K=128, V=128, BT=64, USE_G=True, IS_VARLEN=True,
                  **c.kwargs)
     sig = {a: "constexpr" if a in const else ptr.get(a, "i32") for a in fn.arg_names}
@@ -487,15 +429,159 @@ for c in SM80_CONFIGS:
         f.flush()
         res = subprocess.run([cuobjdump, "--dump-resource-usage", f.name],
                              capture_output=True, text=True, check=True).stdout
-    out.append([pa.config_spec(c), int(re.search(r"STACK:(\\d+)", res).group(1))])
-print(json.dumps({"rows": out, "spilling": [dict(s) for s in pa.SPILLING[NAME]]}))
+    return int(re.search(r"STACK:(\\d+)", res).group(1))
+"""
+
+# Drive SkipSpillingAutotuner.run through a real benchmark: the launch, the
+# build and do_bench are stubbed, the local sizes come from ``SIZES``.
+_SKIP_BENCH = """
+t = pa.REGISTRY[NAME]
+launched, built = [], []
+class Fn:
+    arg_names = t.fn.arg_names
+    def run(self, *args, warmup=False, **kw):
+        cfg = (kw["BK"], kw["BV"], kw["num_warps"], kw["num_stages"])
+        if warmup:
+            built.append(cfg)
+            return cfg
+        launched.append(cfg)
+t.fn = Fn()
+pa.local_bytes = lambda kernel: SIZES[kernel]
+t.do_bench = lambda call, quantiles: (call(), [1.0, 1.0, 1.0])[1]
+t.cache_results = False
+t.cache.clear()
+x = torch.empty(1, dtype=torch.bfloat16)
+f = torch.empty(1, dtype=torch.float32)
+args = dict(q=x, k=x, v=x, h=x, g=f, o=x, cu_seqlens=None, chunk_indices=None,
+            scale=1.0, T=8, H=24, Hg=8, K=128, V=128, BT=64)
+err = None
+try:
+    t.run(grid=(1,), warmup=False, **args)
+except RuntimeError as e:
+    err = str(e)
+key = next(iter(t.cache), None)
+print(json.dumps({
+    "cls": type(t).__qualname__,
+    "configs": [list(c) for c in SIZES],
+    "launched": sorted(set(launched)),
+    "built": sorted(set(built)),
+    "timings": {str(pa.config_spec(c)): v[0] for c, v in getattr(t, "configs_timings", {}).items()},
+    "best": None if key is None else pa.config_spec(t.cache[key]),
+    "error": err,
+}))
+"""
+
+_SIZES_FROM_BUILD = """
+import torch
+pa._skip_gate = True
+SIZES = {(c.kwargs["BK"], c.kwargs["BV"], c.num_warps, c.num_stages): sm80_local_bytes(c)
+         for c in pa.REGISTRY[NAME].configs}
+"""
+
+_SIZES_ALL_OVER = """
+import torch
+pa._skip_gate = True
+SIZES = {(c.kwargs["BK"], c.kwargs["BV"], c.num_warps, c.num_stages): 2048
+         for c in pa.REGISTRY[NAME].configs}
+"""
+
+_SIZES_GATE_CLOSED = """
+import torch
+pa._skip_gate = False
+SIZES = {(c.kwargs["BK"], c.kwargs["BV"], c.num_warps, c.num_stages): 4096
+         for c in pa.REGISTRY[NAME].configs}
 """
 
 
-def test_spilling_list_matches_sm80_stack():
-    """The listed configs, and only they, need more than the context's default
-    1,024 B of stack per thread when built for sm_80 at the Qwen3.8 TP2 GDN
-    prefill shape (K = V = 128, BT = 64, 24 value and 8 key heads)."""
-    r = _run(_STACK, None)
-    over = [spec for spec, stack in r["rows"] if stack > 1024]
-    assert over == r["spilling"]
+def test_skip_spilling_flag_default_off(monkeypatch):
+    monkeypatch.delenv("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", raising=False)
+    import vllm.envs as envs
+
+    assert envs.VLLM_FLA_AUTOTUNE_SKIP_SPILLING is False
+
+
+def test_skip_spilling_never_launches_an_over_limit_build():
+    r = _run(_SM80_STACK + _SIZES_FROM_BUILD + _SKIP_BENCH, None, smem=True,
+             extra_env=_SKIP_ENV)
+    assert r["cls"] == "SkipSpillingAutotuner"
+    configs = [tuple(c) for c in r["configs"]]
+    # The real sm_80 list: 2 x 2 tiles of 64/128, 2/4/8 warps, 2/3/4 stages.
+    assert {c[:2] for c in configs} == {(64, 64), (64, 128), (128, 64), (128, 128)}
+    assert len(configs) == 36
+    over = {(128, 128, 2, s) for s in (2, 3, 4)}
+    assert {tuple(c) for c in r["built"]} == set(configs)
+    assert {tuple(c) for c in r["launched"]} == set(configs) - over
+    inf = [k for k, v in r["timings"].items() if v == float("inf")]
+    assert len(inf) == 3
+    assert r["best"] is not None and not (
+        r["best"]["kwargs"] == {"BK": 128, "BV": 128} and r["best"]["num_warps"] == 2
+    )
+    assert r["error"] is None
+
+
+def test_skip_spilling_all_configs_over_limit_raises():
+    r = _run(_SM80_STACK + _SIZES_ALL_OVER + _SKIP_BENCH, None, smem=True,
+             extra_env=_SKIP_ENV)
+    assert r["launched"] == []
+    assert "every autotune config of fla.chunk_o.chunk_fwd_kernel_o" in r["error"]
+
+
+def test_skip_spilling_gate_closed_builds_nothing_extra():
+    r = _run(_SM80_STACK + _SIZES_GATE_CLOSED + _SKIP_BENCH, None, smem=True,
+             extra_env=_SKIP_ENV)
+    assert r["built"] == []
+    assert len(r["launched"]) == len(r["configs"]) == 36
+    assert r["error"] is None
+
+
+_SKIP_GATE = """
+import types
+from vllm.platforms import current_platform
+cls = type(current_platform)
+cls.is_cuda = classmethod(lambda c: True)
+out = []
+for major, minor in ((8, 0), (8, 6), (9, 0)):
+    cls.get_device_capability = classmethod(
+        lambda c, device_id=0, m=major, n=minor: types.SimpleNamespace(major=m, minor=n))
+    pa._skip_gate = None
+    out.append(pa._skip_gate_open())
+print(json.dumps(out))
+"""
+
+
+def test_skip_spilling_gate_is_sm80_only_and_logs_cleanly():
+    # The banners dedupe on their arguments, which must be hashable.
+    assert _run(_SKIP_GATE, None, extra_env=_SKIP_ENV) == [True, False, False]
+
+
+def test_skip_spilling_covers_every_kernel_and_leaves_pinning_alone():
+    skip = _run(_DESCRIBE, None, extra_env=_SKIP_ENV)
+    off = _run(_DESCRIBE, None)
+    assert skip.keys() == off.keys()
+    for name, d in skip.items():
+        assert d["cls"].endswith("pinned_autotune.SkipSpillingAutotuner"), name
+        # The config list and the key (hence Triton's autotune cache key) are
+        # unchanged.
+        assert d["configs"] == off[name]["configs"], name
+        assert d["keys"] == off[name]["keys"], name
+    both = _run(_DESCRIBE, "1", extra_env=_SKIP_ENV)
+    for name, d in both.items():
+        assert d["cls"].endswith("pinned_autotune.PinnedAutotuner"), name
+
+
+_SM80_ROWS = """
+print(json.dumps([[pa.config_spec(c), sm80_local_bytes(c)]
+                  for c in pa.REGISTRY[NAME].configs]))
+"""
+
+
+def test_sm80_build_puts_exactly_three_chunk_o_configs_over_the_limit():
+    """At the served shape, only the 2-warp 128 x 128 configs need more than
+    the context's default 1,024 B of local memory per thread."""
+    rows = _run(_SM80_STACK + _SM80_ROWS, None, smem=True)
+    assert len(rows) == 36
+    over = [spec for spec, size in rows if size > 1024]
+    assert over == [
+        {"kwargs": {"BK": 128, "BV": 128}, "num_warps": 2, "num_stages": s}
+        for s in (2, 3, 4)
+    ]

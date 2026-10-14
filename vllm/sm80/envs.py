@@ -373,13 +373,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))
     ),
     # With pinning off, the vendored flash-linear-attention autotuners on sm_80
-    # leave out the configs vllm/sm80/fla/pinned_autotune.py SPILLING lists:
-    # builds whose per-thread stack is far above the context's default
-    # 1,024 B (chunk_fwd_kernel_o at two warps and the 128 x 128 tile: 11,664
-    # B). Benchmarking one in the memory profile makes the driver keep stack x
-    # 2,048 x SMs bytes reserved (about 1.5 GiB on a 74-SM card), which the
-    # KV cache loses. The kernels are unchanged; only those configs are never
-    # timed. Read when those modules are imported. Off by default.
+    # build each config before timing it and skip (never launch) one whose
+    # build needs more than the context's default 1,024 B of local memory per
+    # thread (chunk_fwd_kernel_o at two warps and the 128 x 128 tile: 11,664
+    # B). Timing one in the memory profile makes the driver keep that size x
+    # 2,048 x SMs bytes reserved (about 1.5 GiB on a 74-SM card), which the KV
+    # cache loses. Only boots that benchmark (an empty or stale autotune cache)
+    # are affected; the kernels are unchanged. Read when those modules are
+    # imported. Off by default.
     "VLLM_FLA_AUTOTUNE_SKIP_SPILLING": lambda: bool(
         int(os.getenv("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", "0"))
     ),
