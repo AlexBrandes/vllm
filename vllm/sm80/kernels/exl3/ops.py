@@ -103,6 +103,7 @@ _OPERATORS = (
     "moe_out_v2",
     "moe_out_prefill",
     "ple_decode_out",
+    "ple_read_rows",
     "linear_workspace_size",
     "linear_splitk_splits",
     "moe_workspace_size",
@@ -588,6 +589,39 @@ def ple_decode_out(
         owner_hi,
         bits,
         out,
+    )
+
+
+def ple_read_rows(
+    fd: int,
+    ids: torch.Tensor,
+    dest: torch.Tensor,
+    count: int,
+    base: int,
+    row_bytes: int,
+    owner_lo: int,
+    owner_hi: int,
+    head_offsets: torch.Tensor,
+    head_vocab_sizes: torch.Tensor,
+    retries: int,
+    max_threads: int,
+) -> torch.Tensor:
+    """Read PLE rows from storage in one host call that releases the GIL
+    (csrc/exl3/ple_read.cpp); returns the [index, errno, offset] failures."""
+    ensure_extension()
+    return torch.ops._exl3_C.ple_read_rows(
+        fd,
+        ids,
+        dest,
+        count,
+        base,
+        row_bytes,
+        owner_lo,
+        owner_hi,
+        head_offsets,
+        head_vocab_sizes,
+        retries,
+        max_threads,
     )
 
 

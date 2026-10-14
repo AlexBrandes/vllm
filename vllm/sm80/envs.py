@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_OVERLAP: bool = False
     VLLM_EXL3_DENSE_PREFILL_TC: bool = False
     VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE: str = "planned"
+    VLLM_EXL3_PLE_NATIVE_READ: bool = False
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
@@ -805,6 +806,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE": lambda: _env_with_choices(
         "VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", "planned", ["planned", "whole"]
     )(),
+    # Read the SSD PLE rows of a step in one native call that releases the
+    # GIL (csrc/exl3/ple_read.cpp) instead of a Python loop on a thread pool.
+    # Same rows, bytes, failures and kernels for the consumer. Off by
+    # default.
+    "VLLM_EXL3_PLE_NATIVE_READ": lambda: bool(
+        int(os.getenv("VLLM_EXL3_PLE_NATIVE_READ", "0"))
+    ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
     # of at most 64 rows when every local expert matrix is bits_x2 10 /
     # codebook 2 with hidden 2560, intermediate 640, top-10 and 256 of 512

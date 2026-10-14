@@ -27,6 +27,10 @@ TORCH_LIBRARY(_exl3_C, m) {
   m.def("ple_decode_out(Tensor packed_rows, Tensor global_ids, Tensor head_bias, "
         "Tensor head_offsets, Tensor head_vocab_sizes, int owner_lo, "
         "int owner_hi, int bits, Tensor(a!) out) -> ()");
+  m.def("ple_read_rows(int fd, Tensor ids, Tensor(a!) dest, int count, "
+        "int base, int row_bytes, int owner_lo, int owner_hi, "
+        "Tensor head_offsets, Tensor head_vocab_sizes, int retries, "
+        "int max_threads) -> Tensor");
   // No tensor arguments: these are catch-all CPU arithmetic functions, not
   // CUDA-dispatched ops, and never inspect a device or initialize CUDA.
   m.def("linear_workspace_size(int max_rows, int padded_in, int padded_out) -> int",
@@ -60,6 +64,10 @@ TORCH_LIBRARY_IMPL(_exl3_C, CUDA, m) {
   m.impl("ple_decode_out", &ple_decode_out);
   m.impl("linear_out_reference", &exl3::linear_out_reference);
   m.impl("moe_out_reference", &exl3::moe_out_reference);
+}
+
+TORCH_LIBRARY_IMPL(_exl3_C, CPU, m) {
+  m.impl("ple_read_rows", &ple_read_rows);
 }
 
 namespace {

@@ -99,6 +99,13 @@ def pread_exact_into(fd: int, target: memoryview, offset: int) -> None:
         done += count
 
 
+def _read_error(code: int, offset: int) -> BaseException:
+    """The error pread_exact_into raises for a failure the native reader reports."""
+    if code == 0:
+        return EOFError(f"Truncated PLE data at byte {offset}")
+    return OSError(code, os.strerror(code))
+
+
 # The first retry waits 1 ms, each later one twice as long.
 _READ_BACKOFF_S = 0.001
 # An FP16 quiet NaN as a row's scale makes every decoded channel NaN.
@@ -268,6 +275,45 @@ class Exl3PLERowReader:
                 failed.append((index, error))
         return failed
 
+    @functools.cached_property
+    def _native_heads(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.tensor(self.layout.head_offsets, dtype=torch.int64),
+            torch.tensor(self.layout.head_vocab_sizes, dtype=torch.int64),
+        )
+
+    def read_rows_native(
+        self, ids: torch.Tensor, target: torch.Tensor, count: int, threads: int
+    ) -> list[tuple[int, BaseException]]:
+        """read_rows(ids, target, 0, count) in one native call without the GIL.
+
+        Same bytes in target and the same failures, with equal errors. Rows
+        in the page cache are read on the calling thread, the others on up
+        to `threads` threads. ids is a 1-D CPU int64 tensor, target
+        contiguous CPU memory.
+        """
+        from vllm.sm80.kernels.exl3.ops import ple_read_rows
+
+        offsets, sizes = self._native_heads
+        failed = ple_read_rows(
+            self.fd,
+            ids,
+            target,
+            count,
+            self.base,
+            self.row_bytes,
+            self.owner_lo,
+            self.owner_hi,
+            offsets,
+            sizes,
+            self.retries,
+            threads,
+        )
+        return [
+            (index, _read_error(code, offset))
+            for index, code, offset in failed.tolist()
+        ]
+
     def close(self) -> None:
         fd = getattr(self, "fd", -1)
         if fd >= 0:
@@ -386,6 +432,8 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         # SSD reads run at finalize, after the layers before this one queue.
         self.overlap_reads = envs.VLLM_EXL3_PLE_OVERLAP
         self._deferred: int | None = None
+        # SSD rows are read by one native call instead of the thread pool.
+        self.native_reads = envs.VLLM_EXL3_PLE_NATIVE_READ
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
@@ -544,6 +592,11 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     "EXL3 PLE: SSD row reads overlap the preceding decoder "
                     "layer ON (VLLM_EXL3_PLE_OVERLAP=1; same rows and kernels)"
                 )
+            if self.native_reads and self.placement == "ssd":
+                logger.info(
+                    "EXL3 PLE: native batched SSD row reader ON "
+                    "(VLLM_EXL3_PLE_NATIVE_READ=1; same rows and bytes)"
+                )
             return consumed
         except BaseException:
             reader.close()
@@ -629,29 +682,34 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 if timing is not None:
                     t1 = time.perf_counter_ns()
                 ids = self._host_ids_np[:count]
-                step = (count + self._workers - 1) // self._workers
-                futures = []
-                if step:
-                    for begin in range(0, count, step):
-                        futures.append(
-                            self._pool.submit(
-                                self._reader.read_rows,
-                                ids,
-                                self._host_bytes,
-                                begin,
-                                min(begin + step, count),
+                if self.native_reads:
+                    failed = self._reader.read_rows_native(
+                        self._host_ids, self._host_rows, count, self._workers
+                    )
+                else:
+                    step = (count + self._workers - 1) // self._workers
+                    futures = []
+                    if step:
+                        for begin in range(0, count, step):
+                            futures.append(
+                                self._pool.submit(
+                                    self._reader.read_rows,
+                                    ids,
+                                    self._host_bytes,
+                                    begin,
+                                    min(begin + step, count),
+                                )
                             )
-                        )
-                # Join every read even if one fails, before the slot can close.
-                errors = []
-                failed = []
-                for future in futures:
-                    try:
-                        failed.extend(future.result())
-                    except BaseException as error:
-                        errors.append(error)
-                if errors:
-                    raise errors[0]
+                    # Join every read even if one fails, before the slot can close.
+                    errors = []
+                    failed = []
+                    for future in futures:
+                        try:
+                            failed.extend(future.result())
+                        except BaseException as error:
+                            errors.append(error)
+                    if errors:
+                        raise errors[0]
                 if failed:
                     poison_rows(self._host_rows_np, (index for index, _ in failed))
                     index, error = failed[0]

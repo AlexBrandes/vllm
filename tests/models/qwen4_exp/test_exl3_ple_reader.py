@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The EXL3 PLE row reader: positional reads, retries, truncation, read
 faults, failed-token masks, page-cache residency, slot reuse, the
-prefetch timing summary and the SSD read overlapped with the layer ahead."""
+prefetch timing summary, the SSD read overlapped with the layer ahead and
+the native reader."""
 
 import errno
 import json
@@ -11,6 +12,7 @@ import mmap
 import os
 import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from itertools import accumulate
@@ -470,7 +472,7 @@ _HEADS, _TOKENS = 2, 8
 _REAL_PREADV = os.preadv
 
 
-def _ssd_embedding(tmp_path, monkeypatch, trace, *, overlap, owner_lo=3):
+def _ssd_embedding(tmp_path, monkeypatch, trace, *, overlap, owner_lo=3, native=False):
     """An SSD PLE embedding over a small real table, on the host: streams and
     events trace the host's calls, the decoder records the rows it gets."""
     path, key, _, _ = _packed_ple_file(tmp_path)
@@ -482,6 +484,13 @@ def _ssd_embedding(tmp_path, monkeypatch, trace, *, overlap, owner_lo=3):
         return read_rows(*args)
 
     reader.read_rows = traced_read_rows
+    read_rows_native = reader.read_rows_native
+
+    def traced_read_rows_native(*args):
+        trace.append("read")
+        return read_rows_native(*args)
+
+    reader.read_rows_native = traced_read_rows_native
     current = _Stream("current", trace)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -505,6 +514,7 @@ def _ssd_embedding(tmp_path, monkeypatch, trace, *, overlap, owner_lo=3):
     nn.Module.__init__(module)
     module.placement = "ssd"
     module.overlap_reads = overlap
+    module.native_reads = native
     module._deferred = None
     module.tp_size = module.etp_data_parallel_size = 1
     module.embedding_dim = layout.dim
@@ -696,3 +706,261 @@ def test_exl3_ple_overlap_cancelled_step_reads_nothing(tmp_path, monkeypatch, ov
     finally:
         module.close()
     assert module._pool is None and module._reader.fd == -1
+
+
+@pytest.fixture
+def native_reader():
+    from vllm.sm80.kernels.exl3 import ops
+
+    try:
+        ops.ensure_extension()
+    except RuntimeError as exc:
+        pytest.skip(f"vllm._exl3_C unavailable: {exc}")
+
+
+def test_exl3_ple_native_read_switch_defaults_off(monkeypatch):
+    import vllm.envs as envs
+
+    monkeypatch.delenv("VLLM_EXL3_PLE_NATIVE_READ", raising=False)
+    assert envs.VLLM_EXL3_PLE_NATIVE_READ is False
+    monkeypatch.setenv("VLLM_EXL3_PLE_NATIVE_READ", "1")
+    assert envs.VLLM_EXL3_PLE_NATIVE_READ is True
+
+
+def _python_and_native(reader, ids, threads, count=None):
+    """Destinations and failures of read_rows and read_rows_native over the
+    same ids, both into one extra row of the same garbage."""
+    count = len(ids) if count is None else count
+    host_ids = torch.tensor(ids, dtype=torch.int64)
+    garbage = torch.randint(
+        -(1 << 15), 1 << 15, (len(ids) + 1, reader.row_bytes // 2), dtype=torch.int16
+    )
+    python, native = garbage.clone(), garbage.clone()
+    python_failed = reader.read_rows(
+        host_ids.numpy(), memoryview(python.numpy()).cast("B"), 0, count
+    )
+    native_failed = reader.read_rows_native(host_ids, native, count, threads)
+    assert torch.equal(python[count:], garbage[count:])
+    assert torch.equal(native[count:], garbage[count:])
+    return python, native, python_failed, native_failed
+
+
+def _errors(failed):
+    return [(index, type(error), str(error)) for index, error in failed]
+
+
+@pytest.mark.parametrize("threads", [1, 3, 8])
+@pytest.mark.parametrize("bits,dim", _PLE_LAYOUTS)
+@pytest.mark.parametrize("offset", [32, (1 << 32) + 16])
+def test_exl3_ple_native_read_gives_the_same_bytes(
+    tmp_path, native_reader, offset, bits, dim, threads
+):
+    """Order, repetitions, unowned, padding and out-of-range rows, a count
+    short of the ids and owner ranges that cut a head."""
+    path, key, rows, _ = _packed_ple_file(
+        tmp_path, offset, bits=bits, dim=dim, sizes=(100, 120), rows=230
+    )
+    generator = np.random.default_rng(threads)
+    for owner_lo, owner_hi in ((0, 230), (57, 181), (100, 100)):
+        reader = Exl3PLERowReader(str(path), key, owner_lo, owner_hi)
+        try:
+            ids = [8, 4, 5, 4, 225, -1, 3, 230, 1 << 40, -(1 << 40), 99, 100]
+            ids += generator.integers(-5, 240, 500).tolist()
+            for count in (0, 37, len(ids)):
+                python, native, python_failed, native_failed = _python_and_native(
+                    reader, ids, threads, count
+                )
+                assert python_failed == native_failed == []
+                assert torch.equal(python, native)
+            owned = [owner_lo <= i < min(owner_hi, 220) for i in ids]
+            expected = b"".join(
+                rows[i] if own else bytes(reader.row_bytes)
+                for i, own in zip(ids, owned)
+            )
+            assert native[: len(ids)].numpy().tobytes() == expected
+            assert os.lseek(reader.fd, 0, os.SEEK_CUR) == 0
+        finally:
+            reader.close()
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_exl3_ple_native_read_from_storage_gives_the_same_bytes(
+    tmp_path, native_reader, threads
+):
+    """Rows not in the page cache take the threaded read path."""
+    path, key, rows, _ = _packed_ple_file(tmp_path, sizes=(100, 120), rows=230)
+    reader = Exl3PLERowReader(str(path), key, 0, 230)
+    try:
+        os.fsync(reader.fd)
+        os.posix_fadvise(reader.fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        if reader.page_cache_residency()[0]:
+            pytest.skip("this file system keeps the table in the page cache")
+        ids = np.random.default_rng(7).integers(0, 230, 300).tolist()
+        target = torch.zeros(len(ids), reader.row_bytes // 2, dtype=torch.int16)
+        failed = reader.read_rows_native(torch.tensor(ids), target, len(ids), threads)
+        assert failed == []
+        assert target.numpy().tobytes() == b"".join(
+            rows[i] if i < 220 else bytes(reader.row_bytes) for i in ids
+        )
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_exl3_ple_native_read_fails_the_same_rows_with_equal_errors(
+    tmp_path, native_reader, threads
+):
+    """End of file inside and before a row, and a descriptor that cannot be
+    read: the same rows fail after the retries, with equal errors, and the
+    other rows are read."""
+    path, key, rows, base = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, 0, 10, retries=2)
+    try:
+        os.truncate(path, base + 8 * reader.row_bytes + 10)
+        ids = [8, 1, 9, 0, 8, 7]
+        python, native, python_failed, native_failed = _python_and_native(
+            reader, ids, threads
+        )
+        assert _errors(native_failed) == _errors(python_failed)
+        assert [index for index, _ in native_failed] == [0, 4]  # row 9 is padding
+        assert all(isinstance(error, EOFError) for _, error in native_failed)
+        good = [1, 2, 3, 5]
+        assert torch.equal(native[good], python[good])
+        file_fd = reader.fd
+        reader.fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _, _, python_failed, native_failed = _python_and_native(
+                reader, ids, threads
+            )
+        finally:
+            os.close(reader.fd)
+            reader.fd = file_fd
+        assert _errors(native_failed) == _errors(python_failed)
+        assert [index for index, _ in native_failed] == [0, 1, 3, 4, 5]
+        assert all(isinstance(error, IsADirectoryError) for _, error in native_failed)
+    finally:
+        reader.close()
+
+
+def test_exl3_ple_native_read_releases_the_gil(tmp_path, native_reader):
+    """Python threads run while the native call waits (here on its retry
+    backoff: 1 + 2 + 4 + 8 ms for each of four failing rows)."""
+    path, key, _, _ = _packed_ple_file(tmp_path)
+    reader = Exl3PLERowReader(str(path), key, 0, 10, retries=4)
+    file_fd = reader.fd
+    reader.fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    window = []
+
+    def call():
+        target = torch.empty(4, reader.row_bytes // 2, dtype=torch.int16)
+        window.append(time.perf_counter())
+        reader.read_rows_native(torch.tensor([1, 2, 3, 4]), target, 4, 1)
+        window.append(time.perf_counter())
+
+    try:
+        worker = threading.Thread(target=call)
+        ticks = []
+        worker.start()
+        while worker.is_alive():
+            ticks.append(time.perf_counter())
+        worker.join()
+    finally:
+        os.close(reader.fd)
+        reader.fd = file_fd
+        reader.close()
+    start, end = window
+    assert end - start >= 0.05
+    inside = [start] + [t for t in ticks if start < t < end] + [end]
+    assert max(b - a for a, b in zip(inside, inside[1:])) < (end - start) / 2
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_exl3_ple_native_read_keeps_the_host_order(tmp_path, monkeypatch, overlap):
+    """The native read takes the pooled read's place in the step; nothing
+    else moves."""
+    trace = []
+    module, _ = _ssd_embedding(
+        tmp_path, monkeypatch, trace, overlap=overlap, native=True
+    )
+    module._reader.read_rows = None  # the pool must not be used
+    module._reader.read_rows_native = lambda *args: trace.append("read") or []
+    try:
+        for _ in range(2):
+            trace.clear()
+            _, failed = _step(module, [[3, 6], [4, 9]], trace)
+            assert failed.tolist() == [False, False]
+            calls = [
+                "sync released",
+                "side waits current",
+                "record ids",
+                "sync ids",
+                "read",
+                "decode",
+                "record ready",
+                "current waits ready",
+                "record released",
+            ]
+            calls.insert(3 if overlap else 7, "layer ahead")
+            assert trace == calls
+    finally:
+        module.close()
+
+
+def test_exl3_ple_native_read_gives_the_consumer_the_same_bytes(
+    tmp_path, monkeypatch, native_reader
+):
+    """Rows, ids, outputs and failure masks match bit for bit between the
+    pooled and the native reader, with the overlap off and on, and with the
+    reader switched between steps as the in-boot A/B does. In one step every
+    owned row fails (a descriptor that cannot be read)."""
+    monkeypatch.setattr(exl3_ple.time, "sleep", lambda seconds: None)
+    steps = [
+        [[3, 5]],
+        [[4, 8], [0, 9], [3, 6]],  # row 0 is unowned, row 9 padding
+        [[r % 5, 5 + r % 4] for r in range(_TOKENS)],
+        [[2, 7]],
+    ]
+    results = {}
+    for overlap in (False, True):
+        for arms in ("pooled", "native", "alternating"):
+            name = f"{arms}-{overlap}"
+            (tmp_path / name).mkdir()
+            module, decoded = _ssd_embedding(
+                tmp_path / name,
+                monkeypatch,
+                [],
+                overlap=overlap,
+                native=arms == "native",
+            )
+            outputs = []
+            try:
+                for index, ids in enumerate(steps):
+                    if arms == "alternating":
+                        module.native_reads = bool(index % 2)
+                    if index == 2:
+                        file_fd = module._reader.fd
+                        module._reader.fd = os.open(
+                            tmp_path, os.O_RDONLY | os.O_DIRECTORY
+                        )
+                    try:
+                        output, failed = _step(module, ids, [])
+                    finally:
+                        if index == 2:
+                            os.close(module._reader.fd)
+                            module._reader.fd = file_fd
+                    outputs.append((output.view(torch.int16).clone(), failed.clone()))
+            finally:
+                module.close()
+            results[name] = (decoded, outputs)
+    reference_decoded, reference_outputs = results["pooled-False"]
+    assert reference_outputs[2][1].tolist() == [True] * _TOKENS
+    assert not any(failed.any() for _, failed in reference_outputs[:2])
+    for name, (decoded, outputs) in results.items():
+        assert len(decoded) == len(outputs) == len(steps)
+        for (packed, ids), (ref_packed, ref_ids) in zip(decoded, reference_decoded):
+            assert torch.equal(packed, ref_packed) and torch.equal(ids, ref_ids)
+        for (output, failed), (ref_output, ref_failed) in zip(
+            outputs, reference_outputs
+        ):
+            assert torch.equal(output, ref_output)
+            assert torch.equal(failed, ref_failed)
