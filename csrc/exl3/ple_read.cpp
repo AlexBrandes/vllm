@@ -140,9 +140,11 @@ torch::Tensor ple_read_rows(int64_t fd, const torch::Tensor& ids,
   const int64_t* id = ids.data_ptr<int64_t>();
   uint8_t* out = static_cast<uint8_t*>(dest.data_ptr());
 
-  // Rows already in the page cache are read here without blocking on
+  // Rows already in the page cache are read here without waiting for
   // storage; the rest are read below, on up to max_threads threads, so their
-  // storage latencies overlap.
+  // storage latencies overlap. For a row that is not cached the probe also
+  // starts the read of its page, so such a row gets one more read attempt
+  // than Exl3PLERowReader.read_rows makes.
   std::vector<int64_t> pending;
   bool nowait = true;
   for (int64_t index = 0; index < count; ++index) {
@@ -169,8 +171,16 @@ torch::Tensor ple_read_rows(int64_t fd, const torch::Tensor& ids,
   std::vector<std::vector<Failure>> failures(std::max<int64_t>(threads, 1));
   if (rows > 0) {
     const int64_t step = (rows + threads - 1) / threads;
+    // Every allocation happens before the first thread starts: nothing may
+    // throw while a started thread is still joinable.
+    for (int64_t chunk = 0; chunk < threads; ++chunk) {
+      const int64_t begin = std::min(rows, chunk * step);
+      failures[chunk].reserve(std::min(rows, begin + step) - begin);
+    }
     std::vector<std::thread> workers;
+    workers.reserve(threads);
     std::vector<int64_t> inline_chunks;
+    inline_chunks.reserve(threads);
     for (int64_t chunk = 1; chunk < threads; ++chunk) {
       const int64_t begin = chunk * step;
       const int64_t end = std::min(rows, begin + step);
