@@ -808,8 +808,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     )(),
     # Read the SSD PLE rows of a step in one native call that releases the
     # GIL (csrc/exl3/ple_read.cpp) instead of a Python loop on a thread pool.
-    # Same rows, bytes, failures and kernels for the consumer. Off by
-    # default.
+    # Same rows, bytes and kernels for the consumer; its failures are a
+    # subset of the pool path's (one extra read attempt for rows not in the
+    # page cache). Off by default.
     "VLLM_EXL3_PLE_NATIVE_READ": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_NATIVE_READ", "0"))
     ),

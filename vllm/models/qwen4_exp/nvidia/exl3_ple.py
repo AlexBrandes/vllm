@@ -287,8 +287,10 @@ class Exl3PLERowReader:
     ) -> list[tuple[int, BaseException]]:
         """read_rows(ids, target, 0, count) in one native call without the GIL.
 
-        Same bytes in target and the same failures, with equal errors. Rows
-        in the page cache are read on the calling thread, the others on up
+        Same rows and bytes in target; the failures are a subset of
+        read_rows' (one extra read attempt for rows not in the page cache),
+        with equal errors for rows both report. Rows in the page cache are
+        read on the calling thread, the others on up
         to `threads` threads. ids is a 1-D CPU int64 tensor, target
         contiguous CPU memory.
         """

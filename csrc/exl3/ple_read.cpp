@@ -10,7 +10,7 @@
 #include <cerrno>
 #include <cstring>
 #include <ctime>
-#include <system_error>
+#include <exception>
 #include <thread>
 #include <vector>
 
@@ -171,8 +171,9 @@ torch::Tensor ple_read_rows(int64_t fd, const torch::Tensor& ids,
   std::vector<std::vector<Failure>> failures(std::max<int64_t>(threads, 1));
   if (rows > 0) {
     const int64_t step = (rows + threads - 1) / threads;
-    // Every allocation happens before the first thread starts: nothing may
-    // throw while a started thread is still joinable.
+    // Every allocation happens before the first thread starts. A thread that
+    // fails to start (any exception from its constructor) leaves its chunk to
+    // be read inline, so nothing escapes while a started thread is joinable.
     for (int64_t chunk = 0; chunk < threads; ++chunk) {
       const int64_t begin = std::min(rows, chunk * step);
       failures[chunk].reserve(std::min(rows, begin + step) - begin);
@@ -188,7 +189,7 @@ torch::Tensor ple_read_rows(int64_t fd, const torch::Tensor& ids,
       try {
         workers.emplace_back(read_rows, std::cref(table), out, id,
                              pending.data(), begin, end, &failures[chunk]);
-      } catch (const std::system_error&) {
+      } catch (const std::exception&) {
         inline_chunks.push_back(chunk);
       }
     }
