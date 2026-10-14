@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Fork code outside the fork's own packages.
+#
+# Fork Python code lives in vllm/sm80/ (shared) and in new files under
+# vllm/models/<model>/nvidia/; fork native code in
+# csrc/libtorch_stable/moe/ampere_marlin/ and csrc/exl3/. An upstream-owned
+# file carries at most registered ops and one call into those packages.
+#
+# Each entry is a known exception: a fork-owned file placed in upstream's tree
+# (no `hunks`), or edits of an upstream-owned file that are more than such a
+# call (`hunks`: fingerprints of its zero-context hunks, the first 12 hex digits
+# of the sha256 of the hunk's -/+ lines). Every entry says why no extension
+# point serves it, who removes it and how. Remove an entry in the change that
+# removes its code.
+exceptions:
+- file: vllm/models/qwen4_exp/common/exl3_ple.py
+  reason: >-
+    The EXL3 file-backed PLE embedding subclasses the Qwen4Exp PLE classes and
+    was placed next to them in common/. It is reached only through the EXL3
+    quantization config, so it needs no edit of an upstream file, only a path
+    inside the fork packages.
+  owner: Qwen4Exp EXL3 support
+  removal: >-
+    Move the file unchanged to vllm/models/qwen4_exp/nvidia/exl3_ple.py and
+    update its lazy imports in vllm/sm80/kernels/exl3/ (quant.py, loader.py)
+    and in the EXL3 PLE tests.
+- file: vllm/third_party/exl3/LICENSE
+  reason: >-
+    Copy of the exllamav3 MIT license kept beside the adapted sources. The
+    shipped copy is plugins/sm80/licenses/exl3/LICENSE (same bytes);
+    tests/sm80/test_plugin_distribution.py still compares the shipped copy
+    with this one.
+  owner: sm80 plugin packaging
+  removal: >-
+    Make plugins/sm80/licenses/exl3/ the single copy: point the distribution
+    test and the link in docs/features/quantization/exl3.md at it, then delete
+    vllm/third_party/exl3/.
+- file: vllm/third_party/exl3/NOTICE
+  reason: >-
+    Copy of the exllamav3 notice kept beside the adapted sources. The shipped
+    copy is plugins/sm80/licenses/exl3/NOTICE (same bytes);
+    tests/sm80/test_plugin_distribution.py still compares the shipped copy
+    with this one.
+  owner: sm80 plugin packaging
+  removal: >-
+    Removed together with vllm/third_party/exl3/LICENSE (same plan).
+- file: vllm/v1/failed_inputs.py
+  reason: >-
+    The failed-inputs protocol (fail only the requests whose EXL3 PLE rows
+    could not be read) is called from the scheduler, the V2 model runner and
+    its async output. The module has no upstream counterpart and was placed
+    beside its callers.
+  owner: Qwen4Exp EXL3 support
+  removal: >-
+    Move the file unchanged to vllm/sm80/failed_inputs.py and update the
+    imports in vllm/v1/core/sched/scheduler.py,
+    vllm/v1/worker/gpu/model_runner.py and vllm/v1/worker/gpu/async_utils.py.
