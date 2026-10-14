@@ -19,12 +19,20 @@ after the first, which run outside graphs at exactly the request count;
 steps larger than the largest graph; the warm-up forward before each
 capture), a Gluon call takes 1.7-3.2x the
 time of cuBLAS's at 1-8 rows on the 74-SM part, its launch cost being host
-time that a graph pays once, at capture. The test is the current stream's
-capture status (the binding behind ``torch.cuda.is_current_stream_capturing``,
-called directly): it holds for every way this tree captures, breakable
-PIECEWISE graphs, FULL graphs (whose forward runs with runtime mode NONE
-inside ``torch.cuda.graph``) and side streams joined to a capture, while the
-eager segments of a breakable graph run, and are replayed, outside capture.
+time that a graph pays once, at capture. The test is a count of the graph
+captures under way in the process (``_CAPTURE_DEPTH``), kept by wrapping
+``torch.cuda.CUDAGraph.capture_begin`` and ``capture_end`` when the gate
+opens (``count_captures``): every capture in this tree goes through those two
+methods, FULL graphs through ``torch.cuda.graph`` (their forward runs with
+runtime mode NONE inside it) and breakable PIECEWISE graphs through the
+segments of ``BreakableCUDAGraphCapture``, so a call is counted as captured
+on a side stream joined to the capture too, and the eager segments of a
+breakable graph, which run between one segment's ``capture_end`` and the
+next one's ``capture_begin`` and are replayed outside any capture, read 0.
+An eager call pays one list read for it; asking the stream
+(``cudaStreamIsCapturing``) cost ~0.3 us a call there. The count is
+process-wide: a call made on another thread while one captures counts as
+captured (vLLM issues a process's model GEMMs from one thread).
 
 A captured call goes to ``thin_gemm_gluon.thin_gemm`` when its (N, K) is in
 ``SHAPES``, it has at most ``MAX_M`` rows and ``thin_gemm_supported`` admits
@@ -85,14 +93,44 @@ SM_COUNT = 74
 # Row counts with a schedule row (the forced-schedule diagnostic's values).
 SERVED_M = (1, 2, 4, 8, 16, 24, 32)
 
-# The binding torch.cuda.is_current_stream_capturing() returns, and the
-# switch-off GEMM, bound once: an eager call pays one C call for its test
-# and no attribute lookups (it runs on every drafter decode pass).
-_stream_capturing = torch._C._cuda_isCurrentStreamCapturing
+# Graph captures begun and not yet ended in this process (count_captures), and
+# the switch-off GEMM bound once: an eager call pays one list read for its
+# test and no attribute lookups (it runs on every drafter decode pass).
+_CAPTURE_DEPTH = [0]
 _linear = torch.nn.functional.linear
 
 # Set by warmup_table once every check passed and every variant compiled.
 _LIVE = [False]
+
+
+def count_captures(graph_cls=None) -> None:
+    """Wrap ``graph_cls.capture_begin`` and ``capture_end`` (default
+    ``torch.cuda.CUDAGraph``) once, so that ``_CAPTURE_DEPTH`` counts the
+    captures begun and not yet ended. A ``capture_begin`` that raises counts
+    nothing; ``capture_end`` counts down only a graph whose begin was counted,
+    also when it raises (the capture is over or unusable either way)."""
+    cls = torch.cuda.CUDAGraph if graph_cls is None else graph_cls
+    if getattr(cls, "_thin_gemm_counted", False):
+        return
+    begin, end = cls.capture_begin, cls.capture_end
+
+    @functools.wraps(begin)
+    def capture_begin(self, *args, **kwargs):
+        begin(self, *args, **kwargs)
+        self._thin_gemm_capturing = True
+        _CAPTURE_DEPTH[0] += 1
+
+    @functools.wraps(end)
+    def capture_end(self, *args, **kwargs):
+        try:
+            return end(self, *args, **kwargs)
+        finally:
+            if self.__dict__.pop("_thin_gemm_capturing", False):
+                _CAPTURE_DEPTH[0] -= 1
+
+    cls.capture_begin = capture_begin
+    cls.capture_end = capture_end
+    cls._thin_gemm_counted = True
 
 
 def set_but_off(reason: str) -> None:
@@ -192,6 +230,9 @@ def warmup_table(worker, ms) -> frozenset:
     over = [m for m in ms if m > MAX_M]
     if over:
         shipped_impl().warmup(sorted(SHAPES), over, device=worker.device)
+    # Before any capture (the warmup runs ahead of them): the dispatch's
+    # captured-call test reads the count.
+    count_captures()
     _LIVE[0] = True
     pinned = impl()._FORCE_M[0]
     logger.info_once(
@@ -237,7 +278,7 @@ def wrap_dispatch(shipped):
     ) -> torch.Tensor:
         if not _LIVE[0]:
             return shipped(layer, x, weight, bias)
-        if not _stream_capturing():
+        if not _CAPTURE_DEPTH[0]:
             return _linear(x, weight, bias)
         if (
             x.shape[0] <= MAX_M

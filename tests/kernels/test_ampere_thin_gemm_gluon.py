@@ -13,11 +13,14 @@ CPU (runs anywhere):
   gluon.py (checked in a fresh interpreter, flag unset and set); the warmup
   never imports it either. Dispatch, gate open: a call outside CUDA-graph
   capture takes F.linear (any shape, row count or bias) before any other
-  test, the capture test being torch's own binding; a captured call: exactly
-  the seven (N, K) of the table at M <= 32 go to the Gluon module, everything
-  else (other shapes, more rows, bias, 3-D input) to the wrapped function.
-  Gate closed: the wrapped function for every call, without the capture
-  test.
+  test; a captured call: exactly the seven (N, K) of the table at M <= 32
+  go to the Gluon module, everything else (other shapes, more rows, bias,
+  3-D input) to the wrapped function. Gate closed: the wrapped function for
+  every call, without the capture test. The capture test is a count of the
+  graph captures under way, kept by wrapping a graph class's capture_begin
+  and capture_end once (torch.cuda.CUDAGraph when the gate opens): nested
+  captures, arguments passed through; a begin that raises counts nothing, an
+  end that raises still counts down, an end without a counted begin does not.
   Layout: a table call reaches the kernels only with a unit K stride, a row
   stride that is a multiple of 16 elements and 16-byte aligned operands (what
   the warmup compiled); a row stride of 8 mod 16, an unaligned base or a K
@@ -51,7 +54,11 @@ bitwise their direct call), calls outside capture give F.linear's bits and
 launch none of them, a captured call above 32 rows takes the wrapped one; a
 call captured at a row count the warmup was not given compiles no variant
 and allocates nothing but its output inside the capture (in a fresh
-interpreter: earlier tests have already run the kernels at every M).
+interpreter: earlier tests have already run the kernels at every M); the
+capture count agrees with the stream's capture status through a FULL-style
+torch.cuda.graph capture, a side stream joined to it, the segments of a
+breakable capture and its eager break (at capture and at replay), and after
+a capture whose body raised.
 """
 
 import contextlib
@@ -262,11 +269,11 @@ def test_workspace_lane_is_shared_with_the_shipped_module(g):
 
 def _route(g, monkeypatch, live=True, capturing=True):
     """The dispatch over a recording shipped function and a recording Gluon
-    module, with the stream's capture status fixed to ``capturing``."""
+    module, with the capture count fixed to ``capturing``."""
     calls = []
     monkeypatch.setattr(g, "impl", lambda: types.SimpleNamespace(
         thin_gemm=lambda x, w: calls.append(("gluon", x.shape[0], tuple(w.shape))) or "gluon"))
-    monkeypatch.setattr(g, "_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(g, "_CAPTURE_DEPTH", [1 if capturing else 0])
     g._LIVE[0] = live
 
     def shipped(layer, x, w, bias=None):
@@ -367,22 +374,94 @@ def test_dispatch_follows_the_shipped_bound(g, monkeypatch):
 def test_dispatch_gate_closed_is_the_shipped_path(g, monkeypatch):
     fn, calls = _route(g, monkeypatch, live=False)
 
-    def not_asked():
-        raise AssertionError("the closed gate asked for the capture status")
+    class NotAsked:
+        def __getitem__(self, i):
+            raise AssertionError("the closed gate read the capture count")
 
-    monkeypatch.setattr(g, "_stream_capturing", not_asked)
+    monkeypatch.setattr(g, "_CAPTURE_DEPTH", NotAsked())
     w = torch.empty(512, 2560, dtype=BF16)
     assert fn(None, torch.empty(4, 2560, dtype=BF16), w) == "shipped"
     assert calls == [("shipped", 4, (512, 2560))]
 
 
-def test_capture_test_is_torchs_binding(g):
-    """The dispatch asks the binding torch.cuda.is_current_stream_capturing()
-    returns, and its eager path is the switch-off path's F.linear."""
-    public = torch.cuda.is_current_stream_capturing
-    assert g._stream_capturing is public.__globals__["_cuda_isCurrentStreamCapturing"]
-    assert g._stream_capturing is torch._C._cuda_isCurrentStreamCapturing
+class _FakeGraph:
+    """A graph class whose capture_begin/capture_end record their arguments
+    and raise when ``fail`` names them."""
+
+    def __init__(self, fail=None):
+        self.fail, self.log = fail, []
+
+    def capture_begin(self, pool=None, capture_error_mode="global"):
+        self.log.append(("begin", pool, capture_error_mode))
+        if self.fail == "begin":
+            raise RuntimeError("begin failed")
+
+    def capture_end(self):
+        self.log.append("end")
+        if self.fail == "end":
+            raise RuntimeError("end failed")
+
+
+def test_capture_count(g, monkeypatch):
+    """count_captures wraps a graph class once (twice counts once, a subclass
+    is not wrapped again); the count is the captures begun and not ended,
+    nested ones included; arguments reach the original methods. The eager
+    path is the switch-off path's F.linear."""
+    monkeypatch.setattr(g, "_CAPTURE_DEPTH", [0])
+    cls = type("Graph", (_FakeGraph,), {})
+    g.count_captures(cls)
+    g.count_captures(cls)
+    sub = type("SubGraph", (cls,), {})
+    g.count_captures(sub)
+    a, b = cls(), sub()
+    a.capture_begin(pool=(1, 2), capture_error_mode="relaxed")
+    assert g._CAPTURE_DEPTH[0] == 1 and a.log == [("begin", (1, 2), "relaxed")]
+    b.capture_begin()
+    assert g._CAPTURE_DEPTH[0] == 2
+    b.capture_end()
+    assert g._CAPTURE_DEPTH[0] == 1 and b.log == [("begin", None, "global"), "end"]
+    a.capture_end()
+    assert g._CAPTURE_DEPTH[0] == 0
     assert g._linear is torch.nn.functional.linear
+
+
+def test_capture_count_failures(g, monkeypatch):
+    """Negative cases: a capture_begin that raises counts nothing, a
+    capture_end that raises still counts its capture down, a capture_end with
+    no counted begin (never begun, or ended twice) counts nothing down."""
+    monkeypatch.setattr(g, "_CAPTURE_DEPTH", [0])
+    cls = type("Graph", (_FakeGraph,), {})
+    g.count_captures(cls)
+    with pytest.raises(RuntimeError, match="begin failed"):
+        cls(fail="begin").capture_begin()
+    assert g._CAPTURE_DEPTH[0] == 0
+    bad_end = cls(fail="end")
+    bad_end.capture_begin()
+    assert g._CAPTURE_DEPTH[0] == 1
+    with pytest.raises(RuntimeError, match="end failed"):
+        bad_end.capture_end()
+    assert g._CAPTURE_DEPTH[0] == 0
+    other = cls()
+    other.capture_begin()
+    cls().capture_end()
+    bad_end.fail = None
+    bad_end.capture_end()
+    assert g._CAPTURE_DEPTH[0] == 1
+    other.capture_end()
+    assert g._CAPTURE_DEPTH[0] == 0
+
+
+def test_capture_count_wraps_torchs_graph_class(g, monkeypatch):
+    """By default count_captures wraps torch.cuda.CUDAGraph, the class both
+    torch.cuda.graph and the breakable capture's segments begin and end."""
+    cls = torch.cuda.CUDAGraph
+    begin, end = cls.capture_begin, cls.capture_end
+    monkeypatch.setattr(cls, "capture_begin", begin)
+    monkeypatch.setattr(cls, "capture_end", end)
+    monkeypatch.setattr(cls, "_thin_gemm_counted", False, raising=False)
+    g.count_captures()
+    assert cls.capture_begin.__wrapped__ is begin
+    assert cls.capture_end.__wrapped__ is end
 
 
 def test_eager_calls_take_f_linear_first(g, monkeypatch):
@@ -483,9 +562,13 @@ def _fake_kernels(g, monkeypatch, fail=False):
 def test_warmup_banner_and_split_through_the_vllm_logger(g, monkeypatch, caplog):
     _sms(monkeypatch, 74)
     seen = _fake_kernels(g, monkeypatch)
+    counted = []
+    monkeypatch.setattr(g, "count_captures", lambda: counted.append(g._LIVE[0]))
     with _vllm_log(caplog):
         served = g.warmup_table(_worker(), [1, 2, 4, 32, 40])
     assert served == g.SHAPES and g._LIVE[0] is True
+    # the count is kept from before the gate opens
+    assert counted == [False]
     assert seen == [("gluon", tuple(sorted(g.SHAPES)), tuple(range(1, 33))),
                     ("shipped", tuple(sorted(g.SHAPES)), (40,))]
     lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
@@ -496,13 +579,15 @@ def test_warmup_banner_and_split_through_the_vllm_logger(g, monkeypatch, caplog)
 
 def test_warmup_gate_closed_lines(g, monkeypatch, caplog):
     seen = _fake_kernels(g, monkeypatch)
+    counted = []
+    monkeypatch.setattr(g, "count_captures", lambda: counted.append(1))
     _sms(monkeypatch, 74)
     with _vllm_log(caplog):
         assert g.warmup_table(_worker("VLLM_COMPILE"), [4]) == frozenset()
         assert g.warmup_table(_worker(eager=True, graphs="NONE"), [4]) == frozenset()
         _sms(monkeypatch, 70)
         assert g.warmup_table(_worker(), [4]) == frozenset()
-    assert g._LIVE[0] is False and seen == []
+    assert g._LIVE[0] is False and seen == [] and counted == []
     lines = [(r.levelno, r.getMessage()) for r in caplog.records]
     tail = "; the VLLM_THIN_GEMM path serves every call"
     assert (logging.WARNING, "VLLM_THIN_GEMM_GLUON set but off: compilation mode "
@@ -677,14 +762,14 @@ def test_gpu_row_stride_8_mod_16_takes_the_triton_kernel(nk, monkeypatch):
 @pytest.mark.parametrize("kind", _REFUSED)
 def test_gpu_refused_layouts_take_cublas(g, monkeypatch, kind):
     """A captured table call in a refused layout takes F.linear (the capture
-    status is fixed to capturing: the layout test only runs on that path)."""
+    count is fixed to capturing: the layout test only runs on that path)."""
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
 
     def no_kernel(x, w):
         raise AssertionError("a refused layout reached the Gluon kernels")
 
     monkeypatch.setattr(g, "impl", lambda: types.SimpleNamespace(thin_gemm=no_kernel))
-    monkeypatch.setattr(g, "_stream_capturing", lambda: True)
+    monkeypatch.setattr(g, "_CAPTURE_DEPTH", [1])
     g._LIVE[0] = True
     fn = g.wrap_dispatch(lambda layer, x, w, bias=None: pytest.fail("left the table path"))
     for n, k in NK:
@@ -857,3 +942,55 @@ def test_gpu_capture_at_unlisted_row_counts():
                          capture_output=True, text=True, timeout=1200)
     assert run.returncode == 0, run.stdout[-2000:] + run.stderr[-4000:]
     assert run.stdout.strip().splitlines()[-1] == f"UNLISTED_ROWS OK {5 * len(NK)}"
+
+
+
+@gpu
+def test_gpu_capture_count_matches_the_stream(g):
+    """The capture count agrees with the stream's capture status at every
+    point of the ways this tree captures: a torch.cuda.graph capture (FULL
+    graphs), a side stream joined to it, the segments of a breakable capture
+    and its eager break, at capture and at replay; and it is back at 0 after a
+    capture whose body raised."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    g.count_captures()
+    seen = []
+
+    def probe(tag):
+        seen.append((tag, g._CAPTURE_DEPTH[0] > 0, torch.cuda.is_current_stream_capturing()))
+
+    x = torch.zeros(4, device="cuda")
+    stream = torch.cuda.Stream()
+    probe("eager")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        probe("graph")
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            probe("side stream")
+            x.add_(1)
+        torch.cuda.current_stream().wait_stream(side)
+    probe("after graph")
+    with torch.cuda.stream(stream):
+        cap = BreakableCUDAGraphCapture()
+        with cap:
+            probe("segment 1")
+            x.add_(1)
+            cap.add_eager(lambda: probe("eager break"))
+            probe("segment 2")
+            x.add_(1)
+    probe("after breakable")
+    cap.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    with pytest.raises(RuntimeError, match="body raised"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream):
+            raise RuntimeError("body raised")
+    probe("after a failed capture")
+    assert all(counted == capturing for _, counted, capturing in seen), seen
+    assert [tag for tag, counted, _ in seen if counted] == [
+        "graph", "side stream", "segment 1", "segment 2"], seen
+    assert [tag for tag, _, _ in seen].count("eager break") == 2, seen
+    assert g._CAPTURE_DEPTH[0] == 0
