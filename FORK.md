@@ -413,9 +413,8 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/dflash/utils.py` | modified | 13 | 3 | 4 |
 | `vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` | modified | 282 | 0 | 7 |
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
-| `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **68 files** | | **3,520** | **243** | **481** |
+| **67 files** | | **3,518** | **243** | **479** |
 
 ### Tests, docs and .github
 
@@ -449,9 +448,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 68 | 3,520 | 243 | 481 |
+| Product code | 67 | 3,518 | 243 | 479 |
 | Tests, docs and .github | 22 | 503 | 560 | 68 |
-| All | 90 | 4,023 | 803 | 549 |
+| All | 89 | 4,021 | 803 | 547 |
 
 ## 3. Fork environment variables
 
@@ -553,10 +552,10 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 |---|---:|
 | Fork-added product files | 114 |
 | Fork-added product lines | 32,829 |
-| Patched upstream files | 90 |
-| Patched upstream lines | +4,023 / -803 |
-| Patched upstream product files | 68 |
-| Patched upstream product lines | +3,520 / -243 |
-| Product lines added (new files and patches) | 36,349 |
+| Patched upstream files | 89 |
+| Patched upstream lines | +4,021 / -803 |
+| Patched upstream product files | 67 |
+| Patched upstream product lines | +3,518 / -243 |
+| Product lines added (new files and patches) | 36,347 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |

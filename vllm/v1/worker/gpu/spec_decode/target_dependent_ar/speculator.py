@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified by Morrowmake for CMP 170HX support; see repository history.
 from typing import Any
 
 import torch
@@ -94,7 +93,6 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
-            adaptive_k_capture=True,
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
