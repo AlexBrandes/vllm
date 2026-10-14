@@ -104,7 +104,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 933 |
+| `vllm/sm80/envs.py` | 935 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
@@ -130,7 +130,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **34 files** | **8,720** |
+| **34 files** | **8,722** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -560,11 +560,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 116 |
-| Fork-added product lines | 32,869 |
+| Fork-added product lines | 32,871 |
 | Patched upstream files | 91 |
 | Patched upstream lines | +4,034 / -808 |
 | Patched upstream product files | 68 |
 | Patched upstream product lines | +3,526 / -246 |
-| Product lines added (new files and patches) | 36,395 |
+| Product lines added (new files and patches) | 36,397 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |
