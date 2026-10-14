@@ -31,6 +31,7 @@ TORCH_LIBRARY(_exl3_C, m) {
         "int base, int row_bytes, int owner_lo, int owner_hi, "
         "Tensor head_offsets, Tensor head_vocab_sizes, int retries, "
         "int max_threads) -> Tensor");
+  register_ple_host_reader(m);
   // No tensor arguments: these are catch-all CPU arithmetic functions, not
   // CUDA-dispatched ops, and never inspect a device or initialize CUDA.
   m.def("linear_workspace_size(int max_rows, int padded_in, int padded_out) -> int",

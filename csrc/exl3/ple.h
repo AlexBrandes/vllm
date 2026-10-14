@@ -2,6 +2,7 @@
 #pragma once
 
 #include <torch/all.h>
+#include <torch/library.h>
 
 #include <cstdint>
 
@@ -36,3 +37,17 @@ torch::Tensor ple_read_rows(int64_t fd, const torch::Tensor& ids,
                             int64_t owner_hi, const torch::Tensor& head_offsets,
                             const torch::Tensor& head_vocab_sizes,
                             int64_t retries, int64_t max_threads);
+
+// Registers the class PleHostReader(fd, ids, rows, base, row_bytes, owner_lo,
+// owner_hi, head_offsets, head_vocab_sizes, retries, max_threads, slots):
+// ple_read_rows of ids[0:count) into rows as a host function on a CUDA
+// stream. enqueue(count) queues it on the current stream (never under
+// capture); run(count) runs the same function on the calling thread.
+// Rows that fail are poisoned (an FP16 NaN scale) instead of returned, and
+// take() reports each finished read once, in queue order: [sequence, count,
+// status (0 read, 1 stopped by an unexpected error with every row poisoned),
+// failed rows, first failed index, its row id, its errno (0: end of file),
+// byte offset reached, read ns]. At most `slots` reads are queued or not yet
+// taken. The reader keeps its own duplicate of fd and the ids and rows
+// tensors; a reader dropped while a read is still queued is left allocated.
+void register_ple_host_reader(torch::Library& m);
