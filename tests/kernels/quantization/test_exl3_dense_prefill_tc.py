@@ -286,6 +286,7 @@ def test_a_stale_library_is_refused_with_the_rebuild_hint(monkeypatch):
 
 def test_switch_is_resolved_once_by_ensure_extension(monkeypatch):
     monkeypatch.setattr(exl3_ops, "_loaded", False)
+    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
     monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
     monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
@@ -305,6 +306,7 @@ def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
     after resolve returns. The library and the device are stood in for; the
     warm-up buffers live on the CPU."""
     monkeypatch.setattr(exl3_ops, "_loaded", False)
+    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
     monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
     monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)

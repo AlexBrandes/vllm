@@ -106,6 +106,7 @@ def test_switch_resolution_logs_through_vllm_logger(monkeypatch, caplog):
 def test_switch_is_fixed_once_by_ensure_extension(monkeypatch):
     # Restored after the test: the module's real state.
     monkeypatch.setattr(exl3_ops, "_loaded", False)
+    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
     monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
     monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
