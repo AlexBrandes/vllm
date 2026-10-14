@@ -50,7 +50,8 @@ warmup gate: calls captured into a CUDA graph run the Gluon kernels (replay
 bitwise their direct call), calls outside capture give F.linear's bits and
 launch none of them, a captured call above 32 rows takes the wrapped one; a
 call captured at a row count the warmup was not given compiles no variant
-and allocates nothing but its output inside the capture.
+and allocates nothing but its output inside the capture (in a fresh
+interpreter: earlier tests have already run the kernels at every M).
 """
 
 import contextlib
@@ -799,31 +800,60 @@ def test_gpu_dispatch_end_to_end(g, monkeypatch):
     assert shipped_calls == [40] * len(NK)
 
 
+# Run in a fresh interpreter: in this process the earlier GPU tests have
+# already compiled every variant and allocated every workspace buffer at
+# M 1..32, which would leave the capture nothing to compile or allocate even
+# with a warmup that skipped the unlisted row counts.
+_UNLISTED_ROWS = """
+import torch
+from vllm import envs
+from vllm.sm80.kernels.thin_gemm import gluon as g
+from tests.kernels.test_ampere_thin_gemm_gluon import (
+    NK, _bitwise, _compiled_variants, _inputs, _worker)
+
+envs.VLLM_THIN_GEMM_MAX_TOKENS = 32
+left = []
+fn = g.wrap_dispatch(
+    lambda layer, x, w, bias=None: left.append(x.shape) or torch.nn.functional.linear(x, w, bias))
+device = torch.device("cuda", torch.cuda.current_device())
+assert not g._LIVE[0] and not g.impl()._WORKSPACE
+assert g.warmup_table(_worker(device=device), [1, 2, 4, 8, 16, 24, 32]) == g.SHAPES
+k_mod = g.impl()
+stream = torch.cuda.Stream()
+calls = 0
+for n, k in NK:
+    for m in (3, 5, 12, 20, 28):
+        x, w = _inputs(5 * m, m, n, k)
+        before = _compiled_variants(k_mod)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            start = torch.cuda.memory_stats()["allocation.all.allocated"]
+            out = fn(None, x, w)
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - start
+        assert allocated == 1, (n, k, m, allocated)
+        assert _compiled_variants(k_mod) == before, (n, k, m)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert _bitwise(out, k_mod.thin_gemm(x, w)), (n, k, m)
+        del graph, out
+        calls += 1
+assert not left, left
+print("UNLISTED_ROWS OK", calls)
+"""
+
+
 @gpu
-def test_gpu_capture_at_unlisted_row_counts(g, monkeypatch):
+def test_gpu_capture_at_unlisted_row_counts():
     """No eager forward runs the kernels before a capture any more (eager
     calls take F.linear), so the warmup readies every M up to 32 whatever
-    sizes it is given: a call captured at a row count outside them compiles
-    no variant and allocates nothing but its output inside the capture, and
-    its replay is bitwise the direct call."""
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
-    fn = g.wrap_dispatch(lambda layer, x, w, bias=None: pytest.fail("left the table path"))
-    device = torch.device("cuda", torch.cuda.current_device())
-    assert g.warmup_table(_worker(device=device), [1, 2, 4, 8, 16, 24, 32]) == g.SHAPES
-    k_mod = g.impl()
-    stream = torch.cuda.Stream()
-    for n, k in NK:
-        for m in (3, 5, 12, 20, 28):
-            x, w = _inputs(5 * m, m, n, k)
-            before = _compiled_variants(k_mod)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                start = torch.cuda.memory_stats()["allocation.all.allocated"]
-                out = fn(None, x, w)
-                allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - start
-            assert allocated == 1, (n, k, m, allocated)
-            assert _compiled_variants(k_mod) == before, (n, k, m)
-            graph.replay()
-            torch.cuda.synchronize()
-            assert _bitwise(out, k_mod.thin_gemm(x, w)), (n, k, m)
-            del graph, out
+    sizes it is given: in a fresh interpreter, a call captured at a row count
+    outside them compiles no variant and allocates nothing but its output
+    inside the capture, and its replay is bitwise the direct call."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        p for p in (root, os.environ.get("PYTHONPATH", "")) if p))
+    env.pop("VLLM_THIN_GEMM_CONCAT", None)
+    run = subprocess.run([sys.executable, "-c", _UNLISTED_ROWS], env=env, cwd=root,
+                         capture_output=True, text=True, timeout=1200)
+    assert run.returncode == 0, run.stdout[-2000:] + run.stderr[-4000:]
+    assert run.stdout.strip().splitlines()[-1] == f"UNLISTED_ROWS OK {5 * len(NK)}"
