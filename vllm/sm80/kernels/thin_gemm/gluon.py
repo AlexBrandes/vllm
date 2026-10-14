@@ -9,29 +9,43 @@ reduction in the last-arriving CTA, a K-sliced variant, a persistent
 balanced-column kernel, the Triton thin GEMM for the remaining rows and a GEMV
 for N = 1. Against cuBLAS it is ~1.41x on the served mix of these calls.
 
-This module wraps the ``VLLM_THIN_GEMM`` dispatch (``ampere_thin_gemm``): a
-call goes to ``thin_gemm_gluon.thin_gemm`` when the gate is open, its (N, K)
-is in ``SHAPES``, it has at most ``MAX_M`` rows and ``thin_gemm_supported``
-admits it, and its operands are in the layout the warmup compiled for
+This module wraps the ``VLLM_THIN_GEMM`` dispatch (``ampere_thin_gemm``).
+While the gate is open, only calls being captured into a CUDA graph reach the
+Gluon kernels. A call made outside capture takes ``F.linear``, the call the
+dispatch makes with both flags off, and that test comes first: launched
+eagerly (the drafter's decode passes after the first, which run outside
+graphs at exactly the request count; steps larger than the largest graph;
+the warm-up forward before each capture), a Gluon call takes 1.7-3.2x the
+time of cuBLAS's at 1-8 rows on the 74-SM part, its launch cost being host
+time that a graph pays once, at capture. The test is the current stream's
+capture status (the binding behind ``torch.cuda.is_current_stream_capturing``,
+called directly): it holds for every way this tree captures, breakable
+PIECEWISE graphs, FULL graphs (whose forward runs with runtime mode NONE
+inside ``torch.cuda.graph``) and side streams joined to a capture, while the
+eager segments of a breakable graph run, and are replayed, outside capture.
+
+A captured call goes to ``thin_gemm_gluon.thin_gemm`` when its (N, K) is in
+``SHAPES``, it has at most ``MAX_M`` rows and ``thin_gemm_supported`` admits
+it, and its operands are in the layout the warmup compiled for
 (``gluon_layout_ok``: unit K stride, row stride a multiple of 16 elements,
-16-byte aligned base); every other call takes the wrapped function unchanged,
-except a table call in another layout, which takes cuBLAS (``F.linear``): the
-kernels specialize on those properties, so a different layout would compile
-a new variant at serve time, and the cp.async loads of the Gluon kernels do
-not compile for a row stride that is not a multiple of 16 elements. The row
-count decides, never the phase: prefill and mixed steps with at most 32 rows
-run the same schedule as decode steps of that size.
+16-byte aligned base); every other captured call takes the wrapped function
+unchanged, except a table call in another layout, which takes cuBLAS
+(``F.linear``): the kernels specialize on those properties, so a different
+layout would compile a new variant at serve time, and the cp.async loads of
+the Gluon kernels do not compile for a row stride that is not a multiple of
+16 elements. The row count decides, never the phase: prefill and mixed steps
+with at most 32 rows run the same schedule as decode steps of that size.
 
 The gate is decided once, before CUDA-graph capture, by ``warmup_table``
 (called from ``warmup.py``): sm_80 with 74 SMs (the schedule is measured
 there), compilation mode NONE (no torch.compile tracing through the Gluon
-launches), CUDA graphs for every step (no ``enforce_eager``, no graph mode
-that runs decode or mixed steps eagerly: those send unpadded row counts) and
-the Triton Gluon ampere API importable. Until then, and whenever it stays
-closed, the wrapped dispatch serves every call; a closed gate logs one warning
-with the reason. Once those hold, the warmup compiles every kernel variant
-and allocates its workspace; a failure there fails the boot rather than
-leaving this process on a different kernel from the other ranks.
+launches), CUDA graphs for decode and mixed steps (no ``enforce_eager``, no
+graph mode that runs either eagerly at unpadded row counts) and the Triton
+Gluon ampere API importable. Until then, and whenever it stays closed, the
+wrapped dispatch serves every call; a closed gate logs one warning with the
+reason. Once those hold, the warmup compiles every kernel variant and
+allocates its workspace; a failure there fails the boot rather than leaving
+this process on a different kernel from the other ranks.
 
 ``VLLM_THIN_GEMM_CONCAT`` pairs only the shipped thin GEMM's calls, so the
 two flags do not combine: setting both raises.
@@ -65,6 +79,12 @@ MAX_M = 32
 SM_COUNT = 74
 # Row counts with a schedule row (the forced-schedule diagnostic's values).
 SERVED_M = (1, 2, 4, 8, 16, 24, 32)
+
+# The binding torch.cuda.is_current_stream_capturing() returns, and the
+# switch-off GEMM, bound once: an eager call pays one C call for its test
+# and no attribute lookups (it runs on every drafter decode pass).
+_stream_capturing = torch._C._cuda_isCurrentStreamCapturing
+_linear = torch.nn.functional.linear
 
 # Set by warmup_table once every check passed and every variant compiled.
 _LIVE = [False]
@@ -192,8 +212,9 @@ def gluon_layout_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 def wrap_dispatch(shipped):
-    """``shipped`` (an ``ampere_thin_gemm``) with the table's calls sent to
-    ``thin_gemm_gluon`` while the gate is open. Same signature."""
+    """``shipped`` (an ``ampere_thin_gemm``) with the table's captured calls
+    sent to ``thin_gemm_gluon`` and every call outside capture to
+    ``F.linear`` while the gate is open. Same signature."""
     if envs.VLLM_THIN_GEMM_CONCAT:
         raise ValueError(
             "VLLM_THIN_GEMM_GLUON and VLLM_THIN_GEMM_CONCAT are both set: the "
@@ -206,9 +227,12 @@ def wrap_dispatch(shipped):
         weight: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if not _LIVE[0]:
+            return shipped(layer, x, weight, bias)
+        if not _stream_capturing():
+            return _linear(x, weight, bias)
         if (
-            _LIVE[0]
-            and x.shape[0] <= MAX_M
+            x.shape[0] <= MAX_M
             and tuple(weight.shape) in SHAPES
             and thin_gemm_supported(x, weight, bias)
         ):
@@ -219,7 +243,7 @@ def wrap_dispatch(shipped):
                 "base offset %d mod 16 bytes is not in the layout its kernels "
                 "were compiled for; such calls take cuBLAS",
                 tuple(weight.shape), tuple(x.stride()), x.data_ptr() % 16)
-            return torch.nn.functional.linear(x, weight)
+            return _linear(x, weight)
         return shipped(layer, x, weight, bias)
 
     ampere_thin_gemm.shipped = shipped

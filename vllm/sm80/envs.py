@@ -696,12 +696,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # Send the thin-GEMM calls of the measured Qwen3.8 decode shapes (seven
     # (N, K): hyper-connection down/up and final down, router, shared-expert
-    # gate, GDN in_proj_ba, PLE kv_proj) at M <= 32 to the Gluon thin GEMM
-    # (vllm/sm80/kernels/thin_gemm/gluon.py, thin_gemm_gluon.py). Needs
+    # gate, GDN in_proj_ba, PLE kv_proj) at M <= 32 that are captured into a
+    # CUDA graph to the Gluon thin GEMM (vllm/sm80/kernels/thin_gemm/gluon.py,
+    # thin_gemm_gluon.py); every call outside capture takes F.linear. Needs
     # VLLM_THIN_GEMM, sm_80 with 74 SMs, the Triton Gluon ampere API,
-    # compilation mode NONE and CUDA graphs on every step (no enforce_eager);
-    # anything else keeps the VLLM_THIN_GEMM path. A warmup failure fails the
-    # boot. Raises with VLLM_THIN_GEMM_CONCAT (the two do not combine).
+    # compilation mode NONE and CUDA graphs for decode and mixed steps (no
+    # enforce_eager); anything else keeps the VLLM_THIN_GEMM path. A warmup
+    # failure fails the boot. Raises with VLLM_THIN_GEMM_CONCAT (the two do
+    # not combine).
     # Default OFF: unset, the module is never imported.
     "VLLM_THIN_GEMM_GLUON": lambda: bool(
         int(os.getenv("VLLM_THIN_GEMM_GLUON", "0"))

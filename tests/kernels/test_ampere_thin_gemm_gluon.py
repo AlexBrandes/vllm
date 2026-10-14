@@ -11,9 +11,13 @@ CPU (runs anywhere):
   off path: both flags default off; with VLLM_THIN_GEMM_GLUON unset the
   package binds the shipped ``ampere_thin_gemm`` itself and never imports
   gluon.py (checked in a fresh interpreter, flag unset and set); the warmup
-  never imports it either. Dispatch: exactly the seven (N, K) of the table at
-  M <= 32 with the gate open go to the Gluon module, everything else (other
-  shapes, more rows, bias, 3-D input, gate closed) to the wrapped function.
+  never imports it either. Dispatch, gate open: a call outside CUDA-graph
+  capture takes F.linear (any shape, row count or bias) before any other
+  test, the capture test being torch's own binding; a captured call: exactly
+  the seven (N, K) of the table at M <= 32 go to the Gluon module, everything
+  else (other shapes, more rows, bias, 3-D input) to the wrapped function.
+  Gate closed: the wrapped function for every call, without the capture
+  test.
   Layout: a table call reaches the kernels only with a unit K stride, a row
   stride that is a multiple of 16 elements and 16-byte aligned operands (what
   the warmup compiled); a row stride of 8 mod 16, an unaligned base or a K
@@ -41,7 +45,9 @@ stride of K + 24 takes the Triton kernel; CUDA-graph replay bitwise equal
 to eager with no allocation in capture or replay; split-K arrival counters
 back at zero after every call; the forced schedule makes each row's result
 independent of the call's row count; the dispatch end to end through the
-warmup gate.
+warmup gate: calls captured into a CUDA graph run the Gluon kernels (replay
+bitwise their direct call), calls outside capture give F.linear's bits and
+launch none of them, a captured call above 32 rows takes the wrapped one.
 """
 
 import contextlib
@@ -250,10 +256,13 @@ def test_workspace_lane_is_shared_with_the_shipped_module(g):
     assert k._lane_key(0, 7) == (0, 7)
 
 
-def _route(g, monkeypatch, live=True):
+def _route(g, monkeypatch, live=True, capturing=True):
+    """The dispatch over a recording shipped function and a recording Gluon
+    module, with the stream's capture status fixed to ``capturing``."""
     calls = []
     monkeypatch.setattr(g, "impl", lambda: types.SimpleNamespace(
         thin_gemm=lambda x, w: calls.append(("gluon", x.shape[0], tuple(w.shape))) or "gluon"))
+    monkeypatch.setattr(g, "_stream_capturing", lambda: capturing)
     g._LIVE[0] = live
 
     def shipped(layer, x, w, bias=None):
@@ -353,9 +362,50 @@ def test_dispatch_follows_the_shipped_bound(g, monkeypatch):
 
 def test_dispatch_gate_closed_is_the_shipped_path(g, monkeypatch):
     fn, calls = _route(g, monkeypatch, live=False)
+
+    def not_asked():
+        raise AssertionError("the closed gate asked for the capture status")
+
+    monkeypatch.setattr(g, "_stream_capturing", not_asked)
     w = torch.empty(512, 2560, dtype=BF16)
     assert fn(None, torch.empty(4, 2560, dtype=BF16), w) == "shipped"
     assert calls == [("shipped", 4, (512, 2560))]
+
+
+def test_capture_test_is_torchs_binding(g):
+    """The dispatch asks the binding torch.cuda.is_current_stream_capturing()
+    returns, and its eager path is the switch-off path's F.linear."""
+    public = torch.cuda.is_current_stream_capturing
+    assert g._stream_capturing is public.__globals__["_cuda_isCurrentStreamCapturing"]
+    assert g._stream_capturing is torch._C._cuda_isCurrentStreamCapturing
+    assert g._linear is torch.nn.functional.linear
+
+
+def test_eager_calls_take_f_linear_first(g, monkeypatch):
+    """Gate open, outside capture: every call gives F.linear's result, before
+    the row count, table, support or layout tests and without the Gluon
+    module or the wrapped function."""
+    fn, calls = _route(g, monkeypatch, capturing=False)
+
+    def refused(*args):
+        raise AssertionError("an eager call reached a captured-call test")
+
+    monkeypatch.setattr(g, "thin_gemm_supported", refused)
+    monkeypatch.setattr(g, "gluon_layout_ok", refused)
+    gen = torch.Generator().manual_seed(0)
+    for n, kk in ((48, 2560), (1, 2560), (336, 10240), (64, 128)):
+        w = torch.randn(n, kk, generator=gen).to(BF16)
+        bias = torch.randn(n, generator=gen).to(BF16)
+        for m in (1, 3, 8, 32, 40):
+            x = torch.randn(m, kk, generator=gen).to(BF16)
+            for b in (None, bias):
+                out = fn(None, x, w, b)
+                assert torch.equal(out, torch.nn.functional.linear(x, w, b)), (n, kk, m)
+        x3 = torch.randn(2, 3, kk, generator=gen).to(BF16)
+        assert torch.equal(fn(None, x3, w), torch.nn.functional.linear(x3, w))
+        xa = _layout("unaligned", torch.randn(4, kk, generator=gen).to(BF16))
+        assert torch.equal(fn(None, xa, w), torch.nn.functional.linear(xa, w))
+    assert calls == []
 
 
 def _sms(monkeypatch, n):
@@ -613,12 +663,15 @@ def test_gpu_row_stride_8_mod_16_takes_the_triton_kernel(nk, monkeypatch):
 @gpu
 @pytest.mark.parametrize("kind", _REFUSED)
 def test_gpu_refused_layouts_take_cublas(g, monkeypatch, kind):
+    """A captured table call in a refused layout takes F.linear (the capture
+    status is fixed to capturing: the layout test only runs on that path)."""
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
 
     def no_kernel(x, w):
         raise AssertionError("a refused layout reached the Gluon kernels")
 
     monkeypatch.setattr(g, "impl", lambda: types.SimpleNamespace(thin_gemm=no_kernel))
+    monkeypatch.setattr(g, "_stream_capturing", lambda: True)
     g._LIVE[0] = True
     fn = g.wrap_dispatch(lambda layer, x, w, bias=None: pytest.fail("left the table path"))
     for n, k in NK:
@@ -690,6 +743,10 @@ def test_gpu_forced_schedule_rows_independent_of_row_count(force):
 
 @gpu
 def test_gpu_dispatch_end_to_end(g, monkeypatch):
+    """Through the warmup gate: a call captured into a CUDA graph runs the
+    Gluon kernels (replay bitwise their direct call), a call outside capture
+    gives F.linear's bits and launches none of them, and a captured call
+    above 32 rows takes the wrapped function."""
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 64, raising=False)
     shipped_calls = []
 
@@ -700,10 +757,31 @@ def test_gpu_dispatch_end_to_end(g, monkeypatch):
     fn = g.wrap_dispatch(shipped)
     device = torch.device("cuda", torch.cuda.current_device())
     assert g.warmup_table(_worker(device=device), [1, 2, 4, 8, 16, 24, 32, 40]) == g.SHAPES
+    kernels = g.impl()
+    launched = []
+    monkeypatch.setattr(g, "impl", lambda: types.SimpleNamespace(
+        thin_gemm=lambda x, w: launched.append(x.shape[0]) or kernels.thin_gemm(x, w)))
+    stream = torch.cuda.Stream()
+
+    def captured(x, w):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = fn(None, x, w)
+        graph.replay()
+        torch.cuda.synchronize()
+        return out.clone()
+
     for n, k in NK:
-        for m in (1, 5, 24, 32):
+        for m in (1, 3, 5, 8, 24, 32, 40):
             x, w = _inputs(m, m, n, k)
-            assert _bitwise(fn(None, x, w), g.impl().thin_gemm(x, w)), (n, k, m)
+            assert _bitwise(fn(None, x, w), torch.nn.functional.linear(x, w)), (n, k, m)
+    assert launched == [] and shipped_calls == []
+    assert not torch.cuda.is_current_stream_capturing()
+    for n, k in NK:
+        for m in (1, 2, 4, 8, 16, 24, 32):
+            x, w = _inputs(m, m, n, k)
+            assert _bitwise(captured(x, w), kernels.thin_gemm(x, w)), (n, k, m)
         x, w = _inputs(40, 40, n, k)
-        fn(None, x, w)
+        torch.testing.assert_close(captured(x, w), torch.nn.functional.linear(x, w))
+    assert launched == [1, 2, 4, 8, 16, 24, 32] * len(NK)
     assert shipped_calls == [40] * len(NK)

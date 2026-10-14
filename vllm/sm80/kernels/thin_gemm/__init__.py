@@ -189,9 +189,10 @@ if envs.VLLM_THIN_GEMM_CONCAT:
     )
 
 # VLLM_THIN_GEMM_GLUON: ampere_thin_gemm (as bound above) is wrapped by
-# gluon.py's, which sends the measured Qwen3.8 (N, K) at M <= 32 to the Gluon
-# thin GEMM once the pre-capture warmup has opened its gate. Unset, gluon.py
-# is never imported and every caller binds the function above.
+# gluon.py's, which, once the pre-capture warmup has opened its gate, sends the
+# measured Qwen3.8 (N, K) at M <= 32 to the Gluon thin GEMM when captured into
+# a CUDA graph and every eager call to F.linear. Unset, gluon.py is never
+# imported and every caller binds the function above.
 if envs.VLLM_THIN_GEMM_GLUON:
     from vllm.sm80.kernels.thin_gemm.gluon import wrap_dispatch  # noqa: E402
 

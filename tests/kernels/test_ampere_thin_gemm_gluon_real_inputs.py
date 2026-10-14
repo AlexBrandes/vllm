@@ -15,12 +15,14 @@ given, every file's sha256, every case on the Gluon path (its (N, K) in the
 table, at most 32 rows), and one case per required (shape, rows, phase) cell.
 
 GPU (SM 8.0 with 74 multiprocessors): every case goes through the dispatch
-(``wrap_dispatch`` after ``warmup_table`` opened the gate). F.linear must give
-each live case's recorded output bit for bit (the inputs and weights are the
-served ones); per pool (shape, rows, phase, drafter, source) the dispatch holds
+(``wrap_dispatch`` after ``warmup_table`` opened the gate) captured into a CUDA
+graph, which is where it runs the Gluon kernels, and eagerly, where it must give
+F.linear's bits. F.linear must give each live case's recorded output bit for
+bit (the inputs and weights are the served ones); per pool (shape, rows, phase,
+drafter, source) the captured dispatch holds
 cuBLAS's error against FP64 (pooled mean <= 1.10x, max <= 1.25x, BF16 rounding
-ties forgiven, exact where cuBLAS is exact) and is bitwise run to run. One
-line per pool and per phase's cells is printed; a failing pool fails.
+ties forgiven, exact where cuBLAS is exact) and is bitwise replay to replay.
+One line per pool and per phase's cells is printed; a failing pool fails.
 
 Required cells (REQUIRED_CELLS: the row counts the thin-GEMM dispatch takes at
 1-8 concurrent requests with 3-token speculative decoding or without drafts,
@@ -188,6 +190,19 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
         raise AssertionError("a real case left the Gluon path")
 
     dispatch = gluon.wrap_dispatch(shipped)
+    stream = torch.cuda.Stream()
+
+    def captured(x, w):
+        """The dispatch captured into a CUDA graph: two replays' outputs."""
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = dispatch(None, x, w)
+        graph.replay()
+        first = out.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        return first, out.clone()
+
     weights, live_bad, failed = {}, [], []
     for key, group in real.pools(cases).items():
         pool = _Pool()
@@ -198,8 +213,9 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
             if out is not None and not torch.equal(inc.view(torch.int16),
                                                     out.cuda().view(torch.int16)):
                 live_bad.append(case["id"])
-            c1 = dispatch(None, x, w)
-            c2 = dispatch(None, x, w)
+            eager = dispatch(None, x, w)
+            assert torch.equal(eager.view(torch.int16), inc.view(torch.int16)), case["id"]
+            c1, c2 = captured(x, w)
             assert torch.equal(c1.view(torch.int16), c2.view(torch.int16)), case["id"]
             pool.add(c1, inc, x.double() @ w.double().T)
         name = "%s rows %d %s%s %s" % (key[0], key[1], key[2], " drafter" if key[3] else "", key[4])
