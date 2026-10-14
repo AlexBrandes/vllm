@@ -5,8 +5,10 @@ csrc/exl3/dense_prefill_tc.cu, vllm/sm80/kernels/exl3/dense_prefill_tc.py).
 
 CPU: the switch and its schedule diagnostic default, the gate, the one-time
 resolution with the active and gate-closed log lines (through vLLM's own
-logger), resolution once per process by ensure_extension, and _linear's
-operator per row chunk: with the switch off exactly the base's operator;
+logger), resolution once per process by ensure_extension (with the gate open
+through the real resolve and warm-up, which never call back into
+ensure_extension), and _linear's operator per row chunk: with the switch
+off exactly the base's operator;
 with it on, linear_out_prefill only in prefill steps for launches the
 operator covers and split-K does not split, never in a decode step of more
 than 64 tokens, during a graph capture or without a forward context. The
@@ -22,7 +24,8 @@ split tiles' last-arriving block changes, the sum order does not); the
 whole-tile diagnostic; refusals; _linear end to end (off: linear_out; on:
 each chunk the operator of its launch); graph replay bitwise like eager with
 no allocator event and a NaN-filled workspace (the fixup counters are zeroed
-inside the call).
+inside the call); ensure_extension with the switch set at TP2 opens the gate
+and warms up once.
 """
 
 import logging
@@ -293,6 +296,68 @@ def test_switch_is_resolved_once_by_ensure_extension(monkeypatch):
     exl3_ops.ensure_extension()
     exl3_ops.ensure_extension()
     assert resolved == [1], "resolved once per process"
+
+
+def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
+    """A process's first EXL3 use with the switch set and the gate open (TP2):
+    ensure_extension runs the real resolve and warm-up once, and nothing they
+    run calls back into ensure_extension, which marks the library loaded only
+    after resolve returns. The library and the device are stood in for; the
+    warm-up buffers live on the CPU."""
+    monkeypatch.setattr(exl3_ops, "_loaded", False)
+    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
+    monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
+    monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
+    monkeypatch.setattr(exl3_ops, "_resolve_dense_splitk", lambda: False)
+    for name in ("active", "_max_decode_query_len", "_sms"):
+        monkeypatch.setattr(tc, name, getattr(tc, name))
+    monkeypatch.setattr(tc, "_fake_registered", False)
+    fakes = []
+    monkeypatch.setattr(
+        torch.library, "register_fake", lambda name: lambda fn: fakes.append(name)
+    )
+    monkeypatch.setattr(
+        torch._C, "_dispatch_find_schema_or_throw", lambda name, overload: None
+    )
+    monkeypatch.setenv("VLLM_EXL3_DENSE_PREFILL_TC", "1")
+    monkeypatch.delenv("VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", raising=False)
+    _device(monkeypatch, (8, 0))
+    calls = []
+
+    def workspace_size(*shape):
+        calls.append(("workspace", shape))
+        return 16
+
+    def prefill(x, trellis, suh, svh, bits_x2, *rest):
+        calls.append(("prefill", tuple(x.shape), bits_x2))
+
+    library = SimpleNamespace(
+        set_prefill_schedule=lambda mode: calls.append(("schedule", mode)),
+        linear_workspace_size=workspace_size,
+        linear_out_prefill=prefill,
+    )
+    monkeypatch.setattr(torch.ops, "_exl3_C", library)
+    for name in ("ones", "empty", "zeros"):
+        make = getattr(torch, name)
+        monkeypatch.setattr(
+            torch, name, lambda *a, _make=make, device=None, **kw: _make(*a, **kw)
+        )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    # A cached size would hide a call back into ensure_extension.
+    exl3_ops.linear_workspace_size.cache_clear()
+    resolve, resolved = tc.resolve, []
+    monkeypatch.setattr(tc, "resolve", lambda: resolved.append(1) or resolve())
+    exl3_ops.ensure_extension()
+    exl3_ops.ensure_extension()
+    assert resolved == [1], "resolved once per process"
+    assert exl3_ops._loaded and tc.active and tc._sms == SMS
+    rows, padded_in, padded_out = tc.WARMUP_LAUNCH
+    assert calls == [
+        ("schedule", 0),
+        ("workspace", (rows, padded_in, padded_out)),
+        *(("prefill", (rows, padded_in), bits_x2) for bits_x2 in (10, 12, 14)),
+    ]
+    assert fakes[-1] == "_exl3_C::linear_out_prefill"
 
 
 def _recorders(monkeypatch):
@@ -599,6 +664,33 @@ def test_uncovered_launches_are_refused():
     m = _matrix(64, 3072, 2560, 8)
     with pytest.raises(RuntimeError, match="does not cover"):
         _run(tc.linear_out_prefill, m, _inputs(65, 482, 3072), 8, 2560)
+
+
+@needs_sm80
+def test_ensure_extension_opens_the_gate_and_warms_up_on_the_card(monkeypatch):
+    """A process's first EXL3 use with the switch set at TP2, on the card: the
+    real library, gate and warm-up, resolved once without calling back into
+    ensure_extension."""
+    _gpu_or_skip()
+    import vllm.config
+
+    monkeypatch.setattr(exl3_ops, "_loaded", False)
+    monkeypatch.setattr(exl3_ops, "_dense_splitk", exl3_ops._dense_splitk)
+    for name in ("active", "_max_decode_query_len", "_sms", "_fake_registered"):
+        monkeypatch.setattr(tc, name, getattr(tc, name))
+    # This process registered the operators' fake implementations already.
+    monkeypatch.setattr(torch.library, "register_fake", lambda name: lambda fn: fn)
+    monkeypatch.setenv("VLLM_EXL3_DENSE_PREFILL_TC", "1")
+    monkeypatch.delenv("VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", raising=False)
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", _config)
+    exl3_ops.linear_workspace_size.cache_clear()
+    resolve, resolved = tc.resolve, []
+    monkeypatch.setattr(tc, "resolve", lambda: resolved.append(1) or resolve())
+    exl3_ops.ensure_extension()
+    exl3_ops.ensure_extension()
+    assert resolved == [1] and exl3_ops._loaded
+    assert tc.active and tc._sms == SMS
+    assert tc._max_decode_query_len == DECODE_QUERY_LEN
 
 
 @needs_sm80

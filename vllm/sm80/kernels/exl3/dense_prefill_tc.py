@@ -112,15 +112,16 @@ def closed_reason(
 def _warmup(sms: int) -> None:
     """Run linear_out_prefill once per covered format before any capture, so
     no request's first prefill loads the kernels or sets their attributes.
-    The temporary buffers are freed again."""
+    The temporary buffers are freed again. ops.ensure_extension runs this
+    before it marks the library loaded, so the workspace size comes from the
+    library itself: ops.linear_workspace_size would call ensure_extension."""
     device = torch.device("cuda", torch.cuda.current_device())
     rows, padded_in, padded_out = WARMUP_LAUNCH
-    from vllm.sm80.kernels.exl3.ops import linear_workspace_size
 
     x = torch.ones((rows, padded_in), dtype=torch.bfloat16, device=device)
     out = torch.empty((rows, padded_out), dtype=torch.bfloat16, device=device)
     workspace = torch.empty(
-        linear_workspace_size(rows, padded_in, padded_out),
+        torch.ops._exl3_C.linear_workspace_size(rows, padded_in, padded_out),
         dtype=torch.float32,
         device=device,
     )
@@ -150,7 +151,9 @@ def _warmup(sms: int) -> None:
 def resolve() -> None:
     """VLLM_EXL3_DENSE_PREFILL_TC for this process, with its log line.
 
-    Called once by ops.ensure_extension, after the library loaded."""
+    Called once by ops.ensure_extension, after the library loaded and before
+    ensure_extension returns: nothing here may call an ops function that calls
+    ensure_extension."""
     global active, _max_decode_query_len, _sms, _fake_registered
     if not envs.VLLM_EXL3_DENSE_PREFILL_TC:
         return
