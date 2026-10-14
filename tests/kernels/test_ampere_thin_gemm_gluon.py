@@ -14,6 +14,10 @@ CPU (runs anywhere):
   never imports it either. Dispatch: exactly the seven (N, K) of the table at
   M <= 32 with the gate open go to the Gluon module, everything else (other
   shapes, more rows, bias, 3-D input, gate closed) to the wrapped function.
+  Layout: a table call reaches the kernels only with a unit K stride, a row
+  stride that is a multiple of 16 elements and 16-byte aligned operands (what
+  the warmup compiled); a row stride of 8 mod 16, an unaligned base or a K
+  stride of 2 takes cuBLAS, with one warning; an unaligned weight too.
   Gate: 74 SMs, compilation mode NONE, CUDA graphs on every step
   (enforce_eager and graph modes with eager steps close it), Gluon ampere
   API; a warmup failure fails the boot; VLLM_THIN_GEMM_CONCAT with the flag
@@ -29,8 +33,9 @@ GPU (sm_80 with 74 SMs, skipped otherwise): every (N, K) at every M 1..32
 against an FP64 recomputation, pooled per (N, K, M) over seeds, with cuBLAS
 (F.linear) as the error budget: mean <= 1.10x, max <= 1.25x, BF16 rounding
 ties forgiven (<= 0.1 %), exact where cuBLAS is exact; bitwise run to run and
-out= == out=None; awkward inputs (row-strided, unaligned, K-strided) on the
-module's Triton fallback under the same gate; CUDA-graph replay bitwise equal
+out= == out=None; the views the layout check admits (row stride K + 16, rows
+at a whole-row offset) give the contiguous call's result bit for bit, the
+ones it refuses give F.linear's through the dispatch; CUDA-graph replay bitwise equal
 to eager with no allocation in capture or replay; split-K arrival counters
 back at zero after every call; the forced schedule makes each row's result
 independent of the call's row count; the dispatch end to end through the
@@ -276,6 +281,63 @@ def test_dispatch_sends_exactly_the_table(g, monkeypatch):
     assert fn.shipped is not None
 
 
+# Views of x: what the layout check admits and what it refuses.
+_ADMITTED = ("row_pad16", "row_offset")
+_REFUSED = ("row_pad24", "unaligned", "k_strided")
+
+
+def _layout(kind, x):
+    """``x`` [M, K] copied into a view of the named layout (same values)."""
+    m, k = x.shape
+    nan = dict(fill_value=float("nan"), dtype=x.dtype, device=x.device)
+    if kind in ("row_pad16", "row_pad24"):
+        xa = torch.full((m, k + int(kind[-2:])), **nan)[:, :k]
+    elif kind == "row_offset":
+        xa = torch.full((m + 1, k), **nan)[1:]
+    elif kind == "unaligned":
+        xa = torch.empty(m * k + 1, dtype=x.dtype, device=x.device)[1:].view(m, k)
+    elif kind == "k_strided":
+        xa = torch.empty(m, k, 2, dtype=x.dtype, device=x.device)[..., 0]
+    else:
+        raise ValueError(kind)
+    xa.copy_(x)
+    return xa
+
+
+@pytest.mark.parametrize("kind", _ADMITTED + _REFUSED)
+def test_dispatch_layout_gate(g, monkeypatch, caplog, kind):
+    """A table call runs the kernels only in the layout they were compiled
+    for; any other layout takes cuBLAS (F.linear), never a new variant."""
+    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    fn, calls = _route(g, monkeypatch)
+    w = torch.randn(48, 2560).to(BF16)
+    xa = _layout(kind, torch.randn(4, 2560).to(BF16))
+    assert g.gluon_layout_ok(xa, w) is (kind in _ADMITTED)
+    with _vllm_log(caplog):
+        out = fn(None, xa, w)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    if kind in _ADMITTED:
+        assert out == "gluon" and calls == [("gluon", 4, (48, 2560))]
+        assert warned == []
+    else:
+        assert calls == []
+        assert torch.equal(out, torch.nn.functional.linear(xa, w))
+        # (the vllm logger's handler and pytest's both see each record)
+        assert set(warned) == {
+            f"Gluon thin GEMM: a (N, K) = (48, 2560) call with x strides {tuple(xa.stride())} "
+            f"and base offset {xa.data_ptr() % 16} mod 16 bytes is not in the layout its "
+            "kernels were compiled for; such calls take cuBLAS"}
+
+
+def test_layout_gate_checks_the_weight(g):
+    x = torch.empty(4, 2560, dtype=BF16)
+    assert g.gluon_layout_ok(x, torch.empty(48, 2560, dtype=BF16))
+    unaligned = torch.empty(48 * 2560 + 1, dtype=BF16)[1:].view(48, 2560)
+    assert not g.gluon_layout_ok(x, unaligned)
+    padded = torch.empty(48, 2568, dtype=BF16)[:, :2560]
+    assert not g.gluon_layout_ok(x, padded)
+
+
 def test_dispatch_follows_the_shipped_bound(g, monkeypatch):
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 8, raising=False)
     fn, _ = _route(g, monkeypatch)
@@ -492,29 +554,35 @@ def test_gpu_fp64_gate_every_row_count(nk):
 
 @gpu
 @pytest.mark.parametrize("nk", NK, ids=[f"{n}x{k}" for n, k in NK])
-@pytest.mark.parametrize("kind", ["row_strided", "unaligned", "k_strided"])
-def test_gpu_awkward_inputs(nk, kind):
+@pytest.mark.parametrize("kind", _ADMITTED)
+def test_gpu_admitted_layouts(nk, kind):
+    """Views the layout check admits run the warmed kernels: bit for bit the
+    contiguous call's result."""
     k_mod = _kernel()
     n, k = nk
     for m in (1, 4, 17, 24, 32):
         x, w = _inputs(7 * m, m, n, k)
-        if kind == "row_strided":
-            buf = torch.full((m, k + 24), float("nan"), dtype=BF16, device="cuda")
-            buf[:, :k] = x
-            xa = buf[:, :k]
-        elif kind == "unaligned":
-            buf = torch.empty(m * k + 1, dtype=BF16, device="cuda")
-            xa = buf[1:].view(m, k)
-            xa.copy_(x)
-        else:
-            buf = torch.empty(m, k, 2, dtype=BF16, device="cuda")
-            buf[..., 0] = x
-            xa = buf[..., 0]
-        pool = _pool()
-        c = k_mod.thin_gemm(xa, w)
-        assert torch.isfinite(c.float()).all()
-        pool.add(c, torch.nn.functional.linear(x, w), _ref(x, w))
-        pool.check(f"{n}x{k} M{m} {kind}")
+        xa = _layout(kind, x)
+        assert _gluon().gluon_layout_ok(xa, w), (n, k, m, kind)
+        assert _bitwise(k_mod.thin_gemm(xa, w), k_mod.thin_gemm(x, w)), (n, k, m, kind)
+
+
+@gpu
+@pytest.mark.parametrize("kind", _REFUSED)
+def test_gpu_refused_layouts_take_cublas(g, monkeypatch, kind):
+    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+
+    def no_kernel(x, w):
+        raise AssertionError("a refused layout reached the Gluon kernels")
+
+    monkeypatch.setattr(g, "impl", lambda: types.SimpleNamespace(thin_gemm=no_kernel))
+    g._LIVE[0] = True
+    fn = g.wrap_dispatch(lambda layer, x, w, bias=None: pytest.fail("left the table path"))
+    for n, k in NK:
+        for m in (1, 4, 17, 24, 32):
+            x, w = _inputs(7 * m, m, n, k)
+            xa = _layout(kind, x)
+            assert _bitwise(fn(None, xa, w), torch.nn.functional.linear(xa, w)), (n, k, m, kind)
 
 
 @gpu

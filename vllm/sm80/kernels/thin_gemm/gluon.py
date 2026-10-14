@@ -12,7 +12,13 @@ for N = 1. Against cuBLAS it is ~1.41x on the served mix of these calls.
 This module wraps the ``VLLM_THIN_GEMM`` dispatch (``ampere_thin_gemm``): a
 call goes to ``thin_gemm_gluon.thin_gemm`` when the gate is open, its (N, K)
 is in ``SHAPES``, it has at most ``MAX_M`` rows and ``thin_gemm_supported``
-admits it; every other call takes the wrapped function unchanged. The row
+admits it, and its operands are in the layout the warmup compiled for
+(``gluon_layout_ok``: unit K stride, row stride a multiple of 16 elements,
+16-byte aligned base); every other call takes the wrapped function unchanged,
+except a table call in another layout, which takes cuBLAS (``F.linear``): the
+kernels specialize on those properties, so a different layout would compile
+a new variant at serve time, and the cp.async loads of the Gluon kernels do
+not compile for a row stride that is not a multiple of 16 elements. The row
 count decides, never the phase: prefill and mixed steps with at most 32 rows
 run the same schedule as decode steps of that size.
 
@@ -168,6 +174,23 @@ def warmup_table(worker, ms) -> frozenset:
     return SHAPES
 
 
+def gluon_layout_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether ``x`` and ``weight`` have the layout the warmup compiled for.
+
+    Triton specializes a kernel on each pointer's 16-byte alignment, on an
+    integer argument being 1 or a multiple of 16, so a contiguous operand of
+    the table's K (all multiples of 16) and any view with a unit K stride, a
+    row stride that is a multiple of 16 elements and a 16-byte aligned base
+    run the warmed kernels. Host-side reads only, no allocation."""
+    return (
+        x.stride(1) == 1
+        and x.stride(0) % 16 == 0
+        and x.data_ptr() % 16 == 0
+        and weight.stride(0) % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
+
+
 def wrap_dispatch(shipped):
     """``shipped`` (an ``ampere_thin_gemm``) with the table's calls sent to
     ``thin_gemm_gluon`` while the gate is open. Same signature."""
@@ -189,7 +212,14 @@ def wrap_dispatch(shipped):
             and tuple(weight.shape) in SHAPES
             and thin_gemm_supported(x, weight, bias)
         ):
-            return impl().thin_gemm(x, weight)
+            if gluon_layout_ok(x, weight):
+                return impl().thin_gemm(x, weight)
+            logger.warning_once(
+                "Gluon thin GEMM: a (N, K) = %s call with x strides %s and "
+                "base offset %d mod 16 bytes is not in the layout its kernels "
+                "were compiled for; such calls take cuBLAS",
+                tuple(weight.shape), tuple(x.stride()), x.data_ptr() % 16)
+            return torch.nn.functional.linear(x, weight)
         return shipped(layer, x, weight, bias)
 
     ampere_thin_gemm.shipped = shipped
