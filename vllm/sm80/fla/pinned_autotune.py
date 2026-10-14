@@ -4,9 +4,9 @@
 
 ``pinned_autotune(...)`` takes exactly the arguments of ``triton.autotune``.
 
-* ``VLLM_FLA_PIN_AUTOTUNE`` unset (the default): it returns the object
-  ``triton.autotune(...)(fn)`` returns, unchanged; the kernel is only recorded
-  by name in ``REGISTRY``.
+* ``VLLM_FLA_PIN_AUTOTUNE`` and ``VLLM_FLA_AUTOTUNE_SKIP_SPILLING`` unset
+  (the default): it returns the object ``triton.autotune(...)(fn)`` returns,
+  unchanged; the kernel is only recorded by name in ``REGISTRY``.
 * ``VLLM_FLA_PIN_AUTOTUNE=1``: the ``Autotuner`` becomes a
   ``PinnedAutotuner``. On its first launch it checks the device; on sm_80 every
   launch uses the config the pin table gives for (kernel, autotune key, H,
@@ -15,6 +15,10 @@
   reduction order: BK tiles over a contracted dimension, warp and stage
   counts) is a pure function of the launch shape. On any other device it
   autotunes as usual.
+* ``VLLM_FLA_AUTOTUNE_SKIP_SPILLING=1`` (pinning off): the ``Autotuner``
+  becomes a ``SkipSpillingAutotuner``. On its first launch on sm_80 it drops
+  the configs ``SPILLING`` lists for the kernel and autotunes over the rest;
+  on any other device it autotunes over every config.
 
 The autotune key is built exactly as ``triton.runtime.autotuner.Autotuner.run``
 builds it: the values of ``key`` in argument order, then ``str(dtype)`` of
@@ -38,6 +42,22 @@ from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, triton
 
 logger = init_logger(__name__)
+
+# Configs whose sm_80 build needs far more per-thread stack (local memory)
+# than the CUDA context's default 1,024 B. The driver grows the context's
+# local memory to the largest stack launched, for every thread the device
+# can hold (2,048 per SM), and never shrinks it. Benchmarking one of these
+# configs during the memory profile therefore keeps stack x 2,048 x SMs bytes
+# reserved for the life of the process, and the KV cache loses that much.
+SPILLING: dict[str, tuple[dict, ...]] = {
+    # 11,664 B of stack at two warps for the 128 x 128 tile (sm_80, K = V =
+    # 128, BT = 64, gate and varlen on): about 1.5 GiB on a 74-SM card. Every
+    # other config of the kernel stays at or below 144 B.
+    "fla.chunk_o.chunk_fwd_kernel_o": tuple(
+        {"kwargs": {"BK": 128, "BV": 128}, "num_warps": 2, "num_stages": stages}
+        for stages in (2, 3, 4)
+    ),
+}
 
 _MODULE_PREFIXES = (
     ("vllm.third_party.flash_linear_attention.ops.", "fla."),
@@ -143,6 +163,48 @@ def resolve(
     return config, "default"
 
 
+def _is_sm80() -> bool:
+    from vllm.platforms import current_platform
+
+    cap = current_platform.get_device_capability()
+    return bool(
+        current_platform.is_cuda()
+        and cap is not None
+        and (cap.major, cap.minor) == (8, 0)
+    )
+
+
+def without_spilling(name: str, configs: list) -> list:
+    """``configs`` without the ones ``SPILLING`` lists for kernel ``name``."""
+    dropped = SPILLING.get(name, ())
+    kept = [c for c in configs if config_spec(c) not in dropped]
+    if not kept:
+        raise ValueError(f"every autotune config of {name} is listed as spilling")
+    return kept
+
+
+_skip_gate: bool | None = None
+
+
+def _skip_gate_open() -> bool:
+    global _skip_gate
+    if _skip_gate is None:
+        _skip_gate = _is_sm80()
+        if _skip_gate:
+            logger.info_once(
+                "fla autotune skips %d spilling configs of %d kernels on sm_80 "
+                "(VLLM_FLA_AUTOTUNE_SKIP_SPILLING=1)",
+                sum(len(v) for v in SPILLING.values()),
+                len(SPILLING),
+            )
+        else:
+            logger.info_once(
+                "VLLM_FLA_AUTOTUNE_SKIP_SPILLING is set but the device is not "
+                "sm_80: fla kernels autotune over every config"
+            )
+    return _skip_gate
+
+
 def _gate_open() -> bool:
     global _gate
     if _gate is None:
@@ -214,6 +276,19 @@ if HAS_TRITON:
             self.nargs = None
             return ret
 
+    class SkipSpillingAutotuner(_Autotuner):
+        """An Autotuner that never benchmarks a ``SPILLING`` config on sm_80."""
+
+        _pin_name: str = ""
+        _spilling_dropped: bool = False
+
+        def run(self, *args, **kwargs):
+            if not self._spilling_dropped:
+                if _skip_gate_open():
+                    self.configs = without_spilling(self._pin_name, self.configs)
+                self._spilling_dropped = True
+            return super().run(*args, **kwargs)
+
 
 def pinned_autotune(configs, key, **kwargs):
     """``triton.autotune`` with an optional per-key pin (see module doc)."""
@@ -227,6 +302,9 @@ def pinned_autotune(configs, key, **kwargs):
         REGISTRY[name] = tuner
         if envs.VLLM_FLA_PIN_AUTOTUNE:
             tuner.__class__ = PinnedAutotuner
+            tuner._pin_name = name
+        elif envs.VLLM_FLA_AUTOTUNE_SKIP_SPILLING and name in SPILLING:
+            tuner.__class__ = SkipSpillingAutotuner
             tuner._pin_name = name
         return tuner
 

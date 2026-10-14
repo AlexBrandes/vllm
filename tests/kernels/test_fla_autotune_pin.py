@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """VLLM_FLA_PIN_AUTOTUNE: one pinned config per autotune key.
+VLLM_FLA_AUTOTUNE_SKIP_SPILLING: no spilling config is autotuned on sm_80.
 
 CPU only. The flag is read when the kernel modules are imported, so every
 case that depends on it runs in a fresh interpreter.
@@ -56,6 +57,7 @@ def _run(body: str, flag: str | None, smem: bool = False, extra_env=None):
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("VLLM_FLA_PIN_AUTOTUNE", None)
+    env.pop("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", None)
     if flag is not None:
         env["VLLM_FLA_PIN_AUTOTUNE"] = flag
     env.update(extra_env or {})
@@ -369,3 +371,131 @@ print(json.dumps([opened, src, pa.config_spec(cfg) == autotune_pins.DEFAULTS[nam
 def test_banners_and_bad_pin_fallback_log_cleanly():
     # The log calls dedupe on their arguments, which must be hashable.
     assert _run(_BANNER, "1") == [True, "default", True, False]
+
+
+# VLLM_FLA_AUTOTUNE_SKIP_SPILLING: sm_80 autotuning leaves out the configs
+# pinned_autotune.SPILLING lists.
+
+_SKIP_NAME = "fla.chunk_o.chunk_fwd_kernel_o"
+
+# chunk_fwd_kernel_o's config list on a CMP 170HX: check_shared_mem() is true
+# there (a CPU-only host builds the [32, 64] tiles instead), not Hopper.
+_SM80_CONFIGS = """
+import triton
+SM80_CONFIGS = [
+    triton.Config({"BK": bk, "BV": bv}, num_warps=w, num_stages=s)
+    for bk in (64, 128)
+    for bv in (64, 128)
+    for w in (2, 4, 8)
+    for s in (2, 3, 4)
+]
+"""
+
+_SKIP_RUN = """
+pa._skip_gate = {gate}
+t = pa.REGISTRY[{name!r}]
+t.configs = list(SM80_CONFIGS)
+before = [pa.config_spec(c) for c in t.configs]
+seen = []
+def base_run(self, *a, **k):
+    seen.append([pa.config_spec(c) for c in self.configs])
+Autotuner.run = base_run
+t.run(T=1)
+t.run(T=2)
+print(json.dumps({{
+    "cls": type(t).__qualname__,
+    "before": before,
+    "seen": seen,
+    "spilling": [dict(s) for s in pa.SPILLING[{name!r}]],
+}}))
+"""
+
+
+def test_skip_spilling_flag_default_off(monkeypatch):
+    monkeypatch.delenv("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", raising=False)
+    import vllm.envs as envs
+
+    assert envs.VLLM_FLA_AUTOTUNE_SKIP_SPILLING is False
+
+
+def test_skip_spilling_drops_listed_configs_on_sm80():
+    r = _run(
+        _SM80_CONFIGS + _SKIP_RUN.format(gate=True, name=_SKIP_NAME),
+        None,
+        extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"},
+    )
+    assert r["cls"] == "SkipSpillingAutotuner"
+    # Every listed config is one the kernel really has on a CMP 170HX.
+    assert all(s in r["before"] for s in r["spilling"])
+    kept = [c for c in r["before"] if c not in r["spilling"]]
+    assert len(kept) == len(r["before"]) - len(r["spilling"]) > 1
+    # Both launches autotune over the same reduced list, in the original order.
+    assert r["seen"] == [kept, kept]
+
+
+def test_skip_spilling_gate_closed_keeps_every_config():
+    r = _run(
+        _SM80_CONFIGS + _SKIP_RUN.format(gate=False, name=_SKIP_NAME),
+        None,
+        extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"},
+    )
+    assert r["seen"] == [r["before"], r["before"]]
+
+
+def test_skip_spilling_leaves_other_kernels_and_pinning_alone():
+    skip = _run(_DESCRIBE, None, extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"})
+    off = _run(_DESCRIBE, None)
+    for name, d in skip.items():
+        if name == _SKIP_NAME:
+            assert d["cls"].endswith("pinned_autotune.SkipSpillingAutotuner")
+        else:
+            assert d == off[name], name
+    both = _run(_DESCRIBE, "1", extra_env={"VLLM_FLA_AUTOTUNE_SKIP_SPILLING": "1"})
+    for name, d in both.items():
+        assert d["cls"].endswith("pinned_autotune.PinnedAutotuner"), name
+
+
+_STACK = _SM80_CONFIGS + """
+import re, subprocess, tempfile
+import triton
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+from triton.runtime.jit import JITFunction
+from vllm.third_party.flash_linear_attention.ops import chunk_o
+fn = chunk_o.chunk_fwd_kernel_o
+while not isinstance(fn, JITFunction):
+    fn = fn.fn
+cuobjdump = os.path.join(
+    os.path.dirname(triton.__file__), "backends", "nvidia", "bin", "cuobjdump"
+)
+ptr = {"q": "*bf16", "k": "*bf16", "v": "*bf16", "h": "*bf16", "g": "*fp32",
+       "o": "*bf16", "cu_seqlens": "*i32", "chunk_indices": "*i32"}
+out = []
+NAME = "fla.chunk_o.chunk_fwd_kernel_o"
+for c in SM80_CONFIGS:
+    const = dict(H=24, Hg=8, K=128, V=128, BT=64, USE_G=True, IS_VARLEN=True,
+                 **c.kwargs)
+    sig = {a: "constexpr" if a in const else ptr.get(a, "i32") for a in fn.arg_names}
+    sig["scale"] = "fp32"
+    attrs = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(fn.arg_names)
+             if a in ptr}
+    k = triton.compile(ASTSource(fn, sig, const, attrs),
+                       target=GPUTarget("cuda", 80, 32),
+                       options={"num_warps": c.num_warps, "num_stages": c.num_stages})
+    with tempfile.NamedTemporaryFile(suffix=".cubin") as f:
+        f.write(k.asm["cubin"])
+        f.flush()
+        res = subprocess.run([cuobjdump, "--dump-resource-usage", f.name],
+                             capture_output=True, text=True, check=True).stdout
+    out.append([pa.config_spec(c), int(re.search(r"STACK:(\\d+)", res).group(1))])
+print(json.dumps({"rows": out, "spilling": [dict(s) for s in pa.SPILLING[NAME]]}))
+"""
+
+
+def test_spilling_list_matches_sm80_stack():
+    """The listed configs, and only they, need more than the context's default
+    1,024 B of stack per thread when built for sm_80 at the Qwen3.8 TP2 GDN
+    prefill shape (K = V = 128, BT = 64, 24 value and 8 key heads)."""
+    r = _run(_STACK, None)
+    over = [spec for spec, stack in r["rows"] if stack > 1024]
+    assert over == r["spilling"]
