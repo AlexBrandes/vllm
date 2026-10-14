@@ -315,7 +315,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 378 |
 | `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 453 |
 | `tests/v1/spec_decode/test_glm5_dflash_draft_width.py` | 560 |
-| `tests/v1/worker/test_gpu_async_failed_tokens.py` | 69 |
+| `tests/v1/worker/test_gpu_async_failed_tokens.py` | 74 |
 | `tests/v1/worker/test_gumbel_vocab_clamp.py` | 129 |
 | `tests/v1/worker/test_mamba_block_size_resolution.py` | 92 |
 | `tests/v1/worker/test_mem_attribution.py` | 70 |
@@ -324,7 +324,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **119 files** | **41,498** |
+| **119 files** | **41,503** |
 
 #### `tools/`
 

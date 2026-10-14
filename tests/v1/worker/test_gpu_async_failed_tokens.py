@@ -23,10 +23,12 @@ def test_failed_tokens_map_to_their_requests():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_failed_tokens_copy_outlives_the_callers_mask():
+@pytest.mark.parametrize("failed", [False, True])
+def test_failed_tokens_copy_outlives_the_callers_mask(failed: bool):
     """The runner drops its mask right after building AsyncOutput, while the
     copy to the host may still be queued behind other copies. The mask's
-    memory must not go back to the allocator before that copy has run."""
+    memory must not go back to the allocator before that copy has run:
+    reuse could fail healthy requests or clear a real failure."""
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.worker.gpu.async_utils import AsyncOutput
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -46,6 +48,7 @@ def test_failed_tokens_copy_outlives_the_callers_mask():
     )
     model_runner_output = ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0})
     mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    mask[7] = failed
     torch.cuda.synchronize(device)
     # Hold the copy stream back, as earlier output copies can.
     with torch.cuda.stream(copy_stream):
@@ -62,8 +65,10 @@ def test_failed_tokens_copy_outlives_the_callers_mask():
         query_start_loc_np=query_start_loc,
     )
     del mask
-    # Later work on the main stream takes the freed block if it was released.
+    # Later work on the main stream takes the freed block if it was released,
+    # and writes the opposite of the mask over it.
     later = torch.empty(num_tokens, dtype=torch.bool, device=device)
-    later.fill_(True)
-    assert output.get_output().failed_req_ids is None
+    later.fill_(not failed)
+    expected = {"a"} if failed else None
+    assert output.get_output().failed_req_ids == expected
     del later
