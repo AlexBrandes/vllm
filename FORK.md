@@ -285,6 +285,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/plugins_tests/conftest.py` | 17 |
 | `tests/sm80/seams.yaml` | 1,176 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
+| `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
 | `tests/sm80/test_fork_map.py` | 55 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
@@ -325,7 +326,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **120 files** | **41,583** |
+| **121 files** | **41,648** |
 
 #### `tools/`
 
