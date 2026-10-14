@@ -110,6 +110,8 @@ def _read_error(code: int, offset: int) -> BaseException:
 _READ_BACKOFF_S = 0.001
 # An FP16 quiet NaN as a row's scale makes every decoded channel NaN.
 _POISONED_SCALE = 0x7E00
+# Host reads queued on the PLE stream or finished but not yet taken.
+_HOST_READ_SLOTS = 4
 
 
 def poison_rows(rows: np.ndarray, indices) -> None:
@@ -316,6 +318,31 @@ class Exl3PLERowReader:
             for index, code, offset in failed.tolist()
         ]
 
+    def host_reader(
+        self, ids: torch.Tensor, rows: torch.Tensor, threads: int, slots: int
+    ):
+        """A PleHostReader (csrc/exl3/ple_read.cpp) of this table: reads
+        ids[0:count) into rows as read_rows_native does, in a host function
+        queued on a CUDA stream, and poisons the rows that fail. It keeps a
+        duplicate of fd and the ids and rows tensors."""
+        from vllm.sm80.kernels.exl3.ops import ple_host_reader
+
+        offsets, sizes = self._native_heads
+        return ple_host_reader(
+            self.fd,
+            ids,
+            rows,
+            self.base,
+            self.row_bytes,
+            self.owner_lo,
+            self.owner_hi,
+            offsets,
+            sizes,
+            self.retries,
+            threads,
+            slots,
+        )
+
     def close(self) -> None:
         fd = getattr(self, "fd", -1)
         if fd >= 0:
@@ -335,14 +362,19 @@ class Exl3PLESlot:
         self.completion = completion
         self.state = "idle"
 
-    def acquire(self, count):
+    def acquire(self, count, stream=None):
+        """Wait for the previous output copy: on the host, or on `stream`
+        when given (work queued there after this call waits instead)."""
         if self.state != "idle":
             raise RuntimeError(f"PLE prefetch slot is {self.state}")
         if not 0 <= count <= self.capacity:
             raise ValueError("PLE request exceeds configured staging capacity")
         self.state = "waiting"
         try:
-            self.completion.synchronize()
+            if stream is None:
+                self.completion.synchronize()
+            else:
+                stream.wait_event(self.completion)
         except BaseException:
             self.state = "failed"
             raise
@@ -436,6 +468,10 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         self._deferred: int | None = None
         # SSD rows are read by one native call instead of the thread pool.
         self.native_reads = envs.VLLM_EXL3_PLE_NATIVE_READ
+        # SSD rows are read by a host function queued on the PLE stream.
+        self.hostfn_reads = envs.VLLM_EXL3_PLE_HOSTFN_READ
+        self._host_reader = None
+        self._host_reads_in_flight = 0
 
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         raise RuntimeError("EXL3 PLE must never allocate a dense table")
@@ -589,15 +625,39 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                 reader.row_bytes,
                 self._capacity,
             )
-            if self.overlap_reads and self.placement == "ssd":
-                logger.info(
+            hostfn = self.hostfn_reads and self.placement == "ssd"
+            for name, on, banner in (
+                (
+                    "VLLM_EXL3_PLE_OVERLAP",
+                    self.overlap_reads,
                     "EXL3 PLE: SSD row reads overlap the preceding decoder "
-                    "layer ON (VLLM_EXL3_PLE_OVERLAP=1; same rows and kernels)"
-                )
-            if self.native_reads and self.placement == "ssd":
-                logger.info(
+                    "layer ON (VLLM_EXL3_PLE_OVERLAP=1; same rows and kernels)",
+                ),
+                (
+                    "VLLM_EXL3_PLE_NATIVE_READ",
+                    self.native_reads,
                     "EXL3 PLE: native batched SSD row reader ON "
-                    "(VLLM_EXL3_PLE_NATIVE_READ=1; same rows and bytes)"
+                    "(VLLM_EXL3_PLE_NATIVE_READ=1; same rows and bytes)",
+                ),
+            ):
+                if not on or self.placement != "ssd":
+                    continue
+                if hostfn:
+                    logger.info(
+                        "EXL3 PLE: %s=1 is ignored for SSD rows while "
+                        "VLLM_EXL3_PLE_HOSTFN_READ=1",
+                        name,
+                    )
+                else:
+                    logger.info(banner)
+            if hostfn:
+                self._open_host_reader(at_boot=True)
+                logger.info(
+                    "EXL3 PLE: SSD rows read by a host function on the PLE "
+                    "stream ON (VLLM_EXL3_PLE_HOSTFN_READ=1; same rows and "
+                    "bytes, no host wait; supersedes VLLM_EXL3_PLE_OVERLAP "
+                    "and VLLM_EXL3_PLE_NATIVE_READ for SSD rows; read "
+                    "failures are logged one step later)"
                 )
             return consumed
         except BaseException:
@@ -628,6 +688,14 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         if self._slot is not None:
             self._stream.synchronize()
             self._released.synchronize()
+        if self._host_reader is not None:
+            try:
+                self._take_host_reads()
+            except RuntimeError as error:
+                logger.error("EXL3 PLE: %s", error)
+            # Every queued read has run: the reader closes its descriptor.
+            self._host_reader = None
+            self._host_reads_in_flight = 0
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
@@ -646,22 +714,34 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         slot_size, slot_offset = self._get_dp_gather_slot(ngram_ids.shape[0])
         gathered = self._gather_dp_ids(ngram_ids, slot_size)
         count = gathered.numel()
-        self._slot.acquire(count)
+        hostfn = self.hostfn_reads and self.placement == "ssd"
+        stream = self._stream
+        # With host reads the slot's wait for the previous output copy is
+        # queued on the PLE stream instead of made on the host.
+        self._slot.acquire(count, stream if hostfn else None)
         try:
+            if self._host_reader is not None:
+                # Also after a switch to another reader: its last reads
+                # finished before this step's ids wait.
+                self._take_host_reads(room=hostfn)
             self._local_tokens = ngram_ids.shape[0]
             self._slot_offset = slot_offset
             self._gathered_tokens = gathered.shape[0]
-            stream = self._stream
             stream.wait_stream(torch.cuda.current_stream())
             gathered.record_stream(stream)
             with torch.cuda.stream(stream):
                 self._ids[:count].copy_(gathered.reshape(-1))
                 if self.placement == "ssd":
                     self._host_ids[:count].copy_(self._ids[:count], non_blocking=True)
-                    self._ids_ready.record(stream)
+                    if not hostfn:
+                        self._ids_ready.record(stream)
         except BaseException:
             self._slot.fail()
             raise
+        if hostfn:
+            # The read is queued behind the ids copy; nothing waits on the host.
+            self._queue_read_and_decode(count)
+            return
         if self.overlap_reads and self.placement == "ssd":
             # The read waits for the ids on the host; at finalize that wait
             # no longer holds back the layers queued in between.
@@ -675,7 +755,6 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
         The slot is reading on entry and ready on return, or failed.
         """
         try:
-            stream = self._stream
             if self.placement == "ssd":
                 timing = self._timing
                 if timing is not None:
@@ -726,36 +805,110 @@ class Exl3PLEEmbedding(Qwen4ExpPLEEmbedding):
                     )
                 if timing is not None:
                     timing.add(count, t1 - t0, time.perf_counter_ns() - t1)
-            with torch.cuda.stream(stream):
-                packed = self._packed[:count]
-                if self.placement == "ssd":
-                    packed.copy_(self._host_rows[:count], non_blocking=True)
-                else:
-                    local = self._local_ids[:count]
-                    torch.sub(self._ids[:count], self._reader.owner_lo, out=local)
-                    # Invalid indices use row zero; the decoder masks before bias.
-                    local.clamp_(0, self._reader.owner_hi - self._reader.owner_lo - 1)
-                    torch.index_select(self._table_view, 0, local, out=packed)
-                from vllm.sm80.kernels.exl3.ops import (
-                    ple_decode_out,
-                )
-
-                ple_decode_out(
-                    packed,
-                    self._ids[:count],
-                    self.head_bias,
-                    self.head_offsets,
-                    self.head_vocab_sizes,
-                    self._reader.owner_lo,
-                    self._reader.owner_hi,
-                    self._reader.layout.bits,
-                    self._decoded[:count],
-                )
-                self._ready.record(stream)
+            self._queue_decode(count)
             self._slot.ready()
         except BaseException:
             self._slot.fail()
             raise
+
+    def _open_host_reader(self, at_boot=False):
+        """The host-function reader of the staging buffers, made on first
+        use so the reader can be switched on after boot."""
+        if self._host_reader is None:
+            self._host_reader = self._reader.host_reader(
+                self._host_ids, self._host_rows, self._workers, _HOST_READ_SLOTS
+            )
+            if not at_boot:
+                logger.info(
+                    "EXL3 PLE: SSD rows read by a host function on the PLE "
+                    "stream switched ON after boot (same rows and bytes, no "
+                    "host wait; read failures are logged one step later)"
+                )
+        return self._host_reader
+
+    def _queue_read_and_decode(self, count):
+        """Queue the row read as a host function on the PLE stream, then the
+        copy and decode of its rows behind it. Every reader and writer of the
+        staging buffers runs on that stream in order. The slot is reading on
+        entry and ready on return, or failed."""
+        try:
+            reader = self._open_host_reader()
+            with torch.cuda.stream(self._stream):
+                reader.enqueue(count)
+            self._host_reads_in_flight += 1
+            self._queue_decode(count)
+            self._slot.ready()
+        except BaseException:
+            self._slot.fail()
+            raise
+
+    def _take_host_reads(self, room=False):
+        """Log the finished host reads: failed rows (already poisoned, so
+        their tokens failed in their own step) and timing. With room, first
+        wait for the PLE stream if every read slot is still taken. Raises
+        when a read stopped on an unexpected error."""
+        reader = self._host_reader
+        results = reader.take().tolist()
+        if room and self._host_reads_in_flight - len(results) >= _HOST_READ_SLOTS:
+            logger.warning_once(
+                "EXL3 PLE: every host read slot is in flight; waiting for the "
+                "PLE stream"
+            )
+            self._stream.synchronize()
+            results += reader.take().tolist()
+        self._host_reads_in_flight -= len(results)
+        stopped = 0
+        for _, count, status, failed, _, row, code, offset, read_ns in results:
+            if self._timing is not None:
+                self._timing.add(count, 0, read_ns)
+            if status:
+                stopped += 1
+            elif failed:
+                logger.error(
+                    "EXL3 PLE: %d row read(s) failed after %d retries "
+                    "(first: row %d: %s); the requests using them will be "
+                    "finished with an error",
+                    failed,
+                    self._reader.retries,
+                    row,
+                    _read_error(code, offset),
+                )
+        if stopped:
+            raise RuntimeError(
+                f"{stopped} PLE host read(s) stopped on an unexpected error; "
+                "their rows were poisoned"
+            )
+
+    def _queue_decode(self, count):
+        """Queue the copy of the staged rows and their decode on the PLE
+        stream, then record _ready."""
+        stream = self._stream
+        with torch.cuda.stream(stream):
+            packed = self._packed[:count]
+            if self.placement == "ssd":
+                packed.copy_(self._host_rows[:count], non_blocking=True)
+            else:
+                local = self._local_ids[:count]
+                torch.sub(self._ids[:count], self._reader.owner_lo, out=local)
+                # Invalid indices use row zero; the decoder masks before bias.
+                local.clamp_(0, self._reader.owner_hi - self._reader.owner_lo - 1)
+                torch.index_select(self._table_view, 0, local, out=packed)
+            from vllm.sm80.kernels.exl3.ops import (
+                ple_decode_out,
+            )
+
+            ple_decode_out(
+                packed,
+                self._ids[:count],
+                self.head_bias,
+                self.head_offsets,
+                self.head_vocab_sizes,
+                self._reader.owner_lo,
+                self._reader.owner_hi,
+                self._reader.layout.bits,
+                self._decoded[:count],
+            )
+            self._ready.record(stream)
 
     @eager_break_during_capture
     def _finalize_prefetch(self, output):

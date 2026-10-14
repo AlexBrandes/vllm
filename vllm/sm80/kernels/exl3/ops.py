@@ -110,6 +110,8 @@ _OPERATORS = (
     "moe_workspace_size_v2",
     "moe_workspace_size_prefill",
 )
+# Classes this tree constructs; a library without one of them is refused.
+_CLASSES = ("PleHostReader",)
 
 
 def _runtime_build_info() -> dict:
@@ -138,6 +140,8 @@ def _validate_extension(module) -> None:
             )
     for name in _OPERATORS:
         torch._C._dispatch_find_schema_or_throw(f"_exl3_C::{name}", "")
+    for name in _CLASSES:
+        getattr(torch.classes._exl3_C, name)
 
 
 def dense_splitk_closed_reason(capability: tuple[int, int] | None) -> str | None:
@@ -622,6 +626,39 @@ def ple_read_rows(
         head_vocab_sizes,
         retries,
         max_threads,
+    )
+
+
+def ple_host_reader(
+    fd: int,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    base: int,
+    row_bytes: int,
+    owner_lo: int,
+    owner_hi: int,
+    head_offsets: torch.Tensor,
+    head_vocab_sizes: torch.Tensor,
+    retries: int,
+    max_threads: int,
+    slots: int,
+):
+    """A PLE row reader of ids into rows whose reads run as host functions
+    on a CUDA stream (csrc/exl3/ple_read.cpp, PleHostReader)."""
+    ensure_extension()
+    return torch.classes._exl3_C.PleHostReader(
+        fd,
+        ids,
+        rows,
+        base,
+        row_bytes,
+        owner_lo,
+        owner_hi,
+        head_offsets,
+        head_vocab_sizes,
+        retries,
+        max_threads,
+        slots,
     )
 
 

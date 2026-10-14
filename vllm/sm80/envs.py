@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_EXL3_DENSE_PREFILL_TC: bool = False
     VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE: str = "planned"
     VLLM_EXL3_PLE_NATIVE_READ: bool = False
+    VLLM_EXL3_PLE_HOSTFN_READ: bool = False
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
@@ -813,6 +814,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # page cache). Off by default.
     "VLLM_EXL3_PLE_NATIVE_READ": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_NATIVE_READ", "0"))
+    ),
+    # Read the SSD PLE rows of a step in a host function queued on the PLE
+    # stream (csrc/exl3/ple_read.cpp, the native reader's core), between the
+    # copy of the ids to the host and the copy of the rows to the device, so
+    # the host never waits for the ids. Same rows and bytes as the native
+    # reader; failed rows reach the consumer poisoned in the same step and
+    # are logged at the next step. Takes precedence over
+    # VLLM_EXL3_PLE_OVERLAP and VLLM_EXL3_PLE_NATIVE_READ for SSD tables.
+    # Off by default.
+    "VLLM_EXL3_PLE_HOSTFN_READ": lambda: bool(
+        int(os.getenv("VLLM_EXL3_PLE_HOSTFN_READ", "0"))
     ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
     # of at most 64 rows when every local expert matrix is bits_x2 10 /
