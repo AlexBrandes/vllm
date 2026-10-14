@@ -56,9 +56,12 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/attention/triton_mla_sparse.py` | 593 |
 | `vllm/sm80/kernels/attention/triton_mqa_logits.py` | 628 |
 | `vllm/sm80/kernels/exl3/__init__.py` | 13 |
+| `vllm/sm80/kernels/exl3/dense_mma.py` | 151 |
+| `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 316 |
 | `vllm/sm80/kernels/exl3/loader.py` | 270 |
-| `vllm/sm80/kernels/exl3/ops.py` | 547 |
-| `vllm/sm80/kernels/exl3/quant.py` | 811 |
+| `vllm/sm80/kernels/exl3/ops.py` | 655 |
+| `vllm/sm80/kernels/exl3/quant.py` | 950 |
+| `vllm/sm80/kernels/exl3/step_phase.py` | 59 |
 | `vllm/sm80/kernels/exl3/utils.py` | 382 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
 | `vllm/sm80/kernels/indexer/__init__.py` | 10 |
@@ -84,12 +87,14 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/moe/routing.py` | 709 |
 | `vllm/sm80/kernels/moe/sum.py` | 84 |
 | `vllm/sm80/kernels/moe/warmup.py` | 110 |
-| `vllm/sm80/kernels/thin_gemm/__init__.py` | 189 |
+| `vllm/sm80/kernels/thin_gemm/__init__.py` | 198 |
 | `vllm/sm80/kernels/thin_gemm/concat.py` | 275 |
+| `vllm/sm80/kernels/thin_gemm/gluon.py` | 226 |
+| `vllm/sm80/kernels/thin_gemm/thin_gemm_gluon.py` | 966 |
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
-| `vllm/sm80/kernels/thin_gemm/warmup.py` | 138 |
+| `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **43 files** | **13,886** |
+| **48 files** | **15,874** |
 
 ### `vllm/sm80/`
 
@@ -105,7 +110,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 954 |
+| `vllm/sm80/envs.py` | 1,028 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -132,7 +137,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **9,089** |
+| **35 files** | **9,163** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -165,24 +170,31 @@ Files added elsewhere, grouped by top-level directory.
 
 | Path | Lines |
 |---|---:|
-| `csrc/exl3/build_standalone.py` | 108 |
+| `csrc/exl3/build_standalone.py` | 111 |
 | `csrc/exl3/codec.cuh` | 211 |
 | `csrc/exl3/codec_moe_v2.cuh` | 92 |
+| `csrc/exl3/codec_prefill.cuh` | 68 |
 | `csrc/exl3/common.h` | 66 |
 | `csrc/exl3/dense.cu` | 149 |
-| `csrc/exl3/dense_splitk.cu` | 614 |
+| `csrc/exl3/dense_mma.cu` | 858 |
+| `csrc/exl3/dense_mma.h` | 24 |
+| `csrc/exl3/dense_prefill_tc.cu` | 633 |
+| `csrc/exl3/dense_prefill_tc.h` | 40 |
+| `csrc/exl3/dense_splitk.cu` | 621 |
 | `csrc/exl3/dense_splitk.h` | 26 |
 | `csrc/exl3/gemm.cu` | 489 |
 | `csrc/exl3/gemm.cuh` | 82 |
-| `csrc/exl3/module.cpp` | 78 |
+| `csrc/exl3/module.cpp` | 86 |
 | `csrc/exl3/moe.cu` | 407 |
+| `csrc/exl3/moe_prefill.cu` | 1,043 |
+| `csrc/exl3/moe_prefill.h` | 28 |
 | `csrc/exl3/moe_v2.cu` | 1,055 |
 | `csrc/exl3/moe_v2.h` | 23 |
 | `csrc/exl3/ops.h` | 45 |
 | `csrc/exl3/ple.cu` | 234 |
 | `csrc/exl3/ple.h` | 20 |
 | `csrc/exl3/reference.cu` | 447 |
-| **17 files** | **4,146** |
+| **24 files** | **6,858** |
 
 #### `docs/`
 
@@ -190,9 +202,9 @@ Files added elsewhere, grouped by top-level directory.
 |---|---:|
 | `docs/THIRD_PARTY.md` | 85 |
 | `docs/UPSTREAM_README.md` | 111 |
-| `docs/features/quantization/exl3.md` | 76 |
+| `docs/features/quantization/exl3.md` | 82 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 150 |
-| **4 files** | **422** |
+| **4 files** | **428** |
 
 #### `plugins/`
 
@@ -220,13 +232,20 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/moe/test_moe_route_v2_mask.py` | 410 |
 | `tests/kernels/moe/test_shared_experts_reorder.py` | 488 |
 | `tests/kernels/moe_align_reference.py` | 87 |
-| `tests/kernels/quantization/exl3_real_cases.py` | 359 |
+| `tests/kernels/quantization/exl3_real_cases.py` | 374 |
+| `tests/kernels/quantization/test_exl3_dense_mma.py` | 596 |
+| `tests/kernels/quantization/test_exl3_dense_mma_real_inputs.py` | 295 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 789 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 281 |
 | `tests/kernels/quantization/test_exl3_dense_splitk.py` | 467 |
 | `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 321 |
 | `tests/kernels/quantization/test_exl3_kernels.py` | 366 |
-| `tests/kernels/quantization/test_exl3_moe_v2.py` | 591 |
-| `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 337 |
+| `tests/kernels/quantization/test_exl3_moe_prefill.py` | 529 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 598 |
+| `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
+| `tests/kernels/quantization/test_exl3_step_phase.py` | 85 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
 | `tests/kernels/test_ampere_decode.py` | 464 |
 | `tests/kernels/test_ampere_decode_mhc_v3.py` | 390 |
@@ -251,6 +270,8 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 429 |
 | `tests/kernels/test_ampere_thin_gemm.py` | 233 |
 | `tests/kernels/test_ampere_thin_gemm_concat.py` | 963 |
+| `tests/kernels/test_ampere_thin_gemm_gluon.py` | 662 |
+| `tests/kernels/test_ampere_thin_gemm_gluon_real_inputs.py` | 215 |
 | `tests/kernels/test_ampere_thin_gemm_v74.py` | 282 |
 | `tests/kernels/test_ampere_tp4_kda_prefill.py` | 365 |
 | `tests/kernels/test_ampere_tp4_marlin_prefill.py` | 417 |
@@ -261,6 +282,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_topk_reference.py` | 114 |
 | `tests/kernels/test_topk_tiefix.py` | 444 |
 | `tests/kernels/test_topk_tiefix_split.py` | 310 |
+| `tests/kernels/thin_gemm_real_cases.py` | 148 |
 | `tests/kernels/topk_reference.py` | 59 |
 | `tests/model_executor/layers/test_exl3_layers.py` | 614 |
 | `tests/model_executor/model_loader/test_exl3_manifest.py` | 249 |
@@ -334,7 +356,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **127 files** | **43,288** |
+| **137 files** | **47,180** |
 
 #### `tools/`
 
@@ -485,7 +507,12 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S` | `float` | `60.0` | `'60'` |
 | `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P` | `bool` | `False` | `'0'` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_DENSE_MMA` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE` | `str` | `''` | `''` |
+| `VLLM_EXL3_DENSE_PREFILL_TC` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE` | `str` | `'planned'` | `'planned'` |
 | `VLLM_EXL3_DENSE_SPLITK` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_PLE_COLD` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_PLE_OVERLAP` | `bool` | `False` | `'0'` |
@@ -541,9 +568,11 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
+| `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
+| `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **78 variables** | | | |
+| **85 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -557,12 +586,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 114 |
-| Fork-added product lines | 33,050 |
+| Fork-added product files | 126 |
+| Fork-added product lines | 37,824 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 36,568 |
-| Fork environment variables (flags) | 78 |
+| Product lines added (new files and patches) | 41,342 |
+| Fork environment variables (flags) | 85 |
 | Unreferenced fork definitions | 0 (0 lines) |
