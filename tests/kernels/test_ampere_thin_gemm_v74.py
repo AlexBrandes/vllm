@@ -265,8 +265,12 @@ def test_gpu_graph_replay(M):
     for _ in range(3):
         g.replay()
     torch.cuda.synchronize()
+    # Read before the comparison: torch.equal allocates its eq and all()
+    # temporaries, and whether they need a new allocator segment depends on
+    # what earlier tests in the process left in the pool.
+    grown = (torch.cuda.memory_allocated() - a0, torch.cuda.memory_reserved() - r0)
     assert all(torch.equal(a, b) for a, b in zip(outs, eager))
-    assert (torch.cuda.memory_allocated(), torch.cuda.memory_reserved()) == (a0, r0)
+    assert grown == (0, 0), M
 
 
 @gpu

@@ -596,11 +596,15 @@ def test_gpu_graph_replay_bitwise_no_allocation(m):
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
-    before = torch.cuda.memory_stats()["allocation.all.allocated"]
     with torch.cuda.graph(graph, stream=stream):
+        # Counted inside the capture: capture_begin allocates the default
+        # generator's RNG seed and offset tensors for every new capture (two
+        # allocator events that are torch's, not the GEMM's).
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
         for ((x, w), _), o in zip(cases, outs):
             k_mod.thin_gemm(x, w, out=o)
-    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        captured = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+    assert captured == 0, m
     used = torch.cuda.memory_allocated()
     for _ in range(3):
         for o in outs:
