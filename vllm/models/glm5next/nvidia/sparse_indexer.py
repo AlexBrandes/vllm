@@ -393,11 +393,11 @@ def sparse_attn_indexer_kpool(
                 logits = triton_fp8_mqa_logits(
                     q_slice_cast,
                     (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    weights[row_start:row_end],
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
                 )
-                row_starts, row_ends = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
+                row_starts, row_ends = cu_seqlen_ks, cu_seqlen_ke
             elif chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
             else:
@@ -837,10 +837,10 @@ class SparseAttnIndexerKpool(CustomOp):
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         if current_platform.is_cuda() and not is_deep_gemm_supported():
-            if use_fp4_cache:
+            if use_fp4_cache or mqa_logits_use_mx_scales():
                 raise RuntimeError(
-                    "Sparse Attention Indexer MXFP4 cache requires DeepGEMM "
-                    "(SM100/SM120)."
+                    "Sparse Attention Indexer MXFP4 or MX-scaled (SM100) cache "
+                    "requires DeepGEMM."
                 )
             logger.info_once(
                 "DeepGEMM is not usable on this device; the sparse attention "
