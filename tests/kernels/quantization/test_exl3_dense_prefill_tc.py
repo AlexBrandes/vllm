@@ -593,11 +593,7 @@ def test_uncovered_launches_are_refused():
     for rows in (64, 482):  # the decode bound; 8 output tiles
         with pytest.raises(RuntimeError, match="does not cover"):
             _run(tc.linear_out_prefill, m, _inputs(rows, rows, 2560), 14, 256)
-    m = _matrix(62, 3072, 2560, 14)
-    unaligned = dict(
-        m, trellis=torch.empty_like(m["owner"])[1:].view(m["trellis"].shape)
-    )
-    unaligned["trellis"].copy_(m["trellis"])
+    unaligned = _matrix(62, 3072, 2560, 14, unaligned=True)
     with pytest.raises(RuntimeError, match="16-byte aligned"):
         _run(tc.linear_out_prefill, unaligned, _inputs(63, 482, 3072), 14, 2560)
     m = _matrix(64, 3072, 2560, 8)
