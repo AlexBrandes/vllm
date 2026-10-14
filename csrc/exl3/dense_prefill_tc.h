@@ -17,7 +17,9 @@
 //   out = bf16_rn(H128(acc) * svh) exactly as linear_out's linear_output (a block owns whole H128 column blocks).
 // Deterministic: the schedule and the k split points are a function of the launch shape and the device's
 // multiprocessor count only, the split tiles' partial sums are added in a fixed (k) order whichever block
-// finishes the tile, and no row's value depends on another row's.
+// finishes the tile, and no row's value depends on another row's. A row's bits do depend on the row count of
+// its launch and the row's position in it: the schedule follows the row count, and a tile in the split region
+// sums k segments that each start from 0 where a whole tile runs one chain.
 #include <torch/types.h>
 #include <cstdint>
 namespace exl3 {

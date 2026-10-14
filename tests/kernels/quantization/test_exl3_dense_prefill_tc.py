@@ -132,16 +132,57 @@ def test_switch_and_schedule_default_off(monkeypatch):
     assert set(tc.SCHEDULES) == {"planned", "whole"}
 
 
-def test_gate_opens_only_on_sm80_with_74_sms_and_a_config():
-    config = SimpleNamespace(num_speculative_tokens=3)
+def _config(tp=2, pp=1, method="mtp", parallel_drafting=False):
+    speculative = (
+        None
+        if method is None
+        else SimpleNamespace(method=method, parallel_drafting=parallel_drafting)
+    )
+    return SimpleNamespace(
+        num_speculative_tokens=0 if method is None else 3,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp, pipeline_parallel_size=pp
+        ),
+        speculative_config=speculative,
+    )
+
+
+def test_gate_opens_only_on_the_validated_configuration():
+    config = _config()
     assert tc.closed_reason((8, 0), 74, config) is None
+    assert tc.closed_reason((8, 0), 74, _config(method=None)) is None
+    assert tc.closed_reason((8, 0), 74, _config(method="eagle3")) is None
     assert "(8, 6)" in tc.closed_reason((8, 6), 74, config)
     assert "None" in tc.closed_reason(None, None, config)
     assert "70 multiprocessors" in tc.closed_reason((8, 0), 70, config)
     assert "no vLLM config" in tc.closed_reason((8, 0), 74, None)
+    # Other layouts give other matrices and row chunks.
+    assert "(1, 1), not (2, 1)" in tc.closed_reason((8, 0), 74, _config(tp=1))
+    assert "(2, 2), not (2, 1)" in tc.closed_reason((8, 0), 74, _config(pp=2))
+    # Drafters whose decode steps schedule more than 1 + k tokens per request.
+    assert "'dflash'" in tc.closed_reason((8, 0), 74, _config(method="dflash"))
+    reason = tc.closed_reason((8, 0), 74, _config(parallel_drafting=True))
+    assert "parallel drafting True" in reason
 
 
-def _device(monkeypatch, capability, sms=SMS, config=True):
+def test_only_validated_matrices_are_taken():
+    _extension_or_skip()
+    for padded_in, padded_out, bits_x2 in tc.VALIDATED_MATRICES:
+        assert tc.takes_launch(1489, padded_in, padded_out, bits_x2, 2, False, SMS)
+        assert not tc.takes_launch(1489, padded_in, padded_out, bits_x2, 1, False, SMS)
+    # Full-width matrices of a one-card layout, and a validated shape stored
+    # at another rate: the operator covers them, the gate does not.
+    for padded_in, padded_out, bits_x2 in (
+        (2560, 512, 14),
+        (2560, 12288, 14),
+        (2560, 2560, 14),
+        (2560, 6144, 12),
+    ):
+        assert tc.linear_prefill_applies(2730, padded_in, padded_out, bits_x2, 2)
+        assert not tc.takes_launch(2730, padded_in, padded_out, bits_x2, 2, False, SMS)
+
+
+def _device(monkeypatch, capability, sms=SMS, config=True, **layout):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: capability is not None)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
@@ -154,7 +195,7 @@ def _device(monkeypatch, capability, sms=SMS, config=True):
     )
     import vllm.config
 
-    value = SimpleNamespace(num_speculative_tokens=3) if config else None
+    value = _config(**layout) if config else None
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: value)
 
 
@@ -167,6 +208,8 @@ def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
     monkeypatch.setattr(tc, "_fake_registered", True)
     schedules = []
     monkeypatch.setattr(tc, "set_prefill_schedule", schedules.append)
+    warmed = []
+    monkeypatch.setattr(tc, "_warmup", warmed.append)
     monkeypatch.setattr(
         torch._C, "_dispatch_find_schema_or_throw", lambda name, overload: None
     )
@@ -185,12 +228,15 @@ def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
             _device(monkeypatch, capability, sms, config)
             tc.resolve()
             assert tc.active is False
+        _device(monkeypatch, (8, 0), tp=1)
+        tc.resolve()
+        assert tc.active is False
         _device(monkeypatch, (8, 0), SMS, False)
         tc.resolve()
-        assert tc.active is False and schedules == []
+        assert tc.active is False and schedules == [] and warmed == []
         _device(monkeypatch, (8, 0))
         tc.resolve()
-        assert tc.active is True and schedules == [0]
+        assert tc.active is True and schedules == [0] and warmed == [SMS]
         assert tc._max_decode_query_len == 4 and tc._sms == SMS
     finally:
         root.removeHandler(caplog.handler)
@@ -200,12 +246,16 @@ def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
         tc.__name__,
         "EXL3 dense prefill tensor-core path active (VLLM_EXL3_DENSE_PREFILL_TC): "
         "in prefill steps (a request with more than 4 tokens scheduled), dense "
-        "launches of more than 64 rows and at least 16 output tiles (bits_x2 "
-        "10/12/14, codebook 2) take linear_out_prefill, schedule planned; split-K "
-        "launches, decode steps and graph captures keep today's kernels.",
+        "launches of more than 64 rows and at least 16 output tiles of the 9 "
+        "validated TP2 matrices (bits_x2 10/12/14, codebook 2) take "
+        "linear_out_prefill, schedule planned; split-K launches, other matrices, "
+        "decode steps and graph captures keep today's kernels.",
     ) in lines
     closed = sorted({m for _, _, m in lines if "gate is closed" in m})
     assert closed == [
+        "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: (tensor, "
+        "pipeline) parallel size (1, 1), not (2, 1); every dense EXL3 launch "
+        "keeps today's kernels.",
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: 70 "
         "multiprocessors, not 74; every dense EXL3 launch keeps today's kernels.",
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: device "
@@ -437,9 +487,14 @@ def _split_ran(names):
     "padded_in,padded_out,bits_x2,logical_in,logical_out,rows,split",
     [
         (2560, 256, 14, 2560, 256, 1906, False),  # k/v, 30 tiles: one wave
-        (2560, 640, 10, 2560, 640, 839, True),  # indexer q/k, 35 tiles
+        (2560, 640, 10, 2560, 640, 839, False),  # indexer q/k, 35 tiles
         (3072, 2560, 14, 3072, 2560, 482, True),  # out/o_proj tail, 80 tiles
         (2560, 1280, 12, 2560, 1280, 1276, True),  # drafter fc, 100 tiles
+        # Column-band splits (the whole-tile rectangle spans every row block).
+        (2560, 3072, 14, 2560, 3072, 1300, True),  # linear-attention z, 264 tiles
+        (2560, 640, 14, 2560, 640, 2200, True),  # shared gate/up, 90 tiles
+        # q_proj, 74 tiles: 37 split blocks, as many as the workspace holds.
+        (2560, 6144, 14, 2560, 6144, 200, True),
         (2560, 2048, 14, 2500, 1999, 200, False),  # cropped edges, 32 tiles
     ],
 )
@@ -471,20 +526,33 @@ def test_prefill_holds_linear_outs_error_against_fp64(
 
 
 @needs_sm80
-def test_stream_k_is_order_independent():
+@pytest.mark.parametrize(
+    "padded_in,padded_out,rows",
+    [
+        (3072, 2560, 482),  # column band of 2 x 4 tiles
+        (2560, 3072, 1300),  # column band of 4 x 11 tiles
+        (2560, 640, 2200),  # column band of 1 x 18 tiles
+        (2560, 6144, 200),  # column band of 11 x 2 tiles, 37 split blocks
+        (2560, 1280, 1276),  # row band of 10 x 3 tiles
+    ],
+)
+def test_stream_k_is_order_independent(padded_in, padded_out, rows):
     """A split tile's value is the sum of its segments' partials in k order,
     whichever block arrives last (the counter only elects the block that adds
     them). Busy multiprocessors change which block that is: the result must
     not change."""
     _gpu_or_skip()
-    m = _matrix(41, 3072, 2560, 14)
-    x = _inputs(42, 482, 3072)
-    assert _split_ran(
-        _prefill_kernels(lambda: _run(tc.linear_out_prefill, m, x, 14, 2560))
-    )
-    reference = _run(tc.linear_out_prefill, m, x, 14, 2560)
+    bits_x2 = 12 if padded_out == 1280 else 14
+    m = _matrix(41 + rows, padded_in, padded_out, bits_x2)
+    x = _inputs(42 + rows, rows, padded_in)
+
+    def call():
+        return _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+
+    assert _split_ran(_prefill_kernels(call))
+    reference = call()
     for _ in range(10):
-        _bitwise(_run(tc.linear_out_prefill, m, x, 14, 2560), reference, "repeat")
+        _bitwise(call(), reference, "repeat")
     side = torch.cuda.Stream()
     a = torch.randn(2048, 2048, device="cuda")
     for delay in range(6):
@@ -492,7 +560,7 @@ def test_stream_k_is_order_independent():
         with torch.cuda.stream(side):
             for _ in range(delay):
                 a = a @ a / 2048
-        out = _run(tc.linear_out_prefill, m, x, 14, 2560)
+        out = call()
         torch.cuda.synchronize()
         _bitwise(out, reference, f"with {delay} matmuls beside it")
 
