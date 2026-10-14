@@ -378,9 +378,29 @@ def sparse_attn_indexer_kpool(
 
             num_rows = q_slice.shape[0]
             row_starts = None
-            if chunk.local_total_seq_lens == 0:
+            if chunk.local_total_seq_lens > 0 and not is_deep_gemm_supported():
+                # CUDA without DeepGEMM (e.g. Ampere): Triton kernel that
+                # dequantizes the fp8 bytes in-kernel (bf16 MMA, fp32 accum).
+                # Its logits are not compressed: row i spans K positions
+                # [ks[i], ke[i]), which the DCP merge below does not take.
+                from vllm.sm80.kernels.attention.triton_mqa_logits import (
+                    fp8_mqa_logits as triton_fp8_mqa_logits,
+                )
+
+                assert not use_fp4_cache and dcp_world_size == 1, (
+                    "The MXFP4 indexer cache and DCP need DeepGEMM"
+                )
+                logits = triton_fp8_mqa_logits(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                row_starts, row_ends = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
+            elif chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
-            elif is_deep_gemm_supported():
+            else:
                 q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
                     q_slice_cast, q_scale_slice, weights[row_start:row_end]
                 )
@@ -397,26 +417,6 @@ def sparse_attn_indexer_kpool(
                     ),
                     row_ends,
                 )
-            else:
-                # CUDA without DeepGEMM (e.g. Ampere): Triton kernel that
-                # dequantizes the fp8 bytes in-kernel (bf16 MMA, fp32 accum).
-                from vllm.sm80.kernels.attention.triton_mqa_logits import (
-                    fp8_mqa_logits as triton_fp8_mqa_logits,
-                )
-
-                assert not use_fp4_cache, (
-                    "MXFP4 indexer cache requires DeepGEMM (SM100/SM120)"
-                )
-                logits = triton_fp8_mqa_logits(
-                    q_slice_cast,
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                )
-                # Not compressed: row i spans K positions [ks[i], ke[i]).
-                row_starts, row_ends = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
-            num_rows = logits.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
@@ -461,7 +461,7 @@ def sparse_attn_indexer_kpool(
                 dcp_rank,
                 dcp_world_size,
                 pool_cp_interleave,
-                row_starts=row_starts,
+                row_starts=None,
             )
             # Free the fp32 logits before the next chunk allocates its own.
             # The buffer is [chunk_rows, compressed_context] and the metadata
@@ -676,10 +676,11 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
+        padded_q_scale, decode_weights = mqa_logits_mx_inputs(
+            padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
+        )
+        # SM100 decode is varlen: one row and context length per token.
         if is_deep_gemm_supported():
-            padded_q_scale, decode_weights = mqa_logits_mx_inputs(
-                padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
-            )
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -690,7 +691,6 @@ def sparse_attn_indexer_kpool(
                 max_model_len=max_pool_len,
                 indices=decode_metadata.indices,
             )
-            # SM100 decode is varlen: one row and context length per token.
             logits = as_fp32_logits(logits, seq_lens.view(-1))
         else:
             # CUDA without DeepGEMM (e.g. Ampere): Triton paged kernel over the

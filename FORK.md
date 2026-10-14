@@ -375,7 +375,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/models/glm5next/common/kda.py` | modified | 270 | 14 | 19 |
 | `vllm/models/glm5next/nvidia/ops/kpool_compress.py` | modified | 48 | 14 | 23 |
 | `vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py` | modified | 8 | 6 | 8 |
-| `vllm/models/glm5next/nvidia/sparse_indexer.py` | modified | 130 | 21 | 21 |
+| `vllm/models/glm5next/nvidia/sparse_indexer.py` | modified | 125 | 16 | 18 |
 | `vllm/models/kimi_k3/nvidia/kda_metadata.py` | modified | 3 | 0 | 2 |
 | `vllm/models/kimi_k3/nvidia/ops/recoverssm.py` | modified | 3 | 1 | 3 |
 | `vllm/models/qwen4_exp/common/ngram_embedding.py` | modified | 3 | 0 | 1 |
@@ -420,7 +420,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **68 files** | | **3,520** | **251** | **481** |
+| **68 files** | | **3,515** | **246** | **478** |
 
 ### Tests, docs and .github
 
@@ -455,9 +455,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 68 | 3,520 | 251 | 481 |
+| Product code | 68 | 3,515 | 246 | 478 |
 | Tests, docs and .github | 23 | 508 | 562 | 71 |
-| All | 91 | 4,028 | 813 | 552 |
+| All | 91 | 4,023 | 808 | 549 |
 
 ## 3. Fork environment variables
 
@@ -560,9 +560,9 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Fork-added product files | 116 |
 | Fork-added product lines | 32,869 |
 | Patched upstream files | 91 |
-| Patched upstream lines | +4,028 / -813 |
+| Patched upstream lines | +4,023 / -808 |
 | Patched upstream product files | 68 |
-| Patched upstream product lines | +3,520 / -251 |
-| Product lines added (new files and patches) | 36,389 |
+| Patched upstream product lines | +3,515 / -246 |
+| Product lines added (new files and patches) | 36,384 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |
