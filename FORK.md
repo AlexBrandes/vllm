@@ -331,8 +331,8 @@ Files added elsewhere, grouped by top-level directory.
 | Path | Lines |
 |---|---:|
 | `tools/sm80/fork_map.py` | 706 |
-| `tools/sm80/upstream_edit_exceptions.yaml` | 59 |
-| **2 files** | **765** |
+| `tools/sm80/upstream_edit_exceptions.yaml` | 71 |
+| **2 files** | **777** |
 
 #### `vllm/`
 

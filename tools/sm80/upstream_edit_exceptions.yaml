@@ -57,3 +57,15 @@ exceptions:
     Move the file unchanged to vllm/sm80/failed_inputs.py and update the
     imports in vllm/v1/core/sched/scheduler.py,
     vllm/v1/worker/gpu/model_runner.py and vllm/v1/worker/gpu/async_utils.py.
+- file: vllm/v1/worker/gpu/async_utils.py
+  hunks: [659159ed35de]
+  reason: >-
+    Bug fix inside the existing failed-inputs hunk of AsyncOutput: the GPU
+    mask of failed tokens stays referenced until its host copy has run, so
+    its memory cannot be reused before the copy reads it. vLLM has no hook
+    for extra host copies in AsyncOutput, so the fix sits where the copy is.
+  owner: Qwen4Exp EXL3 support
+  removal: >-
+    Remove when the failed-mask copy of AsyncOutput moves into vllm/sm80
+    behind a hook: an AsyncOutput extra-copy hook in vLLM (an upstream
+    candidate), or a runner subclass that wraps AsyncOutput and owns the copy.
