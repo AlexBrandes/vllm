@@ -896,10 +896,12 @@ def thin_gemm(x: torch.Tensor, w: torch.Tensor,
         gluon_k_ok = even_k
     if (warps_m is not None and gluon_k_ok and tiles_m == 1
             and x.stride(1) == 1 and w.stride(1) == 1
-            and x.stride(0) % 8 == 0 and w.stride(0) % 8 == 0
+            and x.stride(0) % 16 == 0 and w.stride(0) % 16 == 0
             and x.data_ptr() % 16 == 0 and w.data_ptr() % 16 == 0):
-        # A Gluon row; awkward inputs (partial K blocks, strided K, unaligned
-        # rows, several M tiles) keep the Triton kernel below.
+        # A Gluon row; awkward inputs (partial K blocks, strided K, a row
+        # stride that is not a multiple of 16 elements, an unaligned base,
+        # several M tiles) keep the Triton kernel below. The Gluon kernels'
+        # cp.async loads need the 16-element row strides they compile for.
         if warps_m == BALANCED:
             _gluon_balanced_kernel[(num_sms(),)](
                 x, w, out, M, N, K, x.stride(0), w.stride(0),

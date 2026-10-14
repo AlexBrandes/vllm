@@ -282,7 +282,7 @@ def test_dispatch_sends_exactly_the_table(g, monkeypatch):
 
 
 # Views of x: what the layout check admits and what it refuses.
-_ADMITTED = ("row_pad16", "row_offset")
+_ADMITTED = ("row_pad16", "row_offset", "col_offset8")
 _REFUSED = ("row_pad24", "unaligned", "k_strided")
 
 
@@ -294,6 +294,9 @@ def _layout(kind, x):
         xa = torch.full((m, k + int(kind[-2:])), **nan)[:, :k]
     elif kind == "row_offset":
         xa = torch.full((m + 1, k), **nan)[1:]
+    elif kind == "col_offset8":
+        # A 16-byte base offset: the tightest base alignment admitted.
+        xa = torch.full((m, k + 16), **nan)[:, 8:8 + k]
     elif kind == "unaligned":
         xa = torch.empty(m * k + 1, dtype=x.dtype, device=x.device)[1:].view(m, k)
     elif kind == "k_strided":
@@ -552,19 +555,57 @@ def test_gpu_fp64_gate_every_row_count(nk):
         pool.check(f"{n}x{k} M{m}")
 
 
+_JIT_KERNELS = ("_gluon_gemm_kernel", "_gluon_sliced_kernel", "_gluon_balanced_kernel",
+                "_thin_gemm_kernel", "_gemv_kernel")
+
+
+def _compiled_variants(k_mod):
+    """Compiled variants per JIT kernel of the module on the current device."""
+    dev = torch.cuda.current_device()
+    return {name: len(getattr(k_mod, name).device_caches[dev][0]) for name in _JIT_KERNELS}
+
+
 @gpu
 @pytest.mark.parametrize("nk", NK, ids=[f"{n}x{k}" for n, k in NK])
 @pytest.mark.parametrize("kind", _ADMITTED)
 def test_gpu_admitted_layouts(nk, kind):
     """Views the layout check admits run the warmed kernels: bit for bit the
-    contiguous call's result."""
+    contiguous call's result, with no variant compiled beyond the contiguous
+    call's."""
     k_mod = _kernel()
     n, k = nk
     for m in (1, 4, 17, 24, 32):
         x, w = _inputs(7 * m, m, n, k)
+        want = k_mod.thin_gemm(x, w)
+        before = _compiled_variants(k_mod)
         xa = _layout(kind, x)
         assert _gluon().gluon_layout_ok(xa, w), (n, k, m, kind)
-        assert _bitwise(k_mod.thin_gemm(xa, w), k_mod.thin_gemm(x, w)), (n, k, m, kind)
+        assert _bitwise(k_mod.thin_gemm(xa, w), want), (n, k, m, kind)
+        assert _compiled_variants(k_mod) == before, (n, k, m, kind)
+
+
+@gpu
+@pytest.mark.parametrize("nk", NK, ids=[f"{n}x{k}" for n, k in NK])
+def test_gpu_row_stride_8_mod_16_takes_the_triton_kernel(nk, monkeypatch):
+    """Called directly, thin_gemm sends a row stride of K + 24 elements (8 mod
+    16) to the Triton kernel, not the Gluon kernels: the same bits as an
+    unaligned view (also Triton), within the FP64 gate."""
+    k_mod = _kernel()
+    n, k = nk
+
+    class _Refused:
+        def __getitem__(self, grid):
+            raise AssertionError("a row stride of 8 mod 16 reached a Gluon kernel")
+
+    for name in ("_gluon_gemm_kernel", "_gluon_sliced_kernel", "_gluon_balanced_kernel"):
+        monkeypatch.setattr(k_mod, name, _Refused())
+    pool = _pool()
+    for m in (1, 4, 17, 24, 32):
+        x, w = _inputs(11 * m, m, n, k)
+        c = k_mod.thin_gemm(_layout("row_pad24", x), w)
+        assert _bitwise(c, k_mod.thin_gemm(_layout("unaligned", x), w)), (n, k, m)
+        pool.add(c, torch.nn.functional.linear(x, w), _ref(x, w))
+    pool.check(f"{n}x{k} row stride K+24")
 
 
 @gpu
