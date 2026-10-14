@@ -111,7 +111,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
 | `vllm/sm80/guard.py` | 68 |
-| `vllm/sm80/kv_planning.py` | 568 |
+| `vllm/sm80/kv_planning.py` | 585 |
 | `vllm/sm80/layers/__init__.py` | 4 |
 | `vllm/sm80/layers/moe/__init__.py` | 19 |
 | `vllm/sm80/layers/moe/gate.py` | 44 |
@@ -132,7 +132,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **8,877** |
+| **35 files** | **8,894** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -293,10 +293,11 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
 | `tests/sm80/test_fork_map.py` | 55 |
+| `tests/sm80/test_glm_pp4_kv_plan.py` | 89 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
-| `tests/sm80/test_kv_planning.py` | 479 |
+| `tests/sm80/test_kv_planning.py` | 487 |
 | `tests/sm80/test_modification_notices.py` | 80 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_mrv2_prepare_inputs_padding.py` | 122 |
@@ -333,7 +334,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **126 files** | **42,901** |
+| **127 files** | **42,998** |
 
 #### `tools/`
 
@@ -555,11 +556,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 114 |
-| Fork-added product lines | 32,838 |
+| Fork-added product lines | 32,855 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 36,356 |
+| Product lines added (new files and patches) | 36,373 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |

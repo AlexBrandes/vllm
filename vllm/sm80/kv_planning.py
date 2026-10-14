@@ -185,6 +185,24 @@ def _anchor_bytes(
     return max(widths.values(), default=0)
 
 
+def _drafter_group(
+    layer_names: list[str], specs: dict[str, KVCacheSpec], is_eagle: bool
+) -> KVCacheGroupSpec:
+    """A drafter group with one spec when its layers share it.
+
+    The drafter runs on the last pipeline stage only. The per-worker
+    projection of the groups keeps a UniformTypeKVCacheSpecs that has none of
+    the worker's layers whole, so the other stages would get cache tensors
+    for the drafter's layers that no group of theirs owns. A plain spec
+    projects to an empty group with no tensors.
+    """
+    spec = specs[layer_names[0]]
+    if any(specs[name] != spec for name in layer_names):
+        spec = UniformTypeKVCacheSpecs.from_specs({n: specs[n] for n in layer_names})
+        assert spec is not None
+    return KVCacheGroupSpec(layer_names, spec, is_eagle_group=is_eagle)
+
+
 def _fit_drafter_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -227,7 +245,12 @@ def _fit_drafter_groups(
     fitted = _exact_fit_drafter_specs(draft_specs, mla_specs)
     if fitted is None:
         for index in draft_indices:
-            kv_cache_groups[index].is_eagle_group = is_eagle
+            group = kv_cache_groups[index]
+            kv_cache_groups[index] = _drafter_group(
+                group.layer_names,
+                {name: _layer_spec(group, name) for name in group.layer_names},
+                is_eagle,
+            )
         return kv_cache_groups
 
     mla_page = mla_specs[0].page_size_bytes
@@ -236,13 +259,7 @@ def _fit_drafter_groups(
     num_groups = cdiv(len(names), max_per_group)
     per_group = cdiv(len(names), num_groups)
     chunks = [names[i : i + per_group] for i in range(0, len(names), per_group)]
-    draft_groups: list[KVCacheGroupSpec] = []
-    for chunk in chunks:
-        uniform = UniformTypeKVCacheSpecs.from_specs({n: fitted[n] for n in chunk})
-        assert uniform is not None
-        draft_groups.append(
-            KVCacheGroupSpec(chunk, uniform, is_eagle_group=is_eagle)
-        )
+    draft_groups = [_drafter_group(chunk, fitted, is_eagle) for chunk in chunks]
     any_draft = next(iter(draft_specs.values()))
     logger.info(
         "DFlash drafter KV: %d sliding-window layers in %d group(s) of %s "

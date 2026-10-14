@@ -319,10 +319,10 @@ def test_drafter_rides_the_mla_block_without_pp(monkeypatch, block_drop):
     assert [g.layer_names for g in draft_groups] == [
         [n for n in specs if _is_draft(n)]
     ]
-    for spec in draft_groups[0].kv_cache_spec.kv_cache_specs.values():
-        assert type(spec) is SlidingWindowSpec
-        assert spec.block_size == MLA_BLOCK // 4
-        assert spec.page_size_bytes == mla_page
+    spec = draft_groups[0].kv_cache_spec
+    assert type(spec) is SlidingWindowSpec
+    assert spec.block_size == MLA_BLOCK // 4
+    assert spec.page_size_bytes == mla_page
     assert [g.is_eagle_group for g in groups] == [
         block_drop and g in draft_groups for g in groups
     ]
@@ -369,7 +369,8 @@ def test_pp_groups_fit_every_stage(monkeypatch, partition):
     # KDA groups: no stage holds more states of one group than fit the block.
     per_block = anchor // mamba_page
     for group in groups:
-        if not isinstance(group.kv_cache_spec.first_spec, MambaSpec):
+        spec = group.kv_cache_spec
+        if not isinstance(getattr(spec, "first_spec", spec), MambaSpec):
             continue
         for worker in workers:
             assert sum(name in worker for name in group.layer_names) <= per_block
@@ -386,6 +387,13 @@ def test_pp_groups_fit_every_stage(monkeypatch, partition):
             )
             <= anchor
         )
+    # Every worker's cache tensors are exactly its own layers, each in one of
+    # its groups: the drafter's layers live on the last stage only.
+    for worker, kv_cache_config in zip(workers, configs):
+        grouped = {n for g in kv_cache_config.kv_cache_groups for n in g.layer_names}
+        tensors = [n for t in kv_cache_config.kv_cache_tensors for n in t.layers]
+        assert sorted(tensors) == sorted(worker)
+        assert grouped == set(worker)
 
     # The scheduler keeps the drafter annotation although worker 0 (whose
     # config it copies) owns no drafter layer.
@@ -423,8 +431,8 @@ def test_misaligned_drafter_keeps_its_block_and_warns(monkeypatch, caplog):
     assert draft_groups
     assert all(g.is_eagle_group for g in draft_groups)
     for group in draft_groups:
-        for spec in group.kv_cache_spec.kv_cache_specs.values():
-            assert spec.block_size == MLA_BLOCK
+        assert type(group.kv_cache_spec) is SlidingWindowSpec
+        assert group.kv_cache_spec.block_size == MLA_BLOCK
 
 
 def test_other_models_are_left_alone():
