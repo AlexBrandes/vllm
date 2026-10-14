@@ -220,7 +220,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/moe/test_moe_route_v2_mask.py` | 410 |
 | `tests/kernels/moe/test_shared_experts_reorder.py` | 488 |
 | `tests/kernels/moe_align_reference.py` | 87 |
-| `tests/kernels/quantization/exl3_real_cases.py` | 350 |
+| `tests/kernels/quantization/exl3_real_cases.py` | 359 |
 | `tests/kernels/quantization/test_exl3_dense_splitk.py` | 467 |
 | `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 321 |
@@ -332,7 +332,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **125 files** | **42,741** |
+| **125 files** | **42,750** |
 
 #### `tools/`
 

@@ -200,6 +200,15 @@ def coverage_report(
                     + "/".join(f"{n}{s[0]}" for s, n in sorted(sources.items()))
                 )
         lines.append(f"CELLS {phase}: " + " ".join(parts))
+    sliced = sorted(
+        (cell for cell, sources in found.items() if sources.get("sliced")),
+        key=lambda c: (c[1], c[0]),
+    )
+    lines.append(
+        "CELLS sources: l = a live captured call, replayed bitwise; s = sliced, the"
+        " last rows of a longer live call (real activations, no recorded output)"
+    )
+    lines.append("CELLS sliced: " + (" ".join(f"{r}/{p}" for r, p in sliced) or "none"))
     missing = sorted(required - set(found), key=lambda c: (c[1], c[0]))
     return lines, missing
 
