@@ -34,6 +34,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    align_blocks_to_rows,
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
@@ -57,6 +58,14 @@ class TritonMLASparseBackend(AttentionBackend):
         # The kernel gathers individual cache rows through a flat row view of
         # the paged cache, so it has no block-size requirement of its own.
         return [MultipleOf(16)]
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        # The flat row view needs blocks a whole number of rows apart, as for
+        # the other sparse MLA backends: a block-outermost layout packs every
+        # layer's page into one block and pads it only to the alignments the
+        # backends ask for.
+        return align_blocks_to_rows(super().customize_spec(spec))
 
     @staticmethod
     def get_name() -> str:

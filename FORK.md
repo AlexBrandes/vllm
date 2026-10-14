@@ -99,7 +99,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 |---|---:|
 | `vllm/sm80/__init__.py` | 34 |
 | `vllm/sm80/attention/__init__.py` | 2 |
-| `vllm/sm80/attention/triton_mla_sparse.py` | 377 |
+| `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
 | `vllm/sm80/distributed/__init__.py` | 2 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
@@ -132,7 +132,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **8,868** |
+| **35 files** | **8,877** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -306,6 +306,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_registrations.py` | 139 |
 | `tests/sm80/test_seams.py` | 57 |
 | `tests/sm80/test_setup_envs_load.py` | 79 |
+| `tests/sm80/test_triton_mla_sparse_block_stride.py` | 151 |
 | `tests/sm80/update_seams.py` | 173 |
 | `tests/test_retired_env_vars.py` | 159 |
 | `tests/v1/attention/test_glm_metadata_reuse.py` | 228 |
@@ -332,7 +333,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **125 files** | **42,750** |
+| **126 files** | **42,901** |
 
 #### `tools/`
 
@@ -554,11 +555,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 114 |
-| Fork-added product lines | 32,829 |
+| Fork-added product lines | 32,838 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 36,347 |
+| Product lines added (new files and patches) | 36,356 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |
