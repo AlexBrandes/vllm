@@ -485,3 +485,35 @@ def test_scheduler_config_merges_eagle_flags_across_workers():
     assert [g.is_eagle_group for g in sched.kv_cache_groups] == [False, True]
     # The workers' own configs are untouched.
     assert not configs[0].kv_cache_groups[1].is_eagle_group
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kv_plan_log(monkeypatch, caplog, enabled):
+    """VLLM_KV_PLAN_LOG logs the plan the concurrency comes from, one entry
+    per group; it changes nothing else."""
+    monkeypatch.setenv("VLLM_KV_PLAN_LOG", "1" if enabled else "0")
+    vllm_config = _mamba_scratch_vllm_config(max_num_seqs=8)
+    # A pool size of its own, so the once-only log is not deduplicated away.
+    num_blocks = 877 if enabled else 879
+    config = _mamba_scratch_kv_cache_config(num_blocks, num_speculative_blocks=3)
+    with caplog.at_level(logging.INFO):
+        concurrency = get_max_concurrency_for_kv_cache_config(vllm_config, config)
+    per_group = _blocks_per_group(vllm_config, config)
+    assert concurrency == pool_concurrency_limit(num_blocks, sum(per_group), 9, 8)
+    lines = [
+        r.getMessage() for r in caplog.records if "KV cache plan" in r.getMessage()
+    ]
+    if not enabled:
+        assert lines == []
+        return
+    assert len(lines) == 1
+    assert f"num_blocks={num_blocks}, {sum(per_group)} blocks per request" in lines[0]
+    assert "of which 9 scratch" in lines[0]
+    assert f"concurrency {concurrency:.4f}" in lines[0]
+    assert "[0] FullAttentionSpec layers=12" in lines[0]
+    for group_id in (1, 2, 3):
+        assert (
+            f"[{group_id}] MambaSpec layers=12 block=1152"
+            f" page={config.kv_cache_groups[group_id].kv_cache_spec.page_size_bytes}"
+            f" charged={per_group[group_id]} scratch=3" in lines[0]
+        )

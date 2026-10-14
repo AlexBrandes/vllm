@@ -105,13 +105,13 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 935 |
+| `vllm/sm80/envs.py` | 941 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 233 |
 | `vllm/sm80/guard.py` | 68 |
-| `vllm/sm80/kv_planning.py` | 585 |
+| `vllm/sm80/kv_planning.py` | 610 |
 | `vllm/sm80/layers/__init__.py` | 4 |
 | `vllm/sm80/layers/moe/__init__.py` | 19 |
 | `vllm/sm80/layers/moe/gate.py` | 44 |
@@ -132,7 +132,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **8,894** |
+| **35 files** | **8,925** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -297,7 +297,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
-| `tests/sm80/test_kv_planning.py` | 487 |
+| `tests/sm80/test_kv_planning.py` | 519 |
 | `tests/sm80/test_modification_notices.py` | 80 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_mrv2_prepare_inputs_padding.py` | 122 |
@@ -334,7 +334,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **127 files** | **42,998** |
+| **127 files** | **43,030** |
 
 #### `tools/`
 
@@ -521,6 +521,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_INDEXER_DECODE_RAW_K` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DSA_REF` | `bool` | `False` | `'0'` |
 | `VLLM_KV_MAMBA_INFLIGHT_STATES` | `bool` | `False` | `'0'` |
+| `VLLM_KV_PLAN_LOG` | `bool` | `False` | `'0'` |
 | `VLLM_MEM_ATTRIBUTION` | `bool` | `False` | `'0'` |
 | `VLLM_MOE_DECODE_ROUTE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_MOE_DETERMINISTIC_ALIGN` | `int` | `0` | `'0'` |
@@ -541,7 +542,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **76 variables** | | | |
+| **77 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -556,11 +557,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 114 |
-| Fork-added product lines | 32,855 |
+| Fork-added product lines | 32,886 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 36,373 |
-| Fork environment variables (flags) | 76 |
+| Product lines added (new files and patches) | 36,404 |
+| Fork environment variables (flags) | 77 |
 | Unreferenced fork definitions | 0 (0 lines) |

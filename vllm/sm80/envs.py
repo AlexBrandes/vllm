@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
+    VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_THIN_GEMM_CONCAT: bool = False
     VLLM_SHARED_EXPERT_REORDER: bool = False
@@ -497,6 +498,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_KV_MAMBA_INFLIGHT_STATES": lambda: bool(
         int(os.getenv("VLLM_KV_MAMBA_INFLIGHT_STATES", "0"))
     ),
+    # Diagnostic: log the scheduler's KV cache plan once at startup, one line
+    # per group (spec, layers, block size, page bytes, blocks charged per
+    # request and their scratch part) with the pool size and concurrency.
+    # Logging only. Default OFF.
+    "VLLM_KV_PLAN_LOG": lambda: bool(int(os.getenv("VLLM_KV_PLAN_LOG", "0"))),
     # Re-order the multi-stream shared-expert overlap in the MoE runner.
     # Upstream enqueues the shared experts on the aux stream *before* the gate
     # and the routed dispatch, then joins after the routed kernels. Because the
