@@ -29,7 +29,7 @@ seams:
   kind: method
   target: vllm.model_executor.models.registry:_ModelInfo.from_model_cls
   why: model information is read from the registered class (architecture = class name, interface flags); the fork GLM classes keep the upstream names and bases so it stays the same
-  sha256: d374687ec0482c29ddeffdf2a91060cbaa868c92690d0786aa3f7c40a11b476e
+  sha256: bf2acb7769abe7fe02c6f1fd52348fe611d27fd46deaaf66b4fd86219116284a
   signature: '(model: type[torch.nn.modules.module.Module]) -> ''_ModelInfo'''
 
 - id: glm-model-init
@@ -356,7 +356,7 @@ seams:
   kind: function
   target: vllm.envs:compile_factors
   why: compile cache keys iterate environment_variables, so fork vars enter the hash unless listed as ignored
-  sha256: 9d429d5b576ecfa3c0011109bd46a010f34bc482c65479a0fe0ed7b5ef1ee4fb
+  sha256: f5e32b8d1bdba04796086c2c9a2f02cce63bc46127008b5395a515acf7fe96c3
   signature: () -> dict[str, object]
 
 - id: config-hash-factors
@@ -425,7 +425,7 @@ seams:
   kind: method
   target: vllm.v1.worker.worker_base:WorkerWrapperBase.init_worker
   why: loads general plugins (running the fork register()) in every worker process
-  sha256: 20465ec13f93deb38160806deedac5dad482adc6c8afefcd45ecb800f80d9a45
+  sha256: f30b1abbfc9f5a8e5112cd8aa83ff60b3e00b2de507712f6b6f9b1ccd1611be1
   signature: '(self, all_kwargs: list[dict[str, typing.Any]]) -> None'
 
 - id: caller-model-registry-subprocess
@@ -515,7 +515,7 @@ seams:
   kind: function
   target: vllm.platforms.cuda:_get_backend_priorities
   why: the CUSTOM candidate goes after the MLA list for cc other than 10.x/12.x, where the fork once appended TRITON_MLA_SPARSE to sparse_tail
-  sha256: e14118b76bd551b7ace11ffba4f34cbd93da32d010b2099d09ba96b838bd7a4c
+  sha256: a383940a1556a8d711dc0e40e99b762d1701d06ed2cda338c8412168bedc83a4
   signature: '(use_mla: ''bool'', device_capability: ''DeviceCapability'', num_heads: ''int | None'' = None, kv_cache_dtype: ''CacheDType | None'' = None, use_non_causal: ''bool'' = False, head_size: ''int | None'' = None, use_mm_prefix: ''bool'' = False) -> ''list[AttentionBackendEnum]'''
 
 - id: attn-get-attn-backend-class
@@ -766,7 +766,7 @@ seams:
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.gate_linear:GateLinear.forward
   why: overridden; delegated to unless route v2 ran
-  sha256: 5a51b00b04ca2519aed6fa8cb8ea28c89e07d0a704ba943e7a045066228282b6
+  sha256: ba0ba5a74fb55d4ed8e48537a38c464ef63acfe7612c977efd0d98af91e7043f
   signature: '(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.nn.parameter.Parameter | None]'
 
 - id: moe-gate-linear-return
@@ -997,8 +997,8 @@ seams:
   kind: function
   target: vllm.compilation.decorators:_support_torch_compile
   why: the fork sharded CandidateSelector subclasses the decorated upstream class without decorating again; the inherited __init__ wrapper runs the upstream __init__ and then the compile setup, and __call__ compiles self.__class__.forward (the fork forward)
-  sha256: 3b52e0e3689d4f1b0f490e50b1b0d79ec244e99302938964f86ad73457e50055
-  signature: '(cls: type[~_T], dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]], mark_unbacked_dims: dict[str, int | list[int]] | None = None, enable_if: collections.abc.Callable[[vllm.config.vllm.VllmConfig], bool] | None = None, is_encoder: bool = False) -> type[~_T]'
+  sha256: c785b3c0c4259e483b7c2a4adb3f0e032d3993bb07eb15a71b27b179994704fb
+  signature: '(cls: type[~_T], dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]], mark_unbacked_dims: dict[str, int | list[int]] | None = None, enable_if: collections.abc.Callable[[vllm.config.vllm.VllmConfig], bool] | None = None, is_encoder: bool = False, use_aot_compile: bool = True) -> type[~_T]'
 
 - id: drafter-speculator-set-block-size
   kind: method
