@@ -92,6 +92,8 @@ if TYPE_CHECKING:
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
     VLLM_EXL3_PLE_OVERLAP: bool = False
+    VLLM_EXL3_DENSE_PREFILL_TC: bool = False
+    VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE: str = "planned"
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_QWEN4_ROUTER_FP32: bool = False
@@ -740,6 +742,24 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_OVERLAP", "0"))
     ),
+    # Dense EXL3 launches of prefill steps with more than 64 rows and at
+    # least 16 output tiles, for bits_x2 10/12/14 with codebook 2 on sm_80
+    # with 74 multiprocessors, take linear_out_prefill
+    # (csrc/exl3/dense_prefill_tc.cu): tensor-core products on an exact
+    # integer grid, FP32 sums in k order, a deterministic k split of the last
+    # wave of tiles. Launches split-K splits keep split-K. Results differ from
+    # linear_out's in the last bits. Set once per process before any launch
+    # (vllm/sm80/kernels/exl3/dense_prefill_tc.py). Default OFF: unset, every
+    # dense call keeps today's kernels.
+    "VLLM_EXL3_DENSE_PREFILL_TC": lambda: bool(
+        int(os.getenv("VLLM_EXL3_DENSE_PREFILL_TC", "0"))
+    ),
+    # Diagnostic for VLLM_EXL3_DENSE_PREFILL_TC: "planned" (default) splits
+    # the last wave's k range when the planner predicts a gain; "whole" runs
+    # whole tiles only, to isolate the k split in a replay.
+    "VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE": lambda: _env_with_choices(
+        "VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", "planned", ["planned", "whole"]
+    )(),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
     # of at most 64 rows when every local expert matrix is bits_x2 10 /
     # codebook 2 with hidden 2560, intermediate 640, top-10 and 256 of 512

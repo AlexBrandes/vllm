@@ -27,6 +27,7 @@ SOURCES = (
     "moe_prefill.cu",
     "dense.cu", "dense_splitk.cu", "gemm.cu", "moe.cu", "moe_v2.cu", "ple.cu",
     "reference.cu", "module.cpp",
+    "dense_prefill_tc.cu",
 )
 
 

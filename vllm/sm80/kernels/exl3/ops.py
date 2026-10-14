@@ -9,6 +9,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.sm80.kernels.exl3 import dense_prefill_tc
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -194,6 +195,7 @@ def ensure_extension() -> None:
     ):
         torch.library.register_fake(f"_exl3_C::{name}")(fake)
     _dense_splitk = _resolve_dense_splitk()
+    dense_prefill_tc.resolve()
     _loaded = True
 
 
@@ -618,6 +620,8 @@ def _linear(
     workspace = _linear_scratch(x.device)
     out = torch.empty((x.shape[0], logical_out), dtype=x.dtype, device=x.device)
     operator = linear_out_splitk if _dense_splitk else linear_out
+    if dense_prefill_tc.active:
+        operator = dense_prefill_tc.route(operator, x.shape[0], _dense_splitk)
     for start in range(0, x.shape[0], row_chunk):
         operator(
             x[start : start + row_chunk],
