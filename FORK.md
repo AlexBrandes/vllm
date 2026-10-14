@@ -292,6 +292,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_fork_map.py` | 55 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_import_cuda_init.py` | 135 |
+| `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
 | `tests/sm80/test_kv_planning.py` | 479 |
 | `tests/sm80/test_modification_notices.py` | 80 |
 | `tests/sm80/test_moe_layers.py` | 297 |
@@ -328,7 +329,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **121 files** | **41,650** |
+| **122 files** | **41,707** |
 
 #### `tools/`
 
@@ -391,7 +392,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/third_party/flash_linear_attention/ops/solve_tril.py` | modified | 5 | 3 | 5 |
 | `vllm/third_party/flash_linear_attention/ops/utils.py` | modified | 38 | 9 | 9 |
 | `vllm/third_party/flash_linear_attention/ops/wy_fast.py` | modified | 3 | 1 | 3 |
-| `vllm/v1/attention/backends/mla/indexer.py` | modified | 12 | 5 | 7 |
+| `vllm/v1/attention/backends/mla/indexer.py` | modified | 6 | 2 | 4 |
 | `vllm/v1/attention/backends/recoverssm_metadata.py` | modified | 5 | 0 | 2 |
 | `vllm/v1/core/kv_cache_coordinator.py` | modified | 23 | 1 | 8 |
 | `vllm/v1/core/kv_cache_manager.py` | modified | 3 | 0 | 3 |
@@ -414,7 +415,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py` | modified | 2 | 0 | 2 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **68 files** | | **3,526** | **246** | **484** |
+| **68 files** | | **3,520** | **243** | **481** |
 
 ### Tests, docs and .github
 
@@ -434,7 +435,6 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 4 | 2 | 2 |
 | `tests/test_envs.py` | modified | 62 | 0 | 3 |
-| `tests/v1/attention/test_indexer_native_next_n.py` | modified | 5 | 2 | 3 |
 | `tests/v1/core/test_kv_cache_utils.py` | modified | 2 | 0 | 2 |
 | `tests/v1/core/test_scheduler.py` | modified | 19 | 20 | 9 |
 | `tests/v1/core/test_single_type_kv_cache_manager.py` | modified | 105 | 0 | 2 |
@@ -443,15 +443,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 4 | 1 | 4 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 9 | 1 | 5 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **23 files** | | **508** | **562** | **71** |
+| **22 files** | | **503** | **560** | **68** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 68 | 3,526 | 246 | 484 |
-| Tests, docs and .github | 23 | 508 | 562 | 71 |
-| All | 91 | 4,034 | 808 | 555 |
+| Product code | 68 | 3,520 | 243 | 481 |
+| Tests, docs and .github | 22 | 503 | 560 | 68 |
+| All | 90 | 4,023 | 803 | 549 |
 
 ## 3. Fork environment variables
 
@@ -553,10 +553,10 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 |---|---:|
 | Fork-added product files | 114 |
 | Fork-added product lines | 32,829 |
-| Patched upstream files | 91 |
-| Patched upstream lines | +4,034 / -808 |
+| Patched upstream files | 90 |
+| Patched upstream lines | +4,023 / -803 |
 | Patched upstream product files | 68 |
-| Patched upstream product lines | +3,526 / -246 |
-| Product lines added (new files and patches) | 36,355 |
+| Patched upstream product lines | +3,520 / -243 |
+| Product lines added (new files and patches) | 36,349 |
 | Fork environment variables (flags) | 76 |
 | Unreferenced fork definitions | 0 (0 lines) |

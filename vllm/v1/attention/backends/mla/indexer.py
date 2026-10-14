@@ -933,7 +933,7 @@ def _supports_varlen_paged_mqa_logits() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
-        and is_deep_gemm_supported()
+        and has_deep_gemm()
     )
 
 
@@ -941,7 +941,7 @@ def _supports_flattened_device_query_lens() -> bool:
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(90)
-        and is_deep_gemm_supported()
+        and has_deep_gemm()
     )
 
 
@@ -962,10 +962,7 @@ def _supports_native_decode(next_n: int) -> bool:
     instead of flattening to one single-token row per query, which re-reads
     the KV tile once per row.
     """
-    # Without DeepGEMM (non-CUDA, or CUDA below SM90 such as Ampere) the
-    # Triton paged kernel takes next_n in {1, 2} natively with the same
-    # (B, next_n) seq_lens layout; larger next_n is flattened.
-    if not (current_platform.is_cuda() and is_deep_gemm_supported()):
+    if not (current_platform.is_cuda() and has_deep_gemm()):
         return next_n in (1, 2)
     if current_platform.is_device_capability_family(100):
         return True
