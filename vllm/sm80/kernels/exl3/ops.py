@@ -38,8 +38,10 @@ MOE_V2_EXPERT_META = [
     [MOE_V2_INTERMEDIATE, MOE_V2_HIDDEN, 10, 2],
 ]
 # moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the configuration
-# moe_out_v2 covers, for calls of at least MOE_PREFILL_MIN_ROWS rows.
+# moe_out_v2 covers; it serves calls of MOE_PREFILL_MIN_ROWS to
+# MOE_PREFILL_MAX_ROWS rows (the validated range: one 3460-token prefill chunk).
 MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
+MOE_PREFILL_MAX_ROWS = 3460
 
 
 def _linear_fake(

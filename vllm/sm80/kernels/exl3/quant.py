@@ -686,10 +686,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 reason,
             )
             return 0, workspace
+        rows = min(max_rows, exl3_ops.MOE_PREFILL_MAX_ROWS)
         workspace = max(
             workspace,
             exl3_ops.moe_workspace_size_prefill(
-                max_rows,
+                rows,
                 self.hidden_size,
                 self.intermediate_size,
                 layer.top_k,
@@ -705,17 +706,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.intermediate_size,
             layer.top_k,
         )
-        decode_len = max_decode_query_len(get_current_vllm_config())
+        vllm_config = get_current_vllm_config()
+        decode_len = max_decode_query_len(vllm_config)
         logger.info_once(
             "EXL3 MoE prefill kernel active (VLLM_EXL3_MOE_PREFILL_TC): "
             "tensor-core routed experts for MoE calls of %d..%d rows in prefill "
-            "steps (a request scheduled more than %d tokens); decode steps and "
-            "calls of at most %d rows keep their kernels.",
+            "steps (a request scheduled more than %d tokens); decode steps, "
+            "calls of at most %d rows and larger calls keep their kernels.",
             exl3_ops.MOE_PREFILL_MIN_ROWS,
-            max_rows,
+            rows,
             decode_len,
             exl3_ops.MOE_PREFILL_MIN_ROWS - 1,
         )
+        compilation = getattr(vllm_config, "compilation_config", None)
+        graph_max = getattr(compilation, "max_cudagraph_capture_size", None) or 0
+        if graph_max >= exl3_ops.MOE_PREFILL_MIN_ROWS:
+            logger.info_once(
+                "VLLM_EXL3_MOE_PREFILL_TC: CUDA graphs are captured up to %d "
+                "tokens; prefill steps padded to a captured size replay moe_out.",
+                graph_max,
+            )
         return decode_len, workspace
 
     def apply(
@@ -862,13 +872,19 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         )
 
     def _prefill_operator(self, rows: int, operator):
-        """moe_out_prefill for a call of more than 64 rows in a prefill step
-        (the phase the scheduler gave the step, never the row count);
-        otherwise ``operator``."""
-        from vllm.sm80.kernels.exl3.ops import MOE_PREFILL_MIN_ROWS, moe_out_prefill
+        """moe_out_prefill for a call of MOE_PREFILL_MIN_ROWS..MOE_PREFILL_MAX_ROWS
+        rows in a prefill step (the phase the scheduler gave the step, never
+        the row count); otherwise ``operator``."""
+        from vllm.sm80.kernels.exl3.ops import (
+            MOE_PREFILL_MAX_ROWS,
+            MOE_PREFILL_MIN_ROWS,
+            moe_out_prefill,
+        )
         from vllm.sm80.kernels.exl3.step_phase import prefill_step
 
-        if rows >= MOE_PREFILL_MIN_ROWS and prefill_step(self.prefill_decode_len):
+        if MOE_PREFILL_MIN_ROWS <= rows <= MOE_PREFILL_MAX_ROWS and prefill_step(
+            self.prefill_decode_len
+        ):
             return moe_out_prefill
         return operator
 

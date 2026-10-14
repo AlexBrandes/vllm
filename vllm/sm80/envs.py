@@ -748,10 +748,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # every call takes moe_out.
     "VLLM_EXL3_MOE_V2": lambda: bool(int(os.getenv("VLLM_EXL3_MOE_V2", "0"))),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
-    # calls of more than 64 rows in prefill steps (some request scheduled more
+    # calls of 65..3460 rows in prefill steps (some request scheduled more
     # than 1 + num_speculative_tokens tokens), with the configuration
-    # VLLM_EXL3_MOE_V2 covers (vllm/sm80/kernels/exl3/quant.py). Calls of at
-    # most 64 rows and every call of a decode step keep their kernels. Results
+    # VLLM_EXL3_MOE_V2 covers (vllm/sm80/kernels/exl3/quant.py). Other calls
+    # and every call of a decode step keep their kernels. Results
     # differ from moe_out in the last bits. Default OFF: unset, prefill calls
     # take moe_out.
     "VLLM_EXL3_MOE_PREFILL_TC": lambda: bool(

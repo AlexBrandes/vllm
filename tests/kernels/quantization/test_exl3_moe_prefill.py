@@ -4,10 +4,10 @@
 
 CPU: the switch default, the configuration gate with its workspace, warm-up
 and log lines (through vLLM's own logger), the dispatch in Exl3Experts.apply
-by rows and by the scheduler phase of the step (calls of more than 64 rows in
-prefill steps only; decode steps of any size and calls of at most 64 rows
-keep their kernels; with the switch off the base rule), and the operator's
-workspace contract.
+by rows and by the scheduler phase of the step (calls of 65..3460 rows in
+prefill steps only; decode steps of any size, calls of at most 64 rows and
+larger calls keep their kernels; with the switch off the base rule), and the
+operator's workspace contract.
 
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
 256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
@@ -83,7 +83,6 @@ def test_switch_defaults_off(monkeypatch):
 
 def _method(monkeypatch, warmed, num_speculative_tokens=3):
     import vllm.config
-
     from vllm.sm80.kernels.exl3.quant import Exl3MoEMethod
 
     method = object.__new__(Exl3MoEMethod)
@@ -133,12 +132,15 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
         # max(what the layer had, moe_out_prefill's at the layer's max rows).
         assert method._moe_prefill(layer, SERVED_META, 3460, 7) == (4, 3460000)
         assert method._moe_prefill(layer, SERVED_META, 3460, 10**10) == (4, 10**10)
-        assert len(warmed) == 2 and warmed[0][3] == method.global_expert_ids
+        # Larger batches: sized only for the validated 3460 rows.
+        assert method._moe_prefill(layer, SERVED_META, 8192, 7) == (4, 3460000)
+        assert method._moe_prefill(layer, SERVED_META, 1000, 7) == (4, 1000000)
+        assert len(warmed) == 4 and warmed[0][3] == method.global_expert_ids
         # Closed: one line saying why; nothing sized or warmed.
         wrong = _meta_with(3, 0, [2560, 640, 8, 2])
         assert method._moe_prefill(layer, wrong, 3460, 7) == (0, 7)
         assert method._moe_prefill(layer, SERVED_META, 64, 7) == (0, 7)
-        assert len(warmed) == 2
+        assert len(warmed) == 4
     finally:
         root.removeHandler(caplog.handler)
     lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
@@ -147,8 +149,8 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
         quant.__name__,
         "EXL3 MoE prefill kernel active (VLLM_EXL3_MOE_PREFILL_TC): tensor-core "
         "routed experts for MoE calls of 65..3460 rows in prefill steps (a "
-        "request scheduled more than 4 tokens); decode steps and calls of at "
-        "most 64 rows keep their kernels.",
+        "request scheduled more than 4 tokens); decode steps, calls of at most "
+        "64 rows and larger calls keep their kernels.",
     ) in lines
     closed = sorted({m for _, _, m in lines if "gate is closed" in m})
     assert len(closed) == 2
@@ -165,8 +167,33 @@ def test_gate_counts_the_speculative_draft(monkeypatch):
     assert method._moe_prefill(layer, SERVED_META, 3460, 7)[0] == 1
 
 
+@pytest.mark.parametrize("graph_max, said", [(64, False), (72, True)])
+def test_gate_says_when_graphs_cover_prefill_sizes(monkeypatch, graph_max, said):
+    import vllm.config
+    from vllm.sm80.kernels.exl3 import quant
+
+    method, layer = _method(monkeypatch, [])
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            num_speculative_tokens=3,
+            compilation_config=SimpleNamespace(max_cudagraph_capture_size=graph_max),
+        ),
+    )
+    lines = []
+    monkeypatch.setattr(
+        quant.logger, "info_once", lambda msg, *a: lines.append(msg % a)
+    )
+    method._moe_prefill(layer, SERVED_META, 3460, 7)
+    graph_lines = [m for m in lines if "CUDA graphs are captured up to" in m]
+    assert len(graph_lines) == int(said)
+    if said:
+        assert "72 tokens" in graph_lines[0]
+
+
 def _experts(
-    moe_v2_rows, prefill_decode_len, max_rows=4096, workspace=0, expert_map="layer map"
+    moe_v2_rows, prefill_decode_len, max_rows=8192, workspace=0, expert_map="layer map"
 ):
     """Exl3Experts without its constructor (see test_exl3_moe_v2._experts)."""
     from vllm.sm80.kernels.exl3.quant import Exl3Experts
@@ -181,13 +208,13 @@ def _experts(
     return experts
 
 
-ROWS = (1, 4, 32, 63, 64, 65, 80, 97, 128, 256, 309, 1906, 3460)
+ROWS = (1, 4, 32, 63, 64, 65, 80, 97, 128, 256, 309, 1906, 3460, 3461, 8192)
 
 
 def expected_operator(rows, phase, moe_v2_rows, prefill_decode_len):
-    """The dispatch rule: the base rule, then calls of more than 64 rows in a
+    """The dispatch rule: the base rule, then calls of 65..3460 rows in a
     prefill step take moe_out_prefill when the gate is open."""
-    if prefill_decode_len and rows > 64 and phase == "prefill":
+    if prefill_decode_len and 64 < rows <= 3460 and phase == "prefill":
         return "moe_out_prefill"
     return "moe_out_v2" if 0 < rows <= moe_v2_rows else "moe_out"
 
@@ -230,6 +257,7 @@ def test_apply_dispatches_by_rows_and_scheduler_phase(
 def test_operator_list_and_workspace_contract():
     assert {"moe_out_prefill", "moe_workspace_size_prefill"} <= set(exl3_ops._OPERATORS)
     assert exl3_ops.MOE_PREFILL_MIN_ROWS == exl3_ops.MOE_V2_MAX_ROWS + 1 == 65
+    assert exl3_ops.MOE_PREFILL_MAX_ROWS == 3460
     _extension_or_skip()
     size = torch.ops._exl3_C.moe_workspace_size_prefill
     # 650 assignments: FP16 hi/lo gate/up operands (2 x 2 x 2560 halves, later
@@ -249,7 +277,7 @@ def test_operator_list_and_workspace_contract():
 # ---------------------------------------------------------------- GPU tests
 
 
-def _p(served, x, ids, weights):
+def _p(served, x, ids, weights):  # noqa: F811
     return _run(
         exl3_ops.moe_out_prefill,
         served,
