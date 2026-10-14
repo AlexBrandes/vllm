@@ -161,16 +161,6 @@ __device__ __forceinline__ void mma_k16(const uint4& a, uint32_t b0, uint32_t b1
       : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "f"(0.0f));
 }
 
-// D = A * B + C.
-__device__ __forceinline__ void mma_k16_c(const uint4& a, uint32_t b0, uint32_t b1, const float (&c)[4],
-                                          float (&d)[4]) {
-  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-      "{%10,%11,%12,%13};\n"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
-        "f"(c[3]));
-}
-
 // W = wh + wl exactly: wh = W rounded to the 2^-7 grid ((W + 12) - 12 in FP16; |W| < 4 for both codebooks, so
 // W + 12 lies in [8, 16) where the FP16 ulp is 2^-7), wl = W - wh (|wl| <= 2^-8, exact in FP16).
 __device__ __forceinline__ uint32_t grid_part(uint32_t w) {
@@ -316,15 +306,16 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_gemm(PrefillProblem p, Ou
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
             // wh * hi: integers on the 2^-7 grid, |sum| <= 16 * 2^11 * 2^9: exact in FP32, no truncation.
-            float dh[4], dl[4];
+            float dh[4], dl[4], dw[4];
             mma_k16(wh, b[j].x, b[j].y, dh);
-            // The small terms W * lo + wl * hi (|lo| <= 1/2, |wl| <= 2^-8) share one tensor-core sum.
+            // The small terms W * lo and wl * hi (|lo| <= 1/2, |wl| <= 2^-8): independent tensor-core sums.
             mma_k16(a, b[j].z, b[j].w, dl);
-            mma_k16_c(wl, b[j].x, b[j].y, dl, dl);
-            acc[q][j][0] = __fmaf_rn(__fadd_rn(dh[0], dl[0]), scale[j].x, acc[q][j][0]);
-            acc[q][j][1] = __fmaf_rn(__fadd_rn(dh[1], dl[1]), scale[j].y, acc[q][j][1]);
-            acc[q][j][2] = __fmaf_rn(__fadd_rn(dh[2], dl[2]), scale[j].x, acc[q][j][2]);
-            acc[q][j][3] = __fmaf_rn(__fadd_rn(dh[3], dl[3]), scale[j].y, acc[q][j][3]);
+            mma_k16(wl, b[j].x, b[j].y, dw);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+              acc[q][j][e] = __fmaf_rn(__fadd_rn(dh[e], __fadd_rn(dl[e], dw[e])), e & 1 ? scale[j].y : scale[j].x,
+                                       acc[q][j][e]);
+            }
           }
         }
         // The next stage's decode, interleaved with this stage's MMAs (past the last stage: unused buffer).

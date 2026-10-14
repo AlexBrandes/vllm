@@ -9,11 +9,11 @@
 //   |r| <= 2^-13); W (exact FP16, |W| < 4) = wh + wl with wh on the 2^-7 grid, wl = W - wh (|wl| <= 2^-8).
 //   The tensor cores truncate (round toward zero) every inexact sum, which biases |result| down coherently
 //   over k; so the dominant term is made exact: for every k16 step, dh = mma(wh^T, hi) from C = 0 is a sum of
-//   integer multiples of 2^-7 below 2^24 of them (exact in FP32), dl = mma(wl^T, hi) with C = mma(W^T, lo) from
-//   C = 0 holds the small terms (dh + dl = W * (hi + lo) up to the tensor core's rounding of dl), then
-//   acc = fma(dh + dl, 1 / s, acc) in FP32 round-to-nearest, k16 steps in increasing k; when the schedule splits
-//   a tile's k range over blocks (stream-K), each segment accumulates from 0 and the segments are summed in k
-//   order in FP32;
+//   integer multiples of 2^-7 below 2^24 of them (exact in FP32); the small terms dl = mma(W^T, lo) and
+//   dw = mma(wl^T, hi), each from C = 0 (independent sums: a dependent C chain stalls the tensor pipe), then
+//   acc = fma(dh + (dl + dw), 1 / s, acc) in FP32 round-to-nearest, k16 steps in increasing k; when the
+//   schedule splits a tile's k range over blocks (stream-K), each segment accumulates from 0 and the segments
+//   are summed in k order in FP32;
 //   out = bf16_rn(H128(acc) * svh) exactly as linear_out's linear_output (a block owns whole H128 column blocks).
 // Deterministic: the schedule and the k split points are a function of the launch shape and the device's
 // multiprocessor count only, the split tiles' partial sums are added in a fixed (k) order whichever block
