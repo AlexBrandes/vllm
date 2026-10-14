@@ -306,7 +306,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/attention/test_kpool_tail_padding_invariant.py` | 117 |
 | `tests/v1/attention/test_sm80_triton_mla_sparse_decode.py` | 76 |
 | `tests/v1/core/test_dflash_boundary_cache.py` | 478 |
-| `tests/v1/core/test_fair_prefill.py` | 688 |
+| `tests/v1/core/test_fair_prefill.py` | 689 |
 | `tests/v1/core/test_mamba_inflight_states.py` | 291 |
 | `tests/v1/core/test_pp_spread_decodes.py` | 79 |
 | `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
@@ -324,7 +324,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **119 files** | **41,448** |
+| **119 files** | **41,449** |
 
 #### `tools/`
 

@@ -570,6 +570,7 @@ def _mamba_scheduler(block_size: int, **kwargs):
             dtypes=(torch.float32,),
             block_size=block_size,
             page_size_padded=None,
+            mamba_cache_mode="align",
             mamba_type="mamba2",
             num_speculative_blocks=0,
         ),
