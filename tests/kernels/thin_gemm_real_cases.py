@@ -112,23 +112,37 @@ def pools(cases: list[dict]) -> dict[tuple, list[dict]]:
 
 
 def coverage_report(
-    cases: list[dict], required: set[tuple[str, int, str]]
-) -> tuple[list[str], list[tuple[str, int, str]]]:
+    cases: list[dict], required: set[tuple]
+) -> tuple[list[str], list[tuple]]:
     """(one line per phase listing rows:shapes covered, the missing required
-    (shape, rows, phase) cells). "+" marks a row count beyond the required."""
+    cells). A cell (shape, rows, phase) is met by any case of that shape, row
+    count and phase; a cell (shape, rows, phase, "target") only by one of the
+    target model's own weights (not the drafter's), listed on one more line
+    per phase that has such cells. "+" marks a row count beyond the
+    required."""
     found = collections.defaultdict(collections.Counter)
     for case in cases:
-        found[(case["shape"], case["rows"], case["phase"])][case["source"]] += 1
+        cell = (case["shape"], case["rows"], case["phase"])
+        found[cell][case["source"]] += 1
+        if not case["drafter"]:
+            found[cell + ("target",)][case["source"]] += 1
     lines = []
     for phase in PHASES:
-        rows = sorted({r for s, r, p in set(found) | required if p == phase})
-        parts = []
-        for r in rows:
-            req = {s for s, rr, p in required if rr == r and p == phase}
-            have = {s for s, rr, p in found if rr == r and p == phase}
-            mark = "" if req else "+"
-            miss = sorted(req - have)
-            parts.append(f"{mark}{r}:{len(have)}" + (f"(MISSING {','.join(miss)})" if miss else ""))
-        lines.append(f"CELLS {phase}: " + " ".join(parts))
+        for role in ((), ("target",)):
+            want = {c for c in required if c[2] == phase and c[3:] == role}
+            if role and not want:
+                continue
+            got = {c for c in found if c[2] == phase and c[3:] == role}
+            rows = sorted({c[1] for c in want | (set() if role else got)})
+            parts = []
+            for r in rows:
+                req = {c[0] for c in want if c[1] == r}
+                have = {c[0] for c in got if c[1] == r}
+                mark = "" if req else "+"
+                miss = sorted(req - have)
+                parts.append(f"{mark}{r}:{len(have)}"
+                             + (f"(MISSING {','.join(miss)})" if miss else ""))
+            name = " ".join((phase,) + role)
+            lines.append(f"CELLS {name}: " + " ".join(parts))
     missing = sorted(c for c in required if c not in found)
     return lines, missing

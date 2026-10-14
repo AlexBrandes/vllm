@@ -23,10 +23,15 @@ ties forgiven, exact where cuBLAS is exact) and is bitwise run to run. One
 line per pool and per phase's cells is printed; a failing pool fails.
 
 Required cells (REQUIRED_CELLS: the row counts the thin-GEMM dispatch takes at
-1-8 concurrent requests with 3-token speculative decoding, each padded to its
-CUDA-graph size 1, 2, 4, 8, 16, 24 or 32; phase from the scheduler):
+1-8 concurrent requests with 3-token speculative decoding or without drafts,
+each padded to its CUDA-graph size 1, 2, 4, 8, 16, 24 or 32; phase from the
+scheduler):
 - decode: drafter rows 1-8 (hyper-connection, final mixer, router and
   shared-expert gate shapes) and verify rows 4-32 (all seven shapes);
+- decode with the target model's weights at 1 and 2 rows (all seven shapes):
+  a verify step whose drafts the scheduler dropped (structured-output
+  requests whose drafts the grammar rejects, preemption) or a launch without
+  speculative decoding;
 - prefill: all seven shapes at every graph size up to 32;
 - mixed: the drafter shapes at 2 and 4, all seven shapes at 8-32 (row count 4
   of a mixed step comes only from 3 real rows padded: "padded" cases).
@@ -44,6 +49,7 @@ ALL_SHAPES = DRAFTER_SHAPES + ("gdn_ba", "ple_kv")
 REQUIRED_CELLS = (
     {(s, r, "decode") for s in DRAFTER_SHAPES for r in (1, 2, 4, 8)}
     | {(s, r, "decode") for s in ALL_SHAPES for r in (4, 8, 16, 24, 32)}
+    | {(s, r, "decode", "target") for s in ALL_SHAPES for r in (1, 2)}
     | {(s, r, "prefill") for s in ALL_SHAPES for r in (1, 2, 4, 8, 16, 24, 32)}
     | {(s, r, "mixed") for s in DRAFTER_SHAPES for r in (2, 4)}
     | {(s, r, "mixed") for s in ALL_SHAPES for r in (8, 16, 24, 32)}
@@ -112,6 +118,22 @@ def test_synthetic_case_set_loads_pools_and_reports(tmp_path, monkeypatch):
     assert lines[2] == "CELLS mixed: +8:1"
 
 
+def test_target_cells_need_the_target_weights(tmp_path):
+    """A (shape, rows, phase, "target") cell is not met by a drafter case."""
+    base = _synthetic(tmp_path)[0]
+    drafter = dict(base, id="d", shape="hc_down", rows=1, drafter=True)
+    target = dict(base, id="t", rows=2)
+    required = {("hc_down", 1, "decode", "target"), ("gdn_ba", 2, "decode", "target")}
+    lines, missing = real.coverage_report([drafter, target], required)
+    assert missing == [("hc_down", 1, "decode", "target")]
+    assert lines[:2] == ["CELLS decode: +1:1 +2:1",
+                         "CELLS decode target: 1:0(MISSING hc_down) 2:1"]
+    lines, missing = real.coverage_report([drafter], {("hc_down", 1, "decode")})
+    assert missing == [] and lines[0] == "CELLS decode: 1:1"
+    assert real.coverage_report([drafter, dict(drafter, id="d2", drafter=False)],
+                                {("hc_down", 1, "decode", "target")})[1] == []
+
+
 def test_tampered_case_fails(tmp_path):
     cases = _synthetic(tmp_path)
     path = tmp_path / cases[0]["file"]
@@ -145,7 +167,7 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
 
     from tests.kernels.quantization.test_exl3_dense_splitk import _Pool
     from vllm import envs
-    from vllm.config import CompilationMode
+    from vllm.config import CompilationMode, CUDAGraphMode
     from vllm.sm80.kernels.thin_gemm import gluon
 
     directory = real.case_dir_or_skip()
@@ -157,7 +179,9 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
     worker = types.SimpleNamespace(
         device=device,
         vllm_config=types.SimpleNamespace(
-            compilation_config=types.SimpleNamespace(mode=CompilationMode.NONE)))
+            compilation_config=types.SimpleNamespace(
+                mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.PIECEWISE),
+            model_config=types.SimpleNamespace(enforce_eager=False)))
     assert gluon.warmup_table(worker, list(range(1, 33))) == gluon.SHAPES
 
     def shipped(layer, x, w, bias=None):

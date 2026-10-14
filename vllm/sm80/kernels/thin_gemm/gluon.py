@@ -19,10 +19,16 @@ run the same schedule as decode steps of that size.
 The gate is decided once, before CUDA-graph capture, by ``warmup_table``
 (called from ``warmup.py``): sm_80 with 74 SMs (the schedule is measured
 there), compilation mode NONE (no torch.compile tracing through the Gluon
-launches), the Triton Gluon ampere API importable, and every kernel variant
-compiled and its workspace allocated. Until then, and whenever it stays
+launches), CUDA graphs for every step (no ``enforce_eager``, no graph mode
+that runs decode or mixed steps eagerly: those send unpadded row counts) and
+the Triton Gluon ampere API importable. Until then, and whenever it stays
 closed, the wrapped dispatch serves every call; a closed gate logs one warning
-with the reason.
+with the reason. Once those hold, the warmup compiles every kernel variant
+and allocates its workspace; a failure there fails the boot rather than
+leaving this process on a different kernel from the other ranks.
+
+``VLLM_THIN_GEMM_CONCAT`` pairs only the shipped thin GEMM's calls, so the
+two flags do not combine: setting both raises.
 
 Arithmetic: BF16 operands, FP32 accumulation, one BF16 rounding, bitwise
 reproducible run to run; the summation order differs from cuBLAS's and from
@@ -103,13 +109,26 @@ def impl():
     return thin_gemm_gluon
 
 
-def closed_reason(device, compilation_mode_none: bool) -> str:
-    """'' when this process may open the gate, else the reason it may not."""
+def closed_reason(device, vllm_config) -> str:
+    """'' when this process may open the gate, else the reason it may not.
+
+    The same on every rank of a launch (device model, config, venv)."""
+    from vllm.config import CompilationMode, CUDAGraphMode
+
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     if sms != SM_COUNT:
         return f"{sms} SMs, the schedule is measured at {SM_COUNT}"
-    if not compilation_mode_none:
+    compilation = vllm_config.compilation_config
+    if compilation.mode != CompilationMode.NONE:
         return "compilation mode is not NONE"
+    if vllm_config.model_config.enforce_eager:
+        return "enforce_eager runs every step eagerly (unpadded row counts)"
+    graphs = compilation.cudagraph_mode
+    if graphs is None or CUDAGraphMode.NONE in (graphs.decode_mode(),
+                                                graphs.mixed_mode()):
+        name = getattr(graphs, "name", graphs)
+        return (f"cudagraph_mode {name} runs steps eagerly (unpadded row "
+                "counts)")
     return gluon_api_missing()
 
 
@@ -118,22 +137,24 @@ def warmup_table(worker, ms) -> frozenset:
 
     -> the (N, K) this module now serves at M <= MAX_M (empty when closed).
     The shipped thin GEMM is warmed here for those shapes at any M above
-    MAX_M that ``ms`` holds; the caller warms it for everything else.
+    MAX_M that ``ms`` holds; the caller warms it for everything else. A
+    warmup failure raises: one rank must not serve a different kernel from
+    the others (the replicated router and hyper-connection GEMMs would
+    differ between ranks).
     """
-    from vllm.config import CompilationMode
-
     _LIVE[0] = False
-    mode = worker.vllm_config.compilation_config.mode
-    reason = closed_reason(worker.device, mode == CompilationMode.NONE)
+    reason = closed_reason(worker.device, worker.vllm_config)
     if reason:
         set_but_off(reason)
         return frozenset()
     table_ms = [m for m in ms if m <= MAX_M]
     try:
         impl().warmup(sorted(SHAPES), table_ms, device=worker.device)
-    except Exception as exc:  # noqa: BLE001 - a compile failure closes the gate
-        set_but_off(f"warmup failed ({type(exc).__name__}: {exc})")
-        return frozenset()
+    except Exception as exc:
+        raise RuntimeError(
+            "VLLM_THIN_GEMM_GLUON=1: the Gluon thin GEMM warmup failed "
+            f"({type(exc).__name__}: {exc}); unset VLLM_THIN_GEMM_GLUON to "
+            "serve without it") from exc
     over = [m for m in ms if m > MAX_M]
     if over:
         shipped_impl().warmup(sorted(SHAPES), over, device=worker.device)
@@ -150,6 +171,11 @@ def warmup_table(worker, ms) -> frozenset:
 def wrap_dispatch(shipped):
     """``shipped`` (an ``ampere_thin_gemm``) with the table's calls sent to
     ``thin_gemm_gluon`` while the gate is open. Same signature."""
+    if envs.VLLM_THIN_GEMM_CONCAT:
+        raise ValueError(
+            "VLLM_THIN_GEMM_GLUON and VLLM_THIN_GEMM_CONCAT are both set: the "
+            "concat groups pair only the shipped thin GEMM's calls; set one "
+            "of them")
 
     def ampere_thin_gemm(
         layer: torch.nn.Module,

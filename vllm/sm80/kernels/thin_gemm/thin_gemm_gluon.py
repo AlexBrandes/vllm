@@ -35,7 +35,7 @@ M=4 against ~75 flop/byte of bf16 balance on this part.  The only thing that
 matters is streaming the weight once at full HBM rate, which needs enough
 concurrent CTAs to saturate the memory system.  A plain (M, N) tiling gives
 ceil(N/BLOCK_N) CTAs; for the narrow shapes that is 1..8 CTAs on
-a 70-SM part.  Splitting K across CTAs multiplies the CTA count without reading
+a 74-SM part.  Splitting K across CTAs multiplies the CTA count without reading
 any weight byte twice - each CTA owns a disjoint set of K-blocks.
 
 The partial sums are FP32 and are reduced in the same launch: each CTA stores
@@ -63,7 +63,7 @@ from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 # --------------------------------------------------------------------------
 
 # Target CTA count as a multiple of the SM count.  Measured on this part
-# (70 SMs, sm_80): what a weight-streaming schedule wants is *many small* CTAs,
+# (74 SMs, sm_80): what a weight-streaming schedule wants is *many small* CTAs,
 # not few large ones.  A tile that is narrow in N reads exactly the same weight
 # bytes as a wide one, gives the scheduler finer-grained work so the tail of the
 # grid does not idle SMs, and lets SPLIT_K stay at 1 - which drops the whole

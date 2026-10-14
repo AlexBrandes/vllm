@@ -135,6 +135,7 @@ def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
     nk = _discover_nk(worker)
     discovered = len(nk)
     nk.update(_TABLE_NK)
+    backstop = len(nk) - discovered
     device = worker.device
 
     if envs.VLLM_THIN_GEMM_GLUON:
@@ -147,5 +148,5 @@ def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
     logger.info(
         "Warmed up the sm_80 thin-M BF16 GEMM: %d shapes (%d discovered on the "
         "live model, %d from the shape-table backstop) x M in %s (bound %d).",
-        len(nk), discovered, len(nk) - discovered, ms, bound,
+        len(nk), discovered, backstop, ms, bound,
     )

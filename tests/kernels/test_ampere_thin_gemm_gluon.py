@@ -14,8 +14,11 @@ CPU (runs anywhere):
   never imports it either. Dispatch: exactly the seven (N, K) of the table at
   M <= 32 with the gate open go to the Gluon module, everything else (other
   shapes, more rows, bias, 3-D input, gate closed) to the wrapped function.
-  Gate: 74 SMs, compilation mode NONE, Gluon ampere API, warmup failure; the
-  banner and the gate-closed line through vLLM's own logger. Warmup split:
+  Gate: 74 SMs, compilation mode NONE, CUDA graphs on every step
+  (enforce_eager and graph modes with eager steps close it), Gluon ampere
+  API; a warmup failure fails the boot; VLLM_THIN_GEMM_CONCAT with the flag
+  raises; the banner and the gate-closed line through vLLM's own logger,
+  the shipped warmup's count line. Warmup split:
   the Gluon module warms its shapes at M <= 32, the shipped kernel the rest.
   Schedule: the table holds every served row count for every (N, K), its rows
   are the measured ones (pinned), an unserved M takes the next served row;
@@ -77,12 +80,16 @@ def g(monkeypatch):
     _kernel()._FORCE_M[0] = 0
 
 
-def _worker(mode_name="NONE", device="cpu"):
-    from vllm.config import CompilationMode
+def _worker(mode_name="NONE", device="cpu", eager=False, graphs="PIECEWISE"):
+    from vllm.config import CompilationMode, CUDAGraphMode
 
-    cc = types.SimpleNamespace(mode=getattr(CompilationMode, mode_name))
+    cc = types.SimpleNamespace(mode=getattr(CompilationMode, mode_name),
+                               cudagraph_mode=getattr(CUDAGraphMode, graphs))
     return types.SimpleNamespace(
-        vllm_config=types.SimpleNamespace(compilation_config=cc), device=device
+        vllm_config=types.SimpleNamespace(
+            compilation_config=cc,
+            model_config=types.SimpleNamespace(enforce_eager=eager)),
+        device=device,
     )
 
 
@@ -114,6 +121,24 @@ def test_package_binding_in_a_fresh_interpreter(flag, expect):
     out = subprocess.run([sys.executable, "-c", _BINDING], env=env, check=True,
                          capture_output=True, text=True).stdout.strip().splitlines()[-1]
     assert out == expect
+
+
+def test_concat_and_gluon_raise_in_a_fresh_interpreter():
+    """Both flags set: importing the package raises (the concat groups pair
+    only the shipped thin GEMM's calls)."""
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", VLLM_THIN_GEMM_GLUON="1",
+               VLLM_THIN_GEMM_CONCAT="1")
+    run = subprocess.run([sys.executable, "-c", _BINDING], env=env,
+                         capture_output=True, text=True)
+    assert run.returncode != 0
+    assert ("VLLM_THIN_GEMM_GLUON and VLLM_THIN_GEMM_CONCAT are both set"
+            in run.stderr), run.stderr[-2000:]
+
+
+def test_concat_and_gluon_do_not_combine(g, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_CONCAT", True, raising=False)
+    with pytest.raises(ValueError, match="VLLM_THIN_GEMM_CONCAT are both set"):
+        g.wrap_dispatch(lambda layer, x, w, bias=None: None)
 
 
 def test_warmup_never_imports_gluon_when_off(monkeypatch):
@@ -273,13 +298,22 @@ def _sms(monkeypatch, n):
 
 def test_gate_reasons(g, monkeypatch):
     _sms(monkeypatch, 74)
-    assert g.closed_reason("cpu", True) == ""
-    assert g.closed_reason("cpu", False) == "compilation mode is not NONE"
+    assert g.closed_reason("cpu", _worker().vllm_config) == ""
+    assert (g.closed_reason("cpu", _worker("VLLM_COMPILE").vllm_config)
+            == "compilation mode is not NONE")
+    for graphs in ("PIECEWISE", "FULL", "FULL_AND_PIECEWISE"):
+        assert g.closed_reason("cpu", _worker(graphs=graphs).vllm_config) == "", graphs
+    assert (g.closed_reason("cpu", _worker(eager=True, graphs="NONE").vllm_config)
+            == "enforce_eager runs every step eagerly (unpadded row counts)")
+    for graphs in ("NONE", "FULL_DECODE_ONLY"):
+        assert (g.closed_reason("cpu", _worker(graphs=graphs).vllm_config)
+                == f"cudagraph_mode {graphs} runs steps eagerly (unpadded row counts)")
     _sms(monkeypatch, 70)
-    assert g.closed_reason("cpu", True) == "70 SMs, the schedule is measured at 74"
+    assert (g.closed_reason("cpu", _worker().vllm_config)
+            == "70 SMs, the schedule is measured at 74")
     _sms(monkeypatch, 74)
     monkeypatch.setitem(sys.modules, "triton.experimental.gluon.language.nvidia.ampere", None)
-    reason = g.closed_reason("cpu", True)
+    reason = g.closed_reason("cpu", _worker().vllm_config)
     assert reason.startswith("Triton Gluon ampere API missing ("), reason
     assert "triton.experimental.gluon.language.nvidia.ampere" in reason, reason
 
@@ -335,6 +369,7 @@ def test_warmup_gate_closed_lines(g, monkeypatch, caplog):
     _sms(monkeypatch, 74)
     with _vllm_log(caplog):
         assert g.warmup_table(_worker("VLLM_COMPILE"), [4]) == frozenset()
+        assert g.warmup_table(_worker(eager=True, graphs="NONE"), [4]) == frozenset()
         _sms(monkeypatch, 70)
         assert g.warmup_table(_worker(), [4]) == frozenset()
     assert g._LIVE[0] is False and seen == []
@@ -342,21 +377,27 @@ def test_warmup_gate_closed_lines(g, monkeypatch, caplog):
     tail = "; the VLLM_THIN_GEMM path serves every call"
     assert (logging.WARNING, "VLLM_THIN_GEMM_GLUON set but off: compilation mode "
             "is not NONE" + tail) in lines
+    assert (logging.WARNING, "VLLM_THIN_GEMM_GLUON set but off: enforce_eager runs "
+            "every step eagerly (unpadded row counts)" + tail) in lines
     assert (logging.WARNING, "VLLM_THIN_GEMM_GLUON set but off: 70 SMs, the "
             "schedule is measured at 74" + tail) in lines
 
 
-def test_warmup_failure_closes_the_gate(g, monkeypatch):
+def test_warmup_failure_fails_the_boot(g, monkeypatch):
+    """Every rank must serve the same kernel: a warmup failure with the flag
+    set raises instead of leaving this rank on the shipped path."""
     _sms(monkeypatch, 74)
     _fake_kernels(g, monkeypatch, fail=True)
     said = []
     monkeypatch.setattr(g, "set_but_off", said.append)
-    assert g.warmup_table(_worker(), [4]) == frozenset()
+    with pytest.raises(RuntimeError, match=r"VLLM_THIN_GEMM_GLUON=1: the Gluon thin GEMM "
+                       r"warmup failed \(RuntimeError: compile error\)"):
+        g.warmup_table(_worker(), [4])
     assert g._LIVE[0] is False
-    assert said == ["warmup failed (RuntimeError: compile error)"]
+    assert said == []
 
 
-def test_warmup_py_hands_the_table_to_gluon(g, monkeypatch):
+def test_warmup_py_hands_the_table_to_gluon(g, monkeypatch, caplog):
     from vllm.sm80.kernels.thin_gemm import warmup as wu
     import vllm.sm80.kernels.thin_gemm as tg
 
@@ -368,10 +409,16 @@ def test_warmup_py_hands_the_table_to_gluon(g, monkeypatch):
     monkeypatch.setattr(wu, "_discover_nk", lambda worker: {(336, 10240), (4096, 4096)})
     monkeypatch.setattr(g, "warmup_table",
                         lambda worker, ms: seen.append(("gluon", tuple(ms))) or g.SHAPES)
-    wu.warmup_ampere_thin_gemm(_worker(), [1, 4, 32])
+    with _vllm_log(caplog):
+        wu.warmup_ampere_thin_gemm(_worker(), [1, 4, 32])
     assert seen[0] == ("gluon", (1, 2, 3, 4, 8, 32))
     assert (4096, 4096) in seen[1][1]
     assert not set(seen[1][1]) & g.SHAPES
+    # 2 discovered + 18 from the backstop (its 19 shapes but (4096, 4096));
+    # the shipped kernel warms them without the Gluon-owned (336, 10240).
+    assert ("Warmed up the sm_80 thin-M BF16 GEMM: 19 shapes (2 discovered on "
+            "the live model, 18 from the shape-table backstop) x M in "
+            "[1, 2, 3, 4, 8, 32] (bound 32).") in [r.getMessage() for r in caplog.records]
 
 
 @pytest.mark.parametrize("thin_gemm,reason", [
