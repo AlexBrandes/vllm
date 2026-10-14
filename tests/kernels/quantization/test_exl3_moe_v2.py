@@ -427,36 +427,59 @@ SCENARIOS = [
 ]
 
 
+class _Fp64Pool:
+    """moe_out_v2's FP64 gate, pooled over calls: mean error <= 1.10x and max
+    error <= 1.25x moe_out's, BF16 rounding ties forgiven (only when every
+    element over the budget is one, at most 0.1 % of the elements), exact
+    where moe_out is exact, all finite."""
+
+    def __init__(self):
+        self.n = 0
+        self.c_sum = self.i_sum = 0.0
+        self.c_max = self.i_max = 0.0
+        self.parts = []
+
+    def add(self, cand, inc, ref, name):
+        assert torch.isfinite(cand).all(), name
+        ec, ei = (cand.double() - ref).abs(), (inc.double() - ref).abs()
+        exact = ei == 0
+        assert (ec[exact] == 0).all(), f"{name}: inexact where moe_out is"
+        self.n += ec.numel()
+        self.c_sum += float(ec.sum())
+        self.i_sum += float(ei.sum())
+        self.c_max = max(self.c_max, float(ec.max()))
+        self.i_max = max(self.i_max, float(ei.max()))
+        self.parts.append((ec, _tie_mask(cand, inc, ref)))
+
+    def ratios(self):
+        mean_ratio = self.c_sum / self.i_sum
+        max_ratio = self.c_max / self.i_max
+        if max_ratio > 1.25:
+            budget = 1.25 * self.i_max
+            over = sum(int((e > budget).sum()) for e, _ in self.parts)
+            forgiven = sum(int(((e > budget) & t).sum()) for e, t in self.parts)
+            if over == forgiven and forgiven <= 1e-3 * self.n:
+                rest = max(float(torch.where(t, 0.0, e).max()) for e, t in self.parts)
+                max_ratio = rest / self.i_max
+        return mean_ratio, max_ratio
+
+    def check(self, name="moe_out_v2"):
+        """Assert the gate; return (mean ratio, max ratio)."""
+        mean_ratio, max_ratio = self.ratios()
+        assert mean_ratio <= 1.10, f"{name}: mean error x{mean_ratio:.3f} of moe_out"
+        assert max_ratio <= 1.25, f"{name}: max error x{max_ratio:.3f} of moe_out"
+        return mean_ratio, max_ratio
+
+
 @needs_sm80
 def test_v2_meets_the_fp64_gate_of_moe_out(served):
-    pooled = dict(n=0, c_sum=0.0, i_sum=0.0, c_max=0.0, i_max=0.0, parts=[])
+    pool = _Fp64Pool()
     for index, (scenario, rows) in enumerate(SCENARIOS):
         x, ids, weights = _case(served, scenario, rows, 100 + index)
         cand, inc = _v2(served, x, ids, weights), _v1(served, x, ids, weights)
         ref = _reference(served, x, ids, weights)
-        assert torch.isfinite(cand).all(), scenario
-        ec, ei = (cand.double() - ref).abs(), (inc.double() - ref).abs()
-        exact = ei == 0
-        assert (ec[exact] == 0).all(), (
-            f"{scenario} rows={rows}: inexact where moe_out is"
-        )
-        pooled["n"] += ec.numel()
-        pooled["c_sum"] += float(ec.sum())
-        pooled["i_sum"] += float(ei.sum())
-        pooled["c_max"] = max(pooled["c_max"], float(ec.max()))
-        pooled["i_max"] = max(pooled["i_max"], float(ei.max()))
-        pooled["parts"].append((ec, _tie_mask(cand, inc, ref)))
-    mean_ratio = pooled["c_sum"] / pooled["i_sum"]
-    max_ratio = pooled["c_max"] / pooled["i_max"]
-    if max_ratio > 1.25:
-        budget = 1.25 * pooled["i_max"]
-        over = sum(int((e > budget).sum()) for e, _ in pooled["parts"])
-        forgiven = sum(int(((e > budget) & t).sum()) for e, t in pooled["parts"])
-        if over == forgiven and forgiven <= 1e-3 * pooled["n"]:
-            rest = max(float(torch.where(t, 0.0, e).max()) for e, t in pooled["parts"])
-            max_ratio = rest / pooled["i_max"]
-    assert mean_ratio <= 1.10, f"mean error x{mean_ratio:.3f} of moe_out"
-    assert max_ratio <= 1.25, f"max error x{max_ratio:.3f} of moe_out"
+        pool.add(cand, inc, ref, f"{scenario} rows={rows}")
+    pool.check()
 
 
 @needs_sm80

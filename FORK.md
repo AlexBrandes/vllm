@@ -220,10 +220,13 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/moe/test_moe_route_v2_mask.py` | 410 |
 | `tests/kernels/moe/test_shared_experts_reorder.py` | 488 |
 | `tests/kernels/moe_align_reference.py` | 87 |
-| `tests/kernels/quantization/test_exl3_dense_splitk.py` | 465 |
+| `tests/kernels/quantization/exl3_real_cases.py` | 350 |
+| `tests/kernels/quantization/test_exl3_dense_splitk.py` | 467 |
+| `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 321 |
 | `tests/kernels/quantization/test_exl3_kernels.py` | 366 |
-| `tests/kernels/quantization/test_exl3_moe_v2.py` | 568 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 591 |
+| `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 337 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
 | `tests/kernels/test_ampere_decode.py` | 464 |
 | `tests/kernels/test_ampere_decode_mhc_v3.py` | 390 |
@@ -329,7 +332,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **122 files** | **41,707** |
+| **125 files** | **42,741** |
 
 #### `tools/`
 

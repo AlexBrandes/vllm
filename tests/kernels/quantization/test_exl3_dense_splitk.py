@@ -280,7 +280,8 @@ def _bf16_ulp(y):
 class _Pool:
     """validate.py's BF16-level gate: pooled mean <= 1.10x and max <= 1.25x of
     linear_out's error against FP64, genuine rounding ties forgiven (at most
-    0.1 % of elements), exact where linear_out is exact, all finite."""
+    0.1 % of elements), exact where linear_out is exact, all finite. check()
+    returns (mean ratio, max ratio after ties, ties)."""
 
     def __init__(self):
         self.parts = []
@@ -315,6 +316,7 @@ class _Pool:
         assert mean_ratio <= 1.10, f"{name}: mean ratio {mean_ratio:.4f}"
         assert worst <= budget, f"{name}: max ratio {worst / inc_max:.4f}"
         assert ties <= 0.001 * elements, f"{name}: {ties} ties of {elements}"
+        return mean_ratio, worst / inc_max, ties
 
 
 @needs_sm80
