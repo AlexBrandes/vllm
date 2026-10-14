@@ -113,6 +113,13 @@ def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
     )
 
     if not use_ampere_thin_gemm():
+        if envs.VLLM_THIN_GEMM_GLUON:
+            from vllm.sm80.kernels.thin_gemm.gluon import set_but_off
+
+            set_but_off(
+                "not an sm_80 device" if envs.VLLM_THIN_GEMM
+                else "VLLM_THIN_GEMM is off"
+            )
         return
 
     warmup = impl().warmup
@@ -130,6 +137,12 @@ def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
     nk.update(_TABLE_NK)
     device = worker.device
 
+    if envs.VLLM_THIN_GEMM_GLUON:
+        # The Gluon thin GEMM decides its gate here and warms the (N, K) it
+        # takes over; the shipped kernel is warmed for the rest.
+        from vllm.sm80.kernels.thin_gemm.gluon import warmup_table
+
+        nk -= warmup_table(worker, ms)
     warmup(sorted(nk), ms, device=device)
     logger.info(
         "Warmed up the sm_80 thin-M BF16 GEMM: %d shapes (%d discovered on the "

@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Gluon thin GEMM for the Qwen3.8 decode shapes (``VLLM_THIN_GEMM_GLUON``).
+
+``thin_gemm_gluon`` carries a schedule measured on the 74-SM sm_80 part for
+the seven unquantized (N, K) of Qwen3.8-Flash-Next at tensor-parallel size 2
+(``SHAPES``), at every row count up to 32: split-K Gluon kernels with the
+reduction in the last-arriving CTA, a K-sliced variant, a persistent
+balanced-column kernel, the Triton thin GEMM for the remaining rows and a GEMV
+for N = 1. Against cuBLAS it is ~1.41x on the served mix of these calls.
+
+This module wraps the ``VLLM_THIN_GEMM`` dispatch (``ampere_thin_gemm``): a
+call goes to ``thin_gemm_gluon.thin_gemm`` when the gate is open, its (N, K)
+is in ``SHAPES``, it has at most ``MAX_M`` rows and ``thin_gemm_supported``
+admits it; every other call takes the wrapped function unchanged. The row
+count decides, never the phase: prefill and mixed steps with at most 32 rows
+run the same schedule as decode steps of that size.
+
+The gate is decided once, before CUDA-graph capture, by ``warmup_table``
+(called from ``warmup.py``): sm_80 with 74 SMs (the schedule is measured
+there), compilation mode NONE (no torch.compile tracing through the Gluon
+launches), the Triton Gluon ampere API importable, and every kernel variant
+compiled and its workspace allocated. Until then, and whenever it stays
+closed, the wrapped dispatch serves every call; a closed gate logs one warning
+with the reason.
+
+Arithmetic: BF16 operands, FP32 accumulation, one BF16 rounding, bitwise
+reproducible run to run; the summation order differs from cuBLAS's and from
+``thin_gemm_v74``'s.
+"""
+
+import functools
+
+import torch
+
+from vllm import envs
+from vllm.logger import init_logger
+from vllm.sm80.kernels.thin_gemm import impl as shipped_impl
+from vllm.sm80.kernels.thin_gemm import thin_gemm_supported
+
+logger = init_logger(__name__)
+
+# (N, K) of the schedule table: hyper-connection down, final mixer down,
+# hyper-connection up, MoE router, shared-expert gate, GDN in_proj_ba (TP2
+# shard), PLE kv_proj.
+SHAPES = frozenset({
+    (336, 10240), (320, 10240), (10240, 320), (512, 2560), (1, 2560),
+    (48, 2560), (12800, 2560),
+})
+# Largest row count of the table; more rows keep the wrapped dispatch.
+MAX_M = 32
+# The SM count the schedule was measured on.
+SM_COUNT = 74
+# Row counts with a schedule row (the forced-schedule diagnostic's values).
+SERVED_M = (1, 2, 4, 8, 16, 24, 32)
+
+# Set by warmup_table once every check passed and every variant compiled.
+_LIVE = [False]
+
+
+def set_but_off(reason: str) -> None:
+    logger.warning_once(
+        "VLLM_THIN_GEMM_GLUON set but off: %s; the VLLM_THIN_GEMM path serves "
+        "every call", reason)
+
+
+def gluon_api_missing() -> str:
+    """'' when the Triton Gluon ampere API the kernels use imports, else why."""
+    try:
+        from triton.experimental import gluon  # noqa: F401
+        from triton.experimental.gluon import language as gl
+        from triton.experimental.gluon.language.nvidia.ampere import (  # noqa: F401
+            async_copy,
+            mma_v2,
+        )
+        for name in ("NVMMADistributedLayout", "DotOperandLayout",
+                     "SwizzledSharedLayout", "allocate_shared_memory"):
+            getattr(gl, name)
+    except Exception as exc:  # noqa: BLE001 - any failure closes the gate
+        return f"Triton Gluon ampere API missing ({type(exc).__name__}: {exc})"
+    return ""
+
+
+def force_m() -> int:
+    """VLLM_THIN_GEMM_GLUON_FORCE_M if it names a served row count, else 0."""
+    value = envs.VLLM_THIN_GEMM_GLUON_FORCE_M
+    if value and value not in SERVED_M:
+        logger.warning_once(
+            "VLLM_THIN_GEMM_GLUON_FORCE_M=%d ignored: not one of %s",
+            value, SERVED_M)
+        return 0
+    return value
+
+
+@functools.cache
+def impl():
+    """``thin_gemm_gluon``, sharing the shipped module's workspace lane (a
+    caller that selects a lane for a second stream selects it for both)."""
+    from vllm.sm80.kernels.thin_gemm import thin_gemm_gluon
+
+    thin_gemm_gluon._LANE = shipped_impl()._LANE
+    thin_gemm_gluon._FORCE_M[0] = force_m()
+    return thin_gemm_gluon
+
+
+def closed_reason(device, compilation_mode_none: bool) -> str:
+    """'' when this process may open the gate, else the reason it may not."""
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if sms != SM_COUNT:
+        return f"{sms} SMs, the schedule is measured at {SM_COUNT}"
+    if not compilation_mode_none:
+        return "compilation mode is not NONE"
+    return gluon_api_missing()
+
+
+def warmup_table(worker, ms) -> frozenset:
+    """Decide the gate and, if it opens, compile and allocate every variant.
+
+    -> the (N, K) this module now serves at M <= MAX_M (empty when closed).
+    The shipped thin GEMM is warmed here for those shapes at any M above
+    MAX_M that ``ms`` holds; the caller warms it for everything else.
+    """
+    from vllm.config import CompilationMode
+
+    _LIVE[0] = False
+    mode = worker.vllm_config.compilation_config.mode
+    reason = closed_reason(worker.device, mode == CompilationMode.NONE)
+    if reason:
+        set_but_off(reason)
+        return frozenset()
+    table_ms = [m for m in ms if m <= MAX_M]
+    try:
+        impl().warmup(sorted(SHAPES), table_ms, device=worker.device)
+    except Exception as exc:  # noqa: BLE001 - a compile failure closes the gate
+        set_but_off(f"warmup failed ({type(exc).__name__}: {exc})")
+        return frozenset()
+    over = [m for m in ms if m > MAX_M]
+    if over:
+        shipped_impl().warmup(sorted(SHAPES), over, device=worker.device)
+    _LIVE[0] = True
+    pinned = impl()._FORCE_M[0]
+    logger.info_once(
+        "Gluon thin GEMM active [VLLM_THIN_GEMM_GLUON=1]: %d (N, K) x M in %s "
+        "(up to %d rows)%s", len(SHAPES), tuple(table_ms), MAX_M,
+        f", schedule pinned to M={pinned} [VLLM_THIN_GEMM_GLUON_FORCE_M]"
+        if pinned else "")
+    return SHAPES
+
+
+def wrap_dispatch(shipped):
+    """``shipped`` (an ``ampere_thin_gemm``) with the table's calls sent to
+    ``thin_gemm_gluon`` while the gate is open. Same signature."""
+
+    def ampere_thin_gemm(
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            _LIVE[0]
+            and x.shape[0] <= MAX_M
+            and tuple(weight.shape) in SHAPES
+            and thin_gemm_supported(x, weight, bias)
+        ):
+            return impl().thin_gemm(x, weight)
+        return shipped(layer, x, weight, bias)
+
+    ampere_thin_gemm.shipped = shipped
+    return ampere_thin_gemm

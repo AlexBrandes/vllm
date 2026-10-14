@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_THIN_GEMM_CONCAT: bool = False
+    VLLM_THIN_GEMM_GLUON: bool = False
+    VLLM_THIN_GEMM_GLUON_FORCE_M: int = 0
     VLLM_SHARED_EXPERT_REORDER: bool = False
     VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_PP_PACKED_HOP: bool = False
@@ -689,6 +691,23 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # the pairing module is never imported.
     "VLLM_THIN_GEMM_CONCAT": lambda: bool(
         int(os.getenv("VLLM_THIN_GEMM_CONCAT", "0"))
+    ),
+    # Send the thin-GEMM calls of the measured Qwen3.8 decode shapes (seven
+    # (N, K): hyper-connection down/up and final down, router, shared-expert
+    # gate, GDN in_proj_ba, PLE kv_proj) at M <= 32 to the Gluon thin GEMM
+    # (vllm/sm80/kernels/thin_gemm/gluon.py, thin_gemm_gluon.py). Needs
+    # VLLM_THIN_GEMM, sm_80 with 74 SMs, the Triton Gluon ampere API and
+    # compilation mode NONE; anything else keeps the VLLM_THIN_GEMM path.
+    # Default OFF: unset, the module is never imported.
+    "VLLM_THIN_GEMM_GLUON": lambda: bool(
+        int(os.getenv("VLLM_THIN_GEMM_GLUON", "0"))
+    ),
+    # Diagnostic for VLLM_THIN_GEMM_GLUON: 0 (off) or a served row count
+    # (1, 2, 4, 8, 16, 24, 32). Every Gluon thin-GEMM call with at most that
+    # many rows takes that row count's schedule, so a row's result does not
+    # depend on how many rows the call holds. Default 0.
+    "VLLM_THIN_GEMM_GLUON_FORCE_M": lambda: int(
+        os.getenv("VLLM_THIN_GEMM_GLUON_FORCE_M", "0")
     ),
     # Dense EXL3 launches of the tiny or small block shape with at most 1024
     # blocks, for bits_x2 10/12/14 with codebook 2 on sm_80, take
