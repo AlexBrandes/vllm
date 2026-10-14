@@ -6,8 +6,9 @@ Inputs: VLLM_EXL3_TEST_PORT_CASES names the case set (layout in
 exl3_real_cases.py: cases.json plus one torch file per case) and
 VLLM_EXL3_TEST_CHECKPOINT the EXL3 checkpoint the calls ran on (the
 Qwen3.8-Flash-Next 5.05 bpw checkpoint). With either unset or missing, the
-tests that need it skip and say which. Every case is a routed-expert call of
-1..64 rows taken from the served model at tensor parallel size 2, rank 0 (256
+tests that need it skip and say which. Every case these tests take is a
+routed-expert call of 1..64 rows (the set may hold larger calls for other
+kernels) taken from the served model at tensor parallel size 2, rank 0 (256
 of 512 experts local, top-10): its input rows, top-k ids and weights, the
 layer's expert map and packed metadata, and for whole ("live") calls the
 output moe_out gave. The layer's expert weights are read from the checkpoint
@@ -211,6 +212,13 @@ def test_fp64_routed_reference_matches_a_direct_sum():
             np.testing.assert_allclose(out[t].numpy(), expected, rtol=1e-11, atol=1e-12)
 
 
+def _v2_cases(directory):
+    """The case set's MoE calls of 1..64 rows (it may also hold the larger
+    calls other kernels serve)."""
+    _, cases = real.load_manifest(directory, "moe")
+    return [case for case in cases if case["rows"] <= exl3_ops.MOE_V2_MAX_ROWS]
+
+
 def test_required_cells_are_moe_v2_calls():
     for rows, phase in REQUIRED_CELLS:
         assert 0 < rows <= exl3_ops.MOE_V2_MAX_ROWS, (rows, phase)
@@ -218,7 +226,7 @@ def test_required_cells_are_moe_v2_calls():
 
 def test_case_set_files_and_coverage():
     directory = real.case_dir_or_skip()
-    _, cases = real.load_manifest(directory, "moe")
+    cases = _v2_cases(directory)
     for case in cases:
         tensors = real.load_case(directory, "moe", case)
         assert 0 < case["rows"] <= exl3_ops.MOE_V2_MAX_ROWS, case["id"]
@@ -267,7 +275,7 @@ def test_v2_holds_moe_outs_error_against_fp64_on_real_inputs():
     directory = real.case_dir_or_skip()
     checkpoint = real.Checkpoint(real.checkpoint_or_skip())
     _extension_or_skip()
-    _, cases = real.load_manifest(directory, "moe")
+    cases = _v2_cases(directory)
     real.require_cells(cases, REQUIRED_CELLS, "MoE v2")
     device = torch.device("cuda")
     loaded = {case["id"]: real.load_case(directory, "moe", case) for case in cases}

@@ -589,6 +589,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         moe_v2_rows = 0
         if envs.VLLM_EXL3_MOE_V2:
             moe_v2_rows, workspace = self._moe_v2(layer, metadata, max_rows, workspace)
+        prefill_decode_len = 0
+        if envs.VLLM_EXL3_MOE_PREFILL_TC:
+            prefill_decode_len, workspace = self._moe_prefill(
+                layer, metadata, max_rows, workspace
+            )
         experts = Exl3Experts(
             self.moe,
             self.moe_quant_config,
@@ -597,6 +602,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             workspace,
             max_rows,
             moe_v2_rows,
+            prefill_decode_len,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
@@ -650,6 +656,68 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         return rows, workspace
 
+    def _moe_prefill(self, layer, metadata, max_rows: int, workspace: int):
+        """The most tokens one request has in a decode step, above which a
+        step is a prefill step whose calls of more than 64 rows take
+        moe_out_prefill, and a workspace size that fits every operator (0:
+        the gate is closed)."""
+        from vllm.config import get_current_vllm_config
+        from vllm.sm80.kernels.exl3 import ops as exl3_ops
+        from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
+
+        device = layer.exl3_ptrs.device
+        # moe_out_prefill covers the configuration moe_out_v2 covers.
+        reason = exl3_ops.moe_v2_closed_reason(
+            tuple(torch.cuda.get_device_capability(device)),
+            self.moe.in_dtype,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+            self.local_experts,
+            layer.global_num_experts,
+            metadata,
+        )
+        if reason is None and max_rows < exl3_ops.MOE_PREFILL_MIN_ROWS:
+            reason = f"MoE calls have at most {max_rows} rows"
+        if reason is not None:
+            logger.info_once(
+                "VLLM_EXL3_MOE_PREFILL_TC is set but the gate is closed: %s; "
+                "these MoE layers keep moe_out in prefill steps.",
+                reason,
+            )
+            return 0, workspace
+        workspace = max(
+            workspace,
+            exl3_ops.moe_workspace_size_prefill(
+                max_rows,
+                self.hidden_size,
+                self.intermediate_size,
+                layer.top_k,
+                self.local_experts,
+            ),
+        )
+        exl3_ops.warmup_moe_prefill(
+            layer.exl3_ptrs,
+            layer.exl3_meta,
+            layer.exl3_expert_map,
+            self.global_expert_ids,
+            self.hidden_size,
+            self.intermediate_size,
+            layer.top_k,
+        )
+        decode_len = max_decode_query_len(get_current_vllm_config())
+        logger.info_once(
+            "EXL3 MoE prefill kernel active (VLLM_EXL3_MOE_PREFILL_TC): "
+            "tensor-core routed experts for MoE calls of %d..%d rows in prefill "
+            "steps (a request scheduled more than %d tokens); decode steps and "
+            "calls of at most %d rows keep their kernels.",
+            exl3_ops.MOE_PREFILL_MIN_ROWS,
+            max_rows,
+            decode_len,
+            exl3_ops.MOE_PREFILL_MIN_ROWS - 1,
+        )
+        return decode_len, workspace
+
     def apply(
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     ):
@@ -679,6 +747,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         workspace,
         max_rows,
         moe_v2_rows=0,
+        prefill_decode_len=0,
     ):
         super().__init__(moe, quant)
         self.intermediate_size = intermediate_size
@@ -687,6 +756,10 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.max_rows = max_rows
         # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2).
         self.moe_v2_rows = moe_v2_rows
+        # Nonzero (VLLM_EXL3_MOE_PREFILL_TC with its gate open): calls of more
+        # than 64 rows in a step that schedules some request more than this
+        # many tokens take moe_out_prefill.
+        self.prefill_decode_len = prefill_decode_len
 
     @staticmethod
     def activation_format():
@@ -774,6 +847,8 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         ):
             raise ValueError("EXL3 MoE requires unquantized, unweighted BF16 inputs")
         operator = moe_out_v2 if 0 < rows <= self.moe_v2_rows else moe_out
+        if self.prefill_decode_len:
+            operator = self._prefill_operator(rows, operator)
         operator(
             hidden_states,
             topk_ids,
@@ -785,6 +860,17 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             output,
             workspace2.view(torch.float32),
         )
+
+    def _prefill_operator(self, rows: int, operator):
+        """moe_out_prefill for a call of more than 64 rows in a prefill step
+        (the phase the scheduler gave the step, never the row count);
+        otherwise ``operator``."""
+        from vllm.sm80.kernels.exl3.ops import MOE_PREFILL_MIN_ROWS, moe_out_prefill
+        from vllm.sm80.kernels.exl3.step_phase import prefill_step
+
+        if rows >= MOE_PREFILL_MIN_ROWS and prefill_step(self.prefill_decode_len):
+            return moe_out_prefill
+        return operator
 
 
 def dispatched_rows(prepare, moe) -> int:

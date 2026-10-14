@@ -25,7 +25,12 @@ record_sha256 (sha256 of the captured record the case came from).
 source "live": the whole call as it ran, with "out" = the output the shipped
 kernel produced in that call. source "sliced": the last rows of a live call
 of the same matrix, phase and drafter, standing for a launch of that many
-rows that no capture holds whole; it has no stored output.
+rows that no capture holds whole; it has no stored output. source "joined"
+(MoE only): the rows of consecutive live calls of the same layer, phase and
+drafter, in order, standing for a call of more rows than any capture holds
+(the routed experts compute every row from its own input and routes alone);
+joined_from lists [record_sha256, first row, end row] per part, and it has no
+stored output.
 
 Dense case fields: bits_x2, codebook, input_slice [start, stop] and
 output_slices [[start, stop], ...] (the rank's H128 blocks of the checkpoint
@@ -128,7 +133,8 @@ def load_manifest(directory: Path, family: str) -> tuple[dict, list[dict]]:
         assert case["id"] not in seen, f"duplicate case id {case['id']}"
         seen.add(case["id"])
         assert case["phase"] in PHASES, f"case {case['id']}: phase {case['phase']}"
-        assert case["source"] in ("live", "sliced"), case["id"]
+        assert case["source"] in ("live", "sliced", "joined"), case["id"]
+        assert case["source"] != "joined" or family == "moe", case["id"]
         assert case["rows"] > 0, case["id"]
     header = {k: v for k, v in manifest.items() if k not in _FIELDS}
     return header, cases
@@ -209,6 +215,15 @@ def coverage_report(
         " last rows of a longer live call (real activations, no recorded output)"
     )
     lines.append("CELLS sliced: " + (" ".join(f"{r}/{p}" for r, p in sliced) or "none"))
+    joined = sorted(
+        (cell for cell, sources in found.items() if sources.get("joined")),
+        key=lambda c: (c[1], c[0]),
+    )
+    if joined:
+        lines.append(
+            "CELLS joined (j, the rows of consecutive live calls of one layer, no "
+            "recorded output): " + " ".join(f"{r}/{p}" for r, p in joined)
+        )
     missing = sorted(required - set(found), key=lambda c: (c[1], c[0]))
     return lines, missing
 

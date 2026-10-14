@@ -171,6 +171,7 @@ def _experts(moe_v2_rows, max_rows=4096, workspace=0, expert_map="layer map"):
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.prefill_decode_len = 0
     return experts
 
 

@@ -37,6 +37,9 @@ MOE_V2_EXPERT_META = [
     [MOE_V2_HIDDEN, MOE_V2_INTERMEDIATE, 10, 2],
     [MOE_V2_INTERMEDIATE, MOE_V2_HIDDEN, 10, 2],
 ]
+# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the configuration
+# moe_out_v2 covers, for calls of at least MOE_PREFILL_MIN_ROWS rows.
+MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 
 
 def _linear_fake(
@@ -92,11 +95,13 @@ _OPERATORS = (
     "linear_out_splitk",
     "moe_out",
     "moe_out_v2",
+    "moe_out_prefill",
     "ple_decode_out",
     "linear_workspace_size",
     "linear_splitk_splits",
     "moe_workspace_size",
     "moe_workspace_size_v2",
+    "moe_workspace_size_prefill",
 )
 
 
@@ -182,6 +187,7 @@ def ensure_extension() -> None:
         ("linear_out_splitk", _linear_fake),
         ("moe_out", _moe_fake),
         ("moe_out_v2", _moe_fake),
+        ("moe_out_prefill", _moe_fake),
         ("ple_decode_out", _ple_fake),
     ):
         torch.library.register_fake(f"_exl3_C::{name}")(fake)
@@ -453,6 +459,99 @@ def warmup_moe_v2(
         )
     torch.cuda.synchronize(device)
     _moe_v2_warm_devices.add(device)
+
+
+@lru_cache(maxsize=None)
+def moe_workspace_size_prefill(
+    max_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    local_experts: int,
+) -> int:
+    ensure_extension()
+    return torch.ops._exl3_C.moe_workspace_size_prefill(
+        max_rows, hidden_size, intermediate_size, topk, local_experts
+    )
+
+
+def moe_out_prefill(
+    x,
+    topk_ids,
+    topk_weights,
+    packed_ptrs,
+    packed_meta,
+    expert_map,
+    intermediate_size: int,
+    out,
+    workspace,
+) -> None:
+    """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
+    the moe_out_v2 configuration; see csrc/exl3/moe_prefill.cu."""
+    ensure_extension()
+    torch.ops._exl3_C.moe_out_prefill(
+        x,
+        topk_ids,
+        topk_weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        out,
+        workspace,
+    )
+
+
+_moe_prefill_warm_devices: set[torch.device] = set()
+
+
+def warmup_moe_prefill(
+    packed_ptrs: torch.Tensor,
+    packed_meta: torch.Tensor,
+    expert_map: torch.Tensor,
+    global_expert_ids: list[int],
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+) -> None:
+    """Run moe_out_prefill once per device before any CUDA graph capture.
+
+    The operator sets its GEMM kernels' shared-memory limit on its first call
+    and launches the same kernels at every row count (the row tiles of an
+    expert are chosen on the device), so one call of MOE_PREFILL_MIN_ROWS
+    rows, all with local routes, loads every kernel it can launch. The
+    temporary buffers are freed again.
+    """
+    device = packed_ptrs.device
+    if device in _moe_prefill_warm_devices:
+        return
+    rows = MOE_PREFILL_MIN_ROWS
+    ids = torch.tensor(
+        [global_expert_ids[:top_k]] * rows, dtype=torch.int32, device=device
+    )
+    weights = torch.full((rows, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+    x = torch.ones((rows, hidden_size), dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x)
+    workspace = torch.empty(
+        moe_workspace_size_prefill(
+            rows, hidden_size, intermediate_size, top_k, packed_ptrs.shape[0]
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+    moe_out_prefill(
+        x,
+        ids,
+        weights,
+        packed_ptrs,
+        packed_meta,
+        expert_map,
+        intermediate_size,
+        out,
+        workspace,
+    )
+    torch.cuda.synchronize(device)
+    _moe_prefill_warm_devices.add(device)
 
 
 def ple_decode_out(
