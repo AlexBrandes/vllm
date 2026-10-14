@@ -34,8 +34,10 @@ against an FP64 recomputation, pooled per (N, K, M) over seeds, with cuBLAS
 (F.linear) as the error budget: mean <= 1.10x, max <= 1.25x, BF16 rounding
 ties forgiven (<= 0.1 %), exact where cuBLAS is exact; bitwise run to run and
 out= == out=None; the views the layout check admits (row stride K + 16, rows
-at a whole-row offset) give the contiguous call's result bit for bit, the
-ones it refuses give F.linear's through the dispatch; CUDA-graph replay bitwise equal
+at a whole-row offset, a 16-byte base offset) give the contiguous call's
+result bit for bit with no variant compiled beyond the contiguous call's, the
+ones it refuses give F.linear's through the dispatch; called directly, a row
+stride of K + 24 takes the Triton kernel; CUDA-graph replay bitwise equal
 to eager with no allocation in capture or replay; split-K arrival counters
 back at zero after every call; the forced schedule makes each row's result
 independent of the call's row count; the dispatch end to end through the
