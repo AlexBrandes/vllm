@@ -194,6 +194,9 @@ def ensure_extension() -> None:
         ("ple_decode_out", _ple_fake),
     ):
         torch.library.register_fake(f"_exl3_C::{name}")(fake)
+    from vllm.sm80.kernels.exl3 import dense_mma
+
+    dense_mma.resolve()
     _dense_splitk = _resolve_dense_splitk()
     dense_prefill_tc.resolve()
     _loaded = True

@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "codec.cuh"
+#include "dense_mma.h"
 #include "gemm.cuh"
 #include "ops.h"
 
@@ -566,6 +567,12 @@ void linear_out_splitk(const torch::Tensor& x, const torch::Tensor& trellis,
   if (rows == 0) return;
   const c10::cuda::CUDAGuard guard(x.device());
   const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  // With VLLM_EXL3_DENSE_MMA the tensor-core blocks take the launches they
+  // cover first (dense_mma.h); everything else continues below unchanged.
+  if (linear_out_mma(x, trellis, suh, svh, bits_x2, codebook, logical_in, logical_out, out,
+                     workspace, sms)) {
+    return;
+  }
   const GemmShape shape = dense_gemm_shape(rows, padded_out, sms);
   if (!served_format(bits_x2, codebook) || shape_splits(shape, rows, padded_out) != 2) {
     linear_out(x, trellis, suh, svh, bits_x2, codebook, logical_in, logical_out, out, workspace);

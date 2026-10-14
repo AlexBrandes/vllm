@@ -87,6 +87,8 @@ if TYPE_CHECKING:
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_EXL3_DENSE_SPLITK: bool = False
+    VLLM_EXL3_DENSE_MMA: bool = False
+    VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE: str = ""
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
@@ -721,6 +723,25 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # takes linear_out.
     "VLLM_EXL3_DENSE_SPLITK": lambda: bool(
         int(os.getenv("VLLM_EXL3_DENSE_SPLITK", "0"))
+    ),
+    # With VLLM_EXL3_DENSE_SPLITK on, dense EXL3 launches of 1..32 rows of
+    # the validated matrices (one Qwen3.8-Flash-Next rank at TP2, bits_x2
+    # 10/12/14 with codebook 2; the LM head included) on sm_80 with 74 SMs at
+    # TP2 and PP1 run on tensor-core
+    # blocks inside linear_out_splitk (csrc/exl3/dense_mma.cu): activations
+    # split into FP16 hi + lo, FP32 accumulation, K split inside and across
+    # blocks with deterministic adds. Results differ from linear_out's in
+    # the last bits. Set once per process before any launch
+    # (vllm/sm80/kernels/exl3/dense_mma.py). Default OFF: unset, every launch
+    # keeps the split-K operator's path.
+    "VLLM_EXL3_DENSE_MMA": lambda: bool(int(os.getenv("VLLM_EXL3_DENSE_MMA", "0"))),
+    # Diagnostic for VLLM_EXL3_DENSE_MMA: "MT,KW,SPLITS" (MT 2 or 4 column
+    # tiles per warp, KW 1/2/4/8 warps along K per column group, SPLITS 1 or
+    # 2 blocks along K) forces that plan on every launch the tensor-core
+    # blocks take, in place of the per-shape choice. Unset: the shipped
+    # choice.
+    "VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE": lambda: os.getenv(
+        "VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE", ""
     ),
     # Qwen EXL3 checkpoints (vllm/sm80/kernels/exl3/quant.py).
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
