@@ -19,9 +19,11 @@
   becomes a ``SkipSpillingAutotuner``. When it benchmarks on sm_80, it builds
   each config first and skips (never launches) one whose build needs more
   than ``LOCAL_BYTES_LIMIT`` bytes of local memory per thread; the skipped
-  config times as infinite. Configs are only built when a benchmark runs, so
-  a boot that reads its timings from Triton's autotune cache builds nothing
-  extra. On any other device it autotunes as usual.
+  config times as infinite. A benchmark that skips a config and leaves no
+  finite time raises instead of launching anything. On a hit in Triton's
+  autotune cache only the cached winner is built; if it is over the limit
+  (timings written without the flag) the key is benchmarked again. On any
+  other device it autotunes as usual.
 
 The autotune key is built exactly as ``triton.runtime.autotuner.Autotuner.run``
 builds it: the values of ``key`` in argument order, then ``str(dtype)`` of
@@ -38,6 +40,7 @@ flash-linear-attention ops and ``glm5_kda.<function>`` for the GLM-5 KDA
 chunked-prefill kernels.
 """
 
+import math
 from typing import Any
 
 import vllm.envs as envs
@@ -278,13 +281,46 @@ if HAS_TRITON:
 
         _pin_name: str = ""
         _bench_left: int = 0
-        _bench_kept: int = 0
+        _bench_finite: int = 0
+        _bench_skipped: int = 0
+        _run_args: tuple = ((), {})
+
+        def run(self, *args, **kwargs):
+            # check_disk_cache is not given the launch arguments; keep them.
+            self._run_args = (args, kwargs)
+            try:
+                return super().run(*args, **kwargs)
+            finally:
+                self._run_args = ((), {})
 
         def prune_configs(self, kwargs):
             configs = super().prune_configs(kwargs)
-            # Autotuner.run prunes once per benchmark, then times each config.
-            self._bench_left, self._bench_kept = len(configs), 0
+            # Autotuner.run prunes once per new key, then benchmarks (or reads
+            # the autotune cache), timing each config in turn.
+            self._bench_left = len(configs)
+            self._bench_finite = self._bench_skipped = 0
             return configs
+
+        def check_disk_cache(self, tuning_key, configs, bench_fn):
+            hit = super().check_disk_cache(tuning_key, configs, bench_fn)
+            if not (hit and _skip_gate_open()):
+                return hit
+            args, kwargs = self._run_args
+            best = self.cache[tuning_key]
+            size = self._local_bytes(args, best, kwargs)
+            if size is None or size <= LOCAL_BYTES_LIMIT:
+                return hit
+            logger.info(
+                "fla autotune: the cached winner of %s %s needs %d B of local "
+                "memory per thread on sm_80 (limit %d B); benchmarking again",
+                self._pin_name,
+                best,
+                size,
+                LOCAL_BYTES_LIMIT,
+            )
+            del self.cache[tuning_key]
+            bench_fn()
+            return False
 
         def _local_bytes(self, args, config, meta) -> int | None:
             current = {**meta, **config.all_kwargs(), "warmup": True}
@@ -297,6 +333,7 @@ if HAS_TRITON:
 
         def _bench(self, *args, config, **meta):
             self._bench_left -= 1
+            timing = None
             if _skip_gate_open():
                 size = self._local_bytes(args, config, meta)
                 if size is not None and size > LOCAL_BYTES_LIMIT:
@@ -308,15 +345,22 @@ if HAS_TRITON:
                         size,
                         LOCAL_BYTES_LIMIT,
                     )
-                    if self._bench_left == 0 and self._bench_kept == 0:
-                        raise RuntimeError(
-                            f"every autotune config of {self._pin_name} needs "
-                            f"more than {LOCAL_BYTES_LIMIT} B of local memory "
-                            "per thread on sm_80"
-                        )
-                    return [float("inf")] * 3
-            self._bench_kept += 1
-            return super()._bench(*args, config=config, **meta)
+                    self._bench_skipped += 1
+                    timing = [float("inf")] * 3
+            if timing is None:
+                timing = super()._bench(*args, config=config, **meta)
+                if math.isfinite(timing[0]):
+                    self._bench_finite += 1
+            # With every time infinite, Autotuner.run would pick the first
+            # config, which may be one this benchmark skipped.
+            if self._bench_left == 0 and self._bench_skipped and not self._bench_finite:
+                raise RuntimeError(
+                    f"no autotune config of {self._pin_name} has a finite time "
+                    f"on sm_80: {self._bench_skipped} need more than "
+                    f"{LOCAL_BYTES_LIMIT} B of local memory per thread and the "
+                    "rest failed"
+                )
+            return timing
 
 
 def pinned_autotune(configs, key, **kwargs):

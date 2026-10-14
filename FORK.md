@@ -109,7 +109,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
-| `vllm/sm80/fla/pinned_autotune.py` | 340 |
+| `vllm/sm80/fla/pinned_autotune.py` | 384 |
 | `vllm/sm80/guard.py` | 68 |
 | `vllm/sm80/kv_planning.py` | 610 |
 | `vllm/sm80/layers/__init__.py` | 4 |
@@ -132,7 +132,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **9,045** |
+| **35 files** | **9,089** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -255,7 +255,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_tp4_kda_prefill.py` | 365 |
 | `tests/kernels/test_ampere_tp4_marlin_prefill.py` | 417 |
 | `tests/kernels/test_deterministic_moe_align.py` | 411 |
-| `tests/kernels/test_fla_autotune_pin.py` | 587 |
+| `tests/kernels/test_fla_autotune_pin.py` | 629 |
 | `tests/kernels/test_sorted_topk.py` | 103 |
 | `tests/kernels/test_sparse_kv_row_offsets.py` | 173 |
 | `tests/kernels/test_topk_reference.py` | 114 |
@@ -334,7 +334,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **127 files** | **43,246** |
+| **127 files** | **43,288** |
 
 #### `tools/`
 
@@ -558,11 +558,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 114 |
-| Fork-added product lines | 33,006 |
+| Fork-added product lines | 33,050 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 36,524 |
+| Product lines added (new files and patches) | 36,568 |
 | Fork environment variables (flags) | 78 |
 | Unreferenced fork definitions | 0 (0 lines) |

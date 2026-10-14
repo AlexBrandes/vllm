@@ -447,8 +447,18 @@ class Fn:
         launched.append(cfg)
 t.fn = Fn()
 pa.local_bytes = lambda kernel: SIZES[kernel]
-t.do_bench = lambda call, quantiles: (call(), [1.0, 1.0, 1.0])[1]
-t.cache_results = False
+DO_BENCH = globals().get("DO_BENCH", [1.0, 1.0, 1.0])
+CACHE_HIT = globals().get("CACHE_HIT")
+t.do_bench = lambda call, quantiles: (call(), list(DO_BENCH))[1]
+t.cache_results = CACHE_HIT is not None
+if CACHE_HIT is not None:
+    # Stand-in for a hit in Triton's autotune cache (timings of an earlier boot).
+    hit = next(c for c in t.configs
+               if (c.kwargs["BK"], c.kwargs["BV"], c.num_warps, c.num_stages) == CACHE_HIT)
+    def cached(self, key, configs, bench_fn):
+        self.cache[key] = hit
+        return True
+    Autotuner.check_disk_cache = cached
 t.cache.clear()
 x = torch.empty(1, dtype=torch.bfloat16)
 f = torch.empty(1, dtype=torch.float32)
@@ -523,7 +533,39 @@ def test_skip_spilling_all_configs_over_limit_raises():
     r = _run(_SM80_STACK + _SIZES_ALL_OVER + _SKIP_BENCH, None, smem=True,
              extra_env=_SKIP_ENV)
     assert r["launched"] == []
-    assert "every autotune config of fla.chunk_o.chunk_fwd_kernel_o" in r["error"]
+    assert "no autotune config of fla.chunk_o.chunk_fwd_kernel_o has a finite" in r["error"]
+
+
+_ALL_INF = """
+DO_BENCH = [float("inf")] * 3
+"""
+
+
+def test_skip_spilling_no_finite_time_raises_before_any_over_limit_launch():
+    r = _run(_SM80_STACK + _SIZES_FROM_BUILD + _ALL_INF + _SKIP_BENCH, None,
+             smem=True, extra_env=_SKIP_ENV)
+    assert "has a finite time" in r["error"] and "3 need more than 1024 B" in r["error"]
+    assert not {tuple(c) for c in r["launched"]} & {(128, 128, 2, s) for s in (2, 3, 4)}
+
+
+def test_skip_spilling_cache_hit_over_limit_benchmarks_again():
+    r = _run(_SM80_STACK + _SIZES_FROM_BUILD + "CACHE_HIT = (128, 128, 2, 2)\n"
+             + _SKIP_BENCH, None, smem=True, extra_env=_SKIP_ENV)
+    over = {(128, 128, 2, s) for s in (2, 3, 4)}
+    assert (128, 128, 2, 2) in {tuple(c) for c in r["built"]}
+    assert not {tuple(c) for c in r["launched"]} & over
+    assert len(r["launched"]) == 33
+    assert r["best"] is not None and r["error"] is None
+    assert (r["best"]["kwargs"]["BK"], r["best"]["kwargs"]["BV"],
+            r["best"]["num_warps"]) != (128, 128, 2)
+
+
+def test_skip_spilling_cache_hit_under_limit_builds_only_the_winner():
+    r = _run(_SM80_STACK + _SIZES_FROM_BUILD + "CACHE_HIT = (128, 64, 4, 2)\n"
+             + _SKIP_BENCH, None, smem=True, extra_env=_SKIP_ENV)
+    assert [tuple(c) for c in r["built"]] == [(128, 64, 4, 2)]
+    assert [tuple(c) for c in r["launched"]] == [(128, 64, 4, 2)]
+    assert r["error"] is None
 
 
 def test_skip_spilling_gate_closed_builds_nothing_extra():
