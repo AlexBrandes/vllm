@@ -36,9 +36,9 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
 | `vllm/models/glm5next/nvidia/sm80_model.py` | 464 |
-| `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 795 |
+| `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **6 files** | **1,799** |
+| **6 files** | **1,952** |
 
 ### `vllm/sm80/kernels/`
 
@@ -59,7 +59,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/dense_mma.py` | 151 |
 | `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 316 |
 | `vllm/sm80/kernels/exl3/loader.py` | 270 |
-| `vllm/sm80/kernels/exl3/ops.py` | 694 |
+| `vllm/sm80/kernels/exl3/ops.py` | 731 |
 | `vllm/sm80/kernels/exl3/quant.py` | 950 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 59 |
 | `vllm/sm80/kernels/exl3/utils.py` | 382 |
@@ -94,7 +94,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **48 files** | **15,989** |
+| **48 files** | **16,026** |
 
 ### `vllm/sm80/`
 
@@ -110,7 +110,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/envs.py` | 1,040 |
+| `vllm/sm80/envs.py` | 1,052 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -137,7 +137,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
-| **35 files** | **9,175** |
+| **35 files** | **9,187** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -184,7 +184,7 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/dense_splitk.h` | 26 |
 | `csrc/exl3/gemm.cu` | 489 |
 | `csrc/exl3/gemm.cuh` | 82 |
-| `csrc/exl3/module.cpp` | 94 |
+| `csrc/exl3/module.cpp` | 95 |
 | `csrc/exl3/moe.cu` | 407 |
 | `csrc/exl3/moe_prefill.cu` | 1,043 |
 | `csrc/exl3/moe_prefill.h` | 28 |
@@ -192,10 +192,10 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/moe_v2.h` | 23 |
 | `csrc/exl3/ops.h` | 45 |
 | `csrc/exl3/ple.cu` | 234 |
-| `csrc/exl3/ple.h` | 38 |
-| `csrc/exl3/ple_read.cpp` | 221 |
+| `csrc/exl3/ple.h` | 53 |
+| `csrc/exl3/ple_read.cpp` | 549 |
 | `csrc/exl3/reference.cu` | 447 |
-| **25 files** | **7,105** |
+| **25 files** | **7,449** |
 
 #### `docs/`
 
@@ -300,7 +300,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/kimi_k3/test_kda_zero_draft_rows.py` | 101 |
 | `tests/models/qwen4_exp/test_exl3_construction.py` | 273 |
 | `tests/models/qwen4_exp/test_exl3_ple_decode.py` | 232 |
-| `tests/models/qwen4_exp/test_exl3_ple_reader.py` | 966 |
+| `tests/models/qwen4_exp/test_exl3_ple_reader.py` | 1,683 |
 | `tests/models/qwen4_exp/test_mtp_local_argmax.py` | 224 |
 | `tests/models/qwen4_exp/test_precision_switches.py` | 164 |
 | `tests/models/qwen4_exp/test_qsa_canonical_topk.py` | 394 |
@@ -357,7 +357,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **137 files** | **47,851** |
+| **137 files** | **48,568** |
 
 #### `tools/`
 
@@ -516,6 +516,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_PLE_COLD` | `bool` | `False` | `'0'` |
+| `VLLM_EXL3_PLE_HOSTFN_READ` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_PLE_NATIVE_READ` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_PLE_OVERLAP` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_PLE_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
@@ -574,7 +575,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **86 variables** | | | |
+| **87 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -589,11 +590,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 127 |
-| Fork-added product lines | 38,258 |
+| Fork-added product lines | 38,804 |
 | Patched upstream files | 89 |
 | Patched upstream lines | +4,021 / -803 |
 | Patched upstream product files | 67 |
 | Patched upstream product lines | +3,518 / -243 |
-| Product lines added (new files and patches) | 41,776 |
-| Fork environment variables (flags) | 86 |
+| Product lines added (new files and patches) | 42,322 |
+| Fork environment variables (flags) | 87 |
 | Unreferenced fork definitions | 0 (0 lines) |
