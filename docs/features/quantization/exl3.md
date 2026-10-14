@@ -73,4 +73,4 @@ The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel do
 
 ## Third-party material
 
-Codec adaptations preserve the upstream MIT grant and modification credit in [`vllm/third_party/exl3`](../../../vllm/third_party/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships byte copies of both the `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.
+Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.

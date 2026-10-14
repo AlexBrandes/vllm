@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.failed_inputs import failed_request_ids
+from vllm.sm80.failed_inputs import failed_request_ids
 
 
 def test_failed_tokens_map_to_their_requests():

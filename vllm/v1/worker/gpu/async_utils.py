@@ -11,7 +11,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
-from vllm.v1.failed_inputs import failed_request_ids
+from vllm.sm80.failed_inputs import failed_request_ids
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,

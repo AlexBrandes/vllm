@@ -9,9 +9,8 @@
 #   pip install --no-deps --target <dir> plugins/sm80
 # vllm/sm80/guard.py stops vLLM at startup when the plugin is missing.
 #
-# licenses/exl3/ holds byte copies of vllm/third_party/exl3/{LICENSE,NOTICE}
-# (MIT grant of the adapted ExLlamaV3 code), so every install of the plugin
-# carries them in its dist-info. License files must sit inside this
+# licenses/exl3/ holds LICENSE and NOTICE (MIT grant of the adapted ExLlamaV3
+# code), so every install of the plugin carries them in its dist-info. License files must sit inside this
 # directory; tests/sm80/test_plugin_distribution.py checks the copies.
 
 [build-system]

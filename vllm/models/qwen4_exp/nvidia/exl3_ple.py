@@ -19,6 +19,10 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
+from vllm.models.qwen4_exp.common.ngram_embedding import (
+    Qwen4ExpPLEEmbedding,
+    Qwen4ExpPLEEmbeddingMethod,
+)
 from vllm.sm80.kernels.exl3.utils import (
     PLE_AUXILIARIES,
     TensorHeader,
@@ -28,8 +32,6 @@ from vllm.sm80.kernels.exl3.utils import (
 )
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-
-from .ngram_embedding import Qwen4ExpPLEEmbedding, Qwen4ExpPLEEmbeddingMethod
 
 logger = init_logger(__name__)
 

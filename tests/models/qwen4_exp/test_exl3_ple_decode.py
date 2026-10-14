@@ -195,7 +195,7 @@ def test_ple_decode_real_checkpoint_rows():
         read_headers,
         read_metadata,
     )
-    from vllm.models.qwen4_exp.common.exl3_ple import Exl3PLERowReader
+    from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLERowReader
 
     path = Path(os.environ["EXL3_PLE_CHECKPOINT"]) / "ngram_embedding.safetensors"
     headers = read_headers(path)

@@ -98,7 +98,7 @@ def _setup_ple_file(module, path: str, key: str) -> set[str]:
     consume its small auxiliaries. Reads the module's ngram_embedding,
     ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers
     (pinned in tests/sm80/seams.yaml)."""
-    from vllm.models.qwen4_exp.common.exl3_ple import Exl3PLEEmbedding
+    from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbedding
 
     if not isinstance(module.ngram_embedding, Exl3PLEEmbedding):
         raise TypeError("File-backed PLE setup requires EXL3 quantization")

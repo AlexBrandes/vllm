@@ -171,14 +171,14 @@ class Exl3Config(QuantizationConfig):
 
     def get_ple_embedding_method(self):
         """Qwen4Exp PLE method (vllm/models/qwen4_exp/common/ngram_embedding.py)."""
-        from vllm.models.qwen4_exp.common.exl3_ple import Exl3PLEEmbeddingMethod
+        from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbeddingMethod
 
         return Exl3PLEEmbeddingMethod(self)
 
     @property
     def ple_embedding_cls(self):
         """Qwen4Exp PLE table (vllm/models/qwen4_exp/nvidia/ngram_embedding.py)."""
-        from vllm.models.qwen4_exp.common.exl3_ple import Exl3PLEEmbedding
+        from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbedding
 
         return Exl3PLEEmbedding
 

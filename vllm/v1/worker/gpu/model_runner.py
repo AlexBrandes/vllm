@@ -66,6 +66,7 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.sm80.failed_inputs import take_failed_tokens
 from vllm.sm80.spec_decode.aux_fc_fold import (
     mark_drafter_aux_fc_folded,
     maybe_configure_aux_fc_fold,
@@ -77,7 +78,6 @@ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.failed_inputs import take_failed_tokens
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,

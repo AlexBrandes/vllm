@@ -16,6 +16,8 @@ can reach.
 - ``kv_planning``: KV cache planning rules: packed-group refit for MLA +
   Mamba hybrids (DFlash drafter fit, PP-aware state groups), speculative
   scratch in KV capacity, and the scheduler's eagle-group flags.
+- ``failed_inputs``: fails only the requests whose model inputs a worker
+  could not produce (an EXL3 PLE row that storage failed to read).
 - ``envs``: the fork's environment variables; ``vllm/envs.py`` registers
   them at the end of its own import.
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point

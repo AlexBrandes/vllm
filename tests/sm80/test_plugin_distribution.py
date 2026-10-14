@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The plugins/sm80 distribution ships the EXL3 license files.
 
-Every payload that ships EXL3 code carries vllm/third_party/exl3/{LICENSE,
-NOTICE}: the wheel (in its dist-info), the sdist and an installed copy. The
-distribution keeps byte copies under plugins/sm80/licenses/exl3/, because
-license files must sit inside the project directory.
+Every payload that ships EXL3 code carries plugins/sm80/licenses/exl3/
+{LICENSE,NOTICE}, the MIT grant of the adapted ExLlamaV3 code: the wheel (in
+its dist-info), the sdist and an installed copy. They are the only copies in
+the repository; license files must sit inside the project directory.
 """
 
 import os
@@ -20,7 +20,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 PLUGIN = REPO / "plugins" / "sm80"
-SOURCES = REPO / "vllm" / "third_party" / "exl3"
+SOURCES = PLUGIN / "licenses" / "exl3"
 NAMES = ("LICENSE", "NOTICE")
 # PEP 639 project.license-files needs setuptools 77.
 MIN_SETUPTOOLS = (77,)
@@ -30,9 +30,11 @@ def _expected() -> dict[str, bytes]:
     return {name: (SOURCES / name).read_bytes() for name in NAMES}
 
 
-def test_license_copies_equal_the_exl3_sources():
-    for name, data in _expected().items():
-        assert (PLUGIN / "licenses" / "exl3" / name).read_bytes() == data, name
+def test_license_files_carry_the_exl3_grant():
+    # The adapted sources under csrc/exl3 cite this grant in their headers.
+    license_text, notice = _expected()["LICENSE"], _expected()["NOTICE"]
+    assert license_text.startswith(b"MIT License\n\nCopyright (c) 2025 Turboderp")
+    assert b"github.com/turboderp-org/exllamav3" in notice
 
 
 @pytest.fixture(scope="module")

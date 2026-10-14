@@ -9,5 +9,5 @@
   ``utils``   the checkpoint manifest, tensor headers, the PLE layout
              and the load ledger
 The Qwen4Exp PLE storage built on these stays in
-vllm/models/qwen4_exp/common/exl3_ple.py.
+vllm/models/qwen4_exp/nvidia/exl3_ple.py.
 """

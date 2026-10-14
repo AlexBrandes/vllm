@@ -20,8 +20,8 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.models.qwen4_exp.common import exl3_ple
-from vllm.models.qwen4_exp.common.exl3_ple import (
+from vllm.models.qwen4_exp.nvidia import exl3_ple
+from vllm.models.qwen4_exp.nvidia.exl3_ple import (
     Exl3PLEEmbedding,
     Exl3PLERowReader,
     Exl3PLESlot,

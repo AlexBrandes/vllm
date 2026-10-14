@@ -34,6 +34,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
+from vllm.sm80.failed_inputs import handle_failed_inputs
 from vllm.sm80.spec_decode.adaptive_k import AdaptiveKPolicy
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
@@ -59,7 +60,6 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.failed_inputs import handle_failed_inputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
