@@ -360,6 +360,41 @@ def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
     assert fakes[-1] == "_exl3_C::linear_out_prefill"
 
 
+def test_ensure_extension_retries_resolve_after_it_raised(monkeypatch):
+    """A resolve that raised leaves the library unloaded; the next
+    ensure_extension reaches resolve again instead of failing on the base fake
+    implementations it registered the first time (torch refuses a second
+    registration). The library is stood in for."""
+    monkeypatch.setattr(exl3_ops, "_loaded", False)
+    monkeypatch.setattr(exl3_ops, "_fakes_registered", False, raising=False)
+    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
+    monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
+    monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
+    monkeypatch.setattr(exl3_ops, "_resolve_dense_splitk", lambda: False)
+    fakes = []
+
+    def register_fake(name):
+        if name in fakes:
+            raise RuntimeError(f"{name} already has a fake impl registered")
+        return lambda fn: fakes.append(name)
+
+    monkeypatch.setattr(torch.library, "register_fake", register_fake)
+    resolved = []
+
+    def resolve():
+        resolved.append(1)
+        if len(resolved) == 1:
+            raise RuntimeError("warm-up failed")
+
+    monkeypatch.setattr(tc, "resolve", resolve)
+    with pytest.raises(RuntimeError, match="warm-up failed"):
+        exl3_ops.ensure_extension()
+    assert not exl3_ops._loaded
+    exl3_ops.ensure_extension()
+    assert resolved == [1, 1] and exl3_ops._loaded
+    assert "_exl3_C::linear_out" in fakes and len(fakes) == len(set(fakes))
+
+
 def _recorders(monkeypatch):
     """Replace the three operators by recorders; returns the call list."""
     calls = []

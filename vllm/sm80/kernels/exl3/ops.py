@@ -15,6 +15,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 _loaded = False
+# The base fake implementations, registered once per process: a retry after a
+# resolve that raised must not register them again (torch refuses a second).
+_fakes_registered = False
 # VLLM_EXL3_DENSE_SPLITK with its gate open: _linear calls linear_out_splitk.
 # Fixed by ensure_extension, before any launch or graph capture.
 _dense_splitk = False
@@ -173,7 +176,7 @@ def _resolve_dense_splitk() -> bool:
 
 
 def ensure_extension() -> None:
-    global _loaded, _dense_splitk
+    global _loaded, _dense_splitk, _fakes_registered
     if _loaded:
         return
     try:
@@ -185,15 +188,17 @@ def ensure_extension() -> None:
             "running PyTorch: build it with python csrc/exl3/build_standalone.py "
             f"--out vllm (in the vLLM source tree). Detail: {exc}"
         ) from exc
-    for name, fake in (
-        ("linear_out", _linear_fake),
-        ("linear_out_splitk", _linear_fake),
-        ("moe_out", _moe_fake),
-        ("moe_out_v2", _moe_fake),
-        ("moe_out_prefill", _moe_fake),
-        ("ple_decode_out", _ple_fake),
-    ):
-        torch.library.register_fake(f"_exl3_C::{name}")(fake)
+    if not _fakes_registered:
+        for name, fake in (
+            ("linear_out", _linear_fake),
+            ("linear_out_splitk", _linear_fake),
+            ("moe_out", _moe_fake),
+            ("moe_out_v2", _moe_fake),
+            ("moe_out_prefill", _moe_fake),
+            ("ple_decode_out", _ple_fake),
+        ):
+            torch.library.register_fake(f"_exl3_C::{name}")(fake)
+        _fakes_registered = True
     from vllm.sm80.kernels.exl3 import dense_mma
 
     dense_mma.resolve()
