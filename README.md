@@ -59,6 +59,20 @@ Questions about running a model belong in its recipe's issues.
 | GLM-5.3-Flash | 4 | [Morrowmake/glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe) |
 | Qwen3.8-Flash-Next | 2 | [Morrowmake/qwen38-flash-next-cmp170hx-recipe](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe) |
 
+## Community recipes
+
+Other people build recipes on this fork too: for other models, card counts or
+settings. Each one lives in its author's own repository and pins an exact fork
+version. To add yours, see [COMMUNITY_RECIPES.md](COMMUNITY_RECIPES.md).
+
+Community recipes are made and maintained by their authors; Morrowmake has not
+tested them.
+
+| Recipe | Model | Hardware/layout | Fork version | Author |
+|---|---|---|---|---|
+
+None yet — see [COMMUNITY_RECIPES.md](COMMUNITY_RECIPES.md) to add yours.
+
 ## Supported models
 
 ### GLM-5.3-Flash
