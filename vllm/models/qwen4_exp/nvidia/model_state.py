@@ -15,7 +15,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 
-class Qwen4ExpModelState(MambaHybridModelState):
+class _Qwen4ExpModelStateBase(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
 
     def __init__(
@@ -101,6 +101,15 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        # A replayed CUDA graph reads the request layout through the view it was
+        # captured with, which can be longer than this batch's layout. Entries
+        # past num_reqs_padded would otherwise keep offsets from an earlier batch;
+        # the n-gram id kernel binary-searches this array, so a stale
+        # (non-monotonic) tail maps real tokens to phantom requests and corrupts
+        # their PLE ids. Pad the tail with the batch end: extra requests are empty.
+        tail = self.ple_query_start_loc[num_reqs_padded + 1 :]
+        if tail.numel():
+            tail.copy_(query_start_loc[-1:].expand(tail.numel()))
         model_inputs.update(
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
@@ -139,3 +148,97 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
 
 __all__ = ["Qwen4ExpModelState"]
+
+
+# ============================================================================
+# FN7 overlay (lab): host-side PLE n-gram ids.
+#
+# Everything ABOVE is the image's Qwen4ExpModelState verbatim (class renamed
+# to _Qwen4ExpModelStateBase; image sha256 4a26632e…). This subclass only
+# adds the drive call for the PLE host-ids gather service implemented in
+# vllm_ple_mmap_qwen4 (mounted module). It activates ONLY when
+# VLLM_PLE_HOST_IDS=1 and the mmap embedding loaded with a host service;
+# with the env unset this class behaves exactly like the base.
+# ============================================================================
+import importlib as _importlib  # noqa: E402
+import logging as _logging  # noqa: E402
+
+_ple_log = _logging.getLogger("vllm.fn7.model_state")
+_ple_mod = None
+try:
+    _ple_mod = _importlib.import_module("vllm_ple_mmap_qwen4")
+except Exception as _e:  # module absent: host-ids cannot be enabled
+    _ple_log.debug("PLE host-ids: module unavailable (%s)", _e)
+
+
+class Qwen4ExpModelState(_Qwen4ExpModelStateBase):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        super().__init__(vllm_config, model, encoder_cache, device)
+        self._ple_host_svc = None
+        self._ple_host_mod = None
+        if not getattr(self, "uses_ngram_embedding", False):
+            return  # PP stage without the PLE layer
+        ngram_mods = [
+            m
+            for m in self.model.modules()
+            if getattr(m, "ngram_embedding", None) is not None
+            and hasattr(m, "compute_ngram_ids")
+        ]
+        if not ngram_mods:
+            return
+        if _ple_mod is None or not _ple_mod.host_ids_enabled():
+            return  # production sync path stays active
+        for mod in ngram_mods:
+            svc = getattr(mod.ngram_embedding, "_host_service", None)
+            if svc is not None:
+                self._ple_host_svc = svc
+                self._ple_host_mod = mod
+                break
+        if self._ple_host_svc is None:
+            raise RuntimeError(
+                "VLLM_PLE_HOST_IDS=1 but the PLE mmap embedding has no host "
+                "service (check the vllm_ple_mmap_qwen4 mount and "
+                "VLLM_PLE_MMAP=1)"
+            )
+        bonus = int(self.num_new_sampled_tokens_per_step)
+        if bonus != 1:
+            raise RuntimeError(
+                f"PLE host-ids: num_new_sampled_tokens_per_step={bonus}, "
+                "mirror supports 1 (MTP) only"
+            )
+        _ple_log.info(
+            "PLE host-ids: bound service to %s", type(self._ple_host_mod).__name__
+        )
+
+    def prepare_inputs(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> dict[str, Any]:
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if self._ple_host_svc is not None:
+            # Stage rows_gpu for THIS step before any graph replay/forward.
+            # Dummy/profiling batches are detected inside prepare() and only
+            # zero the rows; real batches must never touch NVMe here (worker
+            # thread does that after its event).
+            self._ple_host_svc.prepare(
+                self._ple_host_mod,
+                input_batch,
+                req_states,
+                self.num_new_sampled_tokens_per_step,
+            )
+        return model_inputs
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        if self._ple_host_svc is not None:
+            # CUDA-graph capture: forward reads rows_gpu[:num_tokens]; keep
+            # zeros there (no NVMe, deterministic capture).
+            self._ple_host_svc.zero_rows(num_tokens)
+        return model_inputs
