@@ -994,6 +994,15 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
+                    # PLE mmap owns these tensors directly from their safetensors
+                    # byte ranges. Skip before safe_open materializes each 102 GB-table
+                    # shard; some shards cannot be represented by torch storage.
+                    if (
+                        os.environ.get("VLLM_PLE_MMAP", "0") == "1"
+                        and "ple_embedding.ngram_embedding.shard_" in name
+                        and name.endswith(".weight")
+                    ):
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)

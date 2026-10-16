@@ -175,6 +175,11 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        # INC quantizes the decoder weights, while this checkpoint stores the
+        # 102 GB PLE table as BF16 shards. Match the pre-0.30 backend's rule:
+        # only an explicitly serialized FP8 PLE table uses PLE quantization.
+        if type(quant_config).__name__ == "INCConfig":
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
             if quant_config._resolve_quant_algo(prefix) == "FP8":
                 return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -937,3 +942,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 __all__ = [
     "Qwen4ExpNGramEmbedding",
 ]
+
+
+from vllm_ple_mmap_qwen4 import apply as _ple_mmap_apply
+_ple_mmap_apply(Qwen4ExpNGramEmbedding)

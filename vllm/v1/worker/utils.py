@@ -423,14 +423,47 @@ def allocate_kv_cache(
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
         layer_name = tensor.layers[0]
-        group_id, group = next(
+        matching_groups = [
             (group_id, group)
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
             if layer_name in group.layer_names
-        )
+        ]
+        if not matching_groups:
+            # PP workers retain global layer indices, while the shared cache
+            # plan may contain only the equivalent layer role from another
+            # stage. Match that role rather than an absent exact layer name.
+            def layer_role(name: str) -> str:
+                prefix, separator, suffix = name.partition(".layers.")
+                if not separator:
+                    return name
+                _, separator, suffix = suffix.partition(".")
+                return prefix + ".layers.*" + separator + suffix
+
+            role = layer_role(layer_name)
+            matching_groups = [
+                (group_id, group)
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                if any(layer_role(name) == role for name in group.layer_names)
+            ]
+        if not matching_groups and all(
+            name.endswith(".ple") for name in tensor.layers
+        ):
+            # PLE state is marked TP-replicated, but under pipeline parallelism
+            # the PLE layer exists only on its owning stage. The shared planner
+            # still includes its tensor on other stages; those workers have no
+            # module to bind the state to and must not create a view for it.
+            continue
+        if not matching_groups:
+            raise RuntimeError(
+                f"No KV cache group for PP layer {layer_name!r}; "
+                f"groups={[group.layer_names for group in kv_cache_config.kv_cache_groups]!r}"
+            )
+        group_id, group = matching_groups[0]
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = spec.kv_cache_specs[layer_name]
+            spec = spec.kv_cache_specs.get(layer_name)
+            if spec is None:
+                spec = next(iter(group.kv_cache_spec.kv_cache_specs.values()))
 
         if not spec.has_layer_views:
             kv_caches.update((name, buf) for name in tensor.layers)

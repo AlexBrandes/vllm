@@ -8,6 +8,7 @@ majority of storage I/O for MoE models (experts typically account for
 ~85-90 % of total weight bytes).
 """
 
+import os
 import regex as re
 
 # Matches per-expert weight names like ".experts.42.gate_proj.weight".
@@ -15,6 +16,9 @@ import regex as re
 # (no numeric id) — those are intentionally left unfiltered so the full
 # tensor is loaded and sliced later by RoutedExperts.weight_loader.
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+_PLE_MMAP_SHARD_RE = re.compile(
+    r"ple_embedding\.ngram_embedding\.shard_\d+\.weight$"
+)
 
 
 def parse_expert_id(weight_name: str) -> int | None:
@@ -65,8 +69,11 @@ def should_skip_weight(
     weight_name: str,
     local_expert_ids: set[int] | None,
 ) -> bool:
-    """Return ``True`` if *weight_name* is an expert weight that does not
-    belong to the local rank and should be skipped during loading."""
+    """Return whether the loader should skip this checkpoint tensor."""
+    if os.environ.get("VLLM_PLE_MMAP", "0") == "1" and (
+        _PLE_MMAP_SHARD_RE.search(weight_name)
+    ):
+        return True
     if local_expert_ids is None:
         return False
     eid = parse_expert_id(weight_name)

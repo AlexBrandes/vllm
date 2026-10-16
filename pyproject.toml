@@ -50,6 +50,10 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
 
+[tool.setuptools]
+# The PLE mmap module is imported top-level by the Qwen4Exp N-gram embedding.
+py-modules = ["vllm_ple_mmap_qwen4"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm*"]
