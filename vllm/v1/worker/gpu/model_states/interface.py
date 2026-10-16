@@ -135,6 +135,10 @@ class ModelState(ABC):
         """
         return AttentionCGSupport.ALWAYS, None
 
+    def bind_block_tables(self, block_tables: tuple[torch.Tensor, ...]) -> None:
+        """Bind stable request-slot block tables needed by deferred state work."""
+        return None
+
     def preprocess_state(
         self,
         input_batch: InputBatch,

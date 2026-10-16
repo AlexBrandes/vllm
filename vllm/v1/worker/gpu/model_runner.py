@@ -672,6 +672,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
         )
+        self.model_state.bind_block_tables(
+            tuple(table.gpu for table in self.block_tables.block_tables)
+        )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
             self.device,

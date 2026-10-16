@@ -477,7 +477,9 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+    # The context owns request-slot tables. Deferred PP work may carry
+    # a stale batch row, but req_idx remains the stable owner of this state.
+    bt_row_idx = req_idx
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -611,7 +613,7 @@ def precopy_mamba_align_fused_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        req_idx,
         src_col,
         dst_col,
         token_bias,

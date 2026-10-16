@@ -111,6 +111,13 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+            self._source_block_tables: tuple[torch.Tensor, ...] | None = None
+
+    def bind_block_tables(self, block_tables: tuple[torch.Tensor, ...]) -> None:
+        # These tables are indexed by stable request slot. Unlike gathered
+        # batch-order tables, their rows retain their meaning while PP defers
+        # recurrent-state postprocessing across later scheduler steps.
+        self._source_block_tables = block_tables
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -169,14 +176,15 @@ class MambaHybridModelState(DefaultModelState):
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
             forward_context = self.vllm_config.compilation_config.static_forward_context
-            # block_tables are batch-order slices of the persistent
-            # input_block_tables (stable data_ptr), so the metadata is captured
-            # once here and reused across steps.
+            # Deferred PP postprocessing must use request-slot rows. A
+            # gathered table is stable in address but not in row identity: later
+            # scheduler steps overwrite each batch row with another request.
+            assert self._source_block_tables is not None
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
                 copy_funcs,
-                [block_tables[gid] for gid in mamba_group_ids],
+                [self._source_block_tables[gid] for gid in mamba_group_ids],
             )
         return ctx
 
