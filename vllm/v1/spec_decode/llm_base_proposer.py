@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import dataclasses
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
@@ -1554,11 +1555,25 @@ class SpecDecodeBaseProposer:
                 )
         else:
             # MTP model
-            share_lm_head = True
-            logger.info(
-                "Detected MTP model. "
-                "Sharing target model lm_head weights with the draft model."
-            )
+            if (
+                os.environ.get("VLLM_MTP_DRAFT_HEAD_PATH")
+                and getattr(self.model, "draft_head_quantized", False)
+            ):
+                # The drafter owns a W4A16 Marlin head loaded from
+                # VLLM_MTP_DRAFT_HEAD_PATH; keep it instead of adopting the
+                # target's BF16 head.
+                share_lm_head = False
+                logger.info(
+                    "MTP draft owns a W4A16 lm_head "
+                    "(VLLM_MTP_DRAFT_HEAD_PATH set); keeping it instead of "
+                    "sharing the target's BF16 head."
+                )
+            else:
+                share_lm_head = True
+                logger.info(
+                    "Detected MTP model. "
+                    "Sharing target model lm_head weights with the draft model."
+                )
 
         if share_lm_head and hasattr(target_language_model, "lm_head"):
             if hasattr(self.model, "lm_head"):

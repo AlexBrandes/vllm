@@ -58,6 +58,71 @@ from .model import (
     Qwen4ExpSparseMoeBlock,
 )
 
+# ---------------------------------------------------------------------------
+# Experimental W4A16 MTP draft head (VLLM_MTP_DRAFT_HEAD_PATH)
+#
+# Normally this drafter has no head of its own: after loading, its
+# ``lm_head`` is replaced by the target model's BF16 head (see
+# ``vllm/v1/worker/gpu/spec_decode/eagle/utils.py``), so every draft step
+# pays a full 248320x2560 BF16 GEMV (~1.27 GiB read).  When
+# ``VLLM_MTP_DRAFT_HEAD_PATH`` names a packed W4A16 copy of the head
+# (int4, group-128, symmetric, GPTQ/AutoGPTQ layout -- see
+# quantize_lm_head.py in the drafthead lab), this module builds its own
+# Marlin W4A16 ``lm_head`` (the same quant linear the model's own layers
+# use), loads the packed tensors from that file, and the standard
+# ``process_weights_after_loading`` pass repacks them for the kernel
+# exactly once.  With the variable unset, this file behaves exactly like
+# the unpatched module.
+# ---------------------------------------------------------------------------
+import os
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.auto_gptq import (
+    AutoGPTQConfig,
+    AutoGPTQLinearMethod,
+)
+
+logger = init_logger(__name__)
+
+_DRAFT_HEAD_BITS = 4
+_DRAFT_HEAD_GROUP = 128
+
+
+class _QuantDraftHeadConfig(QuantizationConfig):
+    """Always-quantized config: W4A16 GPTQ-Marlin linear for the head."""
+
+    def get_name(self) -> str:
+        return "auto_gptq"
+
+    def get_supported_act_dtypes(self) -> list[torch.dtype]:
+        return [torch.half, torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 75
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict) -> "_QuantDraftHeadConfig":
+        raise RuntimeError("_QuantDraftHeadConfig is instantiated directly")
+
+    def get_quant_method(self, layer, prefix) -> "AutoGPTQLinearMethod":
+        return AutoGPTQLinearMethod(
+            AutoGPTQConfig(
+                weight_bits=_DRAFT_HEAD_BITS,
+                group_size=_DRAFT_HEAD_GROUP,
+                desc_act=False,
+                is_sym=True,
+                lm_head_quantized=True,
+                dynamic={},
+                full_config={},
+            )
+        )
+
 
 def _remap_ignored_layers(
     ignored_layers: list[str],
@@ -399,9 +464,27 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
+        self.draft_head_quantized = False
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
+            elif os.environ.get("VLLM_MTP_DRAFT_HEAD_PATH"):
+                # Experimental: the drafter keeps its own Marlin W4A16 head
+                # instead of adopting the target's BF16 head after loading.
+                self.lm_head = ColumnParallelLinear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    bias=False,
+                    return_bias=False,
+                    quant_config=_QuantDraftHeadConfig(),
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
+                self.draft_head_quantized = True
+                logger.info(
+                    "MTP draft lm_head built as W4A16 GPTQ-Marlin head; packed "
+                    "weights will be loaded from %s",
+                    os.environ["VLLM_MTP_DRAFT_HEAD_PATH"],
+                )
             else:
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
@@ -444,12 +527,68 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def _load_quant_draft_head(self, path: str) -> None:
+        """Fill the W4A16 draft lm_head from a packed GPTQ/AutoGPTQ file.
+
+        Expected tensors (TP=1, GPTQ layout, matching the model's own
+        W4A16 linears):
+          lm_head.qweight  int32        [K // 8,    N]
+          lm_head.scales   fp16/bf16    [K // 128,  N]
+          lm_head.qzeros   int32        [K // 128,  N // 8]   (constant
+                                                     zero-point; ignored by
+                                                     the symmetric Marlin
+                                                     kernel)
+        with K = hidden_size and N = vocab_size.
+        """
+        from safetensors import safe_open
+
+        if getattr(self.lm_head, "tp_size", 1) != 1:
+            raise NotImplementedError(
+                "VLLM_MTP_DRAFT_HEAD_PATH supports TP=1 only "
+                f"(lm_head tp_size={self.lm_head.tp_size})."
+            )
+        in_size, out_size = self.config.hidden_size, self.config.vocab_size
+        expected = {
+            "qweight": (in_size // 8, out_size),
+            "scales": (in_size // _DRAFT_HEAD_GROUP, out_size),
+            "qzeros": (in_size // _DRAFT_HEAD_GROUP, out_size // 8),
+        }
+        with safe_open(path, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for name, shape in expected.items():
+                key = f"lm_head.{name}"
+                if key not in keys:
+                    raise ValueError(f"{path}: missing tensor {key!r}")
+                tensor = f.get_tensor(key)
+                if tuple(tensor.shape) != tuple(shape):
+                    raise ValueError(
+                        f"{path}: {key} has shape {tuple(tensor.shape)}, "
+                        f"expected {shape} for in={in_size}, out={out_size}"
+                    )
+                param = getattr(self.lm_head, name)
+                param.data.copy_(tensor.to(dtype=param.dtype, device=param.device))
+                logger.info(
+                    "MTP draft head: loaded %s shape=%s dtype=%s device=%s",
+                    key,
+                    tuple(tensor.shape),
+                    param.dtype,
+                    param.device,
+                )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        drop_head_weights = self.draft_head_quantized
+
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
-                if remapped_name is not None:
-                    yield remapped_name, weight
+                if remapped_name is None:
+                    continue
+                # The quantized head is filled from
+                # VLLM_MTP_DRAFT_HEAD_PATH, not the checkpoint: drop the
+                # target's BF16 head tensors so they never shadow it.
+                if drop_head_weights and remapped_name.startswith("lm_head."):
+                    continue
+                yield remapped_name, weight
 
         mapper = WeightsMapper(
             orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
@@ -458,7 +597,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names(), mapper=mapper)
+        loaded = loader.load_weights(remap_weight_names(), mapper=mapper)
+        if drop_head_weights:
+            self._load_quant_draft_head(os.environ["VLLM_MTP_DRAFT_HEAD_PATH"])
+        return loaded
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]
