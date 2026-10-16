@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -333,6 +334,19 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+        # FN12 (CMP Flash-Next): while any running request is decoding, a step's
+        # prefill tokens are capped at VLLM_MIXED_PREFILL_CHUNK x (prompts
+        # awaiting prefill), at most one Mamba block, and spent oldest-first
+        # (v2; v1 capped each request, so a burst of arrivals shared the steps
+        # and every first token came late). A budget below the block takes the
+        # sub-block path in the aligned split, so a lone prompt advances every
+        # step instead of flooring to 0 and decoders see short steps. With no
+        # decoder running, prefill uses the full budget. 0 = off.
+        self.mixed_prefill_chunk = int(os.environ.get("VLLM_MIXED_PREFILL_CHUNK", "0") or 0)
+        self.step_prefill_cap = 0
+        self.step_prefill_left: int | None = None
+        if self.mixed_prefill_chunk:
+            logger.info("FN12 mixed-step prefill cap: %d tokens", self.mixed_prefill_chunk)
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
@@ -474,6 +488,8 @@ class Scheduler(SchedulerInterface):
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            if self.step_prefill_left is not None:
+                max_prefill_tokens = min(max_prefill_tokens, self.step_prefill_cap)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -607,6 +623,24 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # FN12: budget prefill on every step while a decoder is running.
+        # Under PP a decoder skips steps, but the step in between still delays
+        # it, so the budget keys on decoders existing, not on rows in this step.
+        self.step_prefill_left = None
+        self.step_prefill_cap = 0
+        if self.mixed_prefill_chunk and any(
+            not r.is_prefill_chunk for r in self.running
+        ):
+            awaiting = (
+                sum(1 for r in self.running if r.is_prefill_chunk)
+                + len(self.waiting)
+                + len(self.skipped_waiting)
+            )
+            self.step_prefill_left = min(
+                self.mixed_prefill_chunk * max(1, awaiting),
+                max(self.cache_config.block_size, self.mixed_prefill_chunk),
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -660,6 +694,12 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            fn12_prefill = (
+                self.step_prefill_left is not None and request.is_prefill_chunk
+            )
+            if fn12_prefill:
+                self.step_prefill_cap = self.step_prefill_left
+                num_new_tokens = min(num_new_tokens, self.step_prefill_left)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -806,6 +846,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if fn12_prefill:
+                self.step_prefill_left = max(0, self.step_prefill_left - num_new_tokens)
             req_index += 1
 
             # Speculative decode related.
@@ -1022,6 +1064,7 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                fn12_prefill = False
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -1066,6 +1109,14 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    fn12_prefill = (
+                        self.step_prefill_left is not None and not pad_spec_decode
+                    )
+                    if fn12_prefill:
+                        self.step_prefill_cap = self.step_prefill_left
+                        num_new_tokens = min(num_new_tokens, self.step_prefill_left)
+                        if num_new_tokens == 0:
+                            break
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1261,6 +1312,10 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if fn12_prefill:
+                    self.step_prefill_left = max(
+                        0, self.step_prefill_left - num_new_tokens
+                    )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
