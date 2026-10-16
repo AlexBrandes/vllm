@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="target" src="https://img.shields.io/badge/target-Ampere%20sm__80-76b900?style=flat">
   &nbsp;
-  <img alt="base" src="https://img.shields.io/badge/upstream-vLLM%200.30.1%20dev-4b32c3?style=flat">
+  <img alt="base" src="https://img.shields.io/badge/upstream-vLLM%200.32.0%20dev-4b32c3?style=flat">
   &nbsp;
   <img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue?style=flat">
 </p>
@@ -14,64 +14,81 @@ This is a fork of [vLLM](https://github.com/vllm-project/vllm) for the
 **NVIDIA CMP 170HX** (Ampere, sm_80), built to serve models fast on one card
 or several: tensor-parallel and pipeline-parallel layouts across cards, a
 full-precision KV cache and repeatable single-request outputs.
-**GLM-5.3-Flash** is the first supported model; more will follow.
+Two models are supported today: **GLM-5.3-Flash** on four cards and
+**Qwen3.8-Flash-Next** on two.
 
 The fork has two layers:
 
 - **General work** for sm_80 and PCIe-connected cards: kernels and attention
-  backends, all-reduce through host memory or PCIe, KV accounting,
-  determinism, pipeline-parallel scheduling, and an optional compiled Marlin
-  extension.
+  backends, EXL3 quantised kernels, all-reduce through host memory or PCIe,
+  KV accounting, determinism, pipeline-parallel scheduling, and an optional
+  compiled Marlin extension.
 - **Model-specific work**, gated by model family: it lives in that family's
   model code or behind its own switches, and its kernels check the exact
   shapes they were built for, handing anything else back to upstream's path.
 
+The fork's own code lives in the `vllm/sm80/` package and in each model
+family's `nvidia/` directory under `vllm/models/`. vLLM loads it through the
+`sm80` plugin (the `vllm-sm80-plugin` distribution in `plugins/sm80/`), which
+registers the fork's platform, layers and model classes; upstream files carry
+only small hooks into it. The engine stops at startup if the plugin is missing,
+rather than quietly running upstream's path.
+
 Every performance feature sits behind an environment variable and is **off in
 the code by default**. Each supported model has a recipe repository whose
 launcher switches on the tested set. `0` turns a feature off again, with no rebuild.
-Variables carry the prefix of the model they were first built for
-(`VLLM_GLM5_*`), including some general ones.
+Switches are named after what they control: shared sm_80 kernel paths use
+`VLLM_AMPERE_*`, other shared features carry the feature's name
+(`VLLM_CUSTOM_ALLREDUCE_*`, `VLLM_EXL3_*`, `VLLM_DFLASH_*`, `VLLM_MOE_*`,
+`VLLM_PP_*`, `VLLM_THIN_GEMM*`, …), and only code for one model family keeps
+that family's prefix (`VLLM_GLM5_*`, `VLLM_QWEN4_*`). All of them are declared
+in `vllm/sm80/envs.py`, together with every earlier name that was renamed or
+removed; setting a retired name logs a warning that names its replacement and
+is otherwise ignored.
 
 ## Using it: take a recipe
 
 Each model is served through its own recipe, which pins an exact fork commit,
 ships the engine as a container image, downloads the weights and starts an
-OpenAI-compatible server. Questions about running a model belong in its
-recipe's issues.
+OpenAI-compatible server. Both recipes start with one command from a fresh
+clone, `./start.sh` or `docker compose up`, and run only as a container.
+Questions about running a model belong in its recipe's issues.
 
-| Model | Recipe |
-|---|---|
-| GLM-5.3-Flash | [Morrowmake/glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe) |
+| Model | Cards | Recipe |
+|---|---|---|
+| GLM-5.3-Flash | 4 | [Morrowmake/glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe) |
+| Qwen3.8-Flash-Next | 2 | [Morrowmake/qwen38-flash-next-cmp170hx-recipe](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe) |
 
 ## Supported models
 
 ### GLM-5.3-Flash
 
-320B MoE, W4A16, 262,144-token context, DFlash2 speculative decoding.
-Upstream's sparse-attention path needs Hopper; this fork adds the sm_80 path
-that makes the model run at all, then makes it fast.
+320B MoE, W4A16, 262,144-token context, DFlash2 speculative decoding, on four
+cards. Upstream's sparse-attention path needs Hopper; this fork adds the sm_80
+path that makes the model run at all, then makes it fast.
 
 ```bash
 git clone https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe.git
 cd glm53-flash-cmp170hx-recipe && ./start.sh     # LAYOUT=pp4 for pipeline-parallel 4
 ```
 
-From the recipe's [release 1.5.0 results](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe#results)
-(DFlash2 at k=3, 180 W per card; methods and caveats are there):
+From the recipe's [release 1.8.0 results](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/blob/main/docs/results.md)
+(DFlash2, peer-to-peer on, 74 SMs and 180 W per card, PCIe x16 links; methods
+and caveats are there):
 
 | | TP4 (default) | PP4 (`LAYOUT=pp4`) |
 |---|---:|---:|
-| Streaming decode, 1 user, structured | **267.3 tok/s** | 141.8 tok/s |
-| Decode, 8 users, aggregate, structured | **758.9 tok/s** | 603.0 tok/s |
-| Cold prefill | 2,657 tok/s | **6,575 tok/s** |
-| KV pool at 262,144 context | 1,176,646 tokens | **2,334,498 tokens** |
+| Streaming decode, 1 user, structured | **up to 482.6 tok/s** | up to 232.4 tok/s |
+| Decode, 8 users, aggregate, structured | **up to 943.7 tok/s** | up to 664.1 tok/s |
+| Cold prefill | up to 3,161 tok/s | **up to 7,419 tok/s** |
+| KV pool at 262,144 context | 1,203,765 tokens | **2,088,960 tokens** |
 
-Quality with DFlash2 (release 1.4.3, fixed batches): HumanEval 162/164 under
-TP4 and 163/164 under PP4; GSM8K 1,281/1,319 and 1,284/1,319.
+Quality (release 1.8.0, TP4, scored on the answer after the reasoning):
+HumanEval 151/164, GSM8K 1,286/1,319.
 
 GLM-specific switches (the recipe's
-[kill switch table](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe#kill-switches)
-says which layout each serves):
+[engine switches](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/blob/main/docs/engine-switches.md)
+page says which layout each serves):
 
 - Fused decode kernels for mHC mixing, MoE routing and alignment, and the KDA
   decode step (gate projections, convolution, delta rule and gated norm in one
@@ -99,6 +116,39 @@ says which layout each serves):
   input projection under PP4 — `VLLM_GLM5_PP_FOLD_DRAFT_FC`.
 - Always on: a rejected draft can no longer overwrite the tail of the
   sparse-attention key pool.
+
+### Qwen3.8-Flash-Next
+
+EXL3 5.05 bpw weights, BF16 KV cache, 262,144-token context and native MTP
+speculative decoding, on two cards: tensor-parallel 2 with expert parallelism,
+whole routed experts on each card. Every weight sits on the GPUs except the
+compressed n-gram table, read from the checkpoint on an SSD while decoding.
+
+```bash
+git clone https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe.git
+cd qwen38-flash-next-cmp170hx-recipe && ./start.sh
+```
+
+From the recipe's [release 1.0.0 results](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe#headline-numbers)
+(MTP with 3 draft tokens, peer-to-peer on, 74 SMs and 180 W per card, PCIe x16
+links; methods and caveats are there):
+
+| | TP2 |
+|---|---:|
+| Streaming decode, 1 user, structured | **up to 152.8 tok/s** |
+| Decode, 8 users, aggregate, code | **up to 674.7 tok/s** |
+| Cold prefill | up to 2,651 tok/s |
+| KV pool at 262,144 context | 1,044,325 tokens |
+
+Quality (release 1.0.0): HumanEval 157/164, GSM8K 1,289/1,319.
+
+The EXL3 kernels written for this card — MoE kernels for decode and prefill, a
+split-K dense kernel with tensor-core blocks for small decode launches, a
+tensor-core dense kernel for prefill and a native n-gram table read — are
+switched by `VLLM_EXL3_*`; the model's sparse-attention top-k tie order by
+`VLLM_QWEN4_QSA_TOPK_CANONICAL`. The recipe's
+[engine switches](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe#engine-switches)
+table lists the set it turns on.
 
 ## General features
 
@@ -167,31 +217,40 @@ is retained only in tests.
 ## Upstream base
 
 The fork sits on upstream `main` at
-[`e55d076f89`](https://github.com/vllm-project/vllm/commit/e55d076f89fd01a0538a3e496d8ff20bf7980100)
-(2026-09-25), the vLLM **0.30.1** development line (`git describe`:
-`v0.30.1rc0-181-ge55d076f8`). `main` on this fork stays a clean mirror of
-upstream; general fixes are offered back upstream as pull requests.
+[`4e0681ed56`](https://github.com/vllm-project/vllm/commit/4e0681ed5654c1d8afb3c104d4381afd08529de8)
+(2026-10-14), the vLLM **0.32.0** development line (`git describe`:
+`v0.32.0rc0`, plus the fork's commits). `main` on this fork stays a clean
+mirror of upstream; general fixes are offered back upstream as pull requests.
 
 ## Branches and releases
 
-The work is one branch, today `ampere-glm53`. When the second model lands it
-will be renamed to a model-neutral name; GitHub redirects the old name.
+The work is one branch, `ampere`, shared by every model. The earlier
+`ampere-glm53` branch is retired.
 
 A recipe pins an exact fork commit, never the branch. The branch moves to a
 newer upstream from time to time; every commit a recipe release pins is kept
-under a tag `<recipe>-<version>` (for GLM-5.3-Flash, `glm53-recipe-<version>`),
-so older releases keep installing. Release notes live in each recipe's
-changelog, e.g. [GLM-5.3-Flash](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/blob/main/CHANGELOG.md).
+under a tag `<model>-recipe-<version>`, so older releases keep installing:
+
+| Recipe release | Fork tag | Commit |
+|---|---|---|
+| GLM-5.3-Flash 1.8.0 | `glm53-recipe-1.8.0` | [`819146023f`](https://github.com/Morrowmake/vllm-cmp170hx/commit/819146023facb31c04f1f8512e52464835a10d40) |
+| Qwen3.8-Flash-Next 1.0.0 | `qwen38-recipe-1.0.0` | [`18305948ac`](https://github.com/Morrowmake/vllm-cmp170hx/commit/18305948acba3f4c4d912cdd56f2202d2ebd94e8) |
+
+Release notes live in each recipe's changelog:
+[GLM-5.3-Flash](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/blob/main/CHANGELOG.md),
+[Qwen3.8-Flash-Next](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe/blob/main/CHANGELOG.md).
 
 ## Building from source
 
-A recipe's native install (`RUNTIME=native ./install.sh`) is the reference.
-In short, on Python 3.12 with torch 2.13.0 (CUDA 13.0):
+The recipes serve the engine only as a container image; each recipe's
+`docker/README.md` shows how that image is built and is the reference. In
+short, on Python 3.12 with torch 2.13.0 (CUDA 13.0):
 
 ```bash
-git clone -b ampere-glm53 https://github.com/Morrowmake/vllm-cmp170hx.git && cd vllm-cmp170hx
+git clone -b ampere https://github.com/Morrowmake/vllm-cmp170hx.git && cd vllm-cmp170hx
 VLLM_USE_PRECOMPILED=1 uv pip install -e .    # upstream's precompiled extensions carry sm_80
 uv pip install -r requirements/cuda.txt
+uv pip install --no-deps plugins/sm80          # the plugin entry points; required
 # optional compiled Marlin, built on its own without rebuilding the engine:
 VLLM_AMPERE_MARLIN_BUILD=1 python csrc/libtorch_stable/moe/ampere_marlin/build_standalone.py --out vllm
 ```
@@ -211,4 +270,10 @@ contributors; thank you. Upstream's own README is kept at
 Some implementations are adapted from other projects; these are not all
 independently authored patches. [Third-party sources and idea credits](docs/THIRD_PARTY.md)
 identify those adaptations, their licences and the ideas that informed our
-changes. Original component copyright and licence notices remain applicable.
+changes. Original component copyright and licence notices remain applicable;
+the adapted ExLlamaV3 code's MIT notice ships with the `plugins/sm80`
+distribution.
+
+[NOTICE](NOTICE) states the attribution that goes with redistributions of this
+fork. If this work helps you, please credit Morrowmake and link this
+repository; citation metadata is in [CITATION.cff](CITATION.cff).
