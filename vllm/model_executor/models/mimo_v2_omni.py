@@ -263,7 +263,7 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
-            sinks_bias_key0=True,
+            sinks_bias_key0=False,
         )
         return output
 
@@ -1229,6 +1229,8 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
 class MiMoV2OmniForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3
 ):
+    packed_modules_mapping = MiMoV2FlashForCausalLM.packed_modules_mapping.copy()
+
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
