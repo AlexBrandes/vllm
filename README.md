@@ -70,8 +70,7 @@ tested them.
 
 | Recipe | Model | Hardware/layout | Fork version | Author |
 |---|---|---|---|---|
-
-None yet — see [COMMUNITY_RECIPES.md](COMMUNITY_RECIPES.md) to add yours.
+| [mimo-v26-flash-cmp170hx-recipe](https://github.com/ElectroHobo/mimo-v26-flash-cmp170hx-recipe) | MiMo-V2.6-Flash-RL (NVFP4) | 4× CMP 170HX, TP=4 | `18305948acba3f4c4d912cdd56f2202d2ebd94e8` | @ElectroHobo |
 
 ## Supported models
 
