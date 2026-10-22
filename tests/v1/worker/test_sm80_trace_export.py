@@ -19,7 +19,7 @@ from vllm.sm80 import plugin
 from vllm.sm80.worker import trace_export
 
 FLAG = trace_export.FLAG
-KEYS = ("_stop", "_sm80_serial_trace_export")
+KEYS = ("_stop", "step", "shutdown", "_sm80_serial_trace_export")
 
 
 @pytest.fixture(autouse=True)
@@ -100,19 +100,81 @@ def test_workers_stop_one_at_a_time_in_engine_order(monkeypatch, tmp_path):
         assert tempfile.tempdir != str(tmp_path)
 
 
-def test_missing_previous_worker_times_out_and_exports(monkeypatch, tmp_path):
-    done = []
-    monkeypatch.setattr(TorchProfilerWrapper, "_stop", lambda self: done.append(self.local_rank))
+def _recorded_warnings(monkeypatch) -> list[str]:
+    warned: list[str] = []
+    monkeypatch.setattr(trace_export.logger, "warning", lambda msg, *args: warned.append(msg % args))
+    return warned
+
+
+def _cpu_wrapper(directory: Path, name: str, max_iterations: int = 0) -> TorchProfilerWrapper:
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(directory),
+        torch_profiler_use_gzip=True,
+        torch_profiler_with_stack=False,
+        max_iterations=max_iterations,
+    )
+    return TorchProfilerWrapper(config, worker_name=name, local_rank=1, activities=["CPU"])
+
+
+def test_the_stop_profile_rpc_waits_for_the_previous_worker_however_long(monkeypatch, tmp_path):
+    """The worker's profile RPC stops through stop(): the second worker of an
+    engine waits for the first one's marker with no time limit, warning while
+    it waits, then exports, releases its profiler and removes the marker."""
     monkeypatch.setenv(FLAG, "1")
     plugin.register_serial_trace_export()
-    monkeypatch.setattr(trace_export, "WAIT_S", 0.2)
+    assert not hasattr(trace_export, "WAIT_S")
+    warned = _recorded_warnings(monkeypatch)
+    monkeypatch.setattr(trace_export, "LOG_S", 0.1)
     monkeypatch.setattr(trace_export, "engine_position", lambda: (1, 2))
-    w = _fake_workers(tmp_path, 2)[1]
-    t0 = time.monotonic()
-    w._stop()
-    assert done == [1] and time.monotonic() - t0 >= 0.2
-    assert not hasattr(w, "profiler")
+    wrapper = _cpu_wrapper(tmp_path, "rank1")
+    stopped = threading.Event()
+
+    def rpcs() -> None:  # the worker's start and stop RPCs run on its one busy-loop thread
+        wrapper.start()
+        torch.relu(torch.randn(16, 16)).sum()
+        wrapper.stop()
+        stopped.set()
+
+    thread = threading.Thread(target=rpcs, daemon=True)
+    thread.start()
+    time.sleep(0.5)
+    assert not stopped.is_set() and not list(tmp_path.glob("rank1.*.pt.trace.json.gz"))
+    assert any(w.startswith("Serial trace export: waiting") for w in warned)
+    first = trace_export.marker(str(tmp_path), 0, 0)
+    first.touch()
+    thread.join(timeout=60)
+    assert stopped.is_set() and len(list(tmp_path.glob("rank1.*.pt.trace.json.gz"))) == 1
+    assert not hasattr(wrapper, "profiler") and not first.exists()
     assert not list(tmp_path.glob(".trace-export.*"))
+
+
+def test_a_stop_after_max_iterations_inside_a_model_step_is_not_ordered(monkeypatch, tmp_path):
+    """The profiler stopping itself at its iteration limit stops inside the
+    model step: the second worker exports at once without waiting for the
+    first, nothing is released or marked, and a warning says why."""
+    monkeypatch.setenv(FLAG, "1")
+    plugin.register_serial_trace_export()
+    warned = _recorded_warnings(monkeypatch)
+    monkeypatch.setattr(trace_export, "engine_position", lambda: (1, 2))
+    wrapper = _cpu_wrapper(tmp_path, "rank1", max_iterations=2)
+    done = threading.Event()
+
+    def steps() -> None:  # the start RPC, then model steps, on the worker's one thread
+        wrapper.start()
+        for _ in range(3):
+            wrapper.step()
+            torch.relu(torch.randn(16, 16)).sum()
+        done.set()
+
+    thread = threading.Thread(target=steps, daemon=True)
+    thread.start()
+    thread.join(timeout=60)
+    assert done.is_set() and not wrapper.is_running
+    assert len(list(tmp_path.glob("rank1.*.pt.trace.json.gz"))) == 1
+    assert hasattr(wrapper, "profiler") and not list(tmp_path.glob(".trace-export.*"))
+    assert any("inside a model step" in w and "not ordered" in w for w in warned)
+    assert wrapper._sm80_stop_path is None
 
 
 def test_real_session_writes_trace_releases_and_keeps_tmp_on_disk(monkeypatch, tmp_path):

@@ -18,13 +18,19 @@ torch's temporary uncompressed JSON (a gzipped trace is written uncompressed
 first) goes into the trace directory instead of the temporary directory, which
 may be in memory (tmpfs).
 
+Only the stop the stop_profile request makes is ordered: it runs in the
+workers' profile RPC, which the engine waits on without a timeout, so a worker
+waits for the one before it as long as that worker's export takes (a warning
+every ``LOG_S`` names the marker it waits for). A session the profiler stops
+itself after its iteration limit stops inside a model step, under the
+engine's step timeout: that stop is not ordered, nothing else changes, and a
+warning says so. Neither is a stop at shutdown.
+
 Markers are named by the engine (the workers' parent process), the session
 number and the position; the next worker removes the marker it waited for, the
-last worker writes none. A worker that waits longer than ``WAIT_S`` (below the
-engine's 300 s execute-model timeout, since a session stopped after its
-iteration limit stops inside a model step) stops anyway and warns. A process
-that is no model-parallel worker (the front-end profiler) is not ordered; its
-results are still released. Off by default: nothing is patched.
+last worker writes none. A process that is no model-parallel worker (the
+front-end profiler) is not ordered; its results are still released. Off by
+default: nothing is patched.
 """
 
 import ctypes
@@ -43,7 +49,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 FLAG = "VLLM_SM80_SERIAL_TRACE_EXPORT"
-WAIT_S = 240.0
+LOG_S = 60.0
 POLL_S = 0.05
 
 
@@ -54,7 +60,8 @@ def enabled() -> bool:
 
 
 def install() -> bool:
-    """Wrap ``TorchProfilerWrapper._stop`` when the switch is set."""
+    """Wrap ``TorchProfilerWrapper._stop`` (and ``step`` and ``shutdown``,
+    which mark the stops not to order) when the switch is set."""
     if not enabled():
         return False
     from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -62,12 +69,25 @@ def install() -> bool:
     if getattr(TorchProfilerWrapper, "_sm80_serial_trace_export", False):
         return True
     stop = TorchProfilerWrapper._stop
+    step = TorchProfilerWrapper.step
+    shutdown = TorchProfilerWrapper.shutdown
 
     def _stop(self) -> None:
         from vllm.config.profiler import _is_uri_path
 
         session = getattr(self, "_sm80_export_session", 0)
         self._sm80_export_session = session + 1
+        path = getattr(self, "_sm80_stop_path", None)
+        if path is not None:
+            if path == "step":
+                logger.warning(
+                    "Serial trace export: the profiler stopped itself after "
+                    "max_iterations inside a model step; this export is not "
+                    "ordered (profile with max_iterations = 0 and stop with "
+                    "stop_profile)"
+                )
+            stop(self)
+            return
         directory = self._torch_profiler_trace_dir
         local = bool(directory) and not _is_uri_path(directory)
         where = engine_position() if local else None
@@ -81,11 +101,27 @@ def install() -> bool:
             if where is not None and where[0] < where[1] - 1:
                 mark(marker(directory, session, where[0]))
 
+    def _step(self) -> None:
+        self._sm80_stop_path = "step"
+        try:
+            step(self)
+        finally:
+            self._sm80_stop_path = None
+
+    def _shutdown(self) -> None:
+        self._sm80_stop_path = "shutdown"
+        try:
+            shutdown(self)
+        finally:
+            self._sm80_stop_path = None
+
     TorchProfilerWrapper._stop = _stop
+    TorchProfilerWrapper.step = _step
+    TorchProfilerWrapper.shutdown = _shutdown
     TorchProfilerWrapper._sm80_serial_trace_export = True
     logger.warning_once(
         "Serial trace export on: the workers of an engine stop their torch "
-        "profiler sessions one at a time (%s=1)",
+        "profiler sessions one at a time inside stop_profile (%s=1)",
         FLAG,
     )
     return True
@@ -113,21 +149,22 @@ def marker(directory: str, session: int, position: int) -> Path:
     return Path(directory) / name
 
 
-def wait_for(path: Path) -> bool:
-    """Wait for the previous worker's marker and remove it; False (with a
-    warning) when it does not appear within WAIT_S."""
-    deadline = time.monotonic() + WAIT_S
+def wait_for(path: Path) -> None:
+    """Wait for the previous worker's marker, however long its export takes,
+    and remove it."""
+    start = time.monotonic()
+    logged = start
     while not path.exists():
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now - logged >= LOG_S:
             logger.warning(
-                "Serial trace export: no %s after %.0f s; exporting anyway",
+                "Serial trace export: waiting %.0f s for %s",
+                now - start,
                 path,
-                WAIT_S,
             )
-            return False
+            logged = now
         time.sleep(POLL_S)
     path.unlink(missing_ok=True)
-    return True
 
 
 def mark(path: Path) -> None:
