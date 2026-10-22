@@ -3,7 +3,7 @@
 """Bindings for the shipped BF16 EXL3 extension."""
 
 import importlib
-from functools import lru_cache
+from functools import cache
 
 import torch
 
@@ -41,11 +41,16 @@ MOE_V2_EXPERT_META = [
     [MOE_V2_HIDDEN, MOE_V2_INTERMEDIATE, 10, 2],
     [MOE_V2_INTERMEDIATE, MOE_V2_HIDDEN, 10, 2],
 ]
-# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the configuration
-# moe_out_v2 covers; it serves calls of MOE_PREFILL_MIN_ROWS to
-# MOE_PREFILL_MAX_ROWS rows (the validated range: one 3460-token prefill chunk).
+# moe_out_prefill (csrc/exl3/moe_prefill.cu) covers the served shape at either
+# served expert partition: 256 of 512 experts local (tensor parallel size 2)
+# or all 512 (tensor parallel size 1, where pipeline parallelism splits the
+# layers and every stage holds every expert). It serves calls of
+# MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the validated range: one
+# 3460-token prefill chunk); its eligibility is moe_prefill_closed_reason,
+# never the decode gate below, which stays at 256 local experts.
 MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 MOE_PREFILL_MAX_ROWS = 3460
+MOE_PREFILL_LOCAL_EXPERTS = (MOE_V2_LOCAL_EXPERTS, MOE_V2_GLOBAL_EXPERTS)
 
 
 def _linear_fake(
@@ -212,13 +217,13 @@ def ensure_extension() -> None:
     _loaded = True
 
 
-@lru_cache(maxsize=None)
+@cache
 def linear_workspace_size(max_rows: int, padded_in: int, padded_out: int) -> int:
     ensure_extension()
     return torch.ops._exl3_C.linear_workspace_size(max_rows, padded_in, padded_out)
 
 
-@lru_cache(maxsize=None)
+@cache
 def linear_row_chunk(padded_in: int, padded_out: int) -> int:
     """Return the most rows whose linear workspace fits the fixed scratch."""
     rows, limit = 0, LINEAR_SCRATCH_ELEMENTS
@@ -235,7 +240,7 @@ def linear_row_chunk(padded_in: int, padded_out: int) -> int:
     return rows
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size(
     max_rows: int,
     hidden_size: int,
@@ -249,7 +254,7 @@ def moe_workspace_size(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size_v2(
     max_rows: int,
     hidden_size: int,
@@ -261,6 +266,23 @@ def moe_workspace_size_v2(
     return torch.ops._exl3_C.moe_workspace_size_v2(
         max_rows, hidden_size, intermediate_size, topk, local_experts
     )
+
+
+def _expert_meta_closed_reason(
+    local_experts: int, metadata: list[list[list[int]]]
+) -> str | None:
+    """Why these per-expert formats are not the served one, or None: the
+    ``metadata`` is the per-expert [padded_in, padded_out, bits_x2, codebook]
+    list a layer's ``exl3_meta`` buffer is built from."""
+    if len(metadata) != local_experts:
+        return f"{len(metadata)} expert entries for {local_experts} local experts"
+    for local, meta in enumerate(metadata):
+        if [list(m) for m in meta] != MOE_V2_EXPERT_META:
+            return (
+                f"local expert {local} stores [padded_in, padded_out, bits_x2, "
+                f"codebook] {[list(m) for m in meta]}, not {MOE_V2_EXPERT_META}"
+            )
+    return None
 
 
 def moe_v2_closed_reason(
@@ -296,15 +318,52 @@ def moe_v2_closed_reason(
             f"(hidden, intermediate, top_k, local experts, global experts) = "
             f"{shape}, not {expected}"
         )
-    if len(metadata) != local_experts:
-        return f"{len(metadata)} expert entries for {local_experts} local experts"
-    for local, meta in enumerate(metadata):
-        if [list(m) for m in meta] != MOE_V2_EXPERT_META:
-            return (
-                f"local expert {local} stores [padded_in, padded_out, bits_x2, "
-                f"codebook] {[list(m) for m in meta]}, not {MOE_V2_EXPERT_META}"
-            )
-    return None
+    return _expert_meta_closed_reason(local_experts, metadata)
+
+
+def moe_prefill_closed_reason(
+    capability: tuple[int, int] | None,
+    dtype: torch.dtype,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    local_experts: int,
+    global_experts: int,
+    metadata: list[list[list[int]]],
+) -> str | None:
+    """Why moe_out_prefill must not serve this layer, or None when it may.
+
+    The prefill eligibility is its own, not the decode gate above: the kernels
+    in csrc/exl3/moe_prefill.cu read whatever expert map and local expert
+    count the layer has, so they also serve the layer where every pipeline
+    stage holds all 512 experts (which partition pairs with which engine
+    layout is the caller's check, quant._prefill_layout_closed_reason). A
+    closed prefill gate leaves these calls on moe_out; it never changes which
+    calls moe_out_v2 serves. Checked once per layer from host-side values,
+    never from device tensors.
+    """
+    if capability != (8, 0):
+        return f"device capability {capability}, not (8, 0)"
+    if dtype != torch.bfloat16:
+        return f"activation dtype {dtype}, not bfloat16"
+    shape = (hidden_size, intermediate_size, top_k, global_experts)
+    expected = (
+        MOE_V2_HIDDEN,
+        MOE_V2_INTERMEDIATE,
+        MOE_V2_TOP_K,
+        MOE_V2_GLOBAL_EXPERTS,
+    )
+    if shape != expected:
+        return (
+            f"(hidden, intermediate, top_k, global experts) = {shape}, not {expected}"
+        )
+    if local_experts not in MOE_PREFILL_LOCAL_EXPERTS:
+        return (
+            f"{local_experts} of {global_experts} experts local, not "
+            f"{MOE_PREFILL_LOCAL_EXPERTS[0]} or {MOE_PREFILL_LOCAL_EXPERTS[1]} of "
+            f"{global_experts}"
+        )
+    return _expert_meta_closed_reason(local_experts, metadata)
 
 
 def linear_out(
@@ -474,11 +533,11 @@ def warmup_moe_v2(
             out[:count],
             workspace,
         )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     _moe_v2_warm_devices.add(device)
 
 
-@lru_cache(maxsize=None)
+@cache
 def moe_workspace_size_prefill(
     max_rows: int,
     hidden_size: int,
@@ -503,8 +562,9 @@ def moe_out_prefill(
     out,
     workspace,
 ) -> None:
-    """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of
-    the moe_out_v2 configuration; see csrc/exl3/moe_prefill.cu."""
+    """moe_out's contract for calls of at least MOE_PREFILL_MIN_ROWS rows of a
+    served configuration (moe_prefill_closed_reason); see
+    csrc/exl3/moe_prefill.cu."""
     ensure_extension()
     torch.ops._exl3_C.moe_out_prefill(
         x,
@@ -567,7 +627,7 @@ def warmup_moe_prefill(
         out,
         workspace,
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     _moe_prefill_warm_devices.add(device)
 
 

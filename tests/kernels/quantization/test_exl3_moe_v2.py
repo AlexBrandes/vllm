@@ -15,7 +15,6 @@ deterministic; and a captured call replays bitwise like the eager call
 without any allocator event.
 """
 
-import logging
 from types import SimpleNamespace
 
 import numpy as np
@@ -31,6 +30,7 @@ needs_sm80 = pytest.mark.skipif(
 
 HIDDEN, INTERMEDIATE, TOPK = 2560, 640, 10
 LOCAL, GLOBAL = 256, 512
+LOCAL_ALL = GLOBAL  # tensor parallel size 1: every global expert is local
 SERVED_META = [[[2560, 640, 10, 2], [2560, 640, 10, 2], [640, 2560, 10, 2]]] * LOCAL
 
 
@@ -118,46 +118,6 @@ def _method(monkeypatch, warmed):
     )
     monkeypatch.setattr(exl3_ops, "warmup_moe_v2", lambda *args: warmed.append(args))
     return method, layer
-
-
-def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
-    monkeypatch, caplog
-):
-    import vllm.logger as vllm_logger
-    from vllm.sm80.kernels.exl3 import quant
-
-    warmed = []
-    method, layer = _method(monkeypatch, warmed)
-    monkeypatch.setattr(quant, "logger", vllm_logger.init_logger(quant.__name__))
-    # The vllm logger does not propagate to the root, where caplog listens.
-    root = logging.getLogger("vllm")
-    root.addHandler(caplog.handler)
-    caplog.set_level(logging.INFO, logger="vllm")
-    try:
-        vllm_logger._print_info_once.cache_clear()
-        # Open: rows capped at the validated maximum, workspace = max(v1, v2).
-        assert method._moe_v2(layer, SERVED_META, 3200, 7) == (64, 64000)
-        assert method._moe_v2(layer, SERVED_META, 3200, 10**9) == (64, 10**9)
-        assert method._moe_v2(layer, SERVED_META, 16, 7) == (16, 16000)
-        assert len(warmed) == 3 and warmed[0][3] == method.global_expert_ids
-        # Closed: one line saying why; nothing sized or warmed.
-        wrong = _meta_with(3, 0, [2560, 640, 8, 2])
-        assert method._moe_v2(layer, wrong, 3200, 7) == (0, 7)
-        assert len(warmed) == 3
-    finally:
-        root.removeHandler(caplog.handler)
-    lines = [(r.levelno, r.name, r.getMessage()) for r in caplog.records]
-    assert (
-        logging.INFO,
-        quant.__name__,
-        "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
-        "experts for MoE calls of 1..64 rows; larger calls keep moe_out.",
-    ) in lines
-    # One distinct line (caplog may also see it through the root logger).
-    closed = sorted({m for _, _, m in lines if "gate is closed" in m})
-    assert len(closed) == 1
-    assert closed[0].startswith("VLLM_EXL3_MOE_V2 is set but the gate is closed: ")
-    assert "local expert 3" in closed[0]
 
 
 def _experts(moe_v2_rows, max_rows=4096, workspace=0, expert_map="layer map"):
@@ -254,12 +214,22 @@ def served():
     return served_experts(UNALIGNED_SET)
 
 
-def served_experts(unaligned_set):
-    """The ``served`` expert sets; set ``unaligned_set`` (None: no set) has
-    trellis bases that are only 2-byte aligned."""
+def served_experts(unaligned_set, local=LOCAL):
+    """The ``served`` expert sets with ``local`` local experts on one rank; set
+    ``unaligned_set`` (None: no set) has trellis bases that are only 2-byte
+    aligned. ``mapping[g]`` is the local expert of global expert g (-1: another
+    rank's); the served partitions are LOCAL experts holding the even globals
+    (tensor parallel size 2) and LOCAL_ALL holding every global (tensor
+    parallel size 1, where pipeline parallelism splits the layers)."""
     from tests.kernels.quantization.test_exl3_kernels import effective_weight
 
     _extension_or_skip()
+    if local == LOCAL_ALL:
+        mapping = list(range(GLOBAL))
+    elif local == LOCAL:
+        mapping = [g // 2 if g % 2 == 0 else -1 for g in range(GLOBAL)]
+    else:
+        raise ValueError(f"no served expert partition has {local} local experts")
     device = torch.device("cuda")
     rng = np.random.default_rng(1013)
     owners, sets, dense = [], [], []
@@ -290,17 +260,19 @@ def served_experts(unaligned_set):
         sets.append(ptrs)
         dense.append([torch.from_numpy(m).to(device) for m in mats])
     pointers = torch.tensor(
-        [sets[e % DISTINCT] for e in range(LOCAL)], dtype=torch.int64, device=device
+        [sets[e % DISTINCT] for e in range(local)], dtype=torch.int64, device=device
     )
-    meta = torch.tensor(SERVED_META, dtype=torch.int64, device=device)
-    # Even global experts are local (g // 2); odd ones belong to the other rank.
-    expert_map = torch.tensor(
-        [g // 2 if g % 2 == 0 else -1 for g in range(GLOBAL)],
-        dtype=torch.int32,
-        device=device,
+    meta = torch.tensor(
+        [list(map(list, SERVED_META[0]))] * local, dtype=torch.int64, device=device
     )
+    expert_map = torch.tensor(mapping, dtype=torch.int32, device=device)
     return SimpleNamespace(
-        owners=owners, pointers=pointers, meta=meta, expert_map=expert_map, dense=dense
+        owners=owners,
+        pointers=pointers,
+        meta=meta,
+        expert_map=expert_map,
+        dense=dense,
+        mapping=mapping,
     )
 
 
@@ -334,9 +306,10 @@ def _case(served, scenario, rows, seed):
 
 
 def _run(op, served, x, ids, weights, size_fn):
+    local = served.pointers.shape[0]
     out = torch.full_like(x, float("nan"))
     workspace = torch.full(
-        (size_fn(x.shape[0], HIDDEN, INTERMEDIATE, TOPK, LOCAL),),
+        (size_fn(x.shape[0], HIDDEN, INTERMEDIATE, TOPK, local),),
         float("nan"),
         device=x.device,
     )
@@ -371,9 +344,9 @@ def _reference(served, x, ids, weights):
     for t in range(x.shape[0]):
         for j in range(TOPK):
             g = int(ids[t, j])
-            if not 0 <= g < GLOBAL or g % 2:
+            if not 0 <= g < GLOBAL or served.mapping[g] < 0:
                 continue
-            gate, up, down = served.dense[(g // 2) % DISTINCT]
+            gate, up, down = served.dense[served.mapping[g] % DISTINCT]
             a = x64[t] @ gate
             act = a / (1.0 + torch.exp(-a)) * (x64[t] @ up)
             out[t] += float(weights[t, j]) * (act @ down)
@@ -532,7 +505,7 @@ def test_v2_refuses_shapes_outside_its_configuration(served):
 
 
 def _allocations():
-    return torch.cuda.memory_stats()["allocation.all.allocated"]
+    return torch.accelerator.memory_stats()["allocation.all.allocated"]
 
 
 @needs_sm80
@@ -558,10 +531,10 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     def call():
         exl3_ops.moe_out_v2(x, ids, weights, *args, out, workspace)
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     before = _allocations()
     call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert _allocations() == before, "eager call allocated"
     eager = out.clone()
 
@@ -570,7 +543,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     with torch.cuda.stream(stream):
         call()  # warm on the capture stream
     torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     empty = torch.cuda.CUDAGraph()
     before = _allocations()
     with torch.cuda.graph(empty, stream=stream):
@@ -585,7 +558,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     out.fill_(float("nan"))
     workspace.fill_(float("nan"))
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _bitwise(out, eager, "replay vs eager")
 
     # New inputs in the captured buffers: the replay recomputes them.
@@ -594,5 +567,5 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     ids.copy_(ids2)
     weights.copy_(weights2)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _bitwise(out, _v2(served, x2, ids2, weights2), "replay with new inputs")

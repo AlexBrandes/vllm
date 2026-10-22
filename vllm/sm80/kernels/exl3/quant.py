@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EXL3 packed linear and whole-expert inference with BF16 activations."""
 
-import re
 from functools import cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
+import regex as re
 import torch
 from torch import nn
 
@@ -42,6 +42,21 @@ logger = init_logger(__name__)
 # four-output fused one, and the target, MTP and LoRA packed mappings disagree
 # on the indexer, so each layer's output count selects its members.
 _QSA_QKV_MEMBERS = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+
+
+# Engine layouts moe_out_prefill (VLLM_EXL3_MOE_PREFILL_TC) is validated on,
+# each with the expert partition that layout produces: at tensor parallel size
+# 2 without pipeline parallelism the experts are split over the two ranks (256
+# of 512 local), and at tensor parallel size 1 with pipeline parallel size 2
+# the pipeline splits the layers and every stage holds all 512. A layout with
+# any other partition keeps moe_out in prefill steps.
+def _validated_prefill_parallel():
+    from vllm.sm80.kernels.exl3 import ops as exl3_ops
+
+    return {
+        (2, 1): exl3_ops.MOE_V2_LOCAL_EXPERTS,
+        (1, 2): exl3_ops.MOE_V2_GLOBAL_EXPERTS,
+    }
 
 
 def _verify_launch_options(vllm_config) -> None:
@@ -107,7 +122,7 @@ class Exl3Config(QuantizationConfig):
         self.is_qwen = False
 
     @classmethod
-    def get_name(cls) -> Literal["exl3"]:
+    def get_name(cls) -> Any:
         return "exl3"
 
     @classmethod
@@ -158,7 +173,7 @@ class Exl3Config(QuantizationConfig):
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         if self.manifest is None:
             raise ValueError("EXL3 name mapping requires a checkpoint manifest")
-        mapped_prefixes = {}
+        mapped_prefixes: dict[str, str] = {}
         for source in self.manifest.matrices:
             mapped = hf_to_vllm_mapper.map_name(f"{source}.weight")
             if mapped is None:
@@ -492,7 +507,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.local_experts = num_experts
         self.hidden_size = hidden_size
-        weights = [[] for _ in range(num_experts)]
+        weights: list[list[nn.Module]] = [[] for _ in range(num_experts)]
         self.global_expert_ids = [-1] * num_experts
         self.nonlocal_keys = []
         for expert in range(layer.global_num_experts):
@@ -604,6 +619,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_v2_rows,
             prefill_decode_len,
         )
+        assert prepare is not None
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
     def _moe_v2(self, layer, metadata, max_rows: int, workspace: int):
@@ -666,8 +682,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
 
         device = layer.exl3_ptrs.device
-        # moe_out_prefill covers the configuration moe_out_v2 covers.
-        reason = exl3_ops.moe_v2_closed_reason(
+        reason = exl3_ops.moe_prefill_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
             self.moe.in_dtype,
             self.hidden_size,
@@ -684,7 +699,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
         vllm_config = get_current_vllm_config()
         if reason is None:
-            reason = _prefill_layout_closed_reason(vllm_config)
+            reason = _prefill_layout_closed_reason(vllm_config, self.local_experts)
         if reason is not None:
             logger.info_once(
                 "VLLM_EXL3_MOE_PREFILL_TC is set but the gate is closed: %s; "
@@ -894,15 +909,24 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         return operator
 
 
-def _prefill_layout_closed_reason(vllm_config) -> str | None:
-    """Why moe_out_prefill must not serve this engine, or None: it is
-    validated at tensor parallel size 2 without pipeline parallelism, and its
-    prefill-step rule (step_phase) cannot tell the decode steps of drafters
-    with parallel drafting slots (DFlash, DSpark) from prefill steps."""
+def _prefill_layout_closed_reason(vllm_config, local_experts: int) -> str | None:
+    """Why moe_out_prefill must not serve this engine, or None: the operator is
+    validated on the layouts of _validated_prefill_parallel, and a layout only
+    serves the expert partition it was validated with (an arbitrary topology
+    and local expert count is not a validated configuration); its prefill-step
+    rule (step_phase) also cannot tell the decode steps of drafters with
+    parallel drafting slots (DFlash, DSpark) from prefill steps."""
+    validated = _validated_prefill_parallel()
     parallel = vllm_config.parallel_config
     layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
-    if layout != (2, 1):
-        return f"(tensor, pipeline) parallel size {layout}, not (2, 1)"
+    if layout not in validated:
+        first, second = tuple(validated)
+        return f"(tensor, pipeline) parallel size {layout}, not {first} or {second}"
+    if local_experts != validated[layout]:
+        return (
+            f"layout {layout} holds {local_experts} experts locally, not the "
+            f"{validated[layout]} it is validated with"
+        )
     spec = vllm_config.speculative_config
     if spec is not None and (
         getattr(spec, "parallel_drafting", False)

@@ -58,10 +58,10 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/attention/triton_mqa_logits.py` | 628 |
 | `vllm/sm80/kernels/exl3/__init__.py` | 13 |
 | `vllm/sm80/kernels/exl3/dense_mma.py` | 151 |
-| `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 316 |
+| `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 357 |
 | `vllm/sm80/kernels/exl3/loader.py` | 301 |
-| `vllm/sm80/kernels/exl3/ops.py` | 731 |
-| `vllm/sm80/kernels/exl3/quant.py` | 950 |
+| `vllm/sm80/kernels/exl3/ops.py` | 791 |
+| `vllm/sm80/kernels/exl3/quant.py` | 974 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 59 |
 | `vllm/sm80/kernels/exl3/utils.py` | 382 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
@@ -95,7 +95,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **48 files** | **16,057** |
+| **48 files** | **16,182** |
 
 ### `vllm/sm80/`
 
@@ -246,16 +246,16 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/exl3_real_cases.py` | 374 |
 | `tests/kernels/quantization/test_exl3_dense_mma.py` | 596 |
 | `tests/kernels/quantization/test_exl3_dense_mma_real_inputs.py` | 295 |
-| `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 826 |
-| `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 281 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 928 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 319 |
 | `tests/kernels/quantization/test_exl3_dense_splitk.py` | 468 |
 | `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 321 |
 | `tests/kernels/quantization/test_exl3_kernels.py` | 366 |
-| `tests/kernels/quantization/test_exl3_moe_prefill.py` | 529 |
-| `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
-| `tests/kernels/quantization/test_exl3_moe_v2.py` | 598 |
-| `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
+| `tests/kernels/quantization/test_exl3_moe_prefill.py` | 773 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 294 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 571 |
+| `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 349 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 85 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
 | `tests/kernels/test_ampere_decode.py` | 464 |
@@ -370,7 +370,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 171 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **140 files** | **49,275** |
+| **140 files** | **49,668** |
 
 #### `tools/`
 
@@ -388,6 +388,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Path | Change | + | - | Hunks |
 | --- | --- | ---: | ---: | ---: |
+| `.buildkite/test_areas/kernels.yaml` | modified | 2 | 0 | 1 |
 | `.buildkite/test_areas/models_basic.yaml` | modified | 7 | 0 | 4 |
 | `CMakeLists.txt` | modified | 47 | 0 | 3 |
 | `csrc/moe/marlin_moe_wna16/kernel.h` | modified | 46 | 0 | 6 |
@@ -462,7 +463,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
 | `vllm/v1/worker/utils.py` | modified | 17 | 4 | 2 |
-| **74 files** | | **3,804** | **295** | **531** |
+| **75 files** | | **3,806** | **295** | **532** |
 
 ### Tests, docs and .github
 
@@ -500,9 +501,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 | --- | ---: | ---: | ---: | ---: |
-| Product code | 74 | 3,804 | 295 | 531 |
+| Product code | 75 | 3,806 | 295 | 532 |
 | Tests, docs and .github | 26 | 982 | 568 | 94 |
-| All | 100 | 4,786 | 863 | 625 |
+| All | 101 | 4,788 | 863 | 626 |
 
 ## 3. Fork environment variables
 
@@ -617,11 +618,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 | --- | ---: |
 | Fork-added product files | 128 |
-| Fork-added product lines | 39,316 |
-| Patched upstream files | 100 |
-| Patched upstream lines | +4,786 / -863 |
-| Patched upstream product files | 74 |
-| Patched upstream product lines | +3,804 / -295 |
-| Product lines added (new files and patches) | 43,120 |
+| Fork-added product lines | 39,441 |
+| Patched upstream files | 101 |
+| Patched upstream lines | +4,788 / -863 |
+| Patched upstream product files | 75 |
+| Patched upstream product lines | +3,806 / -295 |
+| Product lines added (new files and patches) | 43,247 |
 | Fork environment variables (flags) | 87 |
 | Unreferenced fork definitions | 1 (39 lines) |
