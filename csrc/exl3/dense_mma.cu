@@ -59,17 +59,17 @@ namespace {
 #define EXL3_DENSE_MMA_FORMATS(X) X(10, 2) X(12, 2) X(14, 2)
 
 bool served_format(int64_t bits_x2, int64_t codebook) {
-#define EXL3_SERVED(B, C) if (bits_x2 == B && codebook == C) return true;
+#define EXL3_SERVED(B, C) \
+  if (bits_x2 == B && codebook == C) return true;
   EXL3_DENSE_MMA_FORMATS(EXL3_SERVED)
 #undef EXL3_SERVED
   return false;
 }
 
 // The matrices this path serves (padded_in, padded_out, bits_x2), codebook
-// 2: the dense matrices of one tensor-parallel rank of Qwen3.8-Flash-Next at
-// TP2, the only shapes its plans were measured and validated on (the Python
-// gate also requires TP2, PP1 and 74 SMs). Any other matrix keeps
-// linear_out_splitk.
+// 2: Qwen3.8-Flash-Next at TP2/PP1 and the full-width TP1/PP2 matrices.
+// The Python gate also requires one of these layouts and 74 SMs.
+// Any other matrix keeps linear_out_splitk.
 constexpr int64_t kServedShapes[][3] = {
     {2560, 256, 14},     // attention k/v
     {2560, 640, 14},     // shared expert gate/up
@@ -81,6 +81,12 @@ constexpr int64_t kServedShapes[][3] = {
     {640, 2560, 14},     // shared expert down
     {3072, 2560, 14},    // output projections
     {2560, 124160, 12},  // LM head (half the vocabulary)
+    {2560, 512, 14},     // PP2 attention k/v
+    {2560, 2560, 12},    // PP2 drafter embedding / hidden-state projections
+    {6144, 2560, 14},    // PP2 output projections
+    {2560, 10240, 14},   // PP2 linear-attention qkv
+    {2560, 12288, 14},   // PP2 attention q (with output gate)
+    {2560, 248320, 12},  // PP2 LM head (full vocabulary)
 };
 
 bool served_shape(int64_t k, int64_t n, int64_t bits_x2) {
@@ -126,7 +132,8 @@ struct MmaPlan {
 // FP16 mantissa of 1024.0 (0x6400): exactly 1024 + sum. The second sum lands
 // in the high half first; the first adds onto it (no carry: sums < 2^16).
 __device__ __forceinline__ uint32_t mul1_pair_h2(uint32_t s0, uint32_t s1) {
-  const uint32_t high = __dp4a(s1 * 0x83DCD12Du, 0x01010101u, 0u) * 0x10000u + 0x64006400u;
+  const uint32_t high =
+      __dp4a(s1 * 0x83DCD12Du, 0x01010101u, 0u) * 0x10000u + 0x64006400u;
   const uint32_t packed = __dp4a(s0 * 0x83DCD12Du, 0x01010101u, high);
   const uint32_t scale = 0x1eee1eeeu;
   const uint32_t bias = 0xc931c931u;
@@ -142,8 +149,10 @@ __device__ __forceinline__ uint32_t mul1_pair_h2(uint32_t s0, uint32_t s1) {
 // of the tensor-core lane permutation (codec.cuh decode_lane's order).
 template <int kBitsX2, int kCodebook>
 __device__ __forceinline__ void decode_lane_h2(
-    const uint32_t (&words)[TileRing<kBitsX2>::kLoadWords], int shift, uint32_t (&pair)[4]) {
-  static_assert(kCodebook == 2, "the tensor-core blocks serve the mul1 codebook only");
+    const uint32_t (&words)[TileRing<kBitsX2>::kLoadWords], int shift,
+    uint32_t (&pair)[4]) {
+  static_assert(kCodebook == 2,
+                "the tensor-core blocks serve the mul1 codebook only");
   using Ring = TileRing<kBitsX2>;
   uint32_t u[Ring::kWindowWords];
 #pragma unroll
@@ -161,7 +170,8 @@ __device__ __forceinline__ void decode_lane_h2(
   state[6] = window_state<Ring::rel(6), Ring::kWindowWords>(u);
   state[7] = window_state<Ring::rel(7), Ring::kWindowWords>(u);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) pair[i] = mul1_pair_h2(state[2 * i], state[2 * i + 1]);
+  for (int i = 0; i < 4; ++i)
+    pair[i] = mul1_pair_h2(state[2 * i], state[2 * i + 1]);
 }
 
 // Tensor-core dense blocks at decode row counts (rows <= kMmaMaxRows;
@@ -179,10 +189,12 @@ constexpr int kMmaMinBlockWarps = 4;
 constexpr int kMmaThreads = 32 * kMmaWarps;
 constexpr int kMmaMaxRows = 32;
 
-__device__ __forceinline__ void mma_f16_16816(float (&d)[4], const uint32_t (&a)[4],
+__device__ __forceinline__ void mma_f16_16816(float (&d)[4],
+                                              const uint32_t (&a)[4],
                                               uint32_t b0, uint32_t b1) {
   asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, "
       "{%8, %9}, {%0, %1, %2, %3};"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -213,10 +225,13 @@ constexpr int mma_smem_bytes(int warps) {
 }
 
 __device__ __forceinline__ void cp_async16(uint32_t smem, const void* gmem) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem) : "memory");
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem),
+               "l"(gmem)
+               : "memory");
 }
 __device__ __forceinline__ void cp_async4(uint32_t smem, const void* gmem) {
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem), "l"(gmem) : "memory");
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem), "l"(gmem)
+               : "memory");
 }
 __device__ __forceinline__ void cp_async_commit() {
   asm volatile("cp.async.commit_group;" ::: "memory");
@@ -250,7 +265,8 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
   using Ring = TileRing<kBitsX2>;
   using Stage = MmaStage<kBitsX2, NT, MT>;
   constexpr int S = kMmaStages;
-  static_assert(MT * NT * 4 * 32 * 4 <= S * int(sizeof(Stage)), "reduction exceeds a ring");
+  static_assert(MT * NT * 4 * 32 * 4 <= S * int(sizeof(Stage)),
+                "reduction exceeds a ring");
   // 16-byte pieces of the MT tiles of one slice (a tile is 16 * bits_x2 bytes).
   constexpr int kPieces = MT * kBitsX2;
   extern __shared__ __align__(16) unsigned char mma_smem[];
@@ -265,8 +281,9 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
   // opaque to the compiler so that they stay in registers instead of being
   // recomputed every slice: the issue targets (trellis piece lane, B values),
   // the lane window's words of tile 0, and the window shift.
-  const uint32_t ring = static_cast<uint32_t>(__cvta_generic_to_shared(mma_smem)) +
-                        static_cast<uint32_t>(warp) * S * kStageBytes;
+  const uint32_t ring =
+      static_cast<uint32_t>(__cvta_generic_to_shared(mma_smem)) +
+      static_cast<uint32_t>(warp) * S * kStageBytes;
   const uint32_t issue_words = opaque_u32(ring + 16 * lane);
   const uint32_t act_lane = opaque_u32(ring + kActOffset + 16 * lane);
   const uint32_t scale_lane = opaque_u32(ring + kScaleOffset + 4 * lane);
@@ -275,21 +292,25 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
   {
     const LaneWindow<kBitsX2> window(lane);
 #pragma unroll
-    for (int i = 0; i < Ring::kLoadWords; ++i) read_word[i] = opaque_u32(ring + 4 * window.word[i]);
+    for (int i = 0; i < Ring::kLoadWords; ++i)
+      read_word[i] = opaque_u32(ring + 4 * window.word[i]);
     shift = static_cast<int>(opaque_u32(static_cast<uint32_t>(window.shift)));
   }
   const int kw = p.mma_kw;
   const int splits = p.splits > 1 ? 2 : 1;
   const int steps = p.k / 16;
   const int64_t groups = p.n / (16 * MT);
-  // Block item: (block of column groups, split); warp: (group in block, K part).
+  // Block item: (block of column groups, split); warp: (group in block, K
+  // part).
   const int split = static_cast<int>(blockIdx.x % splits);
-  const int64_t group = int64_t(blockIdx.x / splits) * int(blockDim.x / 32 / kw) + warp / kw;
+  const int64_t group =
+      int64_t(blockIdx.x / splits) * int(blockDim.x / 32 / kw) + warp / kw;
   const int part = split * kw + warp % kw;
   const int first = static_cast<int>(int64_t(part) * steps / (kw * splits));
   const int last = static_cast<int>(int64_t(part + 1) * steps / (kw * splits));
   const bool active = group < groups;
-  static_assert(kActOffset % 16 == 0 && kStageBytes % 16 == 0, "16-byte ring pieces");
+  static_assert(kActOffset % 16 == 0 && kStageBytes % 16 == 0,
+                "16-byte ring pieces");
   // This lane's B rows (row g of each fragment), and its result rows' scale
   // exponents: block_exp holds per H128 block one int16 per row of the row
   // count rounded up to 8, so rows 2q and 2q + 1 of a fragment are one word.
@@ -304,11 +325,13 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
   const int64_t ct0 = group * MT;
   // Running sources of the next slice to issue and the ring stage it fills.
   const uint16_t* tsrc =
-      p.trellis + (int64_t(first) * p.tiles_n + ct0) * Ring::kTileHalfwords + 8 * lane;
+      p.trellis + (int64_t(first) * p.tiles_n + ct0) * Ring::kTileHalfwords +
+      8 * lane;
   const int64_t tstride = p.tiles_n * Ring::kTileHalfwords;
   const uint4* asrc[NT];
 #pragma unroll
-  for (int nt = 0; nt < NT; ++nt) asrc[nt] = arow[nt] != nullptr ? arow[nt] + 4 * first : nullptr;
+  for (int nt = 0; nt < NT; ++nt)
+    asrc[nt] = arow[nt] != nullptr ? arow[nt] + 4 * first : nullptr;
   uint32_t issue_offset = 0;
   int issue_slice = first;
   auto issue = [&]() {
@@ -329,7 +352,9 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
     }
     ++issue_slice;
     tsrc += tstride;
-    issue_offset = issue_offset + kStageBytes == S * kStageBytes ? 0 : issue_offset + kStageBytes;
+    issue_offset = issue_offset + kStageBytes == S * kStageBytes
+                       ? 0
+                       : issue_offset + kStageBytes;
   };
   float acc[MT][NT][4];
 #pragma unroll
@@ -355,7 +380,9 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
       cp_async_wait<S - 1>();
       __syncwarp();
       const uint32_t offset = read_offset;
-      read_offset = read_offset + kStageBytes == S * kStageBytes ? 0 : read_offset + kStageBytes;
+      read_offset = read_offset + kStageBytes == S * kStageBytes
+                        ? 0
+                        : read_offset + kStageBytes;
       // b[nt]: hi pairs (k 2q.., 2q+8..), then lo pairs; zero past the rows.
       // inv[nt]: 2^(e - 14) of the slice's H128 block for rows 2q, 2q + 1
       // (garbage past the rows, whose D columns are zero and never stored).
@@ -363,7 +390,8 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
       float inv[NT][2];
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
-        b[nt] = arow[nt] != nullptr ? lds128(act_lane + offset + 512 * nt) : make_uint4(0u, 0u, 0u, 0u);
+        b[nt] = arow[nt] != nullptr ? lds128(act_lane + offset + 512 * nt)
+                                    : make_uint4(0u, 0u, 0u, 0u);
         const uint32_t exps = lds32(scale_lane + offset + 128 * nt);
         inv[nt][0] = __int_as_float(static_cast<int>((exps & 0xffffu) << 23));
         inv[nt][1] = __int_as_float(static_cast<int>((exps >> 16) << 23));
@@ -378,7 +406,8 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
         uint32_t pair[4];
         decode_lane_h2<kBitsX2, kCodebook>(words, shift, pair);
         // Pairs: 0 (k 2q.., col g), 1 (k 2q+8.., col g), 2 (k 2q.., col g+8),
-        // 3 (k 2q+8.., col g+8); A regs: (g, k), (g+8, k), (g, k+8), (g+8, k+8).
+        // 3 (k 2q+8.., col g+8); A regs: (g, k), (g+8, k), (g, k+8), (g+8,
+        // k+8).
         const uint32_t frag[4] = {pair[0], pair[2], pair[1], pair[3]};
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
@@ -386,7 +415,8 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
           mma_f16_16816(d, frag, b[nt].z, b[nt].w);
           mma_f16_16816(d, frag, b[nt].x, b[nt].y);
 #pragma unroll
-          for (int i = 0; i < 4; ++i) acc[mt][nt][i] = __fmaf_rn(d[i], inv[nt][i & 1], acc[mt][nt][i]);
+          for (int i = 0; i < 4; ++i)
+            acc[mt][nt][i] = __fmaf_rn(d[i], inv[nt][i & 1], acc[mt][nt][i]);
         }
       }
     }
@@ -399,14 +429,16 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
     __syncthreads();
     if (warp % kw != 0) {
 #pragma unroll
-      for (int v = 0; v < kValues; ++v) red[(warp * kValues + v) * 32 + lane] = (&acc[0][0][0])[v];
+      for (int v = 0; v < kValues; ++v)
+        red[(warp * kValues + v) * 32 + lane] = (&acc[0][0][0])[v];
     }
     __syncthreads();
     if (warp % kw == 0) {
       for (int w = warp + 1; w < warp + kw; ++w) {
 #pragma unroll
         for (int v = 0; v < kValues; ++v) {
-          (&acc[0][0][0])[v] = __fadd_rn((&acc[0][0][0])[v], red[(w * kValues + v) * 32 + lane]);
+          (&acc[0][0][0])[v] =
+              __fadd_rn((&acc[0][0][0])[v], red[(w * kValues + v) * 32 + lane]);
         }
       }
     }
@@ -439,8 +471,8 @@ __global__ void __launch_bounds__(kMmaThreads) mma_kernel(MmaProblem p) {
 // `device`, or the current device when it is negative.
 int mma_device(int device) {
   if (device < 0) C10_CUDA_CHECK(cudaGetDevice(&device));
-  TORCH_CHECK(device < kMmaMaxDevices, "EXL3 MMA blocks need a device index below ",
-              kMmaMaxDevices);
+  TORCH_CHECK(device < kMmaMaxDevices,
+              "EXL3 MMA blocks need a device index below ", kMmaMaxDevices);
   return device;
 }
 
@@ -453,10 +485,12 @@ auto prepared_mma_kernel(int device) {
   auto* kernel = mma_kernel<kBitsX2, kCodebook, NT, MT>;
   static std::once_flag attributed[kMmaMaxDevices];
   std::call_once(attributed[device], [kernel] {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        mma_smem_bytes<kBitsX2, NT, MT>(kMmaWarps)));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                        cudaSharedmemCarveoutMaxShared));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        mma_smem_bytes<kBitsX2, NT, MT>(kMmaWarps)));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared));
   });
   return kernel;
 }
@@ -493,19 +527,26 @@ template <int MT, class F>
 void mma_visit_rows(int format, int64_t rows, F&& f) {
   auto by_format = [&]<int NT>() {
     switch (format) {
-#define EXL3_CASE(B, C) \
-      case format_key(B, C): return f.template operator()<B, C, NT, MT>();
+#define EXL3_CASE(B, C)  \
+  case format_key(B, C): \
+    return f.template operator()<B, C, NT, MT>();
       EXL3_DENSE_MMA_FORMATS(EXL3_CASE)
 #undef EXL3_CASE
       default:
-        TORCH_CHECK(false, "EXL3 MMA blocks have no kernel for this rate/codebook combination");
+        TORCH_CHECK(false,
+                    "EXL3 MMA blocks have no kernel for this rate/codebook "
+                    "combination");
     }
   };
   switch ((rows + 7) / 8) {
-    case 1: return by_format.template operator()<1>();
-    case 2: return by_format.template operator()<2>();
-    case 3: return by_format.template operator()<3>();
-    default: return by_format.template operator()<4>();
+    case 1:
+      return by_format.template operator()<1>();
+    case 2:
+      return by_format.template operator()<2>();
+    case 3:
+      return by_format.template operator()<3>();
+    default:
+      return by_format.template operator()<4>();
   }
 }
 template <class F>
@@ -539,7 +580,8 @@ constexpr int kMmaMinSteps = 8;
 MmaPlan dense_mma_plan(int64_t rows, int64_t k, int64_t n, int format, int sms,
                        const void* trellis, int device) {
   MmaPlan plan{};
-  if (rows <= 0 || rows > kMmaMaxRows || k % 128 != 0 || n % 64 != 0) return plan;
+  if (rows <= 0 || rows > kMmaMaxRows || k % 128 != 0 || n % 64 != 0)
+    return plan;
   if (reinterpret_cast<uintptr_t>(trellis) % 16 != 0) return plan;
   if (n / 64 >= int64_t(kMmaWideGroupsPerSm) * sms) return MmaPlan{4, 1, 1};
   device = mma_device(device);
@@ -561,21 +603,26 @@ MmaPlan dense_mma_plan(int64_t rows, int64_t k, int64_t n, int format, int sms,
 }
 
 // `device` is the current device.
-void launch_mma(const MmaProblem& problem, int mt, cudaStream_t stream, int device) {
-  TORCH_CHECK(problem.route == nullptr && problem.rows > 0 && problem.rows <= kMmaMaxRows &&
-                  problem.n % 64 == 0 && problem.k % 16 == 0 &&
+void launch_mma(const MmaProblem& problem, int mt, cudaStream_t stream,
+                int device) {
+  TORCH_CHECK(problem.route == nullptr && problem.rows > 0 &&
+                  problem.rows <= kMmaMaxRows && problem.n % 64 == 0 &&
+                  problem.k % 16 == 0 &&
                   reinterpret_cast<uintptr_t>(problem.trellis) % 16 == 0 &&
                   problem.mma_kw >= 1 && problem.mma_kw <= kMmaWarps &&
                   kMmaWarps % problem.mma_kw == 0,
-              "EXL3 MMA blocks need a dense problem of 1..32 rows and a 16-byte aligned trellis");
+              "EXL3 MMA blocks need a dense problem of 1..32 rows and a "
+              "16-byte aligned trellis");
   const int splits = problem.splits > 1 ? 2 : 1;
   const int warps = mma_block_warps(problem.mma_kw);
-  const unsigned int grid =
-      static_cast<unsigned int>(mma_blocks(problem.n, mt, problem.mma_kw, splits));
-  mma_visit(problem.format, problem.rows, mt, [&]<int B, int C, int NT, int MT>() {
-    auto* kernel = prepared_mma_kernel<B, C, NT, MT>(device);
-    kernel<<<grid, 32 * warps, mma_smem_bytes<B, NT, MT>(warps), stream>>>(problem);
-  });
+  const unsigned int grid = static_cast<unsigned int>(
+      mma_blocks(problem.n, mt, problem.mma_kw, splits));
+  mma_visit(
+      problem.format, problem.rows, mt, [&]<int B, int C, int NT, int MT>() {
+        auto* kernel = prepared_mma_kernel<B, C, NT, MT>(device);
+        kernel<<<grid, 32 * warps, mma_smem_bytes<B, NT, MT>(warps), stream>>>(
+            problem);
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -601,18 +648,21 @@ constexpr int kSplitWarpsPerBlock = 4;
 // the biased FP32 exponent of 2^(e - 14), which the GEMM multiplies the
 // block's slice sums by. With `zeroed` != nullptr the launch also zeroes
 // zero_vectors float4s there (the split GEMM's accumulation target).
-__global__ void linear_input_split(const __nv_bfloat16* x, const half* suh, int64_t rows,
-                                   int64_t logical_in, int64_t padded_in, uint32_t* split,
-                                   int16_t* block_exp, float4* zeroed, int64_t zero_vectors) {
+__global__ void linear_input_split(const __nv_bfloat16* x, const half* suh,
+                                   int64_t rows, int64_t logical_in,
+                                   int64_t padded_in, uint32_t* split,
+                                   int16_t* block_exp, float4* zeroed,
+                                   int64_t zero_vectors) {
   if (zeroed != nullptr) {
-    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < zero_vectors;
-         i += int64_t(gridDim.x) * blockDim.x) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < zero_vectors; i += int64_t(gridDim.x) * blockDim.x) {
       zeroed[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
   }
   const int lane = threadIdx.x & 31;
   const int64_t blocks = padded_in / 128;
-  const int64_t task = int64_t(blockIdx.x) * kSplitWarpsPerBlock + (threadIdx.x >> 5);
+  const int64_t task =
+      int64_t(blockIdx.x) * kSplitWarpsPerBlock + (threadIdx.x >> 5);
   if (task >= rows * blocks) return;
   const int64_t row = task / blocks;
   const int64_t base = (task % blocks) * 128 + lane;
@@ -620,21 +670,25 @@ __global__ void linear_input_split(const __nv_bfloat16* x, const half* suh, int6
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const int64_t col = base + 32 * i;
-    v[i] = col < logical_in ? __fmul_rn(__bfloat162float(x[row * logical_in + col]),
-                                        __half2float(suh[col]))
-                            : 0.0f;
+    v[i] = col < logical_in
+               ? __fmul_rn(__bfloat162float(x[row * logical_in + col]),
+                           __half2float(suh[col]))
+               : 0.0f;
   }
   hadamard128_warp(v, lane);
-  float m = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  float m =
+      fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
   for (int distance = 16; distance > 0; distance >>= 1) {
     m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, distance));
   }
-  // Zero and subnormal maxima clamp to e = -112, so that both powers of two stay normal.
+  // Zero and subnormal maxima clamp to e = -112, so that both powers of two
+  // stay normal.
   const int e = max((__float_as_int(m) >> 23) - 127, -112);
   const float scale = __int_as_float((141 - e) << 23);
   if (lane == 0) {
-    block_exp[(task % blocks) * ((rows + 7) & ~int64_t(7)) + row] = static_cast<int16_t>(113 + e);
+    block_exp[(task % blocks) * ((rows + 7) & ~int64_t(7)) + row] =
+        static_cast<int16_t>(113 + e);
   }
   const int64_t steps = padded_in / 16;
 #pragma unroll
@@ -645,10 +699,12 @@ __global__ void linear_input_split(const __nv_bfloat16* x, const half* suh, int6
     // Lanes lane and lane ^ 1 hold k and k ^ 1: the even lane stores the hi
     // pair, the odd one the lo pair.
     const uint16_t mine = __half_as_ushort((lane & 1) ? hi : lo);
-    const uint16_t other = static_cast<uint16_t>(__shfl_xor_sync(0xffffffffu, uint32_t(mine), 1));
+    const uint16_t other =
+        static_cast<uint16_t>(__shfl_xor_sync(0xffffffffu, uint32_t(mine), 1));
     const uint16_t own = __half_as_ushort((lane & 1) ? lo : hi);
-    const uint32_t pair = (lane & 1) ? (uint32_t(other) | (uint32_t(own) << 16))
-                                     : (uint32_t(own) | (uint32_t(other) << 16));
+    const uint32_t pair = (lane & 1)
+                              ? (uint32_t(other) | (uint32_t(own) << 16))
+                              : (uint32_t(own) | (uint32_t(other) << 16));
     const int64_t k = base + 32 * i;
     const int kk = static_cast<int>(k & 15);
     const int q = (kk & 7) >> 1;
@@ -687,8 +743,9 @@ __device__ __forceinline__ void hadamard128_warp_f64(double (&v)[4], int lane) {
 
 // One warp per (row, 128-column block): H128, then svh, in FP64 and rounded
 // once to FP32, then to BF16.
-__global__ void linear_output(const float* result, const half* svh, int64_t rows,
-                              int64_t padded_out, int64_t logical_out, __nv_bfloat16* out) {
+__global__ void linear_output(const float* result, const half* svh,
+                              int64_t rows, int64_t padded_out,
+                              int64_t logical_out, __nv_bfloat16* out) {
   const int lane = threadIdx.x & 31;
   const int64_t blocks = padded_out / 128;
   for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
@@ -703,8 +760,8 @@ __global__ void linear_output(const float* result, const half* svh, int64_t rows
     for (int i = 0; i < 4; ++i) {
       const int64_t col = base + 32 * i;
       if (col < logical_out) {
-        out[row * logical_out + col] =
-            __float2bfloat16_rn(static_cast<float>(v[i] * double(__half2float(svh[col]))));
+        out[row * logical_out + col] = __float2bfloat16_rn(
+            static_cast<float>(v[i] * double(__half2float(svh[col]))));
       }
     }
   }
@@ -720,34 +777,40 @@ std::atomic<int> g_override{0};
 // logical_out, out 4-byte aligned: the GEMM copies word pairs), with the
 // diagnostic override applied to every launch the plan puts on the
 // tensor-core blocks.
-MmaPlan served_plan(int64_t rows, int64_t k, int64_t n, int64_t logical_out, int64_t bits_x2,
-                    int64_t codebook, int sms, const void* trellis, const void* out,
-                    int device) {
+MmaPlan served_plan(int64_t rows, int64_t k, int64_t n, int64_t logical_out,
+                    int64_t bits_x2, int64_t codebook, int sms,
+                    const void* trellis, const void* out, int device) {
   if (!served_format(bits_x2, codebook)) return MmaPlan{};
   if (!served_shape(k, n, bits_x2)) return MmaPlan{};
   const bool fits_exps = (rows + 7) / 8 * 8 * (k / 128) <= rows * logical_out &&
                          reinterpret_cast<uintptr_t>(out) % 4 == 0;
   if (!fits_exps) return MmaPlan{};
   const MmaPlan plan = dense_mma_plan(
-      rows, k, n, format_key(static_cast<int>(bits_x2), static_cast<int>(codebook)), sms,
+      rows, k, n,
+      format_key(static_cast<int>(bits_x2), static_cast<int>(codebook)), sms,
       trellis, device);
   const int forced = g_override.load(std::memory_order_relaxed);
   if (plan.mt == 0 || forced == 0) return plan;
   return MmaPlan{forced >> 8, (forced >> 4) & 15, forced & 15};
 }
 
-void set_dense_mma(bool enabled) { g_enabled.store(enabled, std::memory_order_relaxed); }
+void set_dense_mma(bool enabled) {
+  g_enabled.store(enabled, std::memory_order_relaxed);
+}
 
 void set_dense_mma_shape_override(int64_t mt, int64_t kw, int64_t splits) {
   if (mt == 0 && kw == 0 && splits == 0) {
     g_override.store(0, std::memory_order_relaxed);
     return;
   }
-  TORCH_CHECK((mt == 2 || mt == 4) && (kw == 1 || kw == 2 || kw == 4 || kw == 8) &&
+  TORCH_CHECK((mt == 2 || mt == 4) &&
+                  (kw == 1 || kw == 2 || kw == 4 || kw == 8) &&
                   (splits == 1 || splits == 2),
-              "EXL3 MMA plan override needs mt 2 or 4, kw 1, 2, 4 or 8 and splits 1 or 2 "
+              "EXL3 MMA plan override needs mt 2 or 4, kw 1, 2, 4 or 8 and "
+              "splits 1 or 2 "
               "(or 0, 0, 0 for none)");
-  g_override.store(static_cast<int>(mt << 8 | kw << 4 | splits), std::memory_order_relaxed);
+  g_override.store(static_cast<int>(mt << 8 | kw << 4 | splits),
+                   std::memory_order_relaxed);
 }
 
 // Sets every instantiation's shared-memory attributes and queries its
@@ -774,15 +837,17 @@ void dense_mma_prepare() {
 // (mt 0: not on the tensor-core blocks). Wide matrices (the LM head) and
 // launches outside the blocks need no device; the 2-tile plans query the
 // occupancy of the current device.
-std::vector<int64_t> linear_mma_plan(int64_t rows, int64_t padded_in, int64_t padded_out,
-                                     int64_t sms, int64_t bits_x2, int64_t codebook) {
+std::vector<int64_t> linear_mma_plan(int64_t rows, int64_t padded_in,
+                                     int64_t padded_out, int64_t sms,
+                                     int64_t bits_x2, int64_t codebook) {
   TORCH_CHECK(rows >= 0, "EXL3 rows must be nonnegative");
   TORCH_CHECK(sms > 0 && sms <= std::numeric_limits<int>::max(),
               "EXL3 multiprocessor count must be a positive int");
   check_padded(padded_in);
   check_padded(padded_out);
-  const MmaPlan plan = served_plan(rows, padded_in, padded_out, padded_out, bits_x2, codebook,
-                                   static_cast<int>(sms), nullptr, nullptr, -1);
+  const MmaPlan plan =
+      served_plan(rows, padded_in, padded_out, padded_out, bits_x2, codebook,
+                  static_cast<int>(sms), nullptr, nullptr, -1);
   return {plan.mt, plan.kw, plan.splits};
 }
 
@@ -800,22 +865,26 @@ bool linear_out_mma(const torch::Tensor& x, const torch::Tensor& trellis,
   const int64_t padded_in = trellis.size(0) * 16;
   const int64_t padded_out = trellis.size(1) * 16;
   const int device = mma_device(x.get_device());
-  const MmaPlan plan = served_plan(rows, padded_in, padded_out, logical_out, bits_x2, codebook,
-                                   sms, trellis.data_ptr(), out.data_ptr(), device);
+  const MmaPlan plan =
+      served_plan(rows, padded_in, padded_out, logical_out, bits_x2, codebook,
+                  sms, trellis.data_ptr(), out.data_ptr(), device);
   if (plan.mt == 0) return false;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
   float* transformed = workspace.data_ptr<float>();
   // rows * padded_out floats, 16-byte aligned (padded_in is a multiple of 128).
   float* result = transformed + rows * padded_in;
   int16_t* block_exp = reinterpret_cast<int16_t*>(out.data_ptr());
-  float4* zeroed = plan.splits > 1 ? reinterpret_cast<float4*>(result) : nullptr;
+  float4* zeroed =
+      plan.splits > 1 ? reinterpret_cast<float4*>(result) : nullptr;
   const int64_t warps = rows * (padded_in / 128);
-  linear_input_split<<<static_cast<unsigned int>((warps + kSplitWarpsPerBlock - 1) /
-                                                 kSplitWarpsPerBlock),
+  linear_input_split<<<static_cast<unsigned int>(
+                           (warps + kSplitWarpsPerBlock - 1) /
+                           kSplitWarpsPerBlock),
                        32 * kSplitWarpsPerBlock, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()), rows, logical_in, padded_in,
-      reinterpret_cast<uint32_t*>(transformed), block_exp, zeroed, rows * padded_out / 4);
+      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()), rows, logical_in,
+      padded_in, reinterpret_cast<uint32_t*>(transformed), block_exp, zeroed,
+      rows * padded_out / 4);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   MmaProblem problem{};
@@ -825,9 +894,11 @@ bool linear_out_mma(const torch::Tensor& x, const torch::Tensor& trellis,
   problem.c_stride = padded_out;
   problem.k = static_cast<int>(padded_in);
   problem.n = static_cast<int>(padded_out);
-  problem.trellis = reinterpret_cast<const uint16_t*>(trellis.data_ptr<int16_t>());
+  problem.trellis =
+      reinterpret_cast<const uint16_t*>(trellis.data_ptr<int16_t>());
   problem.tiles_n = padded_out / 16;
-  problem.format = format_key(static_cast<int>(bits_x2), static_cast<int>(codebook));
+  problem.format =
+      format_key(static_cast<int>(bits_x2), static_cast<int>(codebook));
   problem.rows = rows;
   problem.splits = plan.splits;
   problem.split = reinterpret_cast<const uint4*>(transformed);
@@ -835,9 +906,11 @@ bool linear_out_mma(const torch::Tensor& x, const torch::Tensor& trellis,
   problem.mma_kw = plan.kw;
   launch_mma(problem, plan.mt, stream, device);
 
-  linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
-      result, reinterpret_cast<const half*>(svh.data_ptr<at::Half>()), rows, padded_out,
-      logical_out, reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+  linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock,
+                  0, stream>>>(
+      result, reinterpret_cast<const half*>(svh.data_ptr<at::Half>()), rows,
+      padded_out, logical_out,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return true;
 }
@@ -852,7 +925,9 @@ TORCH_LIBRARY_FRAGMENT(_exl3_C, m) {
   m.def("set_dense_mma_shape_override(int mt, int kw, int splits) -> ()",
         &exl3::dense_mma::set_dense_mma_shape_override);
   m.def("dense_mma_prepare() -> ()", &exl3::dense_mma::dense_mma_prepare);
-  m.def("linear_mma_plan(int rows, int padded_in, int padded_out, int sms, int bits_x2, "
-        "int codebook) -> int[]",
-        &exl3::dense_mma::linear_mma_plan);
+  m.def(
+      "linear_mma_plan(int rows, int padded_in, int padded_out, int sms, int "
+      "bits_x2, "
+      "int codebook) -> int[]",
+      &exl3::dense_mma::linear_mma_plan);
 }

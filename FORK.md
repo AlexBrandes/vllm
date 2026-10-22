@@ -186,7 +186,7 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/codec_prefill.cuh` | 68 |
 | `csrc/exl3/common.h` | 66 |
 | `csrc/exl3/dense.cu` | 149 |
-| `csrc/exl3/dense_mma.cu` | 858 |
+| `csrc/exl3/dense_mma.cu` | 933 |
 | `csrc/exl3/dense_mma.h` | 24 |
 | `csrc/exl3/dense_prefill_tc.cu` | 633 |
 | `csrc/exl3/dense_prefill_tc.h` | 40 |
@@ -205,7 +205,7 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/ple.h` | 53 |
 | `csrc/exl3/ple_read.cpp` | 549 |
 | `csrc/exl3/reference.cu` | 447 |
-| **25 files** | **7,449** |
+| **25 files** | **7,524** |
 
 #### `docs/`
 
@@ -244,7 +244,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/moe/test_shared_experts_reorder.py` | 488 |
 | `tests/kernels/moe_align_reference.py` | 87 |
 | `tests/kernels/quantization/exl3_real_cases.py` | 374 |
-| `tests/kernels/quantization/test_exl3_dense_mma.py` | 596 |
+| `tests/kernels/quantization/test_exl3_dense_mma.py` | 461 |
 | `tests/kernels/quantization/test_exl3_dense_mma_real_inputs.py` | 295 |
 | `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 928 |
 | `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 319 |
@@ -370,7 +370,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 171 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **140 files** | **49,706** |
+| **140 files** | **49,571** |
 
 #### `tools/`
 
@@ -618,11 +618,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 | --- | ---: |
 | Fork-added product files | 128 |
-| Fork-added product lines | 39,458 |
+| Fork-added product lines | 39,533 |
 | Patched upstream files | 101 |
 | Patched upstream lines | +4,788 / -863 |
 | Patched upstream product files | 75 |
 | Patched upstream product lines | +3,806 / -295 |
-| Product lines added (new files and patches) | 43,264 |
+| Product lines added (new files and patches) | 43,339 |
 | Fork environment variables (flags) | 87 |
 | Unreferenced fork definitions | 1 (39 lines) |
