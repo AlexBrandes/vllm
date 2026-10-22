@@ -625,9 +625,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def _moe_v2(self, layer, metadata, max_rows: int, workspace: int):
         """Rows up to which this layer's calls take moe_out_v2, and a workspace
         size that fits both operators (0 rows: the gate is closed)."""
+        from vllm.config import get_current_vllm_config_or_none
         from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
         device = layer.exl3_ptrs.device
+        config = get_current_vllm_config_or_none()
+        parallel_layout = (
+            (
+                config.parallel_config.tensor_parallel_size,
+                config.parallel_config.pipeline_parallel_size,
+            )
+            if config is not None
+            else None
+        )
         reason = exl3_ops.moe_v2_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
             self.moe.in_dtype,
@@ -637,6 +647,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.local_experts,
             layer.global_num_experts,
             metadata,
+            parallel_layout,
         )
         if reason is not None:
             logger.info_once(

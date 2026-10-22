@@ -313,20 +313,6 @@ def test_prefill_gate_reads_every_local_expert_format(local, expert):
     assert reason is not None
 
 
-def test_the_decode_gate_still_closes_at_all_local_experts():
-    """Opening the prefill gate does not widen moe_out_v2: decode steps of a
-    layer that holds every expert keep moe_out."""
-    shape = ((8, 0), torch.bfloat16, HIDDEN, INTERMEDIATE, TOPK)
-    opened = exl3_ops.moe_v2_closed_reason(*shape, LOCAL, GLOBAL, _served_meta(LOCAL))
-    assert opened is None
-    for local in (LOCAL_ALL, 128):
-        closed = exl3_ops.moe_v2_closed_reason(
-            *shape, local, GLOBAL, _served_meta(local)
-        )
-        assert closed is not None
-        assert f"= ({HIDDEN}, {INTERMEDIATE}, {TOPK}, {local}, {GLOBAL})" in closed
-
-
 def test_prefill_workspace_does_not_grow_with_the_local_expert_count():
     """The workspace is bounded by the rows and top-k of the call (the routing
     table and the split operand rows are per assignment), not by how many

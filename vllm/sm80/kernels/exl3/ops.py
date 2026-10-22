@@ -26,9 +26,9 @@ _dense_splitk = False
 # Each matrix processes rows in chunks whose native workspace fits it.
 LINEAR_SCRATCH_ELEMENTS = 8 << 20
 
-# moe_out_v2 (csrc/exl3/moe_v2.cu) covers exactly one configuration: calls of
-# 1..MOE_V2_MAX_ROWS rows, hidden 2560, intermediate 640, top-10, 256 of 512
-# experts local, and every routed matrix stored as below.
+# moe_out_v2 (csrc/exl3/moe_v2.cu) serves calls of 1..MOE_V2_MAX_ROWS
+# rows, hidden 2560, intermediate 640, top-10, with 256 local experts at
+# TP2/PP1 or 512 at TP1/PP2, and every routed matrix stored as below.
 MOE_V2_MAX_ROWS = 64
 MOE_V2_HIDDEN = 2560
 MOE_V2_INTERMEDIATE = 640
@@ -47,7 +47,7 @@ MOE_V2_EXPERT_META = [
 # layers and every stage holds every expert). It serves calls of
 # MOE_PREFILL_MIN_ROWS to MOE_PREFILL_MAX_ROWS rows (the validated range: one
 # 3460-token prefill chunk); its eligibility is moe_prefill_closed_reason,
-# never the decode gate below, which stays at 256 local experts.
+# separate from the decode row and topology gate below.
 MOE_PREFILL_MIN_ROWS = MOE_V2_MAX_ROWS + 1
 MOE_PREFILL_MAX_ROWS = 3460
 MOE_PREFILL_LOCAL_EXPERTS = (MOE_V2_LOCAL_EXPERTS, MOE_V2_GLOBAL_EXPERTS)
@@ -294,6 +294,7 @@ def moe_v2_closed_reason(
     local_experts: int,
     global_experts: int,
     metadata: list[list[list[int]]],
+    parallel_layout: tuple[int, int] | None,
 ) -> str | None:
     """Why moe_out_v2 must not serve this layer, or None when it may.
 
@@ -305,19 +306,24 @@ def moe_v2_closed_reason(
         return f"device capability {capability}, not (8, 0)"
     if dtype != torch.bfloat16:
         return f"activation dtype {dtype}, not bfloat16"
-    shape = (hidden_size, intermediate_size, top_k, local_experts, global_experts)
+    shape = (hidden_size, intermediate_size, top_k, global_experts)
     expected = (
         MOE_V2_HIDDEN,
         MOE_V2_INTERMEDIATE,
         MOE_V2_TOP_K,
-        MOE_V2_LOCAL_EXPERTS,
         MOE_V2_GLOBAL_EXPERTS,
     )
     if shape != expected:
         return (
-            f"(hidden, intermediate, top_k, local experts, global experts) = "
-            f"{shape}, not {expected}"
+            f"(hidden, intermediate, top_k, global experts) = {shape}, not {expected}"
         )
+    partition = (local_experts, parallel_layout)
+    partitions = (
+        (MOE_V2_LOCAL_EXPERTS, (2, 1)),
+        (MOE_V2_GLOBAL_EXPERTS, (1, 2)),
+    )
+    if partition not in partitions:
+        return f"expert partition {partition}, not one of {partitions}"
     return _expert_meta_closed_reason(local_experts, metadata)
 
 

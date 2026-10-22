@@ -7,8 +7,8 @@ vLLM's own logger), the row dispatch in Exl3Experts.apply with the switch off
 and on, and the operator's workspace contract.
 
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
-256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
-moe_out and the scalar reference; moe_out_v2 is held to moe_out's error against
+256 of 512 experts local for TP2 or all 512 for PP2, bits_x2 10 / codebook 2),
+the off path is bitwise moe_out and the scalar reference; moe_out_v2 is held to
 an FP64 reference (pooled mean <= 1.10x, max <= 1.25x, BF16 rounding ties
 forgiven, exact where moe_out is exact) over awkward routings; it is
 deterministic; and a captured call replays bitwise like the eager call
@@ -63,6 +63,7 @@ def _reason(**changes):
         local_experts=LOCAL,
         global_experts=GLOBAL,
         metadata=SERVED_META,
+        parallel_layout=(2, 1),
     )
     args.update(changes)
     return exl3_ops.moe_v2_closed_reason(**args)
@@ -94,6 +95,46 @@ def test_gate_opens_only_for_the_served_configuration():
         assert reason, name
     assert "local expert 7" in closed["rate"]
     assert "(8, 6)" in closed["capability"]
+
+
+@pytest.mark.parametrize(
+    "local, layout, eligible",
+    [
+        (LOCAL, (2, 1), True),
+        (LOCAL_ALL, (1, 2), True),
+        (LOCAL, (1, 2), False),
+        (LOCAL_ALL, (2, 1), False),
+        (LOCAL_ALL, (1, 1), False),
+        (LOCAL_ALL, (2, 2), False),
+        (LOCAL_ALL, (1, 4), False),
+        (128, (4, 1), False),
+        (LOCAL_ALL, None, False),
+        (LOCAL, None, False),
+    ],
+)
+def test_decode_gate_pairs_the_expert_partition_with_its_layout(
+    local, layout, eligible
+):
+    metadata = [
+        [list(projection) for projection in SERVED_META[0]] for _ in range(local)
+    ]
+    reason = _reason(local_experts=local, metadata=metadata, parallel_layout=layout)
+    assert (reason is None) is eligible
+
+
+def test_pp2_decode_gate_checks_the_last_local_expert():
+    metadata = [
+        [list(projection) for projection in SERVED_META[0]] for _ in range(LOCAL_ALL)
+    ]
+    assert (
+        _reason(local_experts=LOCAL_ALL, metadata=metadata, parallel_layout=(1, 2))
+        is None
+    )
+    metadata[-1][2][2] = 8
+    assert (
+        _reason(local_experts=LOCAL_ALL, metadata=metadata, parallel_layout=(1, 2))
+        is not None
+    )
 
 
 def _method(monkeypatch, warmed):
@@ -207,11 +248,10 @@ DISTINCT = 4  # distinct weight sets; local expert e uses set e % DISTINCT
 UNALIGNED_SET = 3  # its trellis bases are only 2-byte aligned
 
 
-@pytest.fixture(scope="module")
-def served():
-    """256 local experts of the served shape over DISTINCT weight sets, with
-    their FP64 effective weights (an independent NumPy decoder)."""
-    return served_experts(UNALIGNED_SET)
+@pytest.fixture(scope="module", params=[LOCAL, LOCAL_ALL], ids=["tp2", "pp2"])
+def served(request):
+    """Both expert partitions over distinct weight sets and FP64 references."""
+    return served_experts(UNALIGNED_SET, local=request.param)
 
 
 def served_experts(unaligned_set, local=LOCAL):
@@ -292,6 +332,10 @@ def _routes(scenario, rows, generator):
         ids[0, 3] = 2 * UNALIGNED_SET
     elif scenario == "int64":
         pass
+    elif scenario == "all_experts":
+        ids = torch.arange(rows * TOPK).reshape(rows, TOPK) % GLOBAL
+    elif scenario == "upper_half":
+        ids = torch.randint(LOCAL, GLOBAL, (rows, TOPK), generator=generator)
     weights = torch.rand(rows, TOPK, generator=generator) + 0.01
     weights = weights / weights.sum(-1, keepdim=True)
     ids = ids if scenario == "int64" else ids.to(torch.int32)
@@ -380,7 +424,9 @@ def test_off_path_is_moe_out_and_the_scalar_reference(served, rows):
     )
     _bitwise(expected, reference, f"moe_out vs scalar reference rows={rows}")
     for moe_v2_rows in (0, 64) if rows > 64 else (0,):
-        size = exl3_ops.moe_workspace_size(rows, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
+        size = exl3_ops.moe_workspace_size(
+            rows, HIDDEN, INTERMEDIATE, TOPK, served.pointers.shape[0]
+        )
         experts = _experts(moe_v2_rows, workspace=size, expert_map=served.expert_map)
         out = torch.full_like(x, float("nan"))
         workspace2 = torch.empty(2 * size, dtype=torch.bfloat16, device=x.device)
@@ -404,6 +450,8 @@ SCENARIOS = [
     ("hot", 48),
     ("single", 2),
     ("int64", 7),
+    ("all_experts", 64),
+    ("upper_half", 32),
 ]
 
 
@@ -465,6 +513,8 @@ def test_v2_meets_the_fp64_gate_of_moe_out(served):
 @needs_sm80
 def test_v2_rows_without_local_routes_are_exact_zero_and_repeat_bitwise(served):
     x, ids, weights = _case(served, "nonlocal", 16, 7)
+    if served.pointers.shape[0] == LOCAL_ALL:
+        ids.fill_(-1)  # PP2 has no remote experts; mask every route instead.
     assert (_v2(served, x, ids, weights) == 0).all()
     x, ids, weights = _case(served, "hot", 40, 8)
     first = _v2(served, x, ids, weights)
@@ -515,7 +565,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
         served.pointers,
         served.meta,
         served.expert_map,
-        list(range(0, GLOBAL, 2)),
+        [g for g, local in enumerate(served.mapping) if local >= 0],
         HIDDEN,
         INTERMEDIATE,
         TOPK,
@@ -523,7 +573,9 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     x, ids, weights = _case(served, "uniform", rows, 11)
     out = torch.empty_like(x)
     workspace = torch.empty(
-        exl3_ops.moe_workspace_size_v2(rows, HIDDEN, INTERMEDIATE, TOPK, LOCAL),
+        exl3_ops.moe_workspace_size_v2(
+            rows, HIDDEN, INTERMEDIATE, TOPK, served.pointers.shape[0]
+        ),
         device=x.device,
     )
     args = (served.pointers, served.meta, served.expert_map, INTERMEDIATE)
