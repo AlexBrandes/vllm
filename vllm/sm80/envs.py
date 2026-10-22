@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_AMPERE_KDA_PREFILL_WIDE: bool = False
     VLLM_STATE_INDEX_CHECK: bool = False
     VLLM_SM80_EXECUTION_TRACE: bool = False
+    VLLM_SM80_SERIAL_TRACE_EXPORT: bool = False
     VLLM_AMPERE_KDA_PREFILL_NARROW: bool = False
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
@@ -345,6 +346,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # inside CUDA graphs are not in it. Off by default.
     "VLLM_SM80_EXECUTION_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM80_EXECUTION_TRACE", "0"))
+    ),
+    # The workers of an engine stop their torch profiler sessions one after
+    # another (pipeline stage, then tensor-parallel rank), each releasing its
+    # trace's host memory before the next starts, so the host holds one rank's
+    # trace at a time (vllm/sm80/worker/trace_export.py). Off by default.
+    "VLLM_SM80_SERIAL_TRACE_EXPORT": lambda: bool(
+        int(os.getenv("VLLM_SM80_SERIAL_TRACE_EXPORT", "0"))
     ),
     # The same sm_80 KDA chunked prefill with tensor parallel 4 (16 heads per
     # card), for prefill chunks of up to 3460 tokens (the TP token budget) and
