@@ -98,6 +98,7 @@ WARMUP_LAUNCH = (482, 2560, 2560)
 
 # Fixed by resolve(), before any launch or graph capture.
 active = False
+active_layout: tuple[int, int] | None = None
 _max_decode_query_len = 0
 _sms = 0
 _fake_registered = False
@@ -182,6 +183,7 @@ def resolve() -> None:
     ensure_extension returns: nothing here may call an ops function that calls
     ensure_extension."""
     global active, _max_decode_query_len, _sms, _served_matrices, _fake_registered
+    global active_layout
     if not envs.VLLM_EXL3_DENSE_PREFILL_TC:
         return
     from vllm.config import get_current_vllm_config_or_none
@@ -241,6 +243,7 @@ def resolve() -> None:
         schedule,
         scope="process",
     )
+    active_layout = layout
     active = True
 
 

@@ -531,20 +531,41 @@ def test_moe_scratch_rows_follow_the_dispatch_actually_used():
     assert exl3_module.dispatched_rows(sequence, moe) == 4 * 1731
 
 
-def test_linear_row_chunk_keeps_scratch_fixed():
-    budget = exl3_ops.LINEAR_SCRATCH_ELEMENTS
-    for padded_in, padded_out in ((2560, 124160), (2560, 10240), (128, 128)):
-        chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
-        assert exl3_ops.linear_workspace_size(chunk, padded_in, padded_out) <= budget
-        assert exl3_ops.linear_workspace_size(chunk + 1, padded_in, padded_out) > budget
-    # The TP2 LM head shard runs 66 rows per launch within 32 MiB.
-    assert exl3_ops.linear_row_chunk(2560, 124160) == 66
+def test_linear_row_chunk_keeps_scratch_fixed_across_budgets(monkeypatch):
+    exl3_ops.ensure_extension()
+    for prefill, layout in (
+        (False, None),
+        (True, (2, 1)),
+        (True, (1, 2)),
+        (True, (2, 1)),
+        (False, None),
+    ):
+        monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active", prefill)
+        monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active_layout", layout)
+        budget = exl3_ops.linear_scratch_elements()
+        if prefill and layout == (1, 2):
+            assert budget > exl3_ops.LINEAR_SCRATCH_ELEMENTS
+        else:
+            assert budget == exl3_ops.LINEAR_SCRATCH_ELEMENTS
+        for padded_in, padded_out in ((2560, 124160), (2560, 10240), (128, 128)):
+            chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
+            assert (
+                exl3_ops.linear_workspace_size(chunk, padded_in, padded_out) <= budget
+            )
+            assert (
+                exl3_ops.linear_workspace_size(chunk + 1, padded_in, padded_out)
+                > budget
+            )
 
 
-def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch):
+@pytest.mark.parametrize("prefill", [False, True])
+def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch, prefill):
     from vllm.utils import torch_utils
     from vllm.v1.worker import workspace
 
+    exl3_ops.ensure_extension()
+    monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active", prefill)
+    monkeypatch.setattr(exl3_ops.dense_prefill_tc, "active_layout", (1, 2))
     monkeypatch.setattr(torch_utils, "aux_stream", lambda: None)
     monkeypatch.setattr(workspace, "_manager", None)
     workspace.init_workspace_manager(torch.device("cpu"))
@@ -576,7 +597,7 @@ def test_linear_reuses_one_fixed_scratch_for_every_row_count(monkeypatch):
         ]
         assert torch.equal(out[:, 0], x[:, 0])
         assert {c[1:] for c in calls} == {
-            (calls[0][1], exl3_ops.LINEAR_SCRATCH_ELEMENTS)
+            (calls[0][1], exl3_ops.linear_scratch_elements())
         }
         if rows == 1:
             first = calls[0][1]

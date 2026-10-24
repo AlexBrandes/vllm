@@ -58,9 +58,9 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/attention/triton_mqa_logits.py` | 628 |
 | `vllm/sm80/kernels/exl3/__init__.py` | 13 |
 | `vllm/sm80/kernels/exl3/dense_mma.py` | 151 |
-| `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 357 |
+| `vllm/sm80/kernels/exl3/dense_prefill_tc.py` | 360 |
 | `vllm/sm80/kernels/exl3/loader.py` | 301 |
-| `vllm/sm80/kernels/exl3/ops.py` | 797 |
+| `vllm/sm80/kernels/exl3/ops.py` | 808 |
 | `vllm/sm80/kernels/exl3/quant.py` | 985 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 59 |
 | `vllm/sm80/kernels/exl3/utils.py` | 382 |
@@ -95,7 +95,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **48 files** | **16,199** |
+| **48 files** | **16,213** |
 
 ### `vllm/sm80/`
 
@@ -188,8 +188,8 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/dense.cu` | 149 |
 | `csrc/exl3/dense_mma.cu` | 933 |
 | `csrc/exl3/dense_mma.h` | 24 |
-| `csrc/exl3/dense_prefill_tc.cu` | 633 |
-| `csrc/exl3/dense_prefill_tc.h` | 40 |
+| `csrc/exl3/dense_prefill_tc.cu` | 616 |
+| `csrc/exl3/dense_prefill_tc.h` | 43 |
 | `csrc/exl3/dense_splitk.cu` | 621 |
 | `csrc/exl3/dense_splitk.h` | 26 |
 | `csrc/exl3/gemm.cu` | 489 |
@@ -205,7 +205,7 @@ Files added elsewhere, grouped by top-level directory.
 | `csrc/exl3/ple.h` | 53 |
 | `csrc/exl3/ple_read.cpp` | 549 |
 | `csrc/exl3/reference.cu` | 447 |
-| **25 files** | **7,524** |
+| **25 files** | **7,510** |
 
 #### `docs/`
 
@@ -246,12 +246,12 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/exl3_real_cases.py` | 374 |
 | `tests/kernels/quantization/test_exl3_dense_mma.py` | 461 |
 | `tests/kernels/quantization/test_exl3_dense_mma_real_inputs.py` | 295 |
-| `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 928 |
-| `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 319 |
-| `tests/kernels/quantization/test_exl3_dense_splitk.py` | 468 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 910 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 320 |
+| `tests/kernels/quantization/test_exl3_dense_splitk.py` | 358 |
 | `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
 | `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 321 |
-| `tests/kernels/quantization/test_exl3_kernels.py` | 366 |
+| `tests/kernels/quantization/test_exl3_kernels.py` | 373 |
 | `tests/kernels/quantization/test_exl3_moe_prefill.py` | 759 |
 | `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 294 |
 | `tests/kernels/quantization/test_exl3_moe_v2.py` | 623 |
@@ -295,7 +295,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_topk_tiefix_split.py` | 310 |
 | `tests/kernels/thin_gemm_real_cases.py` | 148 |
 | `tests/kernels/topk_reference.py` | 59 |
-| `tests/model_executor/layers/test_exl3_layers.py` | 633 |
+| `tests/model_executor/layers/test_exl3_layers.py` | 654 |
 | `tests/model_executor/model_loader/test_exl3_manifest.py` | 249 |
 | `tests/model_executor/model_loader/test_exl3_pipeline.py` | 143 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_dflash2/config.json` | 61 |
@@ -370,7 +370,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 171 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **140 files** | **49,571** |
+| **140 files** | **49,472** |
 
 #### `tools/`
 

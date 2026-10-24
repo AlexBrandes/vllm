@@ -300,7 +300,7 @@ def _is_mma_kernel(name):
 def test_lm_head_runs_mma_kernel_not_gemm_kernel(monkeypatch, mma_switch, head_shape):
     k, n, bits_x2, codebook = head_shape
     m = _matrix(31, k, n, bits_x2)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device="cuda")
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device="cuda")
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", True)
     row_chunk = exl3_ops.linear_row_chunk(k, n)
@@ -346,7 +346,7 @@ def test_mma_through_linear_on_row_chunk_tails(
         row_chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
         rows = row_chunk + 4
     m = _matrix(41, padded_in, padded_out, bits_x2)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device="cuda")
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device="cuda")
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", True)
     x = _inputs(42, rows, padded_in)

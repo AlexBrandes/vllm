@@ -161,18 +161,6 @@ __device__ __forceinline__ void mma_k16(const uint4& a, uint32_t b0, uint32_t b1
       : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "f"(0.0f));
 }
 
-// W = wh + wl exactly: wh = W rounded to the 2^-7 grid ((W + 12) - 12 in FP16; |W| < 4 for both codebooks, so
-// W + 12 lies in [8, 16) where the FP16 ulp is 2^-7), wl = W - wh (|wl| <= 2^-8, exact in FP16).
-__device__ __forceinline__ uint32_t grid_part(uint32_t w) {
-  const __half2 twelve = __float2half2_rn(12.0f);
-  const __half2 h = __hsub2(__hadd2(*reinterpret_cast<const __half2*>(&w), twelve), twelve);
-  return *reinterpret_cast<const uint32_t*>(&h);
-}
-__device__ __forceinline__ uint32_t rest_part(uint32_t w, uint32_t wh) {
-  const __half2 r = __hsub2(*reinterpret_cast<const __half2*>(&w), *reinterpret_cast<const __half2*>(&wh));
-  return *reinterpret_cast<const uint32_t*>(&r);
-}
-
 __device__ __forceinline__ void store_output(__nv_bfloat16* out, float value) {
   *out = __float2bfloat16_rn(value);
 }
@@ -300,21 +288,16 @@ __global__ void __launch_bounds__(kThreads, 1) prefill_gemm(PrefillProblem p, Ou
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const uint4 a = wfrag[(ks * kWarps + 4 * wn + q) * 32 + lane];
-          const uint4 wh = make_uint4(grid_part(a.x), grid_part(a.y), grid_part(a.z), grid_part(a.w));
-          const uint4 wl = make_uint4(rest_part(a.x, wh.x), rest_part(a.y, wh.y), rest_part(a.z, wh.z),
-                                      rest_part(a.w, wh.w));
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
-            // wh * hi: integers on the 2^-7 grid, |sum| <= 16 * 2^11 * 2^9: exact in FP32, no truncation.
-            float dh[4], dl[4], dw[4];
-            mma_k16(wh, b[j].x, b[j].y, dh);
-            // The small terms W * lo and wl * hi (|lo| <= 1/2, |wl| <= 2^-8): independent tensor-core sums.
+            float dh[4], dl[4];
+            mma_k16(a, b[j].x, b[j].y, dh);
             mma_k16(a, b[j].z, b[j].w, dl);
-            mma_k16(wl, b[j].x, b[j].y, dw);
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-              acc[q][j][e] = __fmaf_rn(__fadd_rn(dh[e], __fadd_rn(dl[e], dw[e])), e & 1 ? scale[j].y : scale[j].x,
-                                       acc[q][j][e]);
+              acc[q][j][e] =
+                  __fmaf_rn(__fadd_rn(dh[e], dl[e]),
+                            e & 1 ? scale[j].y : scale[j].x, acc[q][j][e]);
             }
           }
         }

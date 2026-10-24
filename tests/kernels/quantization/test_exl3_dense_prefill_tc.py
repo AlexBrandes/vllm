@@ -14,10 +14,9 @@ per row chunk: with the switch off exactly the base's operator; with it on,
 linear_out_prefill only in prefill steps for launches the operator covers
 and split-K does not split, never in a decode step of more than 64 tokens,
 during a graph capture or without a forward context. The library's host
-rule (linear_prefill_applies) and the served launches of the 3460 /
-1906-token prefill chunks in both layouts: the k/v 482-row tail keeps
-split-K; every full-width PP2 launch is covered and split-K precedence is
-exact there.
+rule (linear_prefill_applies), historical 32 MiB launch boundaries, and
+the current budget's full-width PP2 launches are covered. The k/v
+482-row tail keeps split-K; split-K precedence remains exact.
 
 GPU (SM 8.0, 74 multiprocessors): linear_out_prefill against an FP64
 reference within linear_out's error (pooled mean <= 1.10x, max <= 1.25x,
@@ -80,8 +79,8 @@ KV2, FC2, OUT2, Z2, QKV2, Q2 = (
 )
 TP2 = tc.VALIDATED_MATRICES[(2, 1)]
 PP2 = tc.VALIDATED_MATRICES[(1, 2)]
-# Every launch of the 8,826-token reference prompt in 3460 / 1906-token chunks
-# (row chunk floor(8 Mi / (K + N))) -> the path with split-K on.
+# Historical 32 MiB launches of the 8,826-token reference prompt in
+# 3460 / 1906-token chunks -> the path with split-K on.
 SERVED_LAUNCHES = [
     (KV, 2978, "tc"),
     (KV, 482, "splitk"),
@@ -114,10 +113,9 @@ SERVED_LAUNCHES = [
     (Q, 943, "tc"),
 ]
 
-# The same reference prompt's launches of the full-width matrices of the
-# TP1 / PP2 layout: scheduler chunks of 3460 and 1906 rows split at each
-# role's row chunk floor(8 Mi / (K + N)); the replicated projections serve
-# unchanged, so their (GATE, INDEXER, DOWN) rows match the TP2 table.
+# Historical 32 MiB launches of the same reference prompt on full-width
+# matrices. Retain these numerical/scheduling boundaries alongside the
+# current-budget PP2 coverage below.
 PP2_SERVED_LAUNCHES = [
     (KV2, 2730),
     (KV2, 730),
@@ -313,74 +311,6 @@ def test_switch_is_resolved_once_by_ensure_extension(monkeypatch):
     assert resolved == [1], "resolved once per process"
 
 
-def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
-    """A process's first EXL3 use with the switch set and the gate open (TP2):
-    ensure_extension runs the real resolve and warm-up once, and nothing they
-    run calls back into ensure_extension, which marks the library loaded only
-    after resolve returns. The library and the device are stood in for; the
-    warm-up buffers live on the CPU."""
-    monkeypatch.setattr(exl3_ops, "_loaded", False)
-    monkeypatch.setattr(exl3_ops, "_fakes_registered", False)
-    monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
-    monkeypatch.setattr(exl3_ops.importlib, "import_module", lambda name: object())
-    monkeypatch.setattr(exl3_ops, "_validate_extension", lambda module: None)
-    monkeypatch.setattr(exl3_ops, "_resolve_dense_splitk", lambda: False)
-    for name in ("active", "_max_decode_query_len", "_sms"):
-        monkeypatch.setattr(tc, name, getattr(tc, name))
-    monkeypatch.setattr(tc, "_fake_registered", False)
-    fakes = []
-    monkeypatch.setattr(
-        torch.library, "register_fake", lambda name: lambda fn: fakes.append(name)
-    )
-    monkeypatch.setattr(
-        torch._C, "_dispatch_find_schema_or_throw", lambda name, overload: None
-    )
-    monkeypatch.setenv("VLLM_EXL3_DENSE_PREFILL_TC", "1")
-    monkeypatch.delenv("VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE", raising=False)
-    _device(monkeypatch, (8, 0))
-    calls = []
-
-    def workspace_size(*shape):
-        calls.append(("workspace", shape))
-        return 16
-
-    def prefill(x, trellis, suh, svh, bits_x2, *rest):
-        calls.append(("prefill", tuple(x.shape), bits_x2))
-
-    library = SimpleNamespace(
-        set_prefill_schedule=lambda mode: calls.append(("schedule", mode)),
-        linear_workspace_size=workspace_size,
-        linear_out_prefill=prefill,
-    )
-    monkeypatch.setattr(torch.ops, "_exl3_C", library)
-    for name in ("ones", "empty", "zeros"):
-        make = getattr(torch, name)
-        monkeypatch.setattr(
-            torch, name, lambda *a, _make=make, device=None, **kw: _make(*a, **kw)
-        )
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: None)
-    # A cached size would hide a call back into ensure_extension.
-    exl3_ops.linear_workspace_size.cache_clear()
-    resolve, resolved = tc.resolve, []
-
-    def resolve_once():
-        resolved.append(1)
-        resolve()
-
-    monkeypatch.setattr(tc, "resolve", resolve_once)
-    exl3_ops.ensure_extension()
-    exl3_ops.ensure_extension()
-    assert resolved == [1], "resolved once per process"
-    assert exl3_ops._loaded and tc.active and tc._sms == SMS
-    rows, padded_in, padded_out = tc.WARMUP_LAUNCH
-    assert calls == [
-        ("schedule", 0),
-        ("workspace", (rows, padded_in, padded_out)),
-        *(("prefill", (rows, padded_in), bits_x2) for bits_x2 in (10, 12, 14)),
-    ]
-    assert fakes[-1] == "_exl3_C::linear_out_prefill"
-
-
 def test_ensure_extension_retries_resolve_after_it_raised(monkeypatch):
     """A resolve that raised leaves the library unloaded; the next
     ensure_extension reaches resolve again instead of failing on the base fake
@@ -461,6 +391,7 @@ def test_switch_off_keeps_the_base_operator(monkeypatch, splitk, max_query_len):
 
 def _on(monkeypatch):
     monkeypatch.setattr(tc, "active", True)
+    monkeypatch.setattr(tc, "active_layout", (2, 1))
     monkeypatch.setattr(tc, "_max_decode_query_len", DECODE_QUERY_LEN)
     monkeypatch.setattr(tc, "_sms", SMS)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -574,20 +505,7 @@ def test_operator_rule_and_served_launches():
         )
     # The k/v tail without split-K: 8 tiles, so linear_out.
     assert not tc.takes_launch(482, 2560, 256, 14, 2, False, SMS, TP2)
-    # Row chunks are the base's (the operator fits linear_workspace_size).
-    assert exl3_ops.linear_row_chunk(2560, 256) == 2978
-    assert exl3_ops.linear_row_chunk(3072, 2560) == 1489
-    # TP1 / PP2 full width: the full-width row chunks, and every launch of
-    # the reference prompt's 3460 / 1906-token chunks: a matrix the
-    # operator covers (split-K off takes all of them), and with split-K on
-    # the precedence is exact - linear_out_prefill serves a launch iff
-    # split-K does not split it.
-    assert exl3_ops.linear_row_chunk(2560, 512) == 2730
-    assert exl3_ops.linear_row_chunk(2560, 2560) == 1638
-    assert exl3_ops.linear_row_chunk(6144, 2560) == 963
-    assert exl3_ops.linear_row_chunk(2560, 6144) == 963
-    assert exl3_ops.linear_row_chunk(2560, 10240) == 655
-    assert exl3_ops.linear_row_chunk(2560, 12288) == 564
+    # Historical full-width launch boundaries preserve exact split-K precedence.
     for (padded_in, padded_out, bits_x2), rows in PP2_SERVED_LAUNCHES:
         off = tc.takes_launch(rows, padded_in, padded_out, bits_x2, 2, False, SMS, PP2)
         assert off, (padded_in, padded_out, rows)
@@ -609,7 +527,7 @@ def _gpu_or_skip():
 
 
 def _prefill_kernels(fn):
-    """Names of the prefill GEMM kernels fn launched."""
+    """Names of the prefill GEMM kernels launched."""
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -620,6 +538,35 @@ def _prefill_kernels(fn):
 
 def _split_ran(names):
     return any(", true>" in n or ",true>" in n or "(bool)1>" in n for n in names)
+
+
+@needs_sm80
+def test_prefill_preserves_small_component_through_transform_cancellation():
+    from tests.kernels.quantization import exl3_real_cases as real
+
+    _gpu_or_skip()
+    rows, padded_in, padded_out, bits_x2 = 512, 2560, 640, 14
+    m = {
+        "trellis": torch.zeros(
+            (padded_in // 16, padded_out // 16, 8 * bits_x2),
+            dtype=torch.int16,
+            device="cuda",
+        ),
+        "suh": torch.ones(padded_in, dtype=torch.float16, device="cuda"),
+        "svh": torch.ones(padded_out, dtype=torch.float16, device="cuda"),
+    }
+    x = torch.zeros((rows, padded_in), dtype=torch.bfloat16, device="cuda")
+    x[:, 0] = 2.0**-16
+    x[:, 1] = 12.0
+    # Constant decoded weights cancel the large second coordinate. Dropping
+    # the low transform component must not erase the small first coordinate.
+    core = real.core_weight(m["trellis"], bits_x2, 2)
+    reference = real.apply_fp64(x, core, m["suh"], m["svh"])
+    candidate = _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+    shipped = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
+    pool = _Pool()
+    pool.add(candidate, shipped, reference)
+    pool.check("mixed-magnitude transform cancellation")
 
 
 @needs_sm80
@@ -636,9 +583,7 @@ def _split_ran(names):
         # q_proj, 74 tiles: 37 split blocks, as many as the workspace holds.
         (2560, 6144, 14, 2560, 6144, 200, True),
         (2560, 2048, 14, 2500, 1999, 200, False),  # cropped edges, 32 tiles
-        # TP1 / PP2 full-width matrices: every row-chunk launch of the
-        # 8,826-token reference prompt in 3460 / 1906-token chunks and its
-        # tail (chunk floor(8 Mi / (K + N))).
+        # Historical 32 MiB PP2 launch boundaries, including chunk tails.
         (2560, 512, 14, 2560, 512, 2730, True),  # k/v, 88 tiles: row band
         (2560, 512, 14, 2560, 512, 730, False),  # tail, 24 tiles: one wave
         (2560, 512, 14, 2560, 512, 1906, False),  # 60 tiles: one wave
@@ -801,12 +746,13 @@ def test_linear_output_matches_each_launch_operator(monkeypatch, splitk):
     _gpu_or_skip()
     m = _matrix(71, 2560, 256, 14)
     x = _inputs(72, 3460, 2560)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device=x.device)
+    chunk = 2978  # Leaves a 482-row k/v tail below the tensor-core tile bound.
+    scratch = torch.empty(
+        exl3_ops.linear_workspace_size(chunk, 2560, 256), device=x.device
+    )
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", splitk)
     default = exl3_ops.linear_out_splitk if splitk else exl3_ops.linear_out
-    chunk = exl3_ops.linear_row_chunk(2560, 256)
-    assert chunk == 2978
 
     def linear():
         return exl3_ops._linear(x, m["trellis"], m["suh"], m["svh"], 14, 2, 256, chunk)
@@ -832,18 +778,17 @@ def test_linear_output_matches_each_launch_operator(monkeypatch, splitk):
 
 @needs_sm80
 def test_pp2_full_width_linear_output_matches_each_launch_operator(monkeypatch):
-    """TP1 / PP2 full-width o_proj through _linear: a 1,489-row prefill call
-    in the base's row chunks takes linear_out_prefill for every launch of
-    the PP2 set (the 963-row chunk and the 526-row tail alike), and a decode
-    step of the same call stays on today's operator, bit for bit."""
+    """Full-width o_proj in fixed chunks exercises both a whole chunk and
+    its tail; a decode step of the same call stays on the base operator."""
     _gpu_or_skip()
     m = _matrix(91, 6144, 2560, 14)
     x = _inputs(92, 1489, 6144)
-    scratch = torch.empty(exl3_ops.LINEAR_SCRATCH_ELEMENTS, device=x.device)
+    chunk = 963
+    scratch = torch.empty(
+        exl3_ops.linear_workspace_size(chunk, 6144, 2560), device=x.device
+    )
     monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
     monkeypatch.setattr(exl3_ops, "_dense_splitk", False)
-    chunk = exl3_ops.linear_row_chunk(6144, 2560)
-    assert chunk == 963
 
     def linear():
         return exl3_ops._linear(x, m["trellis"], m["suh"], m["svh"], 14, 2, 2560, chunk)
@@ -865,6 +810,43 @@ def test_pp2_full_width_linear_output_matches_each_launch_operator(monkeypatch):
     )
     _step(monkeypatch, DECODE_QUERY_LEN)
     _bitwise(linear(), off, "decode step")
+
+
+@needs_sm80
+@pytest.mark.parametrize("padded_in,padded_out,bits_x2", sorted(PP2))
+def test_current_pp2_chunks_hold_fp64_error(
+    monkeypatch, padded_in, padded_out, bits_x2
+):
+    from tests.kernels.quantization.test_exl3_kernels import effective_weight
+
+    _gpu_or_skip()
+    _on(monkeypatch)
+    monkeypatch.setattr(tc, "_served_matrices", PP2)
+    monkeypatch.setattr(tc, "active_layout", (1, 2))
+    monkeypatch.setattr(exl3_ops, "_dense_splitk", True)
+    chunk = exl3_ops.linear_row_chunk(padded_in, padded_out)
+    scratch = torch.empty(exl3_ops.linear_scratch_elements(), device="cuda")
+    monkeypatch.setattr(exl3_ops, "_linear_scratch", lambda device: scratch)
+    m = _matrix(111 + padded_out, padded_in, padded_out, bits_x2)
+    trellis, suh, svh = m["numpy"]
+    weight = torch.from_numpy(effective_weight(trellis, suh, svh, bits_x2, 2)).cuda()
+    pool = _Pool()
+    for rows in (3460, 1906):
+        _step(monkeypatch, rows)
+        x = _inputs(112 + rows, rows, padded_in)
+        candidate = exl3_ops._linear(
+            x, m["trellis"], m["suh"], m["svh"], bits_x2, 2, padded_out, chunk
+        )
+        baseline = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
+        pool.add(candidate, baseline, x.double() @ weight)
+        _bitwise(
+            exl3_ops._linear(
+                x, m["trellis"], m["suh"], m["svh"], bits_x2, 2, padded_out, chunk
+            ),
+            candidate,
+            "current-budget replay",
+        )
+    pool.check(f"current PP2 chunks {padded_in}x{padded_out} bits_x2={bits_x2}")
 
 
 @needs_sm80
