@@ -23,6 +23,6 @@ void moe_out_prefill(const torch::Tensor& x, const torch::Tensor& topk_ids,
                      const torch::Tensor& packed_ptrs,
                      const torch::Tensor& packed_meta,
                      const torch::Tensor& expert_map, int64_t intermediate_size,
-                     torch::Tensor& out, torch::Tensor& workspace);
+                     torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit);
 
 }  // namespace exl3

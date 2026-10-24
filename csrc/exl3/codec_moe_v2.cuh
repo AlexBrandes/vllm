@@ -62,6 +62,33 @@ __device__ __forceinline__ void decode_lane_fragment_mul1(
   a[3] = mul1_half2(state[6], state[7]);
 }
 
+// bits_x2 8: a lane's eight states are the 44 ring bits ending with ring word
+// L (window shift 20 for every lane), i.e. the low 12 bits of word L - 1
+// (mod kWords) and all of word L; the generic window's third word is never
+// needed. With V = w0:w1 (w0 high), state j = (V >> (28 - 4j)) & 0xffff.
+template <int kBitsX2>
+struct WordWindow {
+  static constexpr bool kValue =
+      !TileRing<kBitsX2>::kOdd && 8 * TileRing<kBitsX2>::kWhole == 32;
+};
+__device__ __forceinline__ void decode_lane_fragment_mul1_w32(uint32_t w0, uint32_t w1,
+                                                              uint32_t (&a)[4]) {
+  const uint32_t x = __funnelshift_r(w1, w0, 12);      // V >> 12
+  uint32_t s[8];
+  s[0] = x >> 16;                                      // V >> 28
+  s[1] = (x >> 12) & 0xffffu;                          // V >> 24
+  s[2] = __byte_perm(x, 0u, 0x4421);                   // V >> 20
+  s[3] = w1 >> 16;                                     // V >> 16
+  s[4] = x & 0xffffu;                                  // V >> 12
+  s[5] = __byte_perm(w1, 0u, 0x4421);                  // V >> 8
+  s[6] = (w1 >> 4) & 0xffffu;                          // V >> 4
+  s[7] = w1 & 0xffffu;                                 // V
+  a[0] = mul1_half2(s[0], s[1]);
+  a[1] = mul1_half2(s[4], s[5]);
+  a[2] = mul1_half2(s[2], s[3]);
+  a[3] = mul1_half2(s[6], s[7]);
+}
+
 // hadamard128_warp in FP64 (scale 1/sqrt(128) rounded to FP64).
 __device__ __forceinline__ void hadamard128_warp_f64(double (&v)[4], int lane) {
 #pragma unroll

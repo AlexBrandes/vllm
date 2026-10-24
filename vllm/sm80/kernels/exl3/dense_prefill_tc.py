@@ -14,15 +14,19 @@ splits).
 ``ops._linear`` asks ``route`` for the operator of each call. A row chunk of
 the call takes ``linear_out_prefill`` only when all of these hold:
 - the flag is set and ``resolve`` found the gate open: sm_80 with 74
-  multiprocessors, tensor parallel size 2 and pipeline parallel size 1, no
-  speculative decoding or an MTP / EAGLE drafter without parallel drafting
-  (the drafters ``step_phase`` covers);
+  multiprocessors, a validated layout (tensor parallel size 2 or 4,
+  pipeline parallel size 1), and either no speculative decoding, an MTP /
+  EAGLE drafter without parallel drafting (the drafters ``step_phase``
+  covers), or a drafter whose decode steps carry at most MAX_SHIPPED_ROWS
+  rows in every forward pass (``step_phase.max_decode_step_rows``), so the
+  row floor below keeps every decode step on today's kernels;
 - the running step is a prefill step by the scheduler (``step_phase``: some
   request has more than 1 + num_speculative_tokens tokens scheduled), never
   judged from a row count, and the stream is not capturing a CUDA graph;
 - the matrix is one of VALIDATED_MATRICES (padded_in, padded_out, bits_x2;
-  codebook 2), and the launch has more than 64 rows, at least 16 output tiles
-  of 128 x 128 and a 16-byte aligned trellis;
+  codebook 2), the call has more than MAX_SHIPPED_ROWS rows, and the launch
+  has more than 64 rows, at least 16 output tiles of 128 x 128 and a 16-byte
+  aligned trellis;
 - with VLLM_EXL3_DENSE_SPLITK on, ``linear_out_splitk`` would not split the
   launch's K: every launch split-K splits keeps split-K.
 Every other launch runs the operator ``_linear`` picked before (linear_out or
@@ -46,12 +50,14 @@ logger = init_logger(__name__)
 MAX_SHIPPED_ROWS = 64
 # The multiprocessor count the schedule was validated at.
 VALIDATED_SMS = 74
-# The layout the matrices were validated in: (tensor, pipeline) parallel size.
-VALIDATED_PARALLEL = (2, 1)
+# The layouts the matrices were validated in: (tensor, pipeline) parallel size.
+VALIDATED_PARALLEL = ((2, 1), (4, 1))
 # (padded_in, padded_out, bits_x2) of the validated matrices, codebook 2: the
-# dense matrices of one tensor-parallel rank of Qwen3.8-Flash-Next at TP2.
+# dense matrices of the tensor-parallel ranks of the validated models, each
+# validated at the row chunks of its layout.
 VALIDATED_MATRICES = frozenset(
     {
+        # Qwen3.8-Flash-Next at TP2.
         (2560, 256, 14),  # attention k/v
         (2560, 640, 14),  # shared expert gate/up
         (2560, 640, 10),  # sparse-attention indexer q/k
@@ -61,6 +67,26 @@ VALIDATED_MATRICES = frozenset(
         (2560, 3072, 14),  # linear-attention z
         (2560, 5120, 14),  # linear-attention qkv
         (2560, 6144, 14),  # attention q (with output gate)
+        # DeepSeek-V4.1-Flash at TP4 (every rank), with its DSpark drafter.
+        (5120, 512, 10),  # kv, compressor kv/gate, shared expert gate/up
+        (5120, 512, 12),  # kv; drafter kv, shared expert gate/up
+        (5120, 640, 10),  # shared expert gate/up
+        (5120, 640, 12),  # drafter shared expert gate/up
+        (512, 5120, 10),  # shared expert down
+        (512, 5120, 12),  # drafter shared expert down
+        (640, 5120, 10),  # shared expert down
+        (640, 5120, 12),  # drafter shared expert down
+        (5120, 1280, 10),  # q down-projection
+        (5120, 1280, 12),  # q down-projection; drafter
+        (1280, 8192, 10),  # q up-projection
+        (1280, 8192, 12),  # drafter q up-projection
+        (1280, 4096, 10),  # indexer q
+        (4096, 1024, 10),  # output projection groups
+        (4096, 1024, 12),  # drafter output projection groups
+        (2048, 5120, 10),  # output projection
+        (2048, 5120, 12),  # drafter output projection
+        (6144, 6400, 10),  # Engram kv
+        (15360, 5120, 12),  # drafter hidden-state projection
     }
 )
 VALIDATED_CODEBOOK = 2
@@ -93,25 +119,33 @@ def closed_reason(
         return "no vLLM config is set, so the decode query length is unknown"
     parallel = vllm_config.parallel_config
     layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
-    if layout != VALIDATED_PARALLEL:
-        return f"(tensor, pipeline) parallel size {layout}, not {VALIDATED_PARALLEL}"
+    if layout not in VALIDATED_PARALLEL:
+        return (
+            f"(tensor, pipeline) parallel size {layout}, not one of "
+            f"{', '.join(map(str, VALIDATED_PARALLEL))}"
+        )
     speculative = vllm_config.speculative_config
-    if speculative is not None and (
-        speculative.method not in COVERED_DRAFTERS
-        or getattr(speculative, "parallel_drafting", False)
+    parallel_drafting = bool(getattr(speculative, "parallel_drafting", False))
+    if (
+        speculative is not None
+        and (speculative.method not in COVERED_DRAFTERS or parallel_drafting)
+        and (rows := step_phase.max_decode_step_rows(vllm_config)) > MAX_SHIPPED_ROWS
     ):
         return (
             f"speculative method {speculative.method!r} (parallel drafting "
-            f"{bool(getattr(speculative, 'parallel_drafting', False))}): its "
-            "decode steps can schedule more than 1 + num_speculative_tokens "
-            "tokens per request"
+            f"{parallel_drafting}): its decode steps can schedule more than 1 + "
+            "num_speculative_tokens tokens per request, and a decode step's "
+            f"forward pass can carry {rows} rows, more than the "
+            f"{MAX_SHIPPED_ROWS} rows at or below which every call keeps "
+            "today's kernels"
         )
     return None
 
 
 def _warmup(sms: int) -> None:
-    """Run linear_out_prefill once per covered format before any capture, so
-    no request's first prefill loads the kernels or sets their attributes.
+    """Run linear_out_prefill once per covered format and output dtype (BF16,
+    FP32) before any capture, so no request's first prefill loads the kernels
+    or sets their attributes.
     The temporary buffers are freed again. ops.ensure_extension runs this
     before it marks the library loaded, so the workspace size comes from the
     library itself: ops.linear_workspace_size would call ensure_extension."""
@@ -119,7 +153,10 @@ def _warmup(sms: int) -> None:
     rows, padded_in, padded_out = WARMUP_LAUNCH
 
     x = torch.ones((rows, padded_in), dtype=torch.bfloat16, device=device)
-    out = torch.empty((rows, padded_out), dtype=torch.bfloat16, device=device)
+    outs = [
+        torch.empty((rows, padded_out), dtype=dtype, device=device)
+        for dtype in (torch.bfloat16, torch.float32)
+    ]
     workspace = torch.empty(
         torch.ops._exl3_C.linear_workspace_size(rows, padded_in, padded_out),
         dtype=torch.float32,
@@ -133,18 +170,19 @@ def _warmup(sms: int) -> None:
             dtype=torch.int16,
             device=device,
         )
-        linear_out_prefill(
-            x,
-            trellis,
-            suh,
-            svh,
-            bits_x2,
-            VALIDATED_CODEBOOK,
-            padded_in,
-            padded_out,
-            out,
-            workspace,
-        )
+        for out in outs:
+            linear_out_prefill(
+                x,
+                trellis,
+                suh,
+                svh,
+                bits_x2,
+                VALIDATED_CODEBOOK,
+                padded_in,
+                padded_out,
+                out,
+                workspace,
+            )
     torch.cuda.synchronize(device)
 
 
@@ -199,7 +237,7 @@ def resolve() -> None:
         "EXL3 dense prefill tensor-core path active (VLLM_EXL3_DENSE_PREFILL_TC): "
         "in prefill steps (a request with more than %d tokens scheduled), dense "
         "launches of more than %d rows and at least 16 output tiles of the %d "
-        "validated TP2 matrices (bits_x2 10/12/14, codebook 2) take "
+        "validated matrices (bits_x2 10/12/14, codebook 2) take "
         "linear_out_prefill, schedule %s; split-K launches, other matrices, "
         "decode steps and graph captures keep today's kernels.",
         _max_decode_query_len,

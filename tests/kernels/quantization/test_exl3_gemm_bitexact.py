@@ -23,10 +23,13 @@ import torch
 
 from vllm.sm80.kernels.exl3 import ops as exl3_ops
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
-    reason="EXL3 kernels are built for SM 8.0",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 0),
+        reason="EXL3 kernels are built for SM 8.0",
+    ),
+]
 
 FORMATS = [(bits_x2, codebook) for codebook in (1, 2) for bits_x2 in range(2, 17, 2)]
 FORMATS += [(3, 2), (5, 2), (7, 2)]

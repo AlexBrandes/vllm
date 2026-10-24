@@ -405,11 +405,12 @@ gate_up_operand(const __nv_bfloat16* x, Routing routing, const int* table, __hal
 
 // Down transform of one value: gate and up output transforms already applied
 // (H128 done), then svh, SiLU(gate) * up and down suh (the shipped FP32
-// operations).
+// operations), gate and up clamped first by swiglu_clamp.
 __device__ __forceinline__ float down_input(float g, float u, float gate_svh, float up_svh,
-                                            float down_suh) {
-  const float gv = __fmul_rn(g, gate_svh);
-  const float uv = __fmul_rn(u, up_svh);
+                                            float down_suh, float limit) {
+  float gv = __fmul_rn(g, gate_svh);
+  float uv = __fmul_rn(u, up_svh);
+  swiglu_clamp(gv, uv, limit);
   const float silu = gv / __fadd_rn(1.0f, expf(-gv));
   return __fmul_rn(__fmul_rn(silu, uv), down_suh);
 }
@@ -421,7 +422,7 @@ __device__ __forceinline__ float down_input(float g, float u, float gate_svh, fl
 // hadamard128_warp (lane holds k = 512 + lane + 32 i).
 __global__ void __launch_bounds__(32 * kOperandWarps)
 down_operand(Routing routing, const int* table, const float* gate_up, __half* operand,
-             float* unscale) {
+             float* unscale, float limit) {
   static_assert(kIntermediate == 5 * 128, "four group blocks and one warp block");
   constexpr int kTail = 512;
   const int lane = threadIdx.x & 31;
@@ -460,7 +461,7 @@ down_operand(Routing routing, const int* table, const float* gate_up, __half* op
         load8(down_suh + col, vec, ds);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          v[8 * h + j] = down_input(g[8 * h + j], u[8 * h + j], gs[j], us[j], ds[j]);
+          v[8 * h + j] = down_input(g[8 * h + j], u[8 * h + j], gs[j], us[j], ds[j], limit);
         }
       }
       hadamard128_group(v, lane);
@@ -480,7 +481,7 @@ down_operand(Routing routing, const int* table, const float* gate_up, __half* op
       for (int i = 0; i < 4; ++i) {
         const int col = kTail + lane + 32 * i;
         w[i] = down_input(g[i], u[i], __half2float(gate_svh[col]), __half2float(up_svh[col]),
-                          __half2float(down_suh[col]));
+                          __half2float(down_suh[col]), limit);
       }
       hadamard128_warp(w, lane);
     }
@@ -930,7 +931,7 @@ int64_t workspace_elements(int64_t assignments) {
 void run(const __nv_bfloat16* x, const void* ids, bool ids64, const float* weights,
          const void* expert_map, bool map64, int64_t global_experts, const int64_t* pointers,
          const int64_t* metadata, int64_t local_experts, int64_t rows, int64_t topk,
-         __nv_bfloat16* out, float* workspace, cudaStream_t stream) {
+         __nv_bfloat16* out, float* workspace, float limit, cudaStream_t stream) {
   const int64_t assignments = rows * topk;
   Routing routing{ids, expert_map, pointers, metadata, global_experts, local_experts, topk,
                   ids64, map64};
@@ -960,7 +961,7 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64, const float* weigh
   launch_gemm<GateUpShape>(p, max_tiles * GateUpShape::kProjections * GateUpShape::kColBlocks,
                            stream);
   down_operand<<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(routing, table, gate_up,
-                                                                         operand, unscale);
+                                                                         operand, unscale, limit);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   p.out = down_result;
   launch_gemm<DownShape>(p, max_tiles * DownShape::kProjections * DownShape::kColBlocks, stream);
@@ -994,7 +995,8 @@ void moe_out_prefill(const torch::Tensor& x, const torch::Tensor& topk_ids,
                      const torch::Tensor& packed_ptrs,
                      const torch::Tensor& packed_meta,
                      const torch::Tensor& expert_map, int64_t intermediate_size,
-                     torch::Tensor& out, torch::Tensor& workspace) {
+                     torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit) {
+  const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
   check_tensor(x, x, at::kBFloat16, "x");
   check_integer(topk_ids, x, "topk_ids");
@@ -1037,7 +1039,7 @@ void moe_out_prefill(const torch::Tensor& x, const torch::Tensor& topk_ids,
                    expert_map.scalar_type() == at::kLong, expert_map.numel(),
                    packed_ptrs.data_ptr<int64_t>(), packed_meta.data_ptr<int64_t>(), experts,
                    rows, topk, reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-                   workspace.data_ptr<float>(), stream);
+                   workspace.data_ptr<float>(), limit, stream);
 }
 
 }  // namespace exl3

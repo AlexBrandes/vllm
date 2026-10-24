@@ -259,11 +259,12 @@ def test_qsa_fused_qkv_indexer_shards_heads_and_replicates_the_indexer(
     import vllm.models.qwen4_exp.nvidia.model as qwen_model
     from vllm.models.qwen4_exp.nvidia import mtp as qwen_mtp
     from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAQKVIndexerLinear
+    from vllm.models.qwen4_exp.nvidia.exl3_layout import Qwen4ExpExl3Layout
 
     # The target's packed mapping lists the indexer, the MTP draft's does not;
     # both build the same layers.
     model_class = getattr(qwen_model, owner, None) or getattr(qwen_mtp, owner)
-    monkeypatch.setattr(exl3_config, "is_qwen", True)
+    monkeypatch.setattr(exl3_config, "layout", Qwen4ExpExl3Layout())
     monkeypatch.setattr(
         exl3_config, "packed_modules_mapping", model_class.packed_modules_mapping
     )

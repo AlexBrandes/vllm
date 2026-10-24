@@ -159,10 +159,12 @@ def test_kernels_compile_for_sm80():
     types = {"x_ptr": "*bf16", "res_ptr": "*bf16", "post_ptr": "*fp32",
              "comb_ptr": "*fp32", "fn_ptr": "*fp32", "rc_ptr": "*bf16",
              "mix_ptr": "*fp32", "sqr_ptr": "*fp32", "M": "i32"}
+    # GLM's options (see decode.post_prenorm)
+    glm = dict(HAS_POST=True, ROUND_MIX=False, FP64_ACC=False)
     build(v3._glu_post_prenorm_tb_kernel, types,
-          dict(HIDDEN=HIDDEN, NOUT=NOUT, HB=hb, BT=8, NP2=32))
+          dict(HIDDEN=HIDDEN, NOUT=NOUT, HB=hb, BT=8, NP2=32, **glm))
     build(v3._glu_post_prenorm_kernel, types,
-          dict(HIDDEN=HIDDEN, NOUT=NOUT, HB=hb, BM=16, NP2=32, NW=4))
+          dict(HIDDEN=HIDDEN, NOUT=NOUT, HB=hb, BM=16, NP2=32, NW=4, **glm))
     fin = {"mix_ptr": "*fp32", "sqr_ptr": "*fp32", "scale_ptr": "*fp32", "base_ptr": "*fp32",
            "rc_ptr": "*bf16", "nw_ptr": "*bf16", "post_out_ptr": "*fp32",
            "comb_out_ptr": "*fp32", "li_ptr": "*bf16", "M": "i32", "rms_eps": "fp32",

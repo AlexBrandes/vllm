@@ -269,7 +269,7 @@ __global__ void expert_output(Routing routing, int64_t assignments,
 
 __global__ void activate_down_input(Routing routing, int64_t assignments,
                                     int64_t intermediate, int64_t ipad,
-                                    float* gate, const float* up) {
+                                    float* gate, const float* up, float limit) {
   __shared__ float shared[128];
   const int64_t blocks = ipad / 128;
   for (int64_t task = blockIdx.x; task < assignments * blocks; task += gridDim.x) {
@@ -279,10 +279,12 @@ __global__ void activate_down_input(Routing routing, int64_t assignments,
     float value = 0.0f;
     if (expert >= 0 && col < intermediate) {
       const int64_t index = assignment * ipad + col;
-      const float g = gate[index];
+      float g = gate[index];
+      float u = up[index];
+      swiglu_clamp(g, u, limit);
       const float silu = g / __fadd_rn(1.0f, expf(-g));
       const Matrix down = expert_matrix(routing, expert, 2);
-      value = __fmul_rn(__fmul_rn(silu, up[index]), __half2float(down.suh[col]));
+      value = __fmul_rn(__fmul_rn(silu, u), __half2float(down.suh[col]));
     }
     gate[assignment * ipad + col] = hadamard128(value, shared);
   }
@@ -371,7 +373,8 @@ void moe_out_reference(const torch::Tensor& x, const torch::Tensor& topk_ids,
                        const torch::Tensor& packed_ptrs,
                        const torch::Tensor& packed_meta,
                        const torch::Tensor& expert_map, int64_t intermediate_size,
-                       torch::Tensor& out, torch::Tensor& workspace) {
+                       torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit) {
+  const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
   check_tensor(x, x, at::kBFloat16, "x");
   check_integer(topk_ids, x, "topk_ids");
@@ -427,7 +430,7 @@ void moe_out_reference(const torch::Tensor& x, const torch::Tensor& topk_ids,
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     activate_down_input<<<launch_blocks(assignments * (ipad / 128)), 128, 0, stream>>>(
-        routing, assignments, intermediate_size, ipad, gate, up);
+        routing, assignments, intermediate_size, ipad, gate, up, limit);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     expert_core<<<launch_blocks(assignments * (hpad / 128)), 128, 0, stream>>>(
         gate, routing, assignments, ipad, hpad, 2, input);

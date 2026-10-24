@@ -13,7 +13,7 @@ expert's trellis is 16-byte aligned.
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
 256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
 moe_out; moe_out_prefill is held to moe_out's error against an FP64 reference
-(pooled mean <= 1.10x, max <= 1.25x, BF16 rounding ties forgiven, exact where
+(pooled mean <= 1.10x, max <= 1.25x with no element excused, exact where
 moe_out is exact) over awkward routings of 65..1001 rows; it is deterministic;
 it refuses calls it does not cover; and a captured call replays bitwise like
 the eager call without any allocator event. Every weight set's trellis is
@@ -93,6 +93,7 @@ def _method(monkeypatch, warmed, num_speculative_tokens=3):
     method.intermediate_size = INTERMEDIATE
     method.local_experts = LOCAL
     method.global_expert_ids = list(range(0, GLOBAL, 2))
+    method.swiglu_limit = 0.0
     layer = SimpleNamespace(
         exl3_ptrs=torch.zeros(LOCAL, 3, 3, dtype=torch.int64),
         exl3_meta=torch.tensor(SERVED_META),
@@ -279,7 +280,11 @@ def _experts(
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.moe_out_rows = max_rows
+    experts.moe_v2_bits_x2 = 10
     experts.prefill_decode_len = prefill_decode_len
+    experts.prefill_v2_bits_x2 = 0
+    experts.swiglu_limit = 0.0
     return experts
 
 
@@ -305,7 +310,9 @@ def test_apply_dispatches_by_rows_and_scheduler_phase(
         monkeypatch.setattr(
             exl3_ops,
             name,
-            lambda *args, _name=name: calls.append((_name, args[0].shape[0], args)),
+            lambda *args, _name=name, **kwargs: calls.append(
+                (_name, args[0].shape[0], args)
+            ),
         )
     _phase(monkeypatch, phase)
     experts = _experts(moe_v2_rows, prefill_decode_len)

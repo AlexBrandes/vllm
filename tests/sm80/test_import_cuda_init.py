@@ -59,8 +59,6 @@ except Exception:
 print("RESULT " + json.dumps({"calls": calls, "error": error}))
 '''
 
-GLM_PACKAGE = "vllm.models.glm5next"
-
 
 def _module(qualified: str) -> str:
     """Module of a "<module>:<class>" or "<module>.<class>" name."""
@@ -78,14 +76,21 @@ def _sm80_modules() -> list[str]:
     return sorted(names)
 
 
+def _model_package(module: str) -> str:
+    """The upstream model package a fork module in it extends:
+    vllm.models.<model>.<...> -> vllm.models.<model>."""
+    parts = module.split(".")
+    assert parts[:2] == ["vllm", "models"] and len(parts) > 3, module
+    return ".".join(parts[:3])
+
+
 def _upstream_based() -> dict[str, str]:
     """Registered fork module -> the upstream module its classes extend."""
     based = {}
     for qualified in (*plugin.MODEL_OVERRIDES.values(),
                       *plugin.GLM_LAYER_OVERRIDES.values()):
         module = _module(qualified)
-        assert module.startswith(GLM_PACKAGE + "."), module
-        based[module] = GLM_PACKAGE
+        based[module] = _model_package(module)
     for qualified, upstream in plugin.DRAFTER_OVERRIDES.values():
         based[_module(qualified)] = upstream
     return based

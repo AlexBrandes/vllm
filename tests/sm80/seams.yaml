@@ -1174,3 +1174,430 @@ seams:
   why: kv_planning._layer_stages maps KV cache layers to pipeline stages with it; a layer name it rejects turns the pipeline-parallel group refit off without an error
   sha256: f35c5bac4f8104225cede5a4303b94a3faee829ad781eca5a1e56442ebe5f49d
   signature: '(layer_name: str, num_attn_module: int = 1) -> int'
+
+- id: dsv41-vl-init
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.vl_model:DeepseekV41ForCausalLM.__init__
+  why: the fork DeepseekV41ForCausalLM builds through it, then adopts language_model.model (DeepseekV4Model) and replaces language_model.lm_head with an EXL3 ParallelLMHead (prefix language_model.lm_head)
+  sha256: 61a85946a7076f6a5ed5a36bef2320bf6af14f73ed5f4acbbcf46c5adeafee0f
+  signature: '(self, *, vllm_config, prefix: str = '''') -> None'
+
+- id: dsv41-decoder-layer-forward
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.model:DeepseekV4DecoderLayer.forward
+  why: the fork sm_80 decoder layer forward mirrors it (first-layer, Engram and fused post/pre branches, attention then FFN, same return tuple) with the mHC ops of ops/sm80_mhc.py; a change here must be carried over
+  sha256: 7c90e41ec2d690cc62670680c9577f5f5c7f07a7a1f736e73e0503ca9f1de973
+  signature: '(self, x: torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.MoEOutput, positions: torch.Tensor, input_ids: torch.Tensor | None, pre_mix: torch.Tensor | None = None, post_mix: torch.Tensor | None = None, res_mix: torch.Tensor | None = None, residual: torch.Tensor | None = None, engram_hashes: torch.Tensor | None = None, engram_mask: torch.Tensor | None = None, *, capture_previous_aux: bool = False, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> tuple[torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.MoEOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]'
+
+- id: dsv41-dspark-forward
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4Model.forward
+  why: the fork DSpark model forward mirrors it without sequence parallelism or MegaMoE, with the sm_80 mHC post and hc_collapse_triton
+  sha256: 83bc8973a0792cd3c526cdc229b318cdda992f4fa8a1ce51fe71fa514491da02
+  signature: '(self, input_ids: torch.Tensor, positions: torch.Tensor, inputs_embeds: torch.Tensor | None = None) -> torch.Tensor'
+
+- id: dsv41-dspark-load-weights
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.dspark:DSparkDeepseekV4ForCausalLM.load_weights
+  why: the fork drafter wraps it and restores confidence_head, which it drops when one call (the EXL3 loader passes one tensor per call) carries no confidence-head weight
+  sha256: 2996723e1b649d5d0569e123e912d43e393e36a7b385688d2a07a998664a3bd9
+  signature: '(self, weights: collections.abc.Iterable[tuple[str, torch.Tensor]]) -> set[str]'
+
+- id: dsv41-moe-init
+  kind: method
+  target: vllm.models.deepseek_v4.nvidia.model:DeepseekV4MoE.__init__
+  why: sm80_moe.adopt_moe needs ffn.gate (GateLinear, FP32 out), gate.e_score_correction_bias, gate.bias_vl, tid2eid None and ffn.experts.router a FusedTopKBiasRouter sharing those bias tensors
+  sha256: 90b653eeb223b37da75a5ecc6a3ba5bea05530e945c301f5117d3d5576ad4c0d
+  signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''', use_sequence_parallel: bool = False, *, num_hash_layers: int, reduce_results: bool = True, n_routed_experts: int | None = None, n_activated_experts: int | None = None, image_sentinel_lo: int = 129257)'
+
+- id: dsv41-moe-forward
+  kind: method
+  target: vllm.models.deepseek_v4.nvidia.model:DeepseekV4MoE.forward
+  why: with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE sm80_moe.Sm80DeepseekV41MoE calls it with (hidden_states, input_ids, mega_gate_metadata) and all-reduces the [tokens, hidden] output it returns, which on the modular (non-MegaMoE) path is the runner's output with the final all-reduce skipped
+  sha256: 53c36c52f5aec0d99b54534382463313148f151f77e01f0f57fb4da3e9dd946b
+  signature: '(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None, mega_gate_metadata: vllm.models.deepseek_v4.nvidia.model.MegaGateRoutingMetadata | None = None) -> torch.Tensor'
+
+- id: dsv41-moe-runner-final-all-reduce
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner._maybe_reduce_final_output
+  why: sm80_moe sets moe_config.skip_final_all_reduce after construction; the runner then returns the un-reduced combined routed + shared output (TP or EP > 1, no sequence parallelism, a fused output not reduced by the kernel) and the layer does the one all-reduce the runner would have done
+  sha256: 6a699287ced46d4ada35e4a7dcd1c173af1fae2c45e4110878d74fa765108ffe
+  signature: '(self, states: torch.Tensor, trunc_size: int | None, output_is_reduced: bool | None = None) -> torch.Tensor'
+
+- id: dsv41-topk-bias-router-init
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router:FusedTopKBiasRouter.__init__
+  why: Sm80DeepseekV41Router reads e_score_correction_bias, bias_vl, image_sentinel_lo, renormalize, routed_scaling_factor and top_k set here
+  sha256: a8c908094eacae174a1ef73aa30c6601395d0a9d4f475b53256fcd79a66cf0cd
+  signature: '(self, top_k: int, global_num_experts: int, e_score_correction_bias: torch.Tensor | None = None, renormalize: bool = True, routed_scaling_factor: float = 1.0, eplb_state: vllm.distributed.eplb.eplb_state.EplbLayerState | None = None, *, scoring_func: str = ''sigmoid'', hash_indices_table: torch.Tensor | None = None, num_fused_shared_experts: int = 0, shared_expert_weight: float = 1.0, bias_vl: torch.Tensor | None = None, image_sentinel_lo: int = 0)'
+
+- id: dsv41-gate-linear-forward
+  kind: method
+  target: vllm.model_executor.layers.fused_moe.router.gate_linear:GateLinear.forward
+  why: with every allow_* tier off and an FP32 weight, the fallback casts the BF16 input to FP32 and returns FP32 logits (the reference gate GEMM); sm80_moe.Sm80DeepseekV41Gate overrides it and delegates every call its GEMV does not take, returning the GEMV's logits through GateLinear._return
+  sha256: ba0ba5a74fb55d4ed8e48537a38c464ef63acfe7612c977efd0d98af91e7043f
+  signature: '(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.nn.parameter.Parameter | None]'
+
+- id: dsv41-load-dspark-model
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.dspark.utils:load_dspark_model
+  why: aliases the target embed_tokens and lm_head into the drafter, whose own are PPMissingLayer placeholders in the fork class
+  sha256: 0df5094f15311ebd2341b99fda51058067c03be0b9cda3b54300300264814587
+  signature: '(target_model: torch.nn.modules.module.Module, vllm_config: vllm.config.vllm.VllmConfig) -> torch.nn.modules.module.Module'
+
+- id: dsv41-engram-create-embedding
+  kind: method
+  target: vllm.models.deepseek_v41.common.engram:Engram._create_embedding
+  why: the EXL3 construction test replaces it with a parameter-free table; the fork loader expects no engram.embed tensors in the EXL3 directory
+  sha256: d331ec38811b076c1c742aac125343024fae5ca6ec097bd0811ab8384d4f87ab
+  signature: '(self, layout: vllm.models.deepseek_v41.common.engram.EngramLayout, layer_hash_index: int) -> vllm.models.deepseek_v41.common.engram.ParallelEngramEmbedding'
+
+- id: graphmem-worker-make-model-runner
+  kind: method
+  target: vllm.v1.worker.gpu_worker:Worker._make_model_runner
+  why: the CUDA-graph estimate split worker overrides it to build the V2 runner subclass; it must stay the one place the worker builds its model runner (V2 unless use_v2_model_runner is off or the model is encoder-only)
+  sha256: 3d6601a9b9f755ec6324cd20ced5d604be27b48fe48cb8d34cbd8432621000d1
+  signature: (self) -> 'GPUModelRunner'
+
+- id: graphmem-profile-cudagraph-memory
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
+  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
+  sha256: ffdd4cd7ba6c9cc949864294bdac6dc7f54f6f0e95b41fbfd53b85292eba43ef
+  signature: '(runner: ''GPUModelRunner'') -> int'
+
+- id: graphmem-runner-capture-model
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model
+  why: the estimate split runner overrides it (keyword-only profile_only, returns the free-memory drop in bytes); the worker calls it once for the real capture after the KV cache is sized
+  sha256: 2a6e2e6d2db27b4e82333d5e2ad5ff4695496dbd26a5f2fdc22a47d67fe07e2d
+  signature: '(self, *, profile_only: bool = False) -> int'
+
+- id: graphmem-runner-profile-cudagraph-memory
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.profile_cudagraph_memory
+  why: the estimate split runner overrides it and calls it unbound; the worker subtracts its return value from the KV cache
+  sha256: 7a895d562c9a9408e0feedc1359862e16b800ded2529cb480895243379a9163e
+  signature: (self) -> int
+
+- id: graphmem-manager-capture
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture
+  why: the estimate split sets _max_full_descs_to_capture and _capture_mem_samples to None in the profiling capture; None must mean every FULL graph is captured and no per-graph sample is taken
+  sha256: 7ab498e2e81ba4c4b05bc7e77eb3a9598db97293d10f62fda2473c4cc4e9ca6d
+  signature: '(self, create_forward_fn: vllm.v1.worker.gpu.cudagraph_utils.CreateForwardFn, progress_bar_desc: str = ''Capturing CUDA graphs'') -> None'
+
+- id: graphmem-extrapolate-full
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:_extrapolate_full_graph_memory
+  why: with no FULL samples it must return 0, so profile_cudagraph_memory returns the measured drop of a capture that took every FULL graph
+  sha256: 5707fc144c9fce97ff7875a6ecc30297db36546c3efa191a094c708ae3f03339
+  signature: '(mem_samples: list[int], total_graphs: int) -> int'
+
+- id: dev-ab-breakable-call
+  kind: method
+  target: vllm.compilation.breakable_cudagraph:BreakableCUDAGraphWrapper.__call__
+  why: dev_ab replaces the wrapper's `entries` with an ArmGraphStore; dispatch must reach entries only through get and item assignment keyed by the batch descriptor
+  sha256: 5cf59cf33c3757a908c041fc48f3064fd72d6b0d8dba41395bab19502f8419f8
+  signature: '(self, *args: ''Any'', **kwargs: ''Any'') -> ''Any'''
+
+- id: dev-ab-breakable-clear
+  kind: method
+  target: vllm.compilation.breakable_cudagraph:BreakableCUDAGraphWrapper.clear_graphs
+  why: releasing graphs calls entries.clear(), which ArmGraphStore applies to every arm
+  sha256: 75ac17ef827e23b4c043e37521a25298d1e4c22060ea9a6f90bb5932cd5112e1
+  signature: (self) -> 'None'
+
+- id: dev-ab-cudagraph-call
+  kind: method
+  target: vllm.compilation.cuda_graph:CUDAGraphWrapper.__call__
+  why: dev_ab replaces concrete_cudagraph_entries with an ArmGraphStore; dispatch must reach it only through membership, item get and item assignment
+  sha256: 06cab1e7535cf39740d0e65ebcf2203fc5d57c00547b11ea917c52769c1aa2c2
+  signature: '(self, *args: Any, **kwargs: Any) -> typing.Any | None'
+
+- id: dev-ab-manager-capture
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture
+  why: FULL graphs are stored in self.graphs by descriptor (membership check and item assignment), so an ArmGraphStore keys them by arm; capture can run again for a second arm
+  sha256: 7ab498e2e81ba4c4b05bc7e77eb3a9598db97293d10f62fda2473c4cc4e9ca6d
+  signature: '(self, create_forward_fn: vllm.v1.worker.gpu.cudagraph_utils.CreateForwardFn, progress_bar_desc: str = ''Capturing CUDA graphs'') -> None'
+
+- id: dev-ab-manager-run-fullgraph
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.run_fullgraph
+  why: FULL replay looks the graph up in self.graphs by descriptor, the active arm's dict under dev_ab
+  sha256: d3dd8e8a40ce000e6a3025f7720fac20cb3ca2066a365dd3f8cc75dfae27015c
+  signature: '(self, desc: vllm.v1.worker.gpu.cudagraph_utils.BatchExecutionDescriptor)'
+
+- id: dev-ab-profile-capture
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
+  why: the graph-memory estimate comes from runner.capture_model(profile_only=True), so dev_ab's both-arm capture is what the KV cache is sized against
+  sha256: ffdd4cd7ba6c9cc949864294bdac6dc7f54f6f0e95b41fbfd53b85292eba43ef
+  signature: '(runner: ''GPUModelRunner'') -> int'
+
+- id: dev-ab-request-state
+  kind: method
+  target: vllm.v1.worker.gpu.states:RequestState.__init__
+  why: set_ab_arm refuses while req_id_to_index holds a request
+  sha256: 6b3d13b6bcc6328ab9fa63d77a92a1cf3b7730bb2b0021761bda5bc5fd81555f
+  signature: '(self, max_num_reqs: int, max_model_len: int, max_num_batched_tokens: int, num_speculative_steps: int, vocab_size: int, device: torch.device, num_prefill_lookahead: int = 1, use_dense_all_token_ids: bool = False)'
+
+- id: dev-ab-dynamic-candidates
+  kind: method
+  target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._init_candidates
+  why: the static K table selects compatible candidates by token count while preserving distinct request-count and uniform-query descriptors; dev_ab captures the existing union without respecializing it
+  sha256: 94c269cb0aad093f1b7875db56b8b962a47c53cf9250419d39254f12935ef6a0
+  signature: (self) -> None
+
+- id: dev-ab-dynamic-compatible
+  kind: function
+  target: vllm.v1.worker.gpu.cudagraph_utils:_is_compatible
+  why: the proof inventory resolves the actual target and draft descriptor with the same batch-query compatibility rule as dispatch
+  sha256: 67db5906f69666159eba6290ae57a5bc1230c975ca012f9acecc79d702f8ffa5
+  signature: '(desc: vllm.v1.worker.gpu.cudagraph_utils.BatchExecutionDescriptor, num_reqs: int, num_tokens: int, uniform_token_count: int | None, num_active_loras: int, max_query_len: int | None, num_ubatches: int) -> bool'
+
+- id: dsv41-dspark-sample-sequential
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential
+  why: vllm/sm80/spec_decode/shard_argmax.py replaces its dense greedy path (base logits of every draft position once, then per step the anchor or last draft through markov_embed and markov_bias added to the base logits, the draft written to draft_tokens, the confidence head over the stacked Markov embeddings) and must draft the same tokens
+  sha256: 3781858bbd960f6c82e81332f716a8ca97e58dcdc260a6431fb2e9077f3c0160
+  signature: '(self, num_reqs: int, head_hidden: torch.Tensor) -> None'
+
+- id: dsv41-dspark-sample-logits
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_logits
+  why: with draft_logits None and no acceptance estimator a greedy draft is logits.argmax(dim=-1) mapped by map_draft_to_target; shard_argmax.py reproduces exactly that argmax (first index of the maximum, first NaN) and refuses the other cases
+  sha256: 28e1320d397e53507e39c01d7d54583147386a0a5a328e6d2452ab6957d1a92c
+  signature: '(self, logits: torch.Tensor, idx_map: torch.Tensor, sample_pos: torch.Tensor, step: int) -> torch.Tensor'
+
+- id: dsv41-logits-processor-forward
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor.forward
+  why: with skip_gather the shard logits get the same soft cap and scale as the gathered ones, so shard_argmax.py compares the values the gathered row holds
+  sha256: 8d59778d071858e84cbd263207ebc0b2ef96e54cee5e8a37912ce1b02b02ba57
+  signature: '(self, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, hidden_states: torch.Tensor, embedding_bias: torch.Tensor | None = None, skip_gather: bool = False) -> torch.Tensor | None'
+
+- id: dsv41-logits-processor-get-logits
+  kind: method
+  target: vllm.model_executor.layers.logits_processor:LogitsProcessor._get_logits
+  why: the gathered row is the ranks' head outputs concatenated in rank order (all-gather on the last dim) and cut at org_vocab_size; shard_argmax.py numbers a rank's columns from rank * local width and stops at org_vocab_size
+  sha256: 50f037e79ede7e763cdc90b3bf38d87faa466101ca2088f23576aabb4cbedda6
+  signature: '(self, hidden_states: torch.Tensor, lm_head: vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding, embedding_bias: torch.Tensor | None, skip_gather: bool = False) -> torch.Tensor | None'
+
+- id: dsv41-swa-builder-build
+  kind: method
+  target: vllm.v1.attention.backends.mla.sparse_swa:DeepseekSparseSWAMetadataBuilder.build
+  why: sm80_swa_meta_batch._metadata returns what it returns for a causal batch without image spans (same fields over the same builder buffers), and ops/sm80_swa_meta.py writes what its torch.ge, decode-lens fill and index launches write; a change here must be carried over
+  sha256: a4fde14ecb55f1a2da1e7c0928dc7e77d4659d7723e7bd3323cf77e60302c967
+  signature: '(self, common_prefix_len: int, common_attn_metadata: vllm.v1.attention.backend.CommonAttentionMetadata, fast_build: bool = False, replay_start: torch.Tensor | None = None) -> vllm.v1.attention.backends.mla.sparse_swa.DeepseekSparseSWAMetadata'
+
+- id: dsv41-swa-builder-prefill-metadata
+  kind: method
+  target: vllm.v1.attention.backends.mla.sparse_swa:DeepseekSparseSWAMetadataBuilder._build_deepseek_v4_metadata
+  why: sm80_swa_meta_batch._metadata builds the same prefill fields, the gather lengths from ops/sm80_swa_meta.py
+  sha256: ae4ed4196187fb775a6c53203ead813c390b37bfb12fa24324678acf002db0a3
+  signature: '(self, num_decodes: int, num_prefills: int, seq_lens: torch.Tensor, seq_lens_cpu: torch.Tensor | None, query_start_loc: torch.Tensor, query_start_loc_cpu: torch.Tensor, replay_start: torch.Tensor) -> dict[str, torch.Tensor | int | None]'
+
+- id: dsv41-swa-indices-kernel
+  kind: function
+  target: vllm.v1.attention.backends.mla.sparse_swa:_compute_swa_indices_and_lens_kernel.fn
+  why: ops/sm80_swa_meta.py _window_row is its arithmetic without image spans (window start, replay start, slot ids, -1 padding, invalid rows)
+  sha256: 4954bff106edb182d3bea2a652d93c1606bdb5b838c45f3512c2e7789f198bb3
+  signature: '(swa_indices_ptr, swa_indices_stride, swa_lens_ptr, window_size, index_width, left_visible_ptr, right_visible_ptr, query_start_loc_ptr, seq_lens_ptr, token_to_req_indices_ptr, is_valid_token_ptr, block_table_ptr, block_table_stride, block_size, replay_start_ptr, token_offset, HAS_IMAGE: triton.language.core.constexpr, TRITON_BLOCK_SIZE: triton.language.core.constexpr)'
+
+- id: dsv41-swa-prefill-metadata-kernel
+  kind: function
+  target: vllm.v1.attention.backends.mla.sparse_swa:ComputePrefillMetadataKernel.kernel.fn
+  why: ops/sm80_swa_meta.py writes the prefill gather lengths with its arithmetic
+  sha256: e299bccba808a21ef4b47af7392040f7cc9f106ea6e557b7ebc69487ca1903fc
+  signature: '(prefill_gather_lens_ptr, seq_lens_ptr, query_start_loc_ptr, replay_start_ptr, num_prefills, num_decodes, window_size, BLOCK_SIZE: triton.language.core.constexpr)'
+
+- id: dsv41-swa-build-attn-metadata
+  kind: function
+  target: vllm.v1.worker.gpu.attn_utils:build_attn_metadata
+  why: sm80_swa_meta_batch treats one call as one step - every group's build gets the same batch-level tensors (query_start_loc, seq_lens and their host copies, is_prefilling) sliced fresh per call, the window groups build in group order, and each group's block table and slot mapping are views of the runner's persistent buffers
+  sha256: b7faabe5c799633ecf6f4ee767c989c6e1dd836d7453f01a3e02c239ea62da12
+  signature: '(attn_groups: list[list[vllm.v1.worker.utils.AttentionGroup]], num_reqs: int, num_tokens: int, query_start_loc_gpu: torch.Tensor, query_start_loc_cpu: torch.Tensor, max_query_len: int, seq_lens: torch.Tensor, max_seq_len: int, block_tables: collections.abc.Sequence[torch.Tensor], slot_mappings: torch.Tensor, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, seq_lens_cpu_upper_bound: torch.Tensor | None = None, dcp_local_seq_lens: torch.Tensor | None = None, dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None, positions: torch.Tensor | None = None, is_prefilling: torch.Tensor | None = None, mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None, model_specific_attn_metadata: vllm.v1.worker.gpu.model_states.interface.ModelSpecificAttnMetadata | None = None, for_cudagraph_capture: bool = False, causal: bool | torch.Tensor | collections.abc.Mapping[int, bool] = True, rswa_prefix_lens: torch.Tensor | None = None, ubatch_idx: int = 0, fast_prefill: vllm.v1.worker.gpu.attn_utils.FastPrefillBatchMetadata | None = None, req_idx: numpy.ndarray | None = None) -> dict[str, typing.Any]'
+
+- id: dsv41-swa-block-tables
+  kind: method
+  target: vllm.v1.worker.gpu.block_table:BlockTables.__init__
+  why: the per-group input block tables and the stacked slot mappings are allocated once, so sm80_swa_meta_batch can learn their addresses from one step and launch on them in the next
+  sha256: d7ae50c01b47a6193d06243d62ac0dff8bd27d5cb1bfe749e125ffa0b0614346
+  signature: '(self, block_sizes: list[int], max_num_reqs: int, max_num_batched_tokens: int, max_num_blocks_per_group: list[int], device: torch.device, cp_size: int = 1, cp_rank: int = 0, cp_interleave: int = 1, slot_mapping_enabled: list[bool] | None = None, dcp_sharded: list[bool] | None = None)'
+
+- id: dsv41-recovery-engine-reset
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine.reset
+  why: parser_recovery.RecoveringParserEngine.adopt swaps the class of the engine ParserEngine.__init__ built (no __slots__, nothing else holds the class) and its reset override clears the held candidate after this reset
+  sha256: 5525dd77c49afd19577cb2b94998aeb793a3f65c74dad57ee90699a3185943f4
+  signature: '(self, initial_state: ''ParserState | None'' = None) -> ''None'''
+
+- id: dsv41-recovery-engine-finish
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine.finish
+  why: with a candidate held, RecoveringParserEngine.finish drains the scanner and lexer the way this does, restores the candidate as text, then calls this; it relies on flush_pending and flush returning nothing the second time
+  sha256: f5dd08110cd7e1c8e70efd00a54ab9a8b5d4c7c0c31ba9026feaf250512a1f28
+  signature: (self) -> 'list[SemanticEvent]'
+
+- id: dsv41-recovery-engine-on-terminal
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine._on_terminal
+  why: RecoveringParserEngine handles held candidates and provisional transitions before this and calls it for everything else; a transition must still reach _apply_transition and a terminal without one _emit_for_state, and the skip_tool_parsing projection must still emit tool openers in CONTENT as text
+  sha256: 3dc011d98ed5d36cec26b446359471d13f2f8a59ca8607057d7390a69f9a425a
+  signature: '(self, terminal: ''str'', value: ''str'', token_count: ''int'' = 0) -> ''list[SemanticEvent]'''
+
+- id: dsv41-recovery-engine-emit-for-state
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine._emit_for_state
+  why: every text the engine emits passes through it (feed fast path, _on_content, terminals without a transition), so the override buffers a held candidate's text there; the base returns the state's events without side effects outside TOOL_ARGS JSON buffering, which DSML does not use
+  sha256: fa6dc3e6b302e6b19aa0a81c77b6f1aba6ec24f1e75bc1d15d480609888700a6
+  signature: '(self, text: ''str'', token_count: ''int'' = 0) -> ''list[SemanticEvent]'''
+
+- id: dsv41-recovery-engine-apply-transition
+  kind: method
+  target: vllm.parser.engine.streaming_parser_engine:StreamingParserEngine._apply_transition
+  why: a held candidate runs its real transitions through this and buffers the returned events; it sets state, increments tool_index on TOOL_CALL_START and needs nothing but the Transition fields, so a RecoveryTransition subclass passes
+  sha256: 6629f571e44dae365908f6d0a8ee27333fd1a01f497e433a07d922b1ec58f34c
+  signature: '(self, transition: ''Transition'', value: ''str'', token_count: ''int'' = 0) -> ''list[SemanticEvent]'''
+
+- id: dsv41-recovery-parser-check-skip
+  kind: method
+  target: vllm.parser.engine.parser_engine:ParserEngine._check_skip_tool_parsing
+  why: each request entry point of the parser calls it with the request; the recovering V4.1 parser overrides it to take that request's tools for name validation and headless inference
+  sha256: 556599d84c5bc024b47eefee9b6dce1327ba567791ed0788c9f86cf73dd4a288
+  signature: '(self, request: ''ChatCompletionRequest | ResponsesRequest'') -> ''None'''
+
+- id: dsv41-recovery-parser-extract-name
+  kind: method
+  target: vllm.parser.engine.parser_engine:ParserEngine._try_extract_name
+  why: a call without TOOL_NAME events is named through it when its arguments arrive and when it ends; the recovering V4.1 parser falls back to the headless tool inference there
+  sha256: a11925e4916f5cab43c85ce5170999a2aac610c93e70a302014e2db9f1cf77f9
+  signature: '(self, idx: ''int'') -> ''str | None'''
+
+- id: dsv41-recovery-v4-parser-init
+  kind: method
+  target: vllm.parser.deepseek_v4:DeepSeekV4Parser.__init__
+  why: builds the engine from parser_config(thinking=...), which the recovering V4.1 parser replaces with its recovery config before adopting self._engine
+  sha256: 7b175e1d7ac1ca5d45fe5f18116072236e8fa24877a715ef781c4aed9f921d88
+  signature: '(self, tokenizer: ''TokenizerLike'', tools: ''list[Tool] | None'' = None, **kwargs) -> ''None'''
+
+- id: dsv41-recovery-v4-convert-args
+  kind: method
+  target: vllm.parser.deepseek_v4:DeepSeekV4Parser._convert_args
+  why: well-formed DSML arguments keep this conversion; the recovering V4.1 parser only replaces it for arguments carrying the XML idiom
+  sha256: 2519c74a64c5310dba2b9b230cee4344d48619999e97432585c506e15c3f488e
+  signature: '(self, raw_args: ''str'', partial: ''bool'') -> ''str'''
+
+- id: dsv41-recovery-v41-config
+  kind: function
+  target: vllm.parser.deepseek_v41:deepseek_v41_config
+  why: deepseek_v41_recovery extends this config by terminal name (TOOL_START, TOOL_END, INVOKE_NAME_END, INVOKE_END, PARAM_START, PARAM_CLOSE) and reuses its (TOOL_ARGS, INVOKE_END) transition
+  sha256: 3ad93c31920e9dec85f158a43781ea693e193feff9859cbcdc05922f3a1f638a
+  signature: '(thinking: bool = False) -> vllm.parser.engine.parser_engine_config.ParserEngineConfig'
+
+- id: dsv41-recovery-parser-arg-delta
+  kind: method
+  target: vllm.parser.engine.parser_engine:ParserEngine._compute_arg_delta
+  why: the recovering V4.1 parser returns None here for a recovered call, which arrives whole at commit, so its arguments go out once from _flush_arg_converter at its end; that flush must send the whole final JSON when nothing was streamed
+  sha256: 29054a0967013171745ba341a885f28c21762ac1466e0671d14dca000276647b
+  signature: '(self, idx: ''int'', raw_delta: ''str'') -> ''str | None'''
+
+- id: dsv41-swa-kernel-block-table
+  kind: method
+  target: vllm.v1.worker.utils:AttentionGroup.map_to_kernel_block_table
+  why: a group's kernel-block table is a view of its 3-D kernel_block_table, filled in the group's own build; sm80_swa_meta_batch never batches a group whose block table is not a view of a 2-D runner input table
+  sha256: 1718bff4b602351df9108422a01572b2ebaa609959f0038b04a72f527d56d002
+  signature: '(self, block_table: torch.Tensor, ubatch_idx: int = 0) -> torch.Tensor'
+
+- id: dsv41-swa-kernel-block-builders
+  kind: method
+  target: vllm.v1.worker.utils:AttentionGroup.create_metadata_builders
+  why: kernel_block_table is allocated 3-D (one per microbatch builder), which is how sm80_swa_meta_batch tells it from the runner's 2-D input block tables
+  sha256: 90a29ab48fde025f624d5bbc41ffb5ec5327088ebe512156c055086b2fcea7a3
+  signature: '(self, vllm_config, device, kernel_block_size: int | None = None, num_metadata_builders: int = 1)'
+
+- id: dsv41-target-sampler-call
+  kind: method
+  target: vllm.v1.worker.gpu.sample.sampler:Sampler.__call__
+  why: with every request of the step greedy, no logprobs, no NaN count, no sampling mask and no trace replay of logprobs, the sampled token of a row is the greedy argmax of what Sampler.sample makes of the logits; vllm/sm80/worker/target_argmax.py hands it rows holding 0.0 at torch.argmax of the gathered row and -inf elsewhere, and must sample the same tokens
+  sha256: 120e3dcb0fc3f1792eefa36eb2e7beefb370ebe36da393b46766683779e3d694
+  signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'
+
+- id: dsv41-target-sampler-apply-params
+  kind: method
+  target: vllm.v1.worker.gpu.sample.sampler:Sampler.apply_sampling_params
+  why: the logits come back unchanged when no request of the batch needs logits processing (needs_logits_processing); target_argmax.py serves only such steps, so the samplers read the target logits only through their argmax
+  sha256: c049aa1b1e9ad220d8e6bf21c8d8a6a01c732e7db1a7879b94e955a4b1bd11b5
+  signature: '(self, logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, idx_mapping: torch.Tensor, idx_mapping_np: numpy.ndarray, pos: torch.Tensor, input_ids: torch.Tensor, expanded_local_pos: torch.Tensor, seq_lens_upper_bound_np: numpy.ndarray, skip_top_k_top_p: bool = False) -> torch.Tensor'
+
+- id: dsv41-target-rejection-call
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.rejection_sampler:RejectionSampler.__call__
+  why: the target logits are read by the NaN count, apply_sampling_params and rejection_sample (a greedy request accepts a draft iff it equals the target argmax, then takes the argmax at the first mismatch or the bonus row), and by the logprobs and sampling mask only when requested; target_argmax.py hands it rows holding only that argmax (0.0 there, -inf elsewhere)
+  sha256: 421fd2df7bb2e1c990eee3b650a23bc3f4c5cc03da5ae954f2f02897fa5ce551
+  signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, draft_logits: torch.Tensor | None = None, invalid_drafts: torch.Tensor | None = None) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'
+
+- id: dsv41-target-compute-logits-local
+  kind: method
+  target: vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.compute_logits_local
+  why: the target's shard logits are its logits processor's skip_gather output for the same hidden states, the columns compute_logits all-gathers; target_argmax.py takes the argmax over them
+  sha256: 35012265d57c6eefc7ddb6ef78963a1403428e1c40caf1a9a54e11c89aa33420
+  signature: '(self, hidden_states: torch.Tensor) -> torch.Tensor'
+
+- id: dsv41-target-runner-sample
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample
+  why: outside batch-sharded sampling it calls self.model.compute_logits once, on the step's logits rows, before the grammar bitmask, the sampler and the rejection sampler read the logits; the fork runner (vllm/sm80/worker/graph_mem_worker.py) runs it inside target_argmax.step, and the sm_80 DeepSeek-V4.1 target's compute_logits returns the argmax rows during a greedy-only step
+  sha256: 62c0bcc3433677ba37c10e65019a6cf5894f7a0d58f15643eec078961e391d9e
+  signature: '(self, hidden_states: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> tuple[vllm.v1.worker.gpu.sample.output.SamplerOutput, torch.Tensor, torch.Tensor]'
+
+- id: dsv41-target-dummy-sampler-run
+  kind: method
+  target: vllm.v1.worker.gpu.model_runner:GPUModelRunner._dummy_sampler_run
+  why: profile_run calls it at boot, outside graph capture, on every rank of the last pipeline stage with the same sample hidden states, which compute_logits takes; the fork runner warms the slot kernels (and refuses a target target_argmax cannot serve) on them after it
+  sha256: 250fbef202183c139a42163ae332ea648be031a398923260f747f80de449bc43
+  signature: '(self, hidden_states: torch.Tensor) -> None'
+
+- id: dsv41-target-sampler-sample
+  kind: method
+  target: vllm.v1.worker.gpu.sample.sampler:Sampler.sample
+  why: with no top-k/top-p in the sampling states (get_top_k_top_p gives None, None) nothing runs between apply_sampling_params and the greedy argmax (gumbel_sample at temperature 0); target_argmax.greedy_only requires that, since top-p may drop the first of tied maxima
+  sha256: 148909f008cd7b044b84fd034cd15d5567abd00fcfc49bf4925733f36d8643fa
+  signature: '(self, logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, idx_mapping: torch.Tensor, idx_mapping_np: numpy.ndarray, pos: torch.Tensor, input_ids: torch.Tensor, expanded_local_pos: torch.Tensor, seq_lens_upper_bound_np: numpy.ndarray, return_logprobs: bool = False) -> tuple[torch.Tensor, torch.Tensor]'
+
+- id: dsv41-target-sampling-states-add-request
+  kind: method
+  target: vllm.v1.worker.gpu.sample.states:SamplingStates.add_request
+  why: a temperature-0 request needs no logits processing from these states (temperature and min-p are not applied by apply_sampling_params for it; its top-k/top-p, reset by SamplingParams, are stored as no filter, top_k = vocab_size and top_p = 1.0); target_argmax.greedy_only reads temperature.np, top_k.np, top_p.np and the sampler's needs_logits_processing this sets
+  sha256: 3b14a9e897290c536b7e41f8b33217942c5b973a12ba75df670d78a0e6e72318
+  signature: '(self, req_idx: int, sampling_params: vllm.sampling_params.SamplingParams) -> bool'
+
+- id: dsv41-dspark-propose-arguments
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator.propose
+  why: dspark_confidence.py binds its arguments by name (num_sampled, num_rejected, dummy_run, is_profile) and, before the draft step overwrites draft_token_confidence_probs, pairs the previous draft step's confidences with this step's verification result
+  sha256: 0b0a95528ca4bd603543deade30b5c6ad5145b645052bf74cf268037320c97c3
+  signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, attn_metadata: dict[str, typing.Any], slot_mappings: dict[str, torch.Tensor], last_hidden_states: torch.Tensor, aux_hidden_states: list[torch.Tensor] | None, num_sampled: torch.Tensor, num_rejected: torch.Tensor, last_sampled: torch.Tensor, next_prefill_tokens: torch.Tensor, temperature: torch.Tensor, seeds: torch.Tensor, dp_sync_state: vllm.v1.worker.gpu.dp_utils.DPSyncState | None = None, dummy_run: bool = False, skip_attn_for_dummy_run: bool = False, mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None, is_profile: bool = False, num_speculative_tokens: int | None = None) -> torch.Tensor'
+
+- id: dsv41-dspark-load-draft-model
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.load_draft_model
+  why: it returns the draft model (confidence head at model.model.confidence_head) and sets use_confidence_head only under adaptive verification; dspark_confidence.py sets it afterwards so the captured draft step computes the head into draft_token_confidence_probs
+  sha256: 7284ba4074a78bbb73f700b2fd4378f85358cc4b3bb0355a6ac0423cba4fc502
+  signature: '(self, target_model: torch.nn.modules.module.Module, target_attn_layer_names: set[str]) -> torch.nn.modules.module.Module'
+
+- id: dsv41-row-mask-prepare-dflash-inputs
+  kind: function
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:prepare_dflash_inputs
+  why: before every draft step (eager or replayed) it writes each real request's state slot into sample_idx_mapping at the request's first sample row and -1 for padding requests; dspark_row_mask_conf.py reads slot_r = sample_idx_mapping[r * width] inside the draft graph to publish confidences per slot
+  sha256: f79194be51fdaf5e9b7f5abccebb02ac6b3c8b24b425afc2dd21ac78ff40b7e5
+  signature: '(input_buffers: vllm.v1.worker.gpu.input_batch.InputBuffers, query_slot_mapping: torch.Tensor, context_positions: torch.Tensor, context_slot_mapping: torch.Tensor, sample_indices: torch.Tensor, sample_pos: torch.Tensor, sample_idx_mapping: torch.Tensor, temperature: torch.Tensor, seeds: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, num_sampled: torch.Tensor, num_rejected: torch.Tensor, last_sampled: torch.Tensor, next_prefill_tokens: torch.Tensor, input_temperature: torch.Tensor, input_seeds: torch.Tensor, block_table: torch.Tensor, block_size: int, cp_rank: int, cp_size: int, cp_interleave: int, parallel_drafting_token_id: int, num_query_per_req: int, num_speculative_steps: int, max_num_reqs: int, max_num_tokens: int, max_model_len: int, sample_from_anchor: bool = False) -> None'
+
+- id: dsv41-row-mask-rejection-invalid-drafts
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.rejection_sampler:RejectionSampler.__call__
+  why: invalid_drafts (one bool per logits row) turns a draft into -1 for verification only; a -1 draft is rejected and the token at its row is the target's (greedy argmax, or a plain target sample), and num_rejected counts it; dspark_row_mask_reject.py ORs the masked rows into it
+  sha256: 421fd2df7bb2e1c990eee3b650a23bc3f4c5cc03da5ae954f2f02897fa5ce551
+  signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, draft_logits: torch.Tensor | None = None, invalid_drafts: torch.Tensor | None = None) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'

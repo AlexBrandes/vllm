@@ -18,6 +18,10 @@ can reach.
   scratch in KV capacity, and the scheduler's eagle-group flags.
 - ``failed_inputs``: fails only the requests whose model inputs a worker
   could not produce (an EXL3 PLE row that storage failed to read).
+- ``parser_recovery``: provisional tool-call candidates for the streaming
+  parser engine, held until validated; ``deepseek_v41_recovery`` recovers
+  the damaged DeepSeek V4.1 tool calls with it (vllm/parser/deepseek_v41.py
+  wraps its parser class).
 - ``envs``: the fork's environment variables; ``vllm/envs.py`` registers
   them at the end of its own import.
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point

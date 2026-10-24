@@ -27,8 +27,14 @@ SOURCES = (
     "moe_prefill.cu",
     "dense.cu", "dense_splitk.cu", "gemm.cu", "moe.cu", "moe_v2.cu", "ple.cu",
     "dense_mma.cu",
-    "ple_read.cpp", "reference.cu", "module.cpp",
+    "ple_read.cpp", "engram_fetch.cpp", "reference.cu",
+    "module.cpp",
     "dense_prefill_tc.cu",
+    "moe_prefill_v2.cu",
+    # VLLM_EXL3_MOE_V2_RING: own namespace and headers (moe_v2_try/); leaves every
+    # other object's code as it is.
+    "moe_v2_try.cu",
+    "moe_prefill_try.cu",
 )
 
 

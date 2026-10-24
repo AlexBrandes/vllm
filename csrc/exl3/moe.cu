@@ -194,10 +194,10 @@ __global__ void expert_input(const __nv_bfloat16* x, Routing routing, const int*
 
 // One warp per (local assignment, 128-column block): gate and up output
 // transforms (H128, svh), SiLU(gate) * up, down suh, then the down H128,
-// written over the gate rows.
+// written over the gate rows; gate and up clamped first by swiglu_clamp.
 __global__ void activate_down_input(Routing routing, const int* table,
                                     int64_t intermediate, int64_t ipad, float* gate,
-                                    const float* up) {
+                                    const float* up, float limit) {
   const int lane = threadIdx.x & 31;
   const int* sorted = table + RouteLayout::sorted_offset();
   const int64_t blocks = ipad / 128;
@@ -223,10 +223,11 @@ __global__ void activate_down_input(Routing routing, const int* table,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int64_t col = base + 32 * i;
-      const float gv = __fmul_rn(g[i], __half2float(gate_svh[col]));
-      const float uv = __fmul_rn(u[i], __half2float(up_svh[col]));
+      float gv = __fmul_rn(g[i], __half2float(gate_svh[col]));
+      float uv = __fmul_rn(u[i], __half2float(up_svh[col]));
       v[i] = 0.0f;
       if (col < intermediate) {
+        swiglu_clamp(gv, uv, limit);
         const float silu = gv / __fadd_rn(1.0f, expf(-gv));
         v[i] = __fmul_rn(__fmul_rn(silu, uv), __half2float(down_suh[col]));
       }
@@ -296,7 +297,8 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
              const torch::Tensor& packed_ptrs,
              const torch::Tensor& packed_meta,
              const torch::Tensor& expert_map, int64_t intermediate_size,
-             torch::Tensor& out, torch::Tensor& workspace) {
+             torch::Tensor& out, torch::Tensor& workspace, double swiglu_limit) {
+  const float limit = checked_swiglu_limit(swiglu_limit);
   TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
   check_tensor(x, x, at::kBFloat16, "x");
   check_integer(topk_ids, x, "topk_ids");
@@ -385,7 +387,7 @@ void moe_out(const torch::Tensor& x, const torch::Tensor& topk_ids,
       }
     }
     activate_down_input<<<warp_blocks(assignments * (ipad / 128)), 32 * kWarpsPerBlock, 0,
-                          stream>>>(routing, table, intermediate_size, ipad, gate, up);
+                          stream>>>(routing, table, intermediate_size, ipad, gate, up, limit);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     problem.a = gate;
     problem.a_stride = ipad;

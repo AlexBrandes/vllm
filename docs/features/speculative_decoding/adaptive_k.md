@@ -137,6 +137,24 @@ already on hand and discards the tail.
   count. With `draft_by_load` (greedy DFlash2) the drafter keeps one graph set
   per width and drafts the width the next step verifies, at the price of a
   one-step lag when the load drops.
+* **`dspark`** defaults to a fixed-width draft followed by truncation. Opt in
+  with `VLLM_DSPARK_PER_K_WIDTH=1` to draft each positive K from
+  `num_speculative_tokens_per_batch_size` (or `adaptive_k.draft_by_load`) at
+  its actual width. For example, `[[1,3,5],[4,8,3]]` drafts three query rows
+  per request at batch sizes four through eight for anchor-sampling models,
+  instead of five. This switch requires `sample_from_anchor=True`; fill-in
+  models are refused before device allocation because their graph descriptors
+  are not yet restricted to the selected width. Zero-K context-only steps and
+  the target verification/acceptance policy are unchanged.
+  Per-width anchor tensors and graph managers are created before capture;
+  switching widths allocates no new device storage. Logits keep their
+  maximum-width request/column layout for probabilistic rejection sampling.
+  Capture sizes remain the configured **token** sizes; uncovered shapes run
+  eagerly. Keep the capture ladder unchanged when comparing this switch so
+  the baseline dispatch does not change. The width-five path retains its
+  original layout, graph descriptors and sampling order. A non-causal backbone can
+  produce different narrow-block proposals; compare acceptance and end-to-end
+  output quality rather than assuming prefix identity with a wider block.
 
 ## Observability
 

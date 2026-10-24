@@ -58,9 +58,15 @@ if TYPE_CHECKING:
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_TOOL_CHOICE_NONE_MASK: bool = False
     VLLM_DFLASH_BOUNDARY_CACHE: bool = False
+    VLLM_DSPARK_PER_K_WIDTH: bool = False
+    VLLM_DSPARK_CONFIDENCE_DUMP: str = ""
+    VLLM_DSPARK_ADAPTIVE_DEPTH: str = ""
+    VLLM_DSPARK_DEPTH_HINT: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
+    VLLM_CUDAGRAPH_ESTIMATE_SPLIT: int = 0
+    VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB: int = 0
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_MAX_TOKENS: int = 32
@@ -68,6 +74,7 @@ if TYPE_CHECKING:
     VLLM_THIN_GEMM_GLUON: bool = False
     VLLM_THIN_GEMM_GLUON_FORCE_M: int = 0
     VLLM_SHARED_EXPERT_REORDER: bool = False
+    VLLM_FAIR_PREFILL_SHORT_BYPASS: bool = False
     VLLM_PP_SPREAD_DECODES: bool = False
     VLLM_PP_PACKED_HOP: bool = False
     VLLM_PP_HOP_NO_METADATA: bool = False
@@ -85,13 +92,43 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_HOST_ALLREDUCE: bool = False
+    VLLM_ROUND_ONCE_ALLREDUCE_GROUPED: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_EXL3_DENSE_SPLITK: bool = False
     VLLM_EXL3_DENSE_MMA: bool = False
     VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE: str = ""
     VLLM_EXL3_PLE_PLACEMENT: str = "ssd"
+    VLLM_EXL3_OVERRIDE: str = ""
+    VLLM_EXL3_OVERRIDE_SHA256: str = ""
+    VLLM_EXL3_HYBRID: bool = False
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
+    VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE: bool = False
+    VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
+    VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM: bool = False
+    VLLM_DEEPSEEK_V41_ROUTER_MMA: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
+    VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
+    VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
+    VLLM_DEEPSEEK_V41_WO_A_STRIDED: bool = False
+    VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
+    VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
+    VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
+    VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
+    VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
+    VLLM_DSPARK_SHARD_ARGMAX: bool = False
+    VLLM_SM80_TARGET_SHARD_ARGMAX: bool = False
+    VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
+    VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
+    VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
     VLLM_EXL3_PLE_COLD: bool = False
     VLLM_EXL3_PLE_READ_RETRIES: int = 3
     VLLM_EXL3_PLE_TIMING: bool = False
@@ -100,10 +137,37 @@ if TYPE_CHECKING:
     VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE: str = "planned"
     VLLM_EXL3_PLE_NATIVE_READ: bool = False
     VLLM_EXL3_PLE_HOSTFN_READ: bool = False
+    VLLM_ENGRAM_PLACEMENT: str = "ssd"
+    VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
+    VLLM_ENGRAM_ROW_CACHE_PRELOAD: bool = False
+    VLLM_ENGRAM_DIRECT_READ: bool = False
+    VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
+    VLLM_EXL3_MOE_V2_FOLD: bool = False
+    VLLM_EXL3_MOE_V2_DRAFT: bool = False
+    VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS: int = 0
+    VLLM_EXL3_MOE_V2_RING: bool = False
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
+    VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
+    VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
+    VLLM_EXL3_EXPERT_PLACEMENT: str = ""
+    VLLM_EXL3_EXPERT_PLACEMENT_SHA256: str = ""
+    VLLM_EXL3_EXPERT_REPLICAS: str = ""
+    VLLM_EXL3_EXPERT_REPLICAS_SHA256: str = ""
+    VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
+    VLLM_SM80_CAPTURE_DIR: str = ""
+    VLLM_SM80_CAPTURE_FAMILIES: str = "dense,moe,attn"
+    VLLM_SM80_CAPTURE_MATCH: str = ""
+    VLLM_SM80_CAPTURE_ROWS: str = ""
+    VLLM_SM80_CAPTURE_PER_KEY: int = 2
+    VLLM_SM80_CAPTURE_PREFILL_MATCH: str = ""
+    VLLM_SM80_CAPTURE_PREFILL_CALLS: str = "1"
+    VLLM_SM80_CAPTURE_PREFILL_PER_KEY: int = 0
+    VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS: int = 65
+    VLLM_SM80_CAPTURE_MAX_MB: int = 4096
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
+    VLLM_DEV_AB_SWITCH: str = ""
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -379,8 +443,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # pure function of the shape. Read when those modules are imported; other
     # devices keep normal autotuning. Off by default.
     "VLLM_FLA_PIN_AUTOTUNE": lambda: bool(
-        int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))
-    ),
+        int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))    ),
     # With pinning off, the vendored flash-linear-attention autotuners on sm_80
     # build each config before timing it and skip (never launch) one whose
     # build needs more than the context's default 1,024 B of local memory per
@@ -490,6 +553,30 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_BOUNDARY_CACHE": lambda: bool(
         int(os.getenv("VLLM_DFLASH_BOUNDARY_CACHE", "0"))
     ),
+    # DSpark drafts the scheduled K rather than drafting the maximum and
+    # truncating. Each positive width has persistent anchors and CUDA graphs.
+    "VLLM_DSPARK_PER_K_WIDTH": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_PER_K_WIDTH", "0"))
+    ),
+    # Diagnostics: a directory. The DSpark drafter computes its confidence
+    # head in every draft step (without adaptive verification) and TP rank 0
+    # appends each request's per-position confidences with the accepted
+    # length of the round they predicted (dspark_confidence.py). Empty: off.
+    "VLLM_DSPARK_CONFIDENCE_DUMP": lambda: os.getenv(
+        "VLLM_DSPARK_CONFIDENCE_DUMP", ""
+    ),
+    # A dspark-depth-policy/1 JSON file: each DSpark verify step keeps per
+    # request only the drafts the policy (draft-step features and the
+    # request's acceptance history, against the step cost table) makes worth
+    # verifying; the rows past them take no routed expert and their drafts
+    # count as rejected (dspark_row_mask.py). Greedy output is the unmasked
+    # output truncated at the kept drafts. A host_width block in the file also
+    # has the scheduler choose each step's verified width from the requests'
+    # earlier rounds (dspark_host_width.py). Empty: off.
+    "VLLM_DSPARK_ADAPTIVE_DEPTH": lambda: os.getenv("VLLM_DSPARK_ADAPTIVE_DEPTH", ""),
+    # Trial: DSpark verify width from each request's last verified round, per
+    # load (vllm/sm80/spec_decode/dspark_depth_hint.py); empty is off.
+    "VLLM_DSPARK_DEPTH_HINT": lambda: os.getenv("VLLM_DSPARK_DEPTH_HINT", ""),
     # Diagnostics (step-cost calibration): a file holding a depth; while it
     # holds one inside the adaptive_k load width, every step verifies that
     # depth.
@@ -509,6 +596,28 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # cache is sized. Logging only; the KV cache size is unchanged.
     "VLLM_MEM_ATTRIBUTION": lambda: bool(
         int(os.getenv("VLLM_MEM_ATTRIBUTION", "0"))
+    ),
+    # CUDA-graph memory estimate as the bytes the real capture keeps: the
+    # throwaway graph pool, the graph objects, the buffers the capture creates
+    # and what profiling leaves allocated, instead of the profiling capture's
+    # whole free-memory drop (which also holds one-time costs of the first
+    # capture and the warmups' allocator cache). The profiling capture captures
+    # every FULL graph rather than vLLM's two largest plus a linear
+    # extrapolation. Logs the split once per rank,
+    # and after the real capture what it keeps against the estimate. Runs the
+    # fork GPU worker (vllm/sm80/worker/graph_mem_worker.py, V2 model runner
+    # only; vllm/sm80/worker/cudagraph_mem.py). 2 also records the allocation
+    # history of the profiling run and lists what it leaves allocated by
+    # call stack (diagnostics; slower capture). Default 0 (OFF).
+    "VLLM_CUDAGRAPH_ESTIMATE_SPLIT": lambda: int(
+        os.getenv("VLLM_CUDAGRAPH_ESTIMATE_SPLIT", "0")
+    ),
+    # With VLLM_CUDAGRAPH_ESTIMATE_SPLIT: the allocator's max_split_size_mb
+    # for the length of each CUDA-graph capture (profiling and real), so a
+    # small long-lived allocation made during a capture cannot keep a large
+    # free segment from being released. Default 0 (unchanged).
+    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": lambda: int(
+        os.getenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", "0")
     ),
     # Align-mode Mamba KV reservation under async scheduling or pipeline
     # parallelism: also reserve the state blocks a request holds for the
@@ -542,6 +651,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF until it has its own A/B on the cards.
     "VLLM_SHARED_EXPERT_REORDER": lambda: bool(
         int(os.getenv("VLLM_SHARED_EXPERT_REORDER", "0"))
+    ),
+    # Fair chunked prefill (`--prefill-chunk-with-decodes CAP`): a prefill
+    # whose whole remaining prompt is at most CAP tokens is scheduled in full
+    # within the ordinary token budget, not in capped slices, and is not
+    # charged to the per-step prefill cap or counted in the partial-prefill
+    # split (long prompts keep their share). A burst of short prompts beside a
+    # decoding stream is then admitted in one step instead of several. Long
+    # prompts keep the cap until their last <= CAP tokens. No effect without
+    # the cap or on Mamba align-mode models. Default OFF until measured.
+    "VLLM_FAIR_PREFILL_SHORT_BYPASS": lambda: bool(
+        int(os.getenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", "0"))
     ),
     # Pipeline parallelism: cap each scheduling step at ceil(decoding
     # requests / pp_size) decode requests so the pp_size in-flight
@@ -670,6 +790,20 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_HOST_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_HOST_ALLREDUCE", "0"))
     ),
+    # Round-once all-reduce of large messages for the model call sites that ask
+    # for one (DeepSeek-V4.1: VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE and
+    # VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE) over grouped NCCL send/recv:
+    # a reduce-scatter in the message dtype, each rank's chunk summed in FP64
+    # in rank order and rounded once (the exact sum correctly rounded while the
+    # partials' magnitudes lie within about 2^40 of each other), then an
+    # all-gather. The same bytes as NCCL's ring, which instead rounds every hop
+    # (TP4: about a third of BF16 elements differ from the correct rounding).
+    # Off: those call sites use the custom all-reduce in pieces (slower at
+    # prefill sizes). Eager steps only. Default OFF. Any TP size; see
+    # vllm/sm80/distributed/round_once_all_reduce.py.
+    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED": lambda: bool(
+        int(os.getenv("VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "0"))
+    ),
     # Largest message the host path serves; anything above goes to NCCL. 512 KiB
     # is where the measured curve stops paying: at 8-256 KiB the host path is
     # 1.06-2.04x NCCL, while prefill-sized messages (>= 2 MiB) already run near
@@ -752,6 +886,21 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_PLACEMENT": lambda: _env_with_choices(
         "VLLM_EXL3_PLE_PLACEMENT", "ssd", ["ssd", "ram", "device"]
     )(),
+    # An override sidecar's manifest (tools/sm80/build_override_sidecar.py):
+    # the plain tensors it lists load from its safetensors file, in the source
+    # checkpoint's dtype, in place of an EXL3 export's lower-precision copies
+    # (vllm/sm80/kernels/exl3/override.py). Unset: the export's tensors.
+    "VLLM_EXL3_OVERRIDE": lambda: os.getenv("VLLM_EXL3_OVERRIDE", ""),
+    # sha256 of the VLLM_EXL3_OVERRIDE manifest; required when it is set.
+    "VLLM_EXL3_OVERRIDE_SHA256": lambda: os.getenv(
+        "VLLM_EXL3_OVERRIDE_SHA256", ""
+    ),
+    # Load an EXL3 checkpoint whose quantization_config routes module classes
+    # to EXL3, unquantized or a second registered method (module_quantization,
+    # non_routed_quantization; vllm/sm80/kernels/exl3/hybrid.py), its tensors
+    # selected by its index. Unset: such a config is refused; EXL3
+    # checkpoints without those keys load as before either way.
+    "VLLM_EXL3_HYBRID": lambda: bool(int(os.getenv("VLLM_EXL3_HYBRID", "0"))),
     # Order Qwen QSA's native-selected blocks before expansion/attention.
     # Set 0 to retain native traversal order without changing selection.
     "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(
@@ -767,6 +916,260 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Default OFF: unset, the QSA top-k path is unchanged.
     "VLLM_QWEN4_QSA_TOPK_CANONICAL": lambda: bool(
         int(os.getenv("VLLM_QWEN4_QSA_TOPK_CANONICAL", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: all-reduce the wo_b partials in BF16 when the
+    # custom all-reduce takes that message (its own should_custom_ar, and the
+    # host-staged path not taking it first). That kernel accumulates in FP32
+    # in a fixed order and rounds once, which gives the bits of today's FP32
+    # all-reduce at half the bytes; every other message keeps the FP32 sum
+    # rounded once. Default OFF: unset, every wo_b partial is all-reduced in
+    # FP32. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: all-reduce a wo_b partial that is too large for
+    # the custom all-reduce to take whole (prefill and mixed steps; above 819
+    # rows of 5120 at the 8 MiB buffer) in BF16, rounded once: over grouped
+    # NCCL send/recv with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED, else through that
+    # same custom all-reduce in pieces below its buffer when it takes them.
+    # Each element is summed in FP32 in a fixed order and rounded to BF16
+    # once, as on the FP32 path and in the reference's RowParallelLinear
+    # (y.float(), all_reduce, type_as). The FP32 sum of four BF16 partials is
+    # exact when their magnitudes lie within a factor 2^14 of each other, so
+    # such elements get the FP32 path's bits in any order; others can differ
+    # in the last BF16 bit where the inexact FP32 sum rounds differently in
+    # another order, as the FP32 path's own ring order already can. Half the
+    # bytes of the FP32 message. Eager steps only: never during CUDA graph
+    # capture or its warm-up. Default OFF: unset, such partials are
+    # all-reduced in FP32. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: all-reduce the MoE output partial (routed experts
+    # plus the shared-expert shard, BF16) that is too large for the custom
+    # all-reduce to take whole (prefill and mixed steps) rounded once, as
+    # VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE does for wo_b (grouped NCCL
+    # with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED, else the custom all-reduce in
+    # pieces), instead of NCCL's BF16 ring. Precision: NCCL's ring stores every
+    # hop's sum in BF16, so a TP4 element is rounded three times (CPU emulation:
+    # about a third of the elements differ from one rounding of the FP32 sum);
+    # round-once paths round each element once (grouped: the correctly rounded
+    # sum; pieces: the FP32 sum in a fixed order), as the custom all-reduce
+    # already does for the decode-sized messages it takes whole and as the
+    # reference all-reduces its MoE output in FP32. Speed: grouped moves the
+    # ring's bytes; the custom all-reduce pieces move them more slowly.
+    # The layer does the reduction the runner would do (skip_final_all_reduce);
+    # every other message takes the communicator's usual path. Eager steps
+    # only. Default OFF: unset, the runner all-reduces the MoE output as today.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: in eager steps of at least 1024 rows, run each
+    # target decoder layer's wo_b, FFN and both TP all-reduces in two row
+    # slices, the all-reduces on a side stream, so one slice's all-reduce runs
+    # beside the other slice's compute (sm80_split_reduce.py). Each slice's
+    # message takes the path the whole message would; steps whose slices the
+    # host-staged or custom all-reduce would take run whole. Not bit-equal to
+    # the unsplit step (NCCL's ring and the two-stage custom all-reduce both
+    # sum an element in an order set by its place in the message); judged by
+    # the V2 prefill dNLL check. Default OFF:
+    # unset, every layer runs whole. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: TP all-reduces of the FP32 wo_b partial and of the
+    # MoE output that the host-staged and custom all-reduce do not take (eager
+    # prefill-sized messages) run on a copy-engine ring instead of NCCL
+    # (vllm/sm80/distributed/ce_ring_all_reduce.py): copy-engine copies into
+    # the next rank's IPC scratch, one-block flag kernels and one add per
+    # reduce-scatter step. Device memory per rank: one scratch slot per ring
+    # step for a max_num_batched_tokens x hidden FP32 message (63 MiB at TP4,
+    # 2048 x 5120). The sum order is the ring's, not NCCL's. Default OFF.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
+    # post + pre at every sublayer boundary and the pre-only entries) through
+    # the sm_80 mHC kernel A (ops/sm80_mhc_fused.py: post step, projection and
+    # squared-sum partials) instead of the reference's FP32 torch formulas
+    # (ops/sm80_mhc.py, about 155 kernels per call), with the reference's BF16
+    # rounding points; the finish stays the torch formulas unless
+    # VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH. Default OFF: unset, the torch formulas run.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_model.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC: the finish after kernel A (coefficients,
+    # Sinkhorn, collapse, RMSNorm) as one Triton kernel, two kernels per call.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: the finish v2 in its validated
+    # configuration (hidden 5120, 20 Sinkhorn iterations, 1..2048 rows, with the
+    # norm, sm_80): kernel A with its staging reuse from 17 rows, then the Gluon finish
+    # (ops/sm80_mhc_finish_v2.py: FP64 reciprocals by MUFU approximation and
+    # Newton steps, one-pass collapse) instead of the Triton finish kernel.
+    # Order-changing. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_fused.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: inside a decoder layer's forward,
+    # the mHC finish's coefficient CTAs (post, comb with its Sinkhorn, the next
+    # pre-mix: first read at the next sublayer boundary) of up to 64 rows run on
+    # a side stream beside the sublayer's TP all-reduce, forked as it starts and
+    # joined as it returns; the layer-input CTAs stay in place. Same kernels and
+    # inputs, so the same bytes. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/ops/sm80_mhc_side.py.
+    "VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE gate and routing of calls of 1 to 2047
+    # BF16 rows on the BF16 tensor cores (ops/sm80_router_mma.py): the gate
+    # weight held once, in BF16 (its BF16-valued checkpoint values exactly;
+    # the gate GEMV and the FP32 GEMM widen it exactly, so their bytes are
+    # unchanged), with exact BF16 products, FP32 sums
+    # per K chunk and FP64 across chunks, rounded once to FP32; the top-k
+    # selected in FP32 as the fused route, the weights in FP64 rounded once,
+    # from exactly recomputed logits for calls of up to 64 rows. Not the FP32
+    # GEMM's bytes: closer to the FP64 routing weights. Other calls keep the
+    # gate GEMV or the FP32 gate and the route. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_ROUTER_MMA": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ROUTER_MMA", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
+    # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,
+    # scale, int32 ids: fifteen torch kernels per layer) as one Triton kernel
+    # (ops/sm80_route.py) with the torch ops' arithmetic and order, so the
+    # same bytes. Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the DSpark drafter's context-KV prologue per
+    # draft layer (kv_norm RMSNorm, RoPE, FP8 qdq and the window-cache write
+    # after the wkv projection: 26 torch and Triton kernels per layer) as one
+    # Triton kernel (ops/sm80_draft_prologue.py) with the torch ops'
+    # arithmetic and order (the RMSNorm sum in torch's CUDA reduction order),
+    # so the same cache bytes. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE gate GEMM of calls of at most 64 rows
+    # (decode, speculative verify, draft) as one Triton kernel
+    # (ops/sm80_gate_gemv.py) that reads the BF16 input as is and computes the
+    # logits in FP64, rounded once to FP32, in place of the FP32 copy of the
+    # input, the FP32 GEMM and its split-K reduce. Not the FP32 GEMM's bytes:
+    # the correctly rounded FP32 logits, except where the exact value lies
+    # within the FP64 summation error of an FP32 rounding midpoint. Default
+    # OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_GATE_GEMV": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the grouped FP8 wo_a (one Marlin GEMM per
+    # group) reads each group's rows of the attention output in place, as a
+    # row-strided view (Marlin's A row stride), instead of copying them to a
+    # contiguous tensor first: two copy kernels fewer per layer, the same
+    # GEMMs on the same values, so the same bytes. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_A_STRIDED": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_STRIDED", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the grouped MXFP8 wo_a (one Marlin GEMM per
+    # group and a concat) as one grouped Triton W8A16 GEMM over all groups
+    # that writes the [T, groups * o_lora_rank] result directly
+    # (ops/sm80_wo_a_grouped.py). It holds the loaded FP8 codes and E8M0
+    # scales instead of Marlin's repack (the same bytes); the decoded weights
+    # are Marlin's, the FP32 sums run in another order, so outputs change
+    # within rounding. Default OFF. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
+    # and draft steps (the norms and window row of prepare_layer, the query
+    # RoPE, sparse attention, output RoPE and qdq of attend_layer) as two
+    # fused calls per layer (ops/sm80_attn_fused.py), same rounding points.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: the most rows (tokens of the
+    # padded step) a layer call may have to take the fused path.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
+    ),
+    # DeepSeek-V4.1 on sm_80: the routed experts of the decoder layers run MoE
+    # calls of 65..2048 rows in prefill steps on the tensor cores
+    # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
+    # size 4, with every routed matrix of a layer at bits_x2 6 or 4, codebook 2,
+    # and 16-byte-aligned trellis bases; with a parallel drafter (DFlash,
+    # DSpark) a step counts as a prefill step only when some request has more
+    # than 1 + 2k tokens, its decode pass's widest query
+    # (vllm/sm80/kernels/exl3/quant.py _prefill_v2_decode_len). Other calls
+    # and every call of a decode step keep their kernels. Results differ from
+    # moe_out in the last bits. Default OFF: unset, prefill calls take moe_out.
+    # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
+    ),
+    # Complete decode/verify attention preparation, stable index selection,
+    # and ordered-value output epilogue. Independent of the qualified seed.
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "0"))
+    ),
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", "48")
+    ),
+    # DeepSeek-V4.1 on sm_80, the attention pipeline's exact index selection:
+    # a call of at most 48 rows as one Triton launch (one program per
+    # 8192-column part of a row, the last part to finish merging the parts'
+    # candidates) in place of fifteen, with the same output bytes. Default
+    # OFF. Read in vllm/models/deepseek_v41/nvidia/ops/sm80_index_topk.py.
+    "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
+    ),
+    # The DSpark drafter's greedy Markov sampling (DeepSeek-V4.1 on sm_80):
+    # each TP rank takes the argmax of its own vocabulary shard of the draft
+    # logits (base logits + Markov bias), and the ranks exchange one
+    # (value, index) pair per 4096-column chunk through a 16-byte all-reduce
+    # slot, instead of all-gathering the full-vocabulary base logits once per
+    # draft step. Precision: none changes. The logits are the same values the
+    # gathered path builds (the same head and the same addition on this
+    # rank's columns), and the pick is torch.argmax's over the gathered row,
+    # ties and NaN included: the first index of the largest value, the first
+    # NaN when any is NaN, -0.0 equal to +0.0. Greedy drafts only (no
+    # probabilistic drafting, draft top-k or acceptance estimator). Default
+    # OFF: unset, the full-vocabulary all-gather and torch.argmax run. Read in
+    # vllm/sm80/spec_decode/shard_argmax.py.
+    "VLLM_DSPARK_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_ARGMAX", "0"))
+    ),
+    # Greedy target sampling without the all-gather of the target logits: when
+    # every request of a step is greedy (temperature 0)
+    # and nothing reads the logits beyond their argmax (no logprobs, logits
+    # processing, grammar bitmask, NaN count, sampling mask or watermarking),
+    # each TP rank takes the argmax of its own vocabulary shard of the target
+    # logits, the ranks exchange one (value, index) pair per 4096-column chunk
+    # through the DSpark drafter's 16-byte all-reduce slots, and the samplers
+    # get rows holding 0.0 at that token and -inf elsewhere. Precision: none
+    # changes. The token is torch.argmax's over the gathered row, ties and NaN
+    # included (the first index of the largest value, the first NaN, -0.0
+    # equal to +0.0), so the sampled and accepted tokens are the gathered
+    # path's whenever its rows hold no NaN. Every other step takes the gather.
+    # Set, it selects the fork GPU worker (vllm/sm80/worker/graph_mem_worker.py,
+    # V2 runner; another worker or runner is refused at boot) and warms the
+    # kernels in the dummy sampler run. Default OFF: unset, the full-vocabulary
+    # all-gather always runs. Read in vllm/sm80/worker/target_argmax.py and
+    # vllm/models/deepseek_v41/nvidia/sm80_model.py.
+    "VLLM_SM80_TARGET_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_SM80_TARGET_SHARD_ARGMAX", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
@@ -826,23 +1229,221 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_HOSTFN_READ": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_HOSTFN_READ", "0"))
     ),
+    # Start Engram lookups, row gathers and WKV projections before decoder
+    # layers on the registered auxiliary stream. Its EXL3 scratch is disjoint
+    # from the main stream and ordered before shared-expert GEMMs. TP only;
+    # no sequence parallelism, batched Engram projection or microbatching.
+    "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER", "0"))
+    ),
+    # Every TP rank holds every rank's Engram wkv shard (gathered once after
+    # loading; the layer's own shard is a view of it) and projects steps of
+    # more rows than any decode step or CUDA graph capture from all shards,
+    # without the all-gather of the output: the same GEMM per shard, the
+    # gathered bytes. Smaller steps keep the sharded GEMM and the all-gather.
+    # Costs the other shards' bytes on every card. TP only; no sequence
+    # parallelism or batched Engram projection
+    # (vllm/models/deepseek_v41/nvidia/sm80_engram_wkv.py). Default OFF.
+    "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the sliding-window metadata of every SWA KV
+    # cache group of a step (one group per layer) in one Triton launch
+    # instead of three to five launches per group, the same bytes in the same
+    # builder buffers (vllm/models/deepseek_v41/nvidia/sm80_swa_meta_batch.py).
+    # Eager step preparation only; captures and other shapes build per group.
+    # Default OFF. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_SWA_META_BATCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SWA_META_BATCH", "0"))
+    ),
+    # Where the sm_80 Engram storage keeps the E4M3 values of its owned table
+    # rows (vllm/models/deepseek_v41/nvidia/sm80_engram.py): "ssd" reads them
+    # on demand from the base-checkpoint shards through a bounded host row
+    # cache; "ram" reads them whole at startup, past the page cache, into
+    # host memory of their exact size (~45.8 GiB per rank of DeepSeek V4.1
+    # Flash at TP4) and refuses to start when the host or a cgroup memory
+    # limit cannot hold them. Scales are resident host memory either way.
+    "VLLM_ENGRAM_PLACEMENT": lambda: _env_with_choices(
+        "VLLM_ENGRAM_PLACEMENT", "ssd", ["ssd", "ram"]
+    )(),
+    # Host row cache of the sm_80 Engram SSD placement, in GiB per rank,
+    # split evenly over the Engram tables; includes its tags. 0 disables the
+    # cache (every row is read from the file). Unused by "ram".
+    "VLLM_ENGRAM_ROW_CACHE_GIB": lambda: float(
+        os.getenv("VLLM_ENGRAM_ROW_CACHE_GIB", "1")
+    ),
+    # Fill the host row cache of the sm_80 Engram SSD placement at startup:
+    # one sequential pass over each rank's value extent per table, read past
+    # the page cache, stores rows in empty cache ways only and stops once
+    # every way holds a row (vllm/models/deepseek_v41/nvidia/sm80_engram.py).
+    # Startup reads up to the whole extent (~24.6 GB per table and rank of
+    # DeepSeek V4.1 Flash at TP4); the fetch counters do not count the
+    # stored rows. Unused by "ram" and by a zero cache. Off by default.
+    "VLLM_ENGRAM_ROW_CACHE_PRELOAD": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_ROW_CACHE_PRELOAD", "0"))
+    ),
+    # Read the rows the sm_80 Engram row cache misses with O_DIRECT through
+    # aligned 4 KiB spans instead of buffered 256 B reads, so the misses
+    # leave no pages in the page cache (about 4 KiB of page cache per missed
+    # row otherwise). A file system that refuses O_DIRECT is refused at
+    # startup; there is no buffered fallback. Unused by "ram". Off by
+    # default.
+    "VLLM_ENGRAM_DIRECT_READ": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_DIRECT_READ", "0"))
+    ),
+    # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
+    # hits and misses, page-cache and storage bytes, host read and wait
+    # time) every N steps, and at close and exit
+    # (vllm/models/deepseek_v41/nvidia/sm80_engram.py). The counters are
+    # kept either way. Default 0: never logged.
+    "VLLM_ENGRAM_TELEMETRY_STEPS": lambda: int(
+        os.getenv("VLLM_ENGRAM_TELEMETRY_STEPS", "0")
+    ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu) for calls
-    # of at most 64 rows when every local expert matrix is bits_x2 10 /
-    # codebook 2 with hidden 2560, intermediate 640, top-10 and 256 of 512
-    # experts local, on sm_80 (vllm/sm80/kernels/exl3/quant.py). Results
-    # differ from the default kernels in the last bits. Default OFF: unset,
-    # every call takes moe_out.
+    # of at most 64 rows of the layers ops.MOE_V2_CONFIGS lists (hidden 2560,
+    # intermediate 640, top-10, 256 of 512 experts local, bits_x2 10; hidden
+    # 5120, intermediate 2304, top-6, 96 of 384 experts local, bits_x2 6 or 4),
+    # every local expert matrix of a layer with one bits_x2 and codebook 2, on
+    # sm_80 (vllm/sm80/kernels/exl3/quant.py). Results differ from the default
+    # kernels in the last bits. Default OFF: unset, every call takes moe_out.
     "VLLM_EXL3_MOE_V2": lambda: bool(int(os.getenv("VLLM_EXL3_MOE_V2", "0"))),
+    # With VLLM_EXL3_MOE_V2: its calls take moe_out_v2_fold, which runs the
+    # activation at the end of the gate/up launch and the combine at the end
+    # of the down launch (completion counters; csrc/exl3/moe_v2.cu FoldArgs):
+    # three launches per call instead of five, the same output bits. Needs an
+    # EXL3 extension built from this tree. Default OFF. Read in
+    # vllm/sm80/kernels/exl3/quant.py.
+    "VLLM_EXL3_MOE_V2_FOLD": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_V2_FOLD", "0"))
+    ),
+    # EXL3 routed experts on the tensor cores (csrc/exl3/moe_v2.cu,
+    # DraftTiling) for calls of at most 64 rows of the configuration
+    # ops.MOE_V2_DRAFT_CONFIGS names: the DSpark drafter's experts of
+    # DeepSeek-V4.1-Flash (hidden 5120, intermediate 2304, top-3, 32 of 128
+    # experts local, every local expert matrix bits_x2 8 with codebook 2), on
+    # sm_80; independent of VLLM_EXL3_MOE_V2, which keeps the other
+    # configurations, and never folded (VLLM_EXL3_MOE_V2_FOLD does not apply).
+    # The drafter's experts split across tensor-parallel ranks (intermediate
+    # 640 or 512, all 128 local) keep moe_out with the flag on. Results
+    # differ from moe_out in the last bits. Needs an EXL3 extension
+    # built from this tree. Default OFF: unset, those calls take moe_out. Read
+    # in vllm/sm80/kernels/exl3/quant.py.
+    "VLLM_EXL3_MOE_V2_DRAFT": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_V2_DRAFT", "0"))
+    ),
+    # Diagnostic for VLLM_EXL3_MOE_V2_DRAFT: 0 (off), 8 or 16. Every drafter
+    # row tile takes at least the lane kernel of a tile of that many rows
+    # (moe_v2.cu DraftLanes; by default a tile of 1..4 rows sums the low part
+    # of its activations outside the MMA, a larger one inside), so a row's
+    # result does not depend on how many rows of the call share its expert.
+    # Set once per process (before the warm-up and graph capture). Default 0.
+    "VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS": lambda: int(
+        os.getenv("VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS", "0")
+    ),
+    # With VLLM_EXL3_MOE_V2: the moe_out_v2 calls of the whole-expert layers
+    # of ops.MOE_V2_TRY_CONFIG (hidden 5120, intermediate 2304, top-6, 96 of
+    # 384 experts local, bits_x2 6 or 4, 1..64 rows) take moe_out_v2_try
+    # (csrc/exl3/moe_v2_try.cu) in place of moe_out_v2 or moe_out_v2_fold:
+    # the lane GEMMs' trellis words through a per-warp cp.async shared ring,
+    # the same arguments, workspace contract and output bits. Needs an EXL3
+    # extension built from this tree. Default OFF. Read in
+    # vllm/sm80/kernels/exl3/ops.py (moe_v2_try_open).
+    "VLLM_EXL3_MOE_V2_RING": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_V2_RING", "0"))
+    ),
     # EXL3 routed experts on the tensor cores (csrc/exl3/moe_prefill.cu) for
     # calls of 65..3460 rows in prefill steps (some request scheduled more
-    # than 1 + num_speculative_tokens tokens), with the configuration
-    # VLLM_EXL3_MOE_V2 covers and 16-byte-aligned expert trellis bases
+    # than 1 + num_speculative_tokens tokens), with the hidden-2560
+    # configuration VLLM_EXL3_MOE_V2 covers (ops.MOE_PREFILL_CONFIGS) and
+    # 16-byte-aligned expert trellis bases
     # (vllm/sm80/kernels/exl3/quant.py). Other calls
     # and every call of a decode step keep their kernels. Results
     # differ from moe_out in the last bits. Default OFF: unset, prefill calls
     # take moe_out.
     "VLLM_EXL3_MOE_PREFILL_TC": lambda: bool(
         int(os.getenv("VLLM_EXL3_MOE_PREFILL_TC", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: moe_out_prefill_v2's calls of the
+    # whole-expert configuration (hidden 5120, intermediate 2304, top-6, 96
+    # of 384 experts local, bits_x2 6 or 4, 65..2048 rows) run
+    # moe_out_prefill_try (csrc/exl3/moe_prefill_try.cu) as one launch
+    # sequence per call instead of one per 512-row chunk, so each touched
+    # expert is decoded once per call; the same arithmetic, bitwise equal.
+    # Needs an EXL3 extension built from this tree. Default OFF. Read once
+    # at import in vllm/sm80/kernels/exl3/ops.py.
+    "VLLM_EXL3_MOE_PREFILL_UNCHUNKED": lambda: bool(
+        int(os.getenv("VLLM_EXL3_MOE_PREFILL_UNCHUNKED", "0"))
+    ),
+    # EXL3 routed experts: the trellis, suh and svh of a MoE layer's local
+    # expert matrices are views into one device buffer per tensor kind
+    # (vllm/sm80/kernels/exl3/quant.py expert_buffer_views) instead of one
+    # allocation each, which leaves no allocator holes between them. Same
+    # bytes and the same kernels. Default OFF: one allocation per tensor.
+    "VLLM_EXL3_EXPERTS_CONTIGUOUS": lambda: bool(
+        int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
+    ),
+    # SHA-pinned boot-time whole-expert EP permutation; empty is disabled.
+    "VLLM_EXL3_EXPERT_PLACEMENT": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_PLACEMENT", ""
+    ),
+    "VLLM_EXL3_EXPERT_PLACEMENT_SHA256": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", ""
+    ),
+    # SHA-pinned replicated hot routed experts under whole-expert EP
+    # (vllm/sm80/kernels/exl3/replicas.py); empty is disabled.
+    "VLLM_EXL3_EXPERT_REPLICAS": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_REPLICAS", ""
+    ),
+    "VLLM_EXL3_EXPERT_REPLICAS_SHA256": lambda: os.getenv(
+        "VLLM_EXL3_EXPERT_REPLICAS_SHA256", ""
+    ),
+
+    # EXL3 routed experts: moe_out runs MoE calls of more than this many rows
+    # in row chunks of at most this many, so its workspace is sized for one
+    # chunk (vllm/sm80/kernels/exl3/quant.py). moe_out computes every row from
+    # its own input, so the output bits do not change. Default 0: whole calls.
+    "VLLM_EXL3_MOE_CHUNK_ROWS": lambda: int(
+        os.getenv("VLLM_EXL3_MOE_CHUNK_ROWS", "0")
+    ),
+    # Diagnostic: a directory to which selected served kernel calls (inputs
+    # and outputs) are saved (vllm/sm80/capture.py). Saving waits for the
+    # stream: diagnostic boots only. Default empty: nothing is captured and
+    # nothing is patched.
+    "VLLM_SM80_CAPTURE_DIR": lambda: os.getenv("VLLM_SM80_CAPTURE_DIR", ""),
+    # Comma-separated capture families: dense, moe, attn, mhc.
+    "VLLM_SM80_CAPTURE_FAMILIES": lambda: os.getenv(
+        "VLLM_SM80_CAPTURE_FAMILIES", "dense,moe,attn"
+    ),
+    # Regex searched in a call's prefix (checkpoint prefix for dense
+    # matrices, module prefix otherwise): the calls captured outside prefill
+    # steps. Default empty: every prefix.
+    "VLLM_SM80_CAPTURE_MATCH": lambda: os.getenv("VLLM_SM80_CAPTURE_MATCH", ""),
+    # Comma-separated row counts of the CUDA graphs whose calls are captured.
+    "VLLM_SM80_CAPTURE_ROWS": lambda: os.getenv("VLLM_SM80_CAPTURE_ROWS", ""),
+    # Files per (family, prefix, rows, phase, graph owner).
+    "VLLM_SM80_CAPTURE_PER_KEY": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_PER_KEY", "2")
+    ),
+    # Regex of the prefixes captured in prefill steps (default: the MATCH one).
+    "VLLM_SM80_CAPTURE_PREFILL_MATCH": lambda: os.getenv(
+        "VLLM_SM80_CAPTURE_PREFILL_MATCH", ""
+    ),
+    # Comma-separated ordinals, per family and prefix from 1, of the prefill
+    # step calls (of at least _PREFILL_MIN_ROWS rows) that are saved.
+    "VLLM_SM80_CAPTURE_PREFILL_CALLS": lambda: os.getenv(
+        "VLLM_SM80_CAPTURE_PREFILL_CALLS", "1"
+    ),
+    # Positive: first N eligible prefill attempts per semantic key, including
+    # point and short/long context. Quota refusals count. Zero keeps ordinals.
+    "VLLM_SM80_CAPTURE_PREFILL_PER_KEY": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "0")
+    ),
+    "VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "65")
+    ),
+    # Most MiB of tensors one process saves; later calls are only indexed.
+    "VLLM_SM80_CAPTURE_MAX_MB": lambda: int(
+        os.getenv("VLLM_SM80_CAPTURE_MAX_MB", "4096")
     ),
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
@@ -852,6 +1453,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN4_MTP_PER_STREAM_NORM": lambda: bool(
         int(os.getenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", "0"))
     ),
+    # Development server only: the name of one switch in
+    # vllm/sm80/dev_ab.py SWITCHES. Both of its arms are captured at boot and
+    # POST /collective_rpc set_ab_arm (VLLM_SERVER_DEV_MODE=1) changes the arm
+    # between requests. Costs graph memory and boot time; not for serving.
+    # Unset by default.
+    "VLLM_DEV_AB_SWITCH": lambda: os.getenv("VLLM_DEV_AB_SWITCH", ""),
 }
 
 
@@ -861,6 +1468,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
 # warn_retired_env_vars() and its call below in the next release.
 RETIRED_ENV_VARS: dict[str, str] = {
     # Renamed: shared code is named after the feature, not the model.
+    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": (
+        "renamed to VLLM_DSPARK_SHARD_ARGMAX (read by the shared DSpark "
+        "drafting code)"
+    ),
+    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": (
+        "renamed to VLLM_SM80_TARGET_SHARD_ARGMAX (read by the shared "
+        "sm_80 worker)"
+    ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": (
         "renamed to VLLM_MOE_MASK_PADDING_MAX_TOKENS, which is now also the MoE "
         "padding mask cutoff whether or not VLLM_AMPERE_DECODE_KERNELS is on"
@@ -1022,6 +1637,10 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_EXL3": (
         "removed; an EXL3 checkpoint always loads with the EXL3 method"
+    ),
+    "VLLM_ENGRAM_NATIVE_READ": (
+        "removed; the sm_80 Engram rows are always fetched by one native host "
+        "function (csrc/exl3/engram_fetch.cpp)"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

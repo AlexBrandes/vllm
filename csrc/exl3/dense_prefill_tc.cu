@@ -173,9 +173,6 @@ __device__ __forceinline__ uint32_t rest_part(uint32_t w, uint32_t wh) {
   return *reinterpret_cast<const uint32_t*>(&r);
 }
 
-__device__ __forceinline__ void store_output(__nv_bfloat16* out, float value) {
-  *out = __float2bfloat16_rn(value);
-}
 
 // kSplit = false: whole tile (blockIdx.y, blockIdx.x). kSplit = true: block blockIdx.x's stream-K share.
 template <int kBitsX2, int kCodebook, typename Out, bool kSplit>
@@ -574,7 +571,7 @@ void linear_out_prefill(const torch::Tensor& x, const torch::Tensor& trellis, co
   check_tensor(trellis, x, at::kShort, "trellis");
   check_tensor(suh, x, at::kHalf, "suh");
   check_tensor(svh, x, at::kHalf, "svh");
-  check_tensor(out, x, at::kBFloat16, "out");
+  check_linear_out(out, x);
   check_tensor(workspace, x, at::kFloat, "workspace");
   TORCH_CHECK(x.dim() == 2 && trellis.dim() == 3 && suh.dim() == 1 &&
                   svh.dim() == 1 && out.dim() == 2,
@@ -605,15 +602,16 @@ void linear_out_prefill(const torch::Tensor& x, const torch::Tensor& trellis, co
   const c10::cuda::CUDAGuard guard(x.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
   // The planner places stream-K partials and counters only inside linear_out's workspace bound.
-  dense_prefill_tc::prefill_linear<__nv_bfloat16>(
-      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const half*>(suh.data_ptr<at::Half>()),
-      reinterpret_cast<const half*>(svh.data_ptr<at::Half>()),
-      reinterpret_cast<const uint16_t*>(trellis.data_ptr<int16_t>()),
-      format_key(static_cast<int>(bits_x2), static_cast<int>(codebook)), rows, logical_in, padded_in,
-      logical_out, padded_out, workspace.data_ptr<float>(), needed,
-      at::cuda::getCurrentDeviceProperties()->multiProcessorCount,
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), stream);
+  with_linear_out(out, [&](auto* out_ptr) {
+    dense_prefill_tc::prefill_linear(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const half*>(suh.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(svh.data_ptr<at::Half>()),
+        reinterpret_cast<const uint16_t*>(trellis.data_ptr<int16_t>()),
+        format_key(static_cast<int>(bits_x2), static_cast<int>(codebook)), rows, logical_in,
+        padded_in, logical_out, padded_out, workspace.data_ptr<float>(), needed,
+        at::cuda::getCurrentDeviceProperties()->multiProcessorCount, out_ptr, stream);
+  });
 }
 
 }  // namespace exl3

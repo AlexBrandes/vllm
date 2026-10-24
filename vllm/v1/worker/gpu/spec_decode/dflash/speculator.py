@@ -11,6 +11,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.sm80.spec_decode.zero_draft import draft_context_only
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -163,13 +164,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         if width not in self._draft_token_views:
             width = self.max_width
         self.width = width
+        self.num_query_per_req += width - self.num_speculative_steps
         self.num_speculative_steps = width
-        self.num_query_per_req = 1 + width
         self.draft_tokens = self._draft_token_views[width]
         self.sample_col = self._sample_cols[width]
         if width in self._cg_managers:
             self.query_cudagraph_manager = self._cg_managers[width]
-        self._set_model_block_size(1 + width)
+        self._set_model_block_size(self.num_query_per_req)
         self._on_width(width)
 
     def _set_model_block_size(self, block_size: int) -> None:
@@ -229,7 +230,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.vllm_config,
                 self.device,
                 cudagraph_mode,
-                decode_query_len=1 + width,
+                decode_query_len=self.num_query_per_req + width - self.width,
             )
         self.set_width(self.max_width)
 
@@ -624,6 +625,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
                 num_reqs,
             )
+        if draft_context_only(self, num_speculative_tokens, num_target_tokens):
+            return self.draft_tokens[:num_reqs]
 
         if num_speculative_tokens == 0:
             # No drafts are needed: store the context K/V to keep the drafter in

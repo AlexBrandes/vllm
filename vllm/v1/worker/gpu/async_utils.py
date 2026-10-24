@@ -11,6 +11,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.sm80.distributed.step_errors import install_output_checks
 from vllm.sm80.failed_inputs import failed_request_ids
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -305,3 +306,6 @@ def stream(to_stream: torch.cuda.Stream, from_stream: torch.cuda.Stream):
         yield
     finally:
         torch.cuda.set_stream(from_stream)
+
+
+install_output_checks(AsyncOutput, AsyncPoolingOutput)

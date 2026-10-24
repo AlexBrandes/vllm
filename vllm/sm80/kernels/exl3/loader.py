@@ -20,10 +20,7 @@ from vllm.sm80.kernels.exl3.quant import (
     Exl3LinearMethod,
     Exl3MoEMethod,
 )
-from vllm.sm80.kernels.exl3.utils import (
-    PLE_AUXILIARIES,
-    Exl3LoadLedger,
-)
+from vllm.sm80.kernels.exl3.utils import Exl3LoadLedger
 from vllm.tracing import instrument
 
 logger = init_logger(__name__)
@@ -53,7 +50,7 @@ class Exl3ModelLoader(DefaultModelLoader):
 
             offload = vllm_config.offload_config
             if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
-                raise ValueError("EXL3 permits runtime offload only for compressed PLE")
+                raise ValueError("EXL3 does not support runtime weight offload")
             if vllm_config.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError("EXL3 requires pipeline parallel size one")
             if vllm_config.lora_config is not None:
@@ -69,6 +66,13 @@ class Exl3ModelLoader(DefaultModelLoader):
         self.counter_before_loading_weights = time.perf_counter()
         load_exl3_weights(model, model_config)
         self.counter_after_loading_weights = time.perf_counter()
+
+
+def require_cuda_parameters(model: nn.Module) -> None:
+    """Refuse a loaded EXL3 model with a parameter off the GPU."""
+    for name, parameter in model.named_parameters():
+        if not parameter.is_cuda:
+            raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
 
 
 def manifest_still_needed(vllm_config, is_draft: bool) -> bool:
@@ -93,24 +97,6 @@ def release_manifests(model: torch.nn.Module, quant: Exl3Config) -> None:
         owner.release_manifest()
 
 
-def _setup_ple_file(module, path: str, key: str) -> set[str]:
-    """Join a file-backed manifest entry to a Qwen4ExpNGramEmbedding and
-    consume its small auxiliaries. Reads the module's ngram_embedding,
-    ngram_heads_offsets, ngram_heads_vocab_sizes and layer_multipliers
-    (pinned in tests/sm80/seams.yaml)."""
-    from vllm.models.qwen4_exp.nvidia.exl3_ple import Exl3PLEEmbedding
-
-    if not isinstance(module.ngram_embedding, Exl3PLEEmbedding):
-        raise TypeError("File-backed PLE setup requires EXL3 quantization")
-    return module.ngram_embedding.setup_file(
-        path,
-        key,
-        module.ngram_heads_offsets,
-        module.ngram_heads_vocab_sizes,
-        module.layer_multipliers,
-    )
-
-
 def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     from vllm.sm80.kernels.exl3.ops import ensure_extension
 
@@ -125,46 +111,15 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     if config.parallel_config.pipeline_parallel_size != 1:
         raise ValueError("EXL3 loading currently requires pipeline parallel size one")
     ledger = Exl3LoadLedger(manifest)
-    is_draft = model_config.hf_config.model_type == "qwen4_exp_mtp"
+    layout = quant.layout
+    is_draft = layout.is_draft(model_config)
     loaded = set()
-    file_backed_parameters = set()
     modules = dict(model.named_modules())
-    shared: set[str] = set()
-    if is_draft and quant.mtp_shares_target_embeddings(model_config.hf_text_config):
-        # The draft reuses the target's embedding and head: no draft owner.
-        shared = {
-            name
-            for name in manifest.tensors
-            if name.startswith(("lm_head.", "model.language_model.embed_tokens."))
-        }
-    for name in manifest.tensors:
-        if name in ledger.entries:
-            continue
-        if name in shared:
-            ledger.mark(name, "unused", "shared target embedding/head owner")
-        elif name.startswith("mtp.") and not is_draft:
-            ledger.mark(name, "unused", "native MTP model owner")
-        elif is_draft and not name.startswith("mtp."):
-            if name.startswith(("lm_head.", "model.language_model.embed_tokens.")):
-                continue
-            ledger.mark(name, "unused", "target model owner")
-
-    from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
-
-    for name, module in modules.items():
-        if not isinstance(module, Qwen4ExpNGramEmbedding):
-            continue
-        source = quant.source_prefix(f"{name}.ngram_embedding")
-        table = manifest.ple_tables.get(source)
-        if table is None:
-            raise ValueError(f"Missing EXL3 PLE source for module: {name}")
-        expected = {table.name} | {f"{source}.{suffix}" for suffix in PLE_AUXILIARIES}
-        consumed = _setup_ple_file(module, str(table.path), table.name)
-        if consumed != expected:
-            raise ValueError(f"Incomplete or unexpected EXL3 PLE source join: {source}")
-        for key in sorted(consumed):
-            ledger.mark(key, "file-backed" if key == table.name else "consumed", name)
-        file_backed_parameters.add(f"{name}.ngram_embedding.weight")
+    # The model family's layout marks the tensors another model owns as unused
+    # and joins file-backed sources, whose parameters need no tensor here.
+    file_backed_parameters = layout.assign_owners(
+        model, quant, ledger, model_config, is_draft
+    )
 
     with ExitStack() as stack:
         files = {
@@ -177,6 +132,8 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             method = getattr(module, "quant_method", None)
             if isinstance(method, Exl3LinearMethod):
                 bias_offset = 0
+                for key in method.nonlocal_keys:
+                    ledger.mark(key, "unused", "group assigned to another TP rank")
                 for weight in module.exl3_weights:
                     weight.load(files, ledger)
                     bias_key = f"{weight.matrix.prefix}.bias"
@@ -242,15 +199,18 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     }
     if missing:
         raise ValueError(f"Unloaded EXL3 runtime parameters: {sorted(missing)[:16]}")
-    for name, parameter in model.named_parameters():
-        if not parameter.is_cuda:
-            raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
+    require_cuda_parameters(model)
+    from vllm.sm80 import capture
+
+    if capture.active and "hybrid" in capture.config().families:
+        from vllm.models.deepseek_v41.nvidia.hybrid_capture import register_model
+
+        register_model(model)
     counts = Counter(disposition for disposition, _ in ledger.entries.values())
     logger.info(
-        "EXL3 packed format, BF16 activations; %s model; PLE placement=%s; "
+        "EXL3 packed format, BF16 activations; %s model; "
         "TP rank=%d/%d, EP=%s; sources: %d consumed, %d file-backed, %d unused",
         "draft" if is_draft else "target",
-        quant.ple_placement,
         get_tensor_model_parallel_rank(),
         config.parallel_config.tensor_parallel_size,
         config.parallel_config.enable_expert_parallel,

@@ -7,6 +7,7 @@ import struct
 
 import pytest
 
+from vllm.models.qwen4_exp.nvidia.exl3_layout import Qwen4ExpExl3Layout
 from vllm.sm80.kernels.exl3.utils import (
     Exl3LoadLedger,
     Exl3Manifest,
@@ -134,7 +135,7 @@ def test_tp_preserves_full_blocks_and_replicated_padding():
 def test_qwen_manifest_requires_both_auxiliary_files(tmp_path):
     _write(tmp_path / "model.safetensors", _matrix())
     with pytest.raises(ValueError, match="ngram_embedding.safetensors"):
-        Exl3Manifest(tmp_path, require_qwen_aux=True)
+        Qwen4ExpExl3Layout().check_manifest(Exl3Manifest(tmp_path))
 
 
 def test_vision_fused_fallback_has_explicit_unused_ownership(tmp_path):

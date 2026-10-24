@@ -108,6 +108,63 @@ def test_rejects_image_placeholder_in_reasoning():
         )
 
 
+def tool_call(name):
+    return {
+        "id": name,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
+
+
+def test_drop_thinking_keeps_current_turn_across_tool_results():
+    # A user message holding only tool results does not start a new turn.
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "reasoning_content": "r2",
+            "tool_calls": [tool_call("c1")],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "value"},
+    ]
+    prompt = render(messages)
+    assert "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>" in prompt
+    assert "r1" not in prompt
+    assert "<think>r2</think>" in prompt
+    assert prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
+
+    next_turn = render(messages + [{"role": "user", "content": "q3"}])
+    assert "r2" not in next_turn
+    assert next_turn.endswith("q3<｜Assistant｜><think>")
+
+
+def test_tool_loop_keeps_every_round_of_the_current_turn():
+    def round_(n):
+        return [
+            {
+                "role": "assistant",
+                "reasoning_content": f"r{n}",
+                "tool_calls": [tool_call(f"c{n}")],
+            },
+            {"role": "tool", "tool_call_id": f"c{n}", "content": f"v{n}"},
+        ]
+
+    messages = [{"role": "user", "content": "q"}, *round_(1), *round_(2)]
+    prompt = render(messages)
+    assert "<｜User｜>q<｜Assistant｜><think>r1</think>" in prompt
+    assert "<tool_result>v1</tool_result><｜Assistant｜><think>r2</think>" in prompt
+    assert prompt.endswith("<tool_result>v2</tool_result><｜Assistant｜><think>")
+    # Declared tools turn drop_thinking off; the turns render the same.
+    schema = {"type": "object", "properties": {}}
+    tools = [
+        {"type": "function", "function": {"name": f"c{n}", "parameters": schema}}
+        for n in (1, 2)
+    ]
+    assert render(messages, tools=tools).endswith(prompt[prompt.index("<｜User｜>q") :])
+
+
 @pytest.mark.parametrize(
     ("effort", "budget"),
     [

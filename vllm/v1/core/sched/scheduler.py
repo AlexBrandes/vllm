@@ -503,6 +503,15 @@ class Scheduler(SchedulerInterface):
         self.fair_prefill = self.scheduler_config.enable_chunked_prefill and bool(
             self.prefill_chunk_with_decodes or self.max_num_partial_prefills
         )
+        # VLLM_FAIR_PREFILL_SHORT_BYPASS (default off): a prompt whose whole
+        # remaining prefill fits in `prefill_chunk_with_decodes` is scheduled
+        # in one step, outside the capped prefill budget and the split. Off ->
+        # `_short_prefill_bypass` is always False and nothing changes.
+        self.fair_prefill_short_bypass = (
+            self.fair_prefill
+            and self.prefill_chunk_with_decodes > 0
+            and envs.VLLM_FAIR_PREFILL_SHORT_BYPASS
+        )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -538,6 +547,25 @@ class Scheduler(SchedulerInterface):
         self.mamba_shared_prefix_checkpoint = (
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
+        )
+        # The align-mode state grid is the Mamba group's own block size: the
+        # worker writes a chunk's end state into Mamba column
+        # (end - 1) // MambaSpec.block_size. `cache_config.block_size` is the
+        # minimum over prefix-cacheable groups and can be finer (a drafter
+        # group with a smaller block); splitting on it lets a chunk run past a
+        # Mamba boundary, and the block left behind is then hashed as that
+        # boundary's state.
+        mamba_state_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        assert len(mamba_state_block_sizes) <= 1, (
+            "Mamba align scheduling needs a single Mamba state block size, "
+            f"got {sorted(mamba_state_block_sizes)}"
+        )
+        self.mamba_state_block_size = (
+            next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -643,7 +671,12 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        # Chunk ends are where the worker writes Mamba states, so the stops
+        # follow the Mamba group's grid, not the minimum over all groups.
+        block_size = (
+            getattr(self, "mamba_state_block_size", None)
+            or self.cache_config.block_size
+        )
         drop_eagle_block = getattr(
             self, "mamba_eagle_block_drop", self.use_eagle_block_drop
         )
@@ -795,7 +828,8 @@ class Scheduler(SchedulerInterface):
         * ``per_request`` splits ``total`` evenly between up to
           ``max_num_partial_prefills`` prefill-phase requests (running chunks
           plus the waiting requests that could be admitted this step), so
-          several prompts advance together instead of one at a time.
+          several prompts advance together instead of one at a time. Prompts
+          `_short_prefill_bypass` exempts are not counted.
         """
         total = self.max_num_scheduled_tokens
         if self.prefill_chunk_with_decodes > 0 and any(
@@ -805,7 +839,14 @@ class Scheduler(SchedulerInterface):
 
         per_request = total
         if self.max_num_partial_prefills > 0:
-            num_running_prefills = sum(1 for r in self.running if r.is_prefill_chunk)
+            # Short prompts the bypass exempts do not draw on `total`, so they
+            # take no share of it.
+            num_running_prefills = sum(
+                1
+                for r in self.running
+                if r.is_prefill_chunk
+                and not self._short_prefill_bypass(r.num_tokens - r.num_computed_tokens)
+            )
             free_slots = max(
                 0,
                 self.max_num_active_reqs
@@ -817,6 +858,14 @@ class Scheduler(SchedulerInterface):
                 if self._pause_state == PauseState.UNPAUSED
                 else 0
             )
+            if self.fair_prefill_short_bypass and num_waiting:
+                # Before the prefix-cache lookup: a hit only shortens a prompt,
+                # so this can count a prompt that ends up short, never the
+                # other way round.
+                num_waiting = sum(
+                    not self._short_prefill_bypass(r.num_tokens - r.num_computed_tokens)
+                    for r in itertools.islice(self.waiting, num_waiting)
+                )
             num_prefills = min(
                 self.max_num_partial_prefills, num_running_prefills + num_waiting
             )
@@ -828,6 +877,19 @@ class Scheduler(SchedulerInterface):
         # any sane setting (the lookahead is a handful of tokens).
         floor = self.num_prefill_lookahead + 1
         return max(total, floor), max(per_request, floor)
+
+    def _short_prefill_bypass(self, num_remaining: int) -> bool:
+        """Whether a prefill with ``num_remaining`` tokens left is neither
+        capped nor charged to the prefill budget, so a long prompt beside a
+        short burst keeps its full share. Read per call (not folded into the
+        init flag) so align-mode Mamba, whose chunk sizing derives from the
+        prefill limit, is always excluded.
+        """
+        return (
+            self.fair_prefill_short_bypass
+            and not self.need_mamba_block_aligned_split
+            and num_remaining <= self.prefill_chunk_with_decodes
+        )
 
     def _select_adaptive_k(self) -> tuple[int, int]:
         """Pick this step's verification width and the next drafting width.
@@ -957,7 +1019,7 @@ class Scheduler(SchedulerInterface):
         prefill_chunk_cap = token_budget
         if self.fair_prefill:
             prefill_token_budget, prefill_chunk_cap = self._fair_prefill_budget()
-        # Observability only; refunded when scheduled prefills are preempted.
+        # Prefill charges, refunded when scheduled prefills are preempted.
         num_prefill_tokens = 0
         num_prefill_reqs = 0
 
@@ -1106,7 +1168,13 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = long_prefill_token_threshold
             # Fair chunked prefill leaves decode work outside this budget.
             req_is_prefill = request.is_prefill_chunk
-            is_prefill = self.fair_prefill and req_is_prefill
+            is_prefill = (
+                self.fair_prefill
+                and req_is_prefill
+                and not self._short_prefill_bypass(
+                    request.num_tokens - request.num_computed_tokens
+                )
+            )
             prefill_chunk_limit: int | None = None
             if is_prefill:
                 prefill_chunk_limit = min(prefill_chunk_cap, prefill_token_budget)
@@ -1130,6 +1198,21 @@ class Scheduler(SchedulerInterface):
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
+                if req_is_prefill:
+                    # Decodes can occupy this budget indefinitely. Restore
+                    # other prefills' charges, not decode charges, when finding
+                    # the widest attainable chunk; temporary prefill fragments
+                    # should still wait for a whole block on the next step.
+                    prefill_chunk_limit = min(
+                        prefill_chunk_limit
+                        if prefill_chunk_limit is not None
+                        else self.max_num_scheduled_tokens,
+                        long_prefill_token_threshold or self.max_num_scheduled_tokens,
+                        token_budget + num_prefill_tokens,
+                        input_budget
+                        + num_prefill_tokens
+                        + (num_prefill_reqs - 1) * draft_slots,
+                    )
                 # Positional: tests monkeypatch this with a `*args` stub.
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens, 0, 0, prefill_chunk_limit
@@ -1227,7 +1310,13 @@ class Scheduler(SchedulerInterface):
                             token_budget += restored
                             input_budget += restored + draft_slots
                             if preempted_req.is_prefill_chunk:
-                                if self.fair_prefill:
+                                # Refund exactly what `is_prefill` charged.
+                                if self.fair_prefill and not (
+                                    self._short_prefill_bypass(
+                                        preempted_req.num_tokens
+                                        - preempted_req.num_computed_tokens
+                                    )
+                                ):
                                     prefill_token_budget += restored
                                 num_prefill_tokens -= restored
                                 num_prefill_reqs -= 1
@@ -1640,7 +1729,15 @@ class Scheduler(SchedulerInterface):
                     # already been folded into num_computed_tokens, so only the
                     # tokens actually recomputed are charged.
                     req_is_prefill = num_computed_tokens < request.num_tokens - 1
-                    is_prefill = self.fair_prefill and req_is_prefill
+                    # A short prompt the bypass exempts is neither capped nor
+                    # charged.
+                    is_prefill = (
+                        self.fair_prefill
+                        and req_is_prefill
+                        and not self._short_prefill_bypass(
+                            request.num_tokens - num_computed_tokens
+                        )
+                    )
                     if is_prefill:
                         prefill_chunk_limit = min(
                             prefill_chunk_cap, prefill_token_budget
@@ -1671,6 +1768,19 @@ class Scheduler(SchedulerInterface):
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
+                        if req_is_prefill:
+                            # As for running chunks, exclude decode occupancy
+                            # but restore earlier prefills' tokens and slots.
+                            prefill_chunk_limit = min(
+                                prefill_chunk_limit
+                                if prefill_chunk_limit is not None
+                                else self.max_num_scheduled_tokens,
+                                long_prefill_token_threshold
+                                or self.max_num_scheduled_tokens,
+                                token_budget + num_prefill_tokens,
+                                input_budget + num_prefill_tokens
+                                + (num_prefill_reqs - 1) * draft_slots,
+                            )
                         num_new_tokens = self._mamba_block_aligned_split(
                             request,
                             num_new_tokens,

@@ -18,6 +18,13 @@ where the fork needs it:
 - ``get_device_communicator_cls``: the fork communicator
   (``vllm.sm80.distributed.communicator``) while a fork all-reduce switch is
   set, else upstream's.
+- ``check_and_update_config``: upstream's, then with
+  ``VLLM_CUDAGRAPH_ESTIMATE_SPLIT=1`` or
+  ``VLLM_SM80_TARGET_SHARD_ARGMAX=1`` the fork GPU worker
+  (``vllm.sm80.worker.graph_mem_worker``) in place of upstream's.
+- ``check_and_update_config``: upstream's, then, with ``VLLM_DEV_AB_SWITCH``
+  set, the development A/B setter's worker extension
+  (``vllm.sm80.dev_ab``).
 
 ``Sm80CudaPlatform`` is chosen the way ``vllm.platforms.cuda.CudaPlatform``
 is: the NVML variant when NVML is available, else the non-NVML one.
@@ -105,6 +112,16 @@ class _Sm80CudaPlatformMixin:
         if needs_fork_communicator():
             return COMMUNICATOR_QUALNAME
         return super().get_device_communicator_cls()  # type: ignore[misc]
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config) -> None:
+        """Upstream config, optional graph-memory worker, then A/B extension."""
+        super().check_and_update_config(vllm_config)  # type: ignore[misc]
+        from vllm.sm80.worker.cudagraph_mem import select_worker
+        from vllm.sm80.dev_ab import configure
+
+        select_worker(vllm_config.parallel_config)
+        configure(vllm_config)
 
 
 class Sm80NvmlCudaPlatform(_Sm80CudaPlatformMixin, NvmlCudaPlatform):

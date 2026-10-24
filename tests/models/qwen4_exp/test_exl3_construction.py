@@ -185,7 +185,7 @@ def built(tmp_path_factory):
         assert proc.exitcode == 0
     from vllm.sm80.kernels.exl3.utils import Exl3Manifest
 
-    manifest = Exl3Manifest(CHECKPOINT, require_qwen_aux=True)
+    manifest = Exl3Manifest(CHECKPOINT)
     ranks = [json.loads((out / f"rank{r}.json").read_text()) for r in range(TP)]
     return manifest, ranks
 

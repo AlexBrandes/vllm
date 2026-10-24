@@ -1,0 +1,13 @@
+schema = "native-inputs/1"
+# Canonical per-artifact dependency contract; byte-identical launcher copy is
+# checked by tests/test_native_input_provenance.py. These are NOT exemptions:
+# ownership transfers only with the recorded native manifest, exact installed
+# bytes, pinned builder source and complete matching Git source-input objects.
+# EXL3 is built only by its standalone builder. CMakeLists.txt and setup.py do
+# not add csrc/exl3 to a wheel target; shared build-driver changes still fail
+# the wheel comparison. Do not extend to ampere_marlin: CMake also builds it.
+[[extensions]]
+artifact = "vllm/_exl3_C*.so"
+builder = "csrc/exl3/build_standalone.py"
+paths = ["csrc/exl3"]
+source_inputs = ["CMakeLists.txt", "cmake", "csrc"]

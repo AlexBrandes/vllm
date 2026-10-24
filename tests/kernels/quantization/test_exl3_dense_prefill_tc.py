@@ -28,7 +28,9 @@ inside the call); ensure_extension with the switch set at TP2 opens the gate
 and warms up once.
 """
 
+import json
 import logging
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -135,17 +137,32 @@ def test_switch_and_schedule_default_off(monkeypatch):
     assert set(tc.SCHEDULES) == {"planned", "whole"}
 
 
-def _config(tp=2, pp=1, method="mtp", parallel_drafting=False):
+def _config(
+    tp=2,
+    pp=1,
+    method="mtp",
+    parallel_drafting=False,
+    k=3,
+    max_num_seqs=16,
+    schedule=None,
+):
     speculative = (
         None
         if method is None
-        else SimpleNamespace(method=method, parallel_drafting=parallel_drafting)
+        else SimpleNamespace(
+            method=method,
+            parallel_drafting=parallel_drafting,
+            num_speculative_tokens=k,
+            num_speculative_tokens_per_batch_size=schedule,
+            adaptive_k=None,
+        )
     )
     return SimpleNamespace(
-        num_speculative_tokens=0 if method is None else 3,
+        num_speculative_tokens=0 if method is None else k,
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp, pipeline_parallel_size=pp
         ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         speculative_config=speculative,
     )
 
@@ -159,13 +176,35 @@ def test_gate_opens_only_on_the_validated_configuration():
     assert "None" in tc.closed_reason(None, None, config)
     assert "70 multiprocessors" in tc.closed_reason((8, 0), 70, config)
     assert "no vLLM config" in tc.closed_reason((8, 0), 74, None)
+    assert tc.closed_reason((8, 0), 74, _config(tp=4)) is None
     # Other layouts give other matrices and row chunks.
-    assert "(1, 1), not (2, 1)" in tc.closed_reason((8, 0), 74, _config(tp=1))
-    assert "(2, 2), not (2, 1)" in tc.closed_reason((8, 0), 74, _config(pp=2))
-    # Drafters whose decode steps schedule more than 1 + k tokens per request.
-    assert "'dflash'" in tc.closed_reason((8, 0), 74, _config(method="dflash"))
+    layouts = "not one of (2, 1), (4, 1)"
+    assert f"(1, 1), {layouts}" in tc.closed_reason((8, 0), 74, _config(tp=1))
+    assert f"(2, 2), {layouts}" in tc.closed_reason((8, 0), 74, _config(pp=2))
+    # A drafter whose decode steps schedule more than 1 + k tokens per request
+    # and can carry more than 64 rows. A block drafter (DFlash, DSpark) runs
+    # its block in a forward pass of its own: 17 requests x (1 + 3) = 68.
+    reason = tc.closed_reason((8, 0), 74, _config(method="dflash", max_num_seqs=17))
+    assert "'dflash'" in reason and "carry 68 rows" in reason
     reason = tc.closed_reason((8, 0), 74, _config(parallel_drafting=True))
     assert "parallel drafting True" in reason
+    # A block drafter whose forward passes never carry more than 64 rows: the
+    # row floor keeps them on today's kernels, so the gate opens. 8 requests
+    # x (1 + 5) = 48 rows with or without the batch-size schedule, and 8 x
+    # (1 + 7) = 64 at seven drafts.
+    dspark = dict(
+        tp=4,
+        method="dspark",
+        parallel_drafting=True,
+        k=5,
+        max_num_seqs=8,
+        schedule=[[1, 3, 5], [4, 8, 0]],
+    )
+    assert tc.closed_reason((8, 0), 74, _config(**dspark)) is None
+    assert tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None))) is None
+    assert tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=7))) is None
+    reason = tc.closed_reason((8, 0), 74, _config(**dict(dspark, schedule=None, k=8)))
+    assert "'dspark'" in reason and "carry 72 rows" in reason
 
 
 def test_only_validated_matrices_are_taken():
@@ -249,16 +288,16 @@ def test_resolution_logs_through_vllm_logger(monkeypatch, caplog):
         tc.__name__,
         "EXL3 dense prefill tensor-core path active (VLLM_EXL3_DENSE_PREFILL_TC): "
         "in prefill steps (a request with more than 4 tokens scheduled), dense "
-        "launches of more than 64 rows and at least 16 output tiles of the 9 "
-        "validated TP2 matrices (bits_x2 10/12/14, codebook 2) take "
+        "launches of more than 64 rows and at least 16 output tiles of the 28 "
+        "validated matrices (bits_x2 10/12/14, codebook 2) take "
         "linear_out_prefill, schedule planned; split-K launches, other matrices, "
         "decode steps and graph captures keep today's kernels.",
     ) in lines
     closed = sorted({m for _, _, m in lines if "gate is closed" in m})
     assert closed == [
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: (tensor, "
-        "pipeline) parallel size (1, 1), not (2, 1); every dense EXL3 launch "
-        "keeps today's kernels.",
+        "pipeline) parallel size (1, 1), not one of (2, 1), (4, 1); every dense "
+        "EXL3 launch keeps today's kernels.",
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: 70 "
         "multiprocessors, not 74; every dense EXL3 launch keeps today's kernels.",
         "VLLM_EXL3_DENSE_PREFILL_TC is set but the gate is closed: device "
@@ -331,7 +370,7 @@ def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
         return 16
 
     def prefill(x, trellis, suh, svh, bits_x2, *rest):
-        calls.append(("prefill", tuple(x.shape), bits_x2))
+        calls.append(("prefill", tuple(x.shape), bits_x2, rest[3].dtype))
 
     library = SimpleNamespace(
         set_prefill_schedule=lambda mode: calls.append(("schedule", mode)),
@@ -357,7 +396,8 @@ def test_ensure_extension_runs_the_open_gate_warmup_once(monkeypatch):
     assert calls == [
         ("schedule", 0),
         ("workspace", (rows, padded_in, padded_out)),
-        *(("prefill", (rows, padded_in), bits_x2) for bits_x2 in (10, 12, 14)),
+        *(("prefill", (rows, padded_in), bits_x2, dtype)
+          for bits_x2 in (10, 12, 14) for dtype in (torch.bfloat16, torch.float32)),
     ]
     assert fakes[-1] == "_exl3_C::linear_out_prefill"
 
@@ -623,6 +663,51 @@ def test_prefill_holds_linear_outs_error_against_fp64(
             _run(tc.linear_out_prefill, m, x, bits_x2, logical_out), cand, "repeat"
         )
         inc = _run(exl3_ops.linear_out, m, x, bits_x2, logical_out)
+        pool.add(cand, inc, x.double() @ weight)
+    pool.check(f"{padded_in}x{padded_out} bits_x2={bits_x2} rows {rows}")
+
+
+def _input_shapes():
+    # The lab's shape-gate V2 (tools session.py plan shapes): a shape-gate-shapes/1
+    # file, pinned input LAB_INPUT_SHAPES.
+    path = os.environ.get("LAB_INPUT_SHAPES")
+    if not path:
+        return [
+            pytest.param(
+                0, 0, 0, marks=pytest.mark.skip(reason="LAB_INPUT_SHAPES not set")
+            )
+        ]
+    with open(path) as f:
+        doc = json.load(f)
+    assert doc["schema"] == "shape-gate-shapes/1"
+    return [tuple(s) for s in doc["shapes"]]
+
+
+@needs_sm80
+@pytest.mark.parametrize("rows", [482, 1906, 3460])
+@pytest.mark.parametrize("padded_in,padded_out,bits_x2", _input_shapes())
+def test_input_shapes_hold_linear_outs_error_against_fp64(
+    padded_in, padded_out, bits_x2, rows
+):
+    from tests.kernels.quantization.test_exl3_kernels import effective_weight
+
+    _gpu_or_skip()
+    # library arithmetic, not the VALIDATED_MATRICES table
+    assert tc.linear_prefill_applies(rows, padded_in, padded_out, bits_x2, 2)
+    m = _matrix(17 * bits_x2 + padded_out, padded_in, padded_out, bits_x2)
+    weight = torch.from_numpy(effective_weight(*m["numpy"], bits_x2, 2)).cuda()
+    pool = _Pool()
+    for seed in range(2):
+        x = _inputs(1000 + rows + seed, rows, padded_in)
+        cand = _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+        names = _prefill_kernels(
+            lambda x=x: _run(tc.linear_out_prefill, m, x, bits_x2, padded_out)
+        )
+        assert names, "the prefill GEMM did not run"
+        _bitwise(
+            _run(tc.linear_out_prefill, m, x, bits_x2, padded_out), cand, "repeat"
+        )
+        inc = _run(exl3_ops.linear_out, m, x, bits_x2, padded_out)
         pool.add(cand, inc, x.double() @ weight)
     pool.check(f"{padded_in}x{padded_out} bits_x2={bits_x2} rows {rows}")
 

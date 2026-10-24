@@ -20,6 +20,9 @@ _DTYPE_BYTES = {
     "I64": 8,
     "F64": 8,
 }
+# Element sizes of the FP8 dtypes a hybrid checkpoint's second method may
+# store (hybrid.py); plain EXL3 checkpoints hold none.
+_FP8_DTYPE_BYTES = {"F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1}
 _MARKERS = {"mcg": (1, 0xCBAC1FED), "mul1": (2, 0x83DCD12D)}
 PLE_AUXILIARIES = (
     "head_bias",
@@ -85,20 +88,22 @@ def read_metadata(path: Path) -> dict[str, str]:
     return metadata
 
 
-def read_headers(path: Path) -> dict[str, TensorHeader]:
+def read_headers(
+    path: Path, dtype_bytes: dict[str, int] = _DTYPE_BYTES
+) -> dict[str, TensorHeader]:
     header, start, size = _read_header(path)
     tensors = {}
     for name, entry in header.items():
         if name == "__metadata__":
             continue
         dtype, shape, offsets = (entry["dtype"], entry["shape"], entry["data_offsets"])
-        if dtype not in _DTYPE_BYTES or any(type(d) is not int or d < 0 for d in shape):
+        if dtype not in dtype_bytes or any(type(d) is not int or d < 0 for d in shape):
             raise ValueError(f"Invalid dtype/shape: {name}")
         if (
             len(offsets) != 2
             or any(type(x) is not int for x in offsets)
             or not 0 <= offsets[0] <= offsets[1] <= size - start
-            or offsets[1] - offsets[0] != math.prod(shape) * _DTYPE_BYTES[dtype]
+            or offsets[1] - offsets[0] != math.prod(shape) * dtype_bytes[dtype]
             or start + offsets[1] >= 2**63
         ):
             raise ValueError(f"Invalid tensor extent: {name}")
@@ -151,33 +156,70 @@ def aligned_shard(logical: int, padded: int, rank: int, size: int) -> slice:
     return slice(rank * width, (rank + 1) * width)
 
 
+def block_shard(
+    logical: int, padded: int, rank: int, size: int, rotation: int = 0
+) -> slice:
+    """A TP shard of whole H128 blocks when the blocks need not divide evenly:
+    chunks below ``blocks % size`` take one block more, and rank ``rank``
+    takes chunk ``(rank + rotation) % size``. Only for a projection whose
+    shard width no other rank or layer depends on (Exl3Layout
+    .shards_unevenly; routed experts at tensor parallel size > 1, whose
+    rotation is the layer index so the larger chunks move between ranks from
+    layer to layer)."""
+    if size <= 0 or not 0 <= rank < size or rotation < 0:
+        raise ValueError("Invalid EXL3 shard rank/size/rotation")
+    if size == 1:
+        return slice(0, padded)
+    if logical != padded or logical % 128:
+        raise ValueError(f"EXL3 TP cuts must preserve H128 blocks: {logical=} {padded=}")
+    base, extra = divmod(logical // 128, size)
+    if base == 0:
+        raise ValueError(f"EXL3 cannot give {size} ranks a block of {logical}")
+    chunk = (rank + rotation) % size
+    start = chunk * base + min(chunk, extra)
+    return slice(start * 128, (start + base + (chunk < extra)) * 128)
+
+
 class Exl3Manifest:
-    def __init__(self, directory: str | Path, *, require_qwen_aux: bool = False):
+    """The checkpoint's tensors by name. With ``select_by_index`` (hybrid
+    checkpoints) the index's weight_map selects them: only the tensors it
+    names, each from the file it names; the files' other tensors are not
+    checkpoint tensors (``unselected`` counts them) and FP8 dtypes are
+    accepted."""
+
+    def __init__(self, directory: str | Path, select_by_index: bool = False):
         self.directory = Path(directory)
         self.tensors: dict[str, TensorHeader] = {}
         self.matrices: dict[str, PackedMatrix] = {}
         self.unused: dict[str, str] = {}
+        self.unselected = 0
         paths = sorted(self.directory.glob("*.safetensors"))
         if not paths:
             raise ValueError("EXL3 requires local safetensors checkpoint files")
-        if require_qwen_aux:
-            for name in (
-                "ngram_embedding.safetensors",
-                "mtp_hyper_connection_mixer_patch.safetensors",
-            ):
-                if self.directory / name not in paths:
-                    raise ValueError(f"Missing required EXL3 auxiliary file: {name}")
-        for path in paths:
-            for name, tensor in read_headers(path).items():
-                if name in self.tensors:
-                    raise ValueError(f"Duplicate EXL3 source tensor: {name}")
-                self.tensors[name] = tensor
-        self.tensors = dict(sorted(self.tensors.items()))
         index = self.directory / "model.safetensors.index.json"
+        entries = None
         if index.exists():
             entries = json.loads(index.read_text(), object_pairs_hook=_unique_object)[
                 "weight_map"
             ]
+        elif select_by_index:
+            raise ValueError(
+                "A hybrid EXL3 checkpoint selects its tensors with "
+                "model.safetensors.index.json, which it lacks"
+            )
+        dtype_bytes = _DTYPE_BYTES
+        if select_by_index:
+            dtype_bytes = _DTYPE_BYTES | _FP8_DTYPE_BYTES
+        for path in paths:
+            for name, tensor in read_headers(path, dtype_bytes).items():
+                if select_by_index and entries.get(name) != path.name:
+                    self.unselected += 1
+                    continue
+                if name in self.tensors:
+                    raise ValueError(f"Duplicate EXL3 source tensor: {name}")
+                self.tensors[name] = tensor
+        self.tensors = dict(sorted(self.tensors.items()))
+        if entries is not None:
             for name, filename in entries.items():
                 tensor = self.tensors.get(name)
                 if tensor is None or tensor.path.name != filename:
@@ -214,31 +256,8 @@ class Exl3Manifest:
                             f"Missing independent vision QKV biases: {root}"
                         )
                     self.unused[name] = "redundant fused vision QKV"
-        if require_qwen_aux:
-            patch = "mtp_hyper_connection_mixer_patch.safetensors"
-            down = self.tensors.get(
-                "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
-            )
-            if down is None or len(down.shape) != 2 or min(down.shape) <= 0:
-                raise ValueError("Invalid EXL3 MTP mixer down projection")
-            rank, hidden = down.shape
-            expected = {
-                "mtp.hyper_connection_mixer.hc_norm.weight": (hidden,),
-                "mtp.hyper_connection_mixer.input_mix_weight_down.weight": (
-                    rank,
-                    hidden,
-                ),
-                "mtp.hyper_connection_mixer.input_mix_weight_up.weight": (hidden, rank),
-            }
-            actual = {k for k, h in self.tensors.items() if h.path.name == patch}
-            if actual != expected.keys():
-                raise ValueError("Unexpected EXL3 MTP mixer patch keys")
-            for name, shape in expected.items():
-                self._expect(name, "F16", shape)
-            if not self.ple_tables:
-                raise ValueError("Missing compressed EXL3 PLE table")
 
-    def _expect(self, name: str, dtype: str, shape: tuple[int, ...]):
+    def expect(self, name: str, dtype: str, shape: tuple[int, ...]):
         tensor = self.tensors.get(name)
         if tensor is None or tensor.dtype != dtype or tensor.shape != shape:
             raise ValueError(f"Missing or incompatible EXL3 tensor: {name}")
@@ -251,14 +270,14 @@ class Exl3Manifest:
         k, n = k * 16, n * 16
         if k <= 0 or n <= 0 or k % 128 or n % 128 or stride % 8:
             raise ValueError(f"Invalid EXL3 tile geometry: {prefix}")
-        self._expect(f"{prefix}.suh", "F16", (k,))
-        self._expect(f"{prefix}.svh", "F16", (n,))
+        self.expect(f"{prefix}.suh", "F16", (k,))
+        self.expect(f"{prefix}.svh", "F16", (n,))
         markers = [m for m in _MARKERS if f"{prefix}.{m}" in self.tensors]
         if len(markers) != 1:
             raise ValueError(f"Missing/conflicting EXL3 codebook: {prefix}")
         marker = markers[0]
         codebook, value = _MARKERS[marker]
-        header = self._expect(f"{prefix}.{marker}", "I32", ())
+        header = self.expect(f"{prefix}.{marker}", "I32", ())
         if struct.unpack("<I", header.read_bytes())[0] != value:
             raise ValueError(f"Unsupported EXL3 codebook multiplier: {prefix}")
         bits_x2 = stride // 8

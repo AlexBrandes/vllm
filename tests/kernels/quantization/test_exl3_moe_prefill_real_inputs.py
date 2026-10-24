@@ -20,8 +20,8 @@ GPU (SM 8.0): per case the shipped operator (ops.moe_out), the port
 (ops.moe_out_prefill) and an FP64 reference from the checkpoint weights.
 moe_out must give each live case's recorded output bit for bit; per pool
 (role, rows, phase, drafter) the port holds moe_out's error against FP64
-(test_exl3_moe_v2._Fp64Pool: pooled mean <= 1.10x, max <= 1.25x, BF16
-rounding ties forgiven, exact where moe_out is exact), and a second call is
+(test_exl3_moe_v2._Fp64Pool: pooled mean <= 1.10x, max <= 1.25x with no
+element excused, exact where moe_out is exact), and a second call is
 bitwise the first. One line per pool is printed; a failing pool fails.
 
 Coverage (REQUIRED_CELLS, prefill only): with 3460 tokens per step the served
@@ -126,7 +126,7 @@ def test_case_set_dispatch_and_coverage(monkeypatch, moe_v2_rows):
     calls = []
     for name in ("moe_out", "moe_out_v2", "moe_out_prefill"):
         monkeypatch.setattr(
-            exl3_ops, name, lambda *args, _name=name: calls.append(_name)
+            exl3_ops, name, lambda *args, _name=name, **kwargs: calls.append(_name)
         )
     experts = _experts(moe_v2_rows, DECODE_LEN)
     workspace2 = torch.zeros(8, dtype=torch.bfloat16)

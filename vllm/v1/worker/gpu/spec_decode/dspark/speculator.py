@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """DSpark speculator: semi-autoregressive parallel drafting.
 
 DSpark drafts a block of ``num_speculative_tokens`` tokens in one parallel pass
@@ -30,6 +31,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.sm80.spec_decode.shard_argmax import shard_argmax_sampling
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -153,6 +155,7 @@ class DSparkSpeculator(DFlashSpeculator):
             use_fp64=self.use_fp64_gumbel,
         )
 
+    @shard_argmax_sampling
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)

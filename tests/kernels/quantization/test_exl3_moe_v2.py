@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""EXL3 MoE v2 (VLLM_EXL3_MOE_V2, csrc/exl3/moe_v2.cu).
+"""EXL3 MoE v2 (VLLM_EXL3_MOE_V2, csrc/exl3/moe_v2.cu), hidden-2560 configuration
+(test_exl3_moe_v2_hidden5120.py holds the hidden-5120 one).
 
 CPU: the switch default, the configuration gate and its log lines (through
 vLLM's own logger), the row dispatch in Exl3Experts.apply with the switch off
@@ -9,13 +10,14 @@ and on, and the operator's workspace contract.
 GPU (SM 8.0 only): at the served shape (hidden 2560, intermediate 640, top-10,
 256 of 512 experts local, bits_x2 10 / codebook 2), the off path is bitwise
 moe_out and the scalar reference; moe_out_v2 is held to moe_out's error against
-an FP64 reference (pooled mean <= 1.10x, max <= 1.25x, BF16 rounding ties
-forgiven, exact where moe_out is exact) over awkward routings; it is
+an FP64 reference (pooled mean <= 1.10x, max <= 1.25x with no element excused,
+exact where moe_out is exact) over awkward routings; it is
 deterministic; and a captured call replays bitwise like the eager call
 without any allocator event.
 """
 
 import logging
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,7 +31,7 @@ needs_sm80 = pytest.mark.skipif(
     reason="EXL3 kernels are built for SM 8.0",
 )
 
-HIDDEN, INTERMEDIATE, TOPK = 2560, 640, 10
+HIDDEN, INTERMEDIATE, TOPK, BITS_X2 = 2560, 640, 10, 10
 LOCAL, GLOBAL = 256, 512
 SERVED_META = [[[2560, 640, 10, 2], [2560, 640, 10, 2], [640, 2560, 10, 2]]] * LOCAL
 
@@ -105,6 +107,7 @@ def _method(monkeypatch, warmed):
     method.intermediate_size = INTERMEDIATE
     method.local_experts = LOCAL
     method.global_expert_ids = list(range(0, GLOBAL, 2))
+    method.swiglu_limit = 0.0
     layer = SimpleNamespace(
         exl3_ptrs=torch.zeros(LOCAL, 3, 3, dtype=torch.int64),
         exl3_meta=torch.tensor(SERVED_META),
@@ -135,14 +138,16 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
     caplog.set_level(logging.INFO, logger="vllm")
     try:
         vllm_logger._print_info_once.cache_clear()
-        # Open: rows capped at the validated maximum, workspace = max(v1, v2).
-        assert method._moe_v2(layer, SERVED_META, 3200, 7) == (64, 64000)
-        assert method._moe_v2(layer, SERVED_META, 3200, 10**9) == (64, 10**9)
-        assert method._moe_v2(layer, SERVED_META, 16, 7) == (16, 16000)
+        # Open: rows capped at the validated maximum, the layer's bits_x2,
+        # workspace = max(v1, v2).
+        assert method._moe_v2(layer, SERVED_META, 3200, 7) == (64, 10, 64000)
+        assert method._moe_v2(layer, SERVED_META, 3200, 10**9) == (64, 10, 10**9)
+        assert method._moe_v2(layer, SERVED_META, 16, 7) == (16, 10, 16000)
         assert len(warmed) == 3 and warmed[0][3] == method.global_expert_ids
+        assert warmed[0][7] == BITS_X2
         # Closed: one line saying why; nothing sized or warmed.
         wrong = _meta_with(3, 0, [2560, 640, 8, 2])
-        assert method._moe_v2(layer, wrong, 3200, 7) == (0, 7)
+        assert method._moe_v2(layer, wrong, 3200, 7) == (0, 0, 7)
         assert len(warmed) == 3
     finally:
         root.removeHandler(caplog.handler)
@@ -151,7 +156,8 @@ def test_gate_sizes_workspace_warms_up_and_logs_through_vllm_logger(
         logging.INFO,
         quant.__name__,
         "EXL3 MoE v2 kernel active (VLLM_EXL3_MOE_V2): tensor-core routed "
-        "experts for MoE calls of 1..64 rows; larger calls keep moe_out.",
+        "experts (bits_x2 10) for MoE calls of 1..64 rows; larger calls keep "
+        "moe_out.",
     ) in lines
     # One distinct line (caplog may also see it through the root logger).
     closed = sorted({m for _, _, m in lines if "gate is closed" in m})
@@ -171,7 +177,11 @@ def _experts(moe_v2_rows, max_rows=4096, workspace=0, expert_map="layer map"):
     experts.workspace_elements = workspace
     experts.max_rows = max_rows
     experts.moe_v2_rows = moe_v2_rows
+    experts.moe_out_rows = max_rows
+    experts.moe_v2_bits_x2 = BITS_X2
     experts.prefill_decode_len = 0
+    experts.prefill_v2_bits_x2 = 0
+    experts.swiglu_limit = 0.0
     return experts
 
 
@@ -202,7 +212,9 @@ def test_apply_dispatches_by_rows(monkeypatch, moe_v2_rows):
         monkeypatch.setattr(
             exl3_ops,
             name,
-            lambda *args, _name=name: calls.append((_name, args[0].shape[0], args)),
+            lambda *args, _name=name, **kwargs: calls.append(
+                (_name, args[0].shape[0], args, kwargs)
+            ),
         )
     experts = _experts(moe_v2_rows)
     workspace2 = torch.zeros(8, dtype=torch.bfloat16)
@@ -213,12 +225,17 @@ def test_apply_dispatches_by_rows(monkeypatch, moe_v2_rows):
         ("moe_out_v2" if moe_v2_rows and rows <= 64 else "moe_out", rows)
         for rows in (1, 4, 63, 64, 65, 3200)
     ]
-    assert [(name, rows) for name, rows, _ in calls] == expected
-    for _, _, args in calls:
+    assert [(name, rows) for name, rows, _, _ in calls] == expected
+    for name, _, args, kwargs in calls:
         # Same arguments for both operators: layer map, FP32 view of workspace2.
         assert args[1:6] == ("ids", "weights", "ptrs", "meta", "layer map")
         assert args[6] == INTERMEDIATE and args[7] == "out"
         assert args[8].dtype == torch.float32
+        # moe_out_v2 also gets the layer's bits_x2.
+        expected_kwargs = {"swiglu_limit": 0.0}
+        if name == "moe_out_v2":
+            expected_kwargs["bits_x2"] = BITS_X2
+        assert kwargs == expected_kwargs
 
 
 def test_operator_list_and_workspace_contract():
@@ -229,10 +246,12 @@ def test_operator_list_and_workspace_contract():
     # FP16 hi/lo operands (2 x 2560 + 640 floats), 2^-e per (row, slice)
     # rounded to 4, then the routing table (header, sorted, tiles, the expert
     # of each sorted entry and of each assignment, then per row tile and
-    # projection the int64 trellis address and the tile columns).
+    # projection the int64 trellis address and the tile columns), then per row
+    # the folded call's counters (one per H128 block) and local-route count.
     lane = 640 * (2 * 8 * 640 + 2 * 2560 + 2 * 2560 + 640) + 640 * 18
     table = 4 + 640 + 4 * 640 + 640 + 640 + 2 * 3 * 640 + 3 * 640
-    assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + table
+    fold = 64 * (2560 // 128 + 1)
+    assert size(64, HIDDEN, INTERMEDIATE, TOPK, LOCAL) == lane + table + fold
     assert size(1, 2500, 600, TOPK, LOCAL) == size(1, HIDDEN, INTERMEDIATE, TOPK, LOCAL)
     assert size(64, HIDDEN, INTERMEDIATE, TOPK, 0) == 0
     with pytest.raises(RuntimeError, match="hidden 2560"):
@@ -360,7 +379,12 @@ def _v1(served, x, ids, weights):
 
 def _v2(served, x, ids, weights):
     return _run(
-        exl3_ops.moe_out_v2, served, x, ids, weights, exl3_ops.moe_workspace_size_v2
+        partial(exl3_ops.moe_out_v2, bits_x2=BITS_X2),
+        served,
+        x,
+        ids,
+        weights,
+        exl3_ops.moe_workspace_size_v2,
     )
 
 
@@ -382,14 +406,6 @@ def _reference(served, x, ids, weights):
 
 def _bitwise(a, b, name):
     assert torch.equal(a.view(torch.int16), b.view(torch.int16)), name
-
-
-def _tie_mask(cand, inc, ref):
-    ci = cand.view(torch.int16).to(torch.int32)
-    ii = inc.view(torch.int16).to(torch.int32)
-    adjacent = ((ci - ii).abs() == 1) & ((ci < 0) == (ii < 0))
-    c, i = cand.double(), inc.double()
-    return adjacent & ((ref - 0.5 * (c + i)).abs() <= (c - i).abs() / 16)
 
 
 @needs_sm80
@@ -436,15 +452,13 @@ SCENARIOS = [
 
 class _Fp64Pool:
     """moe_out_v2's FP64 gate, pooled over calls: mean error <= 1.10x and max
-    error <= 1.25x moe_out's, BF16 rounding ties forgiven (only when every
-    element over the budget is one, at most 0.1 % of the elements), exact
+    error <= 1.25x moe_out's (every element counts; no tolerance floor), exact
     where moe_out is exact, all finite."""
 
     def __init__(self):
         self.n = 0
         self.c_sum = self.i_sum = 0.0
         self.c_max = self.i_max = 0.0
-        self.parts = []
 
     def add(self, cand, inc, ref, name):
         assert torch.isfinite(cand).all(), name
@@ -456,19 +470,9 @@ class _Fp64Pool:
         self.i_sum += float(ei.sum())
         self.c_max = max(self.c_max, float(ec.max()))
         self.i_max = max(self.i_max, float(ei.max()))
-        self.parts.append((ec, _tie_mask(cand, inc, ref)))
 
     def ratios(self):
-        mean_ratio = self.c_sum / self.i_sum
-        max_ratio = self.c_max / self.i_max
-        if max_ratio > 1.25:
-            budget = 1.25 * self.i_max
-            over = sum(int((e > budget).sum()) for e, _ in self.parts)
-            forgiven = sum(int(((e > budget) & t).sum()) for e, t in self.parts)
-            if over == forgiven and forgiven <= 1e-3 * self.n:
-                rest = max(float(torch.where(t, 0.0, e).max()) for e, t in self.parts)
-                max_ratio = rest / self.i_max
-        return mean_ratio, max_ratio
+        return self.c_sum / self.i_sum, self.c_max / self.i_max
 
     def check(self, name="moe_out_v2"):
         """Assert the gate; return (mean ratio, max ratio)."""
@@ -515,6 +519,7 @@ def test_v2_refuses_shapes_outside_its_configuration(served):
             512,
             out,
             workspace,
+            bits_x2=BITS_X2,
         )
     with pytest.raises(RuntimeError, match="1024 routed assignments"):
         big = x.new_zeros(103, HIDDEN)
@@ -528,6 +533,20 @@ def test_v2_refuses_shapes_outside_its_configuration(served):
             INTERMEDIATE,
             torch.empty_like(big),
             workspace,
+            bits_x2=BITS_X2,
+        )
+    with pytest.raises(RuntimeError, match="no bits_x2 6 kernels"):
+        exl3_ops.moe_out_v2(
+            x,
+            ids,
+            weights,
+            served.pointers,
+            served.meta,
+            served.expert_map,
+            INTERMEDIATE,
+            out,
+            workspace,
+            bits_x2=6,
         )
 
 
@@ -546,6 +565,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
         HIDDEN,
         INTERMEDIATE,
         TOPK,
+        BITS_X2,
     )
     x, ids, weights = _case(served, "uniform", rows, 11)
     out = torch.empty_like(x)
@@ -556,7 +576,7 @@ def test_v2_graph_replay_is_bitwise_eager_without_allocations(served, rows):
     args = (served.pointers, served.meta, served.expert_map, INTERMEDIATE)
 
     def call():
-        exl3_ops.moe_out_v2(x, ids, weights, *args, out, workspace)
+        exl3_ops.moe_out_v2(x, ids, weights, *args, out, workspace, bits_x2=BITS_X2)
 
     torch.cuda.synchronize()
     before = _allocations()

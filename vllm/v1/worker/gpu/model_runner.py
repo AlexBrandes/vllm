@@ -71,6 +71,9 @@ from vllm.sm80.spec_decode.aux_fc_fold import (
     mark_drafter_aux_fc_folded,
     maybe_configure_aux_fc_fold,
 )
+from vllm.sm80.spec_decode.dspark_row_mask_kernel import begin_target_step
+from vllm.sm80.spec_decode.dspark_row_mask_reject import cap_drafts
+from vllm.sm80.dev_ab import with_ab_capture
 from vllm.sm80.worker import mem_attribution
 from vllm.sm80.worker.pp_draft_tail import DraftTailController
 from vllm.tasks import SupportedTask
@@ -1151,6 +1154,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @with_ab_capture
     def capture_model(self, *, profile_only: bool = False) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
@@ -1801,6 +1805,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.structured_output_request_ids,
                 grammar_output.num_acceptable_drafts,
             )
+        invalid_drafts = cap_drafts(input_batch.logits_indices, invalid_drafts)
 
         sampler_output: SamplerOutput | None
         if input_batch.num_reqs == 0:
@@ -2196,6 +2201,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        begin_target_step(input_batch, dummy_run)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:

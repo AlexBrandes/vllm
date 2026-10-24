@@ -4,9 +4,17 @@ EXL3 loads the checkpoint's packed trellis matrices and original FP16 scales wit
 
 Each GPU block decodes a 16-row slab of trellis tiles once into shared memory and applies it to a block of up to 128 rows; routed experts are grouped by local expert on the device every step, so each active expert is decoded once per step and block of rows. Every output element is still one FP32 fused multiply-add chain over the input channels in increasing order, so a row's result does not depend on how many rows share the launch or which block shape was chosen. The extension keeps the original scalar kernels as test-only reference operators (`linear_out_reference`, `moe_out_reference`) that the fast operators must match bit for bit.
 
-`VLLM_EXL3_MOE_V2=1` (default `0`) runs the routed experts of MoE calls with at most 64 rows on the tensor cores (`csrc/exl3/moe_v2.cu`, operator `moe_out_v2`), for one configuration only: SM 8.0, BF16 activations, hidden size 2560, expert intermediate size 640, top-10 routing with 256 of 512 experts local, and every expert matrix stored at `bits_x2` 10 with codebook 2. Each warp decodes its own trellis tiles straight into `mma.m16n8k16` FP16 operands (decoded weights are exact FP16 values) and multiplies them with the activations as two FP16 parts, a high part and the rounded remainder (about 22 significant bits together, not the full FP32 value), after an exact scaling by a power of two per row (per row and 640-column group for the gate and up inputs of calls of 16 rows or more), starting every 16-deep product from zero and summing in FP32 in a fixed order; the input transform, activation and combine run in FP64 and round once. Results are deterministic and independent of the other rows, but differ from the default kernels in the last bits. Any other layer, and every call with more rows, keeps `moe_out`; a startup line says whether the path is active or why the gate is closed.
+`VLLM_EXL3_MOE_V2=1` (default `0`) runs the routed experts of MoE calls with at most 64 rows on the tensor cores (`csrc/exl3/moe_v2.cu`, operator `moe_out_v2`), for two configurations only (`ops.MOE_V2_CONFIGS`), on SM 8.0 with BF16 activations and codebook 2: hidden size 2560, expert intermediate size 640, top-10 routing with 256 of 512 experts local, every expert matrix at `bits_x2` 10; and hidden size 5120, intermediate size 2304, top-6 routing with 96 of 384 whole experts local (expert parallel size 4), every expert matrix of a layer at one `bits_x2`, 6 or 4. Each warp decodes its own trellis tiles straight into `mma.m16n8k16` FP16 operands (decoded weights are exact FP16 values) and multiplies them with the activations as two FP16 parts, a high part and the rounded remainder (about 22 significant bits together, not the full FP32 value), after an exact scaling by a power of two per row (per row and 640-column group for the gate and up inputs of hidden-2560 calls of at least 160 routed assignments), starting every 16-deep product from zero and summing in FP32 in a fixed order; the input transform, activation and combine run in FP64 and round once. Results are deterministic and independent of the other rows, but differ from the default kernels in the last bits; at hidden size 5120 every call uses one K-slice layout, so a row's result also does not depend on the call's row count. Any other layer, and every call with more rows, keeps `moe_out`; a startup line per bit width says the path is active, or one says why the gate is closed.
 
-`VLLM_EXL3_MOE_PREFILL_TC=1` (default `0`) runs the routed experts of MoE calls of 65 to 3,460 rows (one prefill chunk at the validated `--max-num-batched-tokens 3460`) in prefill steps on the tensor cores (`csrc/exl3/moe_prefill.cu`), for the configuration `VLLM_EXL3_MOE_V2` covers when every local expert's trellis starts at a 16-byte-aligned address, at tensor parallel size 2 without pipeline parallelism, and not with drafters that use parallel drafting slots (DFlash, DSpark). A step is a prefill step when the scheduler gave some request more than 1 + `num_speculative_tokens` tokens; the row count of a call never decides it, so decode steps of any size keep their kernels. The routed rows of each expert are grouped into 64-row tiles, and each tile's GEMMs run `mma.m16n8k16` FP16 on exactly decoded weights against the same high/low FP16 split of the activations, scaled by a power of two per row and projection, with every 16-deep product starting from zero and summed in FP32 in a fixed order. The input, activation and per-route output transforms are `moe_out`'s FP32 operations; the routes' weighted sum runs in FP64 and rounds once. Results are deterministic and independent of the other rows, but differ from `moe_out` in the last bits. The MoE workspace grows to fit the operator (at 3,460 rows per call, 846 MiB instead of 508 MiB per GPU). Calls of at most 64 rows keep `moe_out_v2` or `moe_out`, larger calls keep `moe_out`, and prefill steps padded to a captured CUDA graph size replay the kernels captured for decode; a startup line says whether the path is active or why the gate is closed.
+`VLLM_EXL3_MOE_V2_DRAFT=1` (default `0`) runs the DSpark drafter's routed experts of DeepSeek-V4.1-Flash (top-3 of 128 experts, every expert matrix at `bits_x2` 8, codebook 2) on `moe_out_v2` for MoE calls of at most 64 rows on SM 8.0, independently of `VLLM_EXL3_MOE_V2` (`ops.MOE_V2_DRAFT_CONFIGS`). At expert parallel size 4 (intermediate 2304, 32 whole experts local) the calls take stages of their own (`moe_v2.cu` `DraftTiling`): one gate/up scale per 640 columns, one down scale per K slice, row tiles of up to 16 rows whose low FP16 part (tiles of 5 to 16 rows) is summed in the MMA's C operand. The drafter's experts split across tensor-parallel ranks (intermediate 640 or 512, all 128 local) keep `moe_out`. These calls are never folded (`VLLM_EXL3_MOE_V2_FOLD` does not apply). A row's result depends on whether its tile holds 1..4 rows or more; the diagnostic `VLLM_EXL3_MOE_V2_DRAFT_FORCE_ROWS` (0, 8 or 16) gives every tile at least that tile's kernel.
+
+`VLLM_EXL3_MOE_PREFILL_TC=1` (default `0`) runs the routed experts of MoE calls of 65 to 3,460 rows (one prefill chunk at the validated `--max-num-batched-tokens 3460`) in prefill steps on the tensor cores (`csrc/exl3/moe_prefill.cu`), for the hidden-2560 configuration `VLLM_EXL3_MOE_V2` covers (`ops.MOE_PREFILL_CONFIGS`) when every local expert's trellis starts at a 16-byte-aligned address, at tensor parallel size 2 without pipeline parallelism, and not with drafters that use parallel drafting slots (DFlash, DSpark). A step is a prefill step when the scheduler gave some request more than 1 + `num_speculative_tokens` tokens; the row count of a call never decides it, so decode steps of any size keep their kernels. The routed rows of each expert are grouped into 64-row tiles, and each tile's GEMMs run `mma.m16n8k16` FP16 on exactly decoded weights against the same high/low FP16 split of the activations, scaled by a power of two per row and projection, with every 16-deep product starting from zero and summed in FP32 in a fixed order. The input, activation and per-route output transforms are `moe_out`'s FP32 operations; the routes' weighted sum runs in FP64 and rounds once. Results are deterministic and independent of the other rows, but differ from `moe_out` in the last bits. The MoE workspace grows to fit the operator (at 3,460 rows per call, 846 MiB instead of 508 MiB per GPU). Calls of at most 64 rows keep `moe_out_v2` or `moe_out`, larger calls keep `moe_out`, and prefill steps padded to a captured CUDA graph size replay the kernels captured for decode; a startup line says whether the path is active or why the gate is closed.
+
+`VLLM_DEEPSEEK_V41_MOE_PREFILL_TC=1` (default `0`) runs the routed experts of DeepSeek-V4.1-Flash MoE calls of 65 to 2,048 rows in prefill steps on the tensor cores (`csrc/exl3/moe_prefill_v2.cu`, `moe_out_prefill_v2`): `moe_out_prefill` generalised to hidden 5120, intermediate 2304 and every routed matrix of a layer at `bits_x2` 6 or 4 with codebook 2, at tensor parallel size 4 without pipeline parallelism, with 16-byte-aligned trellis bases, and, with a drafter that drafts in parallel slots, only when no decode step can carry 65 rows. Calls run in row chunks of 512 rows, so its workspace fits in the MoE workspace of 512-row `moe_out` chunks. Decode steps, graph captures, calls of at most 64 rows and larger calls keep their kernels. Results differ from `moe_out` in the last bits.
+
+`VLLM_EXL3_EXPERTS_CONTIGUOUS=1` (default `0`) allocates the trellis, `suh` and `svh` of a MoE layer's local expert matrices as views into one device buffer per layer and tensor kind instead of one allocation per tensor. Each view starts at a 512-byte-aligned offset, the alignment of a caching-allocator block, so the kernels, the per-expert pointer table and the loaded bytes are the same; only the allocator stops leaving holes between the tensors. With routed-expert trellis tensors of 1 to 10 MiB the PyTorch caching allocator serves each from a 20 MiB segment, so several MiB of each segment can stay unusable (about 3.7 GiB per GPU for DeepSeek-V4.1-Flash 2.9 bpw at expert parallel size 4).
+
+`VLLM_EXL3_MOE_CHUNK_ROWS=N` (default `0`, whole calls) runs `moe_out` on calls of more than N rows in row chunks of at most N, so its workspace is sized for N rows instead of the most rows one call can dispatch (`--max-num-batched-tokens` per rank). `moe_out` computes every row from its own input and routes alone, so the output bits do not change; larger prefill calls launch once per chunk. `moe_out_v2` and `moe_out_prefill` calls are not chunked.
 
 EXL3 runs on the extension `vllm._exl3_C`, built for SM 8.0 only; selecting EXL3 on any other GPU is an error. The vLLM build does not compile it: build it ahead of time with `python csrc/exl3/build_standalone.py --out vllm` from the source tree, with the PyTorch that serves (CUDA-enabled PyTorch, a matching CUDA toolkit, a C++20 compiler and Ninja; no GPU needed). Serving never compiles this extension. Its operators are registered through the non-stable `TORCH_LIBRARY` API, so loading refuses a library whose recorded PyTorch version, CUDA major version or C++ ABI differs from the running PyTorch. A successful build, CPU helper check or Meta dispatch is not GPU numerical, graph, quality or capacity validation. Validate those paths before deployment.
 
@@ -77,6 +85,115 @@ A row read that still fails after its retries fails only the requests that use t
 
 The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel does not read ahead around requested rows. Buffered reads still hit the page cache, so warm runs mostly read RAM. Set `VLLM_EXL3_PLE_COLD=1` to call `POSIX_FADV_DONTNEED` on the table at setup (no root needed; pages that another process has mapped stay resident). Page-cache residency of the table (via `mincore`) is logged at setup, after the cold drop and at process exit. `Exl3PLEEmbedding.page_cache_residency()` returns `(resident, total)` pages for sampling between runs.
 
+## Fixed expert placement
+
+`VLLM_EXL3_EXPERT_PLACEMENT` defaults to the empty string (disabled). Set it
+to a JSON file and set `VLLM_EXL3_EXPERT_PLACEMENT_SHA256` to that file's
+SHA256 to install a fixed whole-expert permutation before loading. The schema is
+`{"version":1,"ep_size":2,"layers":{"model.layers.0.mlp.experts":[[0,2],[1,3]]}}`.
+Layer keys are **checkpoint** expert prefixes, not necessarily runtime module
+names. Each ordered rank list gives its local slots in order; every logical ID
+must occur exactly once, with the existing number of slots per rank. Unlisted
+layers keep their ordinary placement. Unknown checkpoint prefixes, missing or
+duplicate experts, wrong capacities and digest mismatches fail at startup.
+
+This is supported only with whole-expert EP, no data parallelism, dynamic EPLB,
+all-to-all dispatch or fused shared experts. It does not replicate experts or
+change the router's IDs, weights or top-k order. The loader and native kernels
+share the same expert map; no per-step map allocation or lookup is added.
+Packed tensors and each expert's arithmetic are unchanged. **Rank partials
+group different experts**, so final MoE bits need not match ordinary placement.
+Validate reduction error and downstream routing before enabling. Equal-sized
+expert permutations add no resident weight or workspace memory; heterogeneous
+experts require a separate per-rank byte ledger despite equal slot counts.
+
+## Replicated hot experts
+
+`VLLM_EXL3_EXPERT_REPLICAS` defaults to the empty string (disabled). Set it to
+a JSON file and set `VLLM_EXL3_EXPERT_REPLICAS_SHA256` to that file's SHA256.
+The schema is `{"version":1,"ep_size":4,"layers":{"layers.1.ffn.experts":[17,5,203]}}`:
+per **checkpoint** expert prefix, the replicated experts, hottest first. Every
+rank then also holds a copy of each listed expert whose home is another rank,
+in local slots after its home slots.
+
+In a MoE call of 1 to 64 rows, each listed expert the call uses gets exactly
+one owner rank, chosen by the same rule on every rank from the call's top-k
+ids. The rule first counts each rank's distinct used experts that are not
+listed. The target is the larger of the busiest count and the call's distinct
+experts divided evenly over the ranks. Listed experts are then taken in plan
+order: one stays home while its home rank is below the target; otherwise it
+goes to the rank with the fewest experts so far. A small kernel writes the
+call's expert map from that rule before the routed-expert operator runs.
+Larger calls keep ordinary placement. Router ids, weights and top-k order are
+unchanged, and so is each expert's arithmetic. **Which rank's partial sum
+carries an expert changes** whenever an expert leaves its home, so final MoE
+bits need not match ordinary placement.
+
+Replicas add resident weight memory: one whole expert per listed expert that
+is not already local, per layer. vLLM's memory profile takes them out of the
+KV cache pool, and the startup log reports the bytes per layer. Supported with
+whole-expert EP at a power-of-two EP size and the linear expert placement, and
+not with data parallelism, EPLB, all-to-all dispatch, fused shared experts or
+`VLLM_EXL3_EXPERT_PLACEMENT`. Unknown checkpoint prefixes or experts and digest
+mismatches fail at startup.
+
+## Tensor-parallel routed experts
+
+With `--tensor-parallel-size` above 1 and without `--enable-expert-parallel`,
+every rank holds every routed expert, cut into whole 128-column blocks of the
+expert intermediate (the EXL3 Hadamard block). The blocks go to the ranks in
+chunks as even as they allow, the larger chunks first, and rank r of layer L
+holds chunk (r + L) mod the tensor parallel size, so the larger chunks move
+between ranks from layer to layer (the layer index is the one in vLLM's module
+name; an MTP drafter's layers follow the target's). DeepSeek-V4.1-Flash's
+2304-wide experts give 640, 640, 512 and 512 columns at tensor parallel size
+4: each rank holds 640 in 20 of the 40 target layers. Gate and up keep all
+inputs and the chunk's output columns (`suh` whole, `svh` of the chunk); down
+keeps the chunk's input rows (`suh` of the chunk) and all outputs (`svh`
+whole). The native operators run at the rank's width. Routing is unchanged:
+each rank routes the same rows over all experts with the identity expert map,
+and the MoE's tensor-parallel all-reduce adds the ranks' partial outputs, so
+final MoE bits need not match whole-expert EP. The startup log names each
+rank's widths. Not supported with data, context or sequence parallelism,
+EPLB, all-to-all dispatch, `VLLM_EXL3_EXPERT_REPLICAS` or
+`VLLM_EXL3_EXPERT_PLACEMENT` (both plan whole experts per rank). Whether the
+decode and prefill operators take a rank width is up to their gates
+(`ops.MOE_V2_CONFIGS`, `ops.MOE_PREFILL_V2_CONFIGS`); `moe_out` takes any.
+The block-aligned split rotated per layer follows the idea of the
+DeepSeek-V4.1-Flash CMP 170HX recipes of GNmac-lab and Curtis White
+(CurtisAccelerate); no code is taken from them.
+
 ## Third-party material
 
 Codec adaptations preserve the upstream MIT grant and modification credit in [`plugins/sm80/licenses/exl3`](../../../plugins/sm80/licenses/exl3). The fork's plugin distribution (`plugins/sm80`, which every installation that runs EXL3 needs) ships that `LICENSE` and `NOTICE` as its license files: in the sdist, and in the `.dist-info/licenses/` directory of its wheel and of every installed copy.
+
+The hidden-5120 shape of `moe_out_v2` follows Curtis White's Apache-2.0 port of that operator; its credit is in the same `NOTICE`.
+
+## DeepSeek switch control
+
+`VLLM_DEV_AB_SWITCH` is empty by default. When explicitly configured, the
+worker captures both implementations before serving and switches only while
+requests are drained. Available DeepSeek selectors are
+`dsv41_fused_attn_decode`, `dsv41_attn_pipeline`, `dsv41_moe_prefill_tc`,
+`dsv41_fused_mhc`, `dsv41_fused_mhc_finish`, `dsv41_fused_mhc_finish_v2`,
+`exl3_moe_v2`, `exl3_moe_v2_draft` (the drafter's experts only), `exl3_dense_splitk`, and
+`exl3_dense_prefill_tc`. The mHC selectors change the loaded decoder operation
+module or its cached finish dispatch; capture wrappers retain their ownership.
+The dense-prefill selector changes the cached dispatcher, not its decode bound,
+workspace, hardware gate, or schedule.
+
+MoE V2, MoE-prefill and dense-prefill selection require their feature enabled at
+construction so that the existing workspace and warmup have completed.
+Selecting the fused mHC finish requires fused mHC enabled at construction.
+Selecting the mHC finish v2 also requires the fused mHC finish enabled at
+construction; switching it on compiles its kernels before its graphs are captured.
+Attention pipeline selection reserves both implementations' scratch before
+profiling. None of these selectors changes the speculative-width policy,
+graph-size ladder, checkpoint, or loaded expert placement.
+
+Hybrid checkpoint selection, expert-placement maps and digests, true per-K
+DSpark construction, reduction transports/output dtypes, early Engram gathers,
+and draft-only shard argmax require a new process. Environment changes alone
+cannot update their constructed modules, storage, graph geometry, or cached
+sampler configuration. Numerical and model-quality qualification remains
+separate from successful switch control.

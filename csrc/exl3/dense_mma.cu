@@ -13,7 +13,7 @@
 // - mma_kernel: trellis tiles decoded in registers straight into m16n8k16 A
 //   fragments, the products on the tensor cores (FP32 accumulate);
 // - linear_output with the output H128 and svh in FP64, rounded once to
-//   FP32 and then to BF16 (linear_out_splitk's).
+//   FP32 and then, for a BF16 out, to BF16 (linear_out_splitk's).
 // Every other launch, including every launch of more than 32 rows, stays
 // with linear_out_splitk (its split-K blocks or linear_out).
 //
@@ -686,9 +686,10 @@ __device__ __forceinline__ void hadamard128_warp_f64(double (&v)[4], int lane) {
 }
 
 // One warp per (row, 128-column block): H128, then svh, in FP64 and rounded
-// once to FP32, then to BF16.
+// once to FP32, then stored as Out (store_output).
+template <typename Out>
 __global__ void linear_output(const float* result, const half* svh, int64_t rows,
-                              int64_t padded_out, int64_t logical_out, __nv_bfloat16* out) {
+                              int64_t padded_out, int64_t logical_out, Out* out) {
   const int lane = threadIdx.x & 31;
   const int64_t blocks = padded_out / 128;
   for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
@@ -703,8 +704,8 @@ __global__ void linear_output(const float* result, const half* svh, int64_t rows
     for (int i = 0; i < 4; ++i) {
       const int64_t col = base + 32 * i;
       if (col < logical_out) {
-        out[row * logical_out + col] =
-            __float2bfloat16_rn(static_cast<float>(v[i] * double(__half2float(svh[col]))));
+        store_output(out + row * logical_out + col,
+                     static_cast<float>(v[i] * double(__half2float(svh[col]))));
       }
     }
   }
@@ -717,7 +718,8 @@ std::atomic<int> g_override{0};
 
 // dense_mma_plan for a served format and matrix (kServedShapes) whose block
 // exponents fit in out ((rows rounded up to 8) * k / 128 int16 within rows *
-// logical_out, out 4-byte aligned: the GEMM copies word pairs), with the
+// logical_out elements, each BF16 or FP32 and so at least one int16; out
+// 4-byte aligned: the GEMM copies word pairs), with the
 // diagnostic override applied to every launch the plan puts on the
 // tensor-core blocks.
 MmaPlan served_plan(int64_t rows, int64_t k, int64_t n, int64_t logical_out, int64_t bits_x2,
@@ -835,9 +837,11 @@ bool linear_out_mma(const torch::Tensor& x, const torch::Tensor& trellis,
   problem.mma_kw = plan.kw;
   launch_mma(problem, plan.mt, stream, device);
 
-  linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
-      result, reinterpret_cast<const half*>(svh.data_ptr<at::Half>()), rows, padded_out,
-      logical_out, reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+  const auto* svh_ptr = reinterpret_cast<const half*>(svh.data_ptr<at::Half>());
+  with_linear_out(out, [&](auto* out_ptr) {
+    linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
+        result, svh_ptr, rows, padded_out, logical_out, out_ptr);
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return true;
 }

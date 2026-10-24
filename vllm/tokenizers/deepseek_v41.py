@@ -69,6 +69,10 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     added_vocab = tokenizer.get_added_vocab()
 
     class _DeepseekV41Tokenizer(tokenizer.__class__):  # type: ignore
+        # The V4.1 encoder renders a mid-conversation system message in
+        # place, so /v1/messages need not merge it into the leading one.
+        renders_inline_system_messages = True
+
         def apply_chat_template(
             self,
             messages: list[ChatCompletionMessageParam],

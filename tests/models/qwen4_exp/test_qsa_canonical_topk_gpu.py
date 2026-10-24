@@ -53,10 +53,13 @@ def _has_persistent_topk() -> bool:
     return True
 
 
-pytestmark = pytest.mark.skipif(
-    not _has_persistent_topk(),
-    reason="needs a CUDA device and torch.ops._C.persistent_topk",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not _has_persistent_topk(),
+        reason="needs a CUDA device and torch.ops._C.persistent_topk",
+    ),
+]
 
 
 def _tied_logits(visible: torch.Tensor, width: int, seed: int) -> torch.Tensor:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Model registry entries of the fork's model classes.
+"""Model registry and model-config entries of the fork's model classes.
 
 vLLM caches the model information of a lazily registered class on disk
 (``$VLLM_CACHE_ROOT/modelinfos``), keyed by a hash of the class's module
@@ -54,3 +54,25 @@ class UpstreamHashedLazyModel(_LazyRegisteredModel):
             hasher.update(path.read_bytes())
             hasher.update(b"\0")
         return hasher.hexdigest()
+
+
+def with_hf_config_defaults(hook: type | None, defaults: dict[str, object]) -> type:
+    """A ``MODELS_CONFIG_MAP`` entry that runs ``hook`` (the entry it replaces,
+    if any) and then sets each attribute of ``defaults`` that the model's HF
+    config leaves unset, so a checkpoint or ``--hf-overrides`` value wins."""
+    from vllm.model_executor.models.config import VerifyAndUpdateConfig
+
+    base = hook or VerifyAndUpdateConfig
+
+    class HfConfigDefaults(base):  # type: ignore[valid-type, misc]
+        hf_config_defaults = dict(defaults)
+        replaced_hook = hook
+
+        @staticmethod
+        def verify_and_update_model_config(model_config) -> None:
+            base.verify_and_update_model_config(model_config)
+            for name, value in defaults.items():
+                if getattr(model_config.hf_config, name, None) is None:
+                    setattr(model_config.hf_config, name, value)
+
+    return HfConfigDefaults

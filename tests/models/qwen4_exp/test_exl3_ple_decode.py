@@ -20,9 +20,10 @@ import numpy as np
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="ple_decode_out needs CUDA"
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="ple_decode_out needs CUDA"),
+]
 
 _MUL1 = 0x83DCD12D
 _K_INV = float(np.array([0x1EEE], np.uint16).view(np.float16)[0])

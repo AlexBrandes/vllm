@@ -14,7 +14,7 @@ _registered = False
 
 
 # ---------------------------------------------------------------------------
-# GLM model code
+# Model code (GLM, DeepSeek-V4.1)
 # ---------------------------------------------------------------------------
 
 # Architectures whose fork classes replace the upstream ones in vLLM's model
@@ -27,6 +27,14 @@ MODEL_OVERRIDES = {
     ),
     "Glm5NextForConditionalGeneration": (
         "vllm.models.glm5next.nvidia.sm80_model:Glm5NextForConditionalGeneration"
+    ),
+    # The DeepSeek-V4.1 vision wrapper (its text model is built inside it)
+    # and its DSpark drafter, whose class lives in the same model package.
+    "DeepseekV41ForCausalLM": (
+        "vllm.models.deepseek_v41.nvidia.sm80_model:DeepseekV41ForCausalLM"
+    ),
+    "DSparkV41DraftModel": (
+        "vllm.models.deepseek_v41.nvidia.sm80_model:DSparkDeepseekV4ForCausalLM"
     ),
 }
 
@@ -52,6 +60,30 @@ def register_models() -> None:
         ModelRegistry.models[architecture] = PackageHashedLazyModel(
             entry.module_name, entry.class_name
         )
+
+
+# HF config attributes the fork's models default (architecture -> attribute
+# -> value), set by vLLM's model-config hook unless the checkpoint or
+# --hf-overrides sets them. DeepSeek-V4.1's reference computes FP32 logits
+# (ParallelHead: an FP32 weight applied to x.float()), so its LM head, the
+# DSpark Markov head and the draft logits run in FP32 (ModelConfig.head_dtype).
+HF_CONFIG_DEFAULTS: dict[str, dict[str, object]] = {
+    "DeepseekV41ForCausalLM": {"head_dtype": "float32"},
+}
+
+
+def register_hf_config_defaults() -> None:
+    """Wrap the ``MODELS_CONFIG_MAP`` entry of each architecture in
+    :data:`HF_CONFIG_DEFAULTS` so it also sets the defaults (idempotent: an
+    entry wrapped in this process already is left as it is)."""
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+    from vllm.sm80.model_registry import with_hf_config_defaults
+
+    for architecture, defaults in HF_CONFIG_DEFAULTS.items():
+        hook = MODELS_CONFIG_MAP.get(architecture)
+        if getattr(hook, "hf_config_defaults", None) is not None:
+            continue
+        MODELS_CONFIG_MAP[architecture] = with_hf_config_defaults(hook, defaults)
 
 
 # DFlash2 drafter code shared by the models (vllm/sm80/spec_decode/).
@@ -134,6 +166,7 @@ def register() -> None:
     """Entry point named in ``plugins/sm80/pyproject.toml``."""
     register_models()
     register_drafter_models()
+    register_hf_config_defaults()
     global _registered
     if not _registered:
         _register_exl3()
@@ -142,6 +175,12 @@ def register() -> None:
     register_triton_mla_sparse_backend()
     register_moe_layers()
     log_marlin_decode_v2_gate()
+    from vllm.sm80.spec_decode.dspark_depth_hint import install as install_depth_hint
+    from vllm.sm80.spec_decode.dspark_host_width import install as install_host_width
+
+    install_depth_hint()
+    # After the hint: the host width runs on the width the hint chose.
+    install_host_width()
 
 
 def is_registered() -> bool:

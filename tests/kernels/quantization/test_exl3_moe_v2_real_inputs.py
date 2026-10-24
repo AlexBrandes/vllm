@@ -25,7 +25,7 @@ GPU (SM 8.0): per case the shipped operator (ops.moe_out), the port
 must give each live case's recorded output bit for bit (the inputs and
 weights are the served ones); per pool (role, rows, phase, drafter) the port
 holds moe_out's error against FP64 (test_exl3_moe_v2._Fp64Pool: pooled mean
-<= 1.10x, max <= 1.25x, BF16 rounding ties forgiven, exact where moe_out is
+<= 1.10x, max <= 1.25x with no element excused, exact where moe_out is
 exact). One line per pool and per phase's cells is printed; a failing pool
 fails.
 

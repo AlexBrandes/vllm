@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -11,6 +12,7 @@ import torch
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.sm80.spec_decode.warmup import warmup_spec_decode
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -250,6 +252,7 @@ def warmup_kernels(
         if adaptive_sampling:
             assert rejection_sampler is not None
             rejection_sampler.enable_adaptive_verification = True
+    warmup_spec_decode(model_runner)
 
 
 def _warmup_kernels(

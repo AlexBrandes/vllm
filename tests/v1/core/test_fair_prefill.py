@@ -687,3 +687,252 @@ def test_uncapped_prefill_is_block_aligned_not_batched_token_sized():
     # whole difference the cap makes, and the decodes ride along either way.
     assert steps <= 5
     assert all_decode_steps == steps
+
+
+# --------------------------------------------------------------------------
+# Short-prompt bypass (VLLM_FAIR_PREFILL_SHORT_BYPASS): a prefill whose whole
+# remaining prompt fits in the cap is scheduled in full and not charged to
+# the capped budget; long prompts keep the cap.
+# --------------------------------------------------------------------------
+
+BYPASS_CAP = 128
+# Seven short prompts arriving together beside one decoding stream (eight
+# concurrent requests); the last one sits exactly on the cap.
+BURST_LENS = (40, 70, 100, 120, 55, 90, BYPASS_CAP)
+
+
+def _bypass_scheduler(monkeypatch, bypass: bool, **kwargs):
+    monkeypatch.setenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", "1" if bypass else "0")
+    kwargs.setdefault("max_num_batched_tokens", 1024)
+    kwargs.setdefault("prefill_chunk_with_decodes", BYPASS_CAP)
+    kwargs.setdefault("max_num_partial_prefills", 2)
+    scheduler = create_scheduler(max_num_seqs=16, max_model_len=MAX_LEN, **kwargs)
+    assert scheduler.fair_prefill_short_bypass == bypass
+    return scheduler
+
+
+def _add_prompts(scheduler, lens, prefix="s"):
+    requests = []
+    for i, num_tokens in enumerate(lens):
+        (request,) = create_requests(
+            num_requests=1,
+            num_tokens=num_tokens,
+            max_tokens=64,
+            ignore_eos=True,
+            req_ids=[f"{prefix}{i}"],
+        )
+        scheduler.add_request(request)
+        requests.append(request)
+    return requests
+
+
+def _decode_tokens(output, decodes):
+    return [output.num_scheduled_tokens.get(r.request_id, 0) for r in decodes]
+
+
+def test_short_bypass_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", raising=False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=16,
+        max_model_len=MAX_LEN,
+        prefill_chunk_with_decodes=BYPASS_CAP,
+        max_num_partial_prefills=2,
+    )
+    assert scheduler.fair_prefill
+    assert not scheduler.fair_prefill_short_bypass
+
+
+def test_short_bypass_needs_the_cap(monkeypatch):
+    """The threshold is the cap: with only the split there is nothing to
+    compare a prompt against, so the switch does nothing."""
+    monkeypatch.setenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", "1")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=16,
+        max_model_len=MAX_LEN,
+        max_num_partial_prefills=2,
+    )
+    assert scheduler.fair_prefill
+    assert not scheduler.fair_prefill_short_bypass
+
+
+def test_short_burst_beside_a_decode_spreads_over_steps_without_bypass(monkeypatch):
+    """Today's schedule, pinned: the burst shares the 128-token cap in 64-token
+    slices, so admitting it takes six steps."""
+    scheduler = _bypass_scheduler(monkeypatch, False)
+    decodes = _start_decode_streams(scheduler, 1)
+    shorts = _add_prompts(scheduler, BURST_LENS)
+
+    trace = []
+    while any(r.is_prefill_chunk or r.num_computed_tokens == 0 for r in shorts):
+        output, prefill_tokens = _step(scheduler)
+        assert _decode_tokens(output, decodes) == [1]
+        trace.append(prefill_tokens)
+        assert len(trace) < 20
+    # `_step` counts a one-token prompt tail as decode work, as the scheduler's
+    # predicate does (steps 4 and 6 each finish such a tail).
+    assert trace == [128, 128, 128, 127, 90, 0]
+
+
+def test_short_burst_beside_a_decode_is_admitted_in_one_step(monkeypatch):
+    """With the bypass every short prompt prefills completely on the step it
+    arrives, and the decode stream keeps its row."""
+    scheduler = _bypass_scheduler(monkeypatch, True)
+    decodes = _start_decode_streams(scheduler, 1)
+    shorts = _add_prompts(scheduler, BURST_LENS)
+
+    output, prefill_tokens = _step(scheduler)
+    assert _decode_tokens(output, decodes) == [1]
+    for request, num_tokens in zip(shorts, BURST_LENS):
+        assert output.num_scheduled_tokens[request.request_id] == num_tokens
+        assert not request.is_prefill_chunk
+    assert prefill_tokens == sum(BURST_LENS)
+
+    # Next step: eight decodes, no prefill.
+    output, prefill_tokens = _step(scheduler)
+    assert prefill_tokens == 0
+    assert _decode_tokens(output, decodes + shorts) == [1] * 8
+
+
+def test_short_burst_stays_within_the_token_budget(monkeypatch):
+    """The bypass lifts the cap, not the ordinary token budget: a burst
+    larger than the budget is chunked by it, and the decode is scheduled
+    first."""
+    scheduler = _bypass_scheduler(monkeypatch, True, max_num_batched_tokens=256)
+    decodes = _start_decode_streams(scheduler, 1)
+    shorts = _add_prompts(scheduler, BURST_LENS)
+
+    output, prefill_tokens = _step(scheduler)
+    assert _decode_tokens(output, decodes) == [1]
+    assert sum(output.num_scheduled_tokens.values()) == 256
+    assert prefill_tokens == 255
+    # 40 + 70 + 100 fit; the fourth prompt gets the 45 tokens left and its
+    # 75-token remainder, now short, is finished whole on the next step.
+    assert [output.num_scheduled_tokens.get(r.request_id, 0) for r in shorts] == [
+        40,
+        70,
+        100,
+        45,
+        0,
+        0,
+        0,
+    ]
+    output, _ = _step(scheduler)
+    assert _decode_tokens(output, decodes + shorts[:3]) == [1] * 4
+    assert output.num_scheduled_tokens["s3"] == 75
+    assert not shorts[3].is_prefill_chunk
+
+
+def test_long_prompt_keeps_the_cap_beside_a_short_burst(monkeypatch):
+    """A long prompt in flight keeps exactly the cap on every step: the burst
+    is not charged to it and takes no share of the split."""
+    scheduler = _bypass_scheduler(monkeypatch, True)
+    decodes = _start_decode_streams(scheduler, 1)
+    (long_req,) = _add_prompts(scheduler, (1800,), prefix="long")
+    output, _ = _step(scheduler)
+    assert output.num_scheduled_tokens["long0"] == BYPASS_CAP
+
+    shorts = _add_prompts(scheduler, BURST_LENS)
+    output, prefill_tokens = _step(scheduler)
+    assert _decode_tokens(output, decodes) == [1]
+    assert output.num_scheduled_tokens["long0"] == BYPASS_CAP
+    assert prefill_tokens == BYPASS_CAP + sum(BURST_LENS)
+    assert not any(r.is_prefill_chunk for r in shorts)
+
+    for _ in range(3):
+        output, prefill_tokens = _step(scheduler)
+        assert output.num_scheduled_tokens["long0"] == BYPASS_CAP
+        assert prefill_tokens == BYPASS_CAP
+        assert _decode_tokens(output, decodes + shorts) == [1] * 8
+    assert long_req.is_prefill_chunk
+
+
+def test_running_prefill_remainder_within_the_cap_finishes_whole(monkeypatch):
+    """Running prefills too: two long prompts split the cap 64/64 until each
+    has at most the cap left, then both finish in one step (without the
+    bypass the last 104 tokens take a 64 and a 40-token step)."""
+    for bypass, tail in ((False, [64, 40]), (True, [104])):
+        scheduler = _bypass_scheduler(monkeypatch, bypass)
+        decodes = _start_decode_streams(scheduler, 1)
+        a, b = _add_prompts(scheduler, (1000, 1000), prefix="p")
+        chunks = []
+        while a.is_prefill_chunk or a.num_computed_tokens == 0:
+            output, _ = _step(scheduler)
+            assert _decode_tokens(output, decodes) == [1]
+            assert (
+                output.num_scheduled_tokens["p0"] == output.num_scheduled_tokens["p1"]
+            )
+            chunks.append(output.num_scheduled_tokens["p0"])
+        assert chunks == [64] * 14 + tail, bypass
+        assert not b.is_prefill_chunk
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("max_batched", [256, 1024])
+def test_short_bypass_never_starves_decodes(monkeypatch, num_spec, max_batched):
+    """Mixed long and short arrivals: every step stays within the token budget,
+    carries every decode stream, and the prefill tokens of prompts longer than
+    the cap never exceed the cap."""
+    scheduler = _bypass_scheduler(
+        monkeypatch,
+        True,
+        max_num_batched_tokens=max_batched,
+        num_speculative_tokens=num_spec or None,
+    )
+    decodes = _start_decode_streams(scheduler, 2)
+    longs = _add_prompts(scheduler, (900, 700), prefix="long")
+    _add_prompts(scheduler, BURST_LENS)
+    for step in range(40):
+        if step == 5:
+            _add_prompts(scheduler, BURST_LENS, prefix="t")
+        before = {
+            r.request_id: r.num_tokens - r.num_computed_tokens
+            for r in scheduler.requests.values()
+            if r.is_prefill_chunk or r.num_computed_tokens == 0
+        }
+        output, _ = _step(scheduler)
+        assert sum(output.num_scheduled_tokens.values()) <= max_batched
+        assert all(n > 0 for n in _decode_tokens(output, decodes))
+        capped = sum(
+            n
+            for req_id, n in output.num_scheduled_tokens.items()
+            if before.get(req_id, 0) > BYPASS_CAP
+        )
+        assert capped <= BYPASS_CAP
+    assert all(r.num_computed_tokens > 0 for r in longs)
+
+
+def test_short_bypass_leaves_the_mamba_aligned_split_alone(monkeypatch):
+    """Align-mode Mamba sizes its chunks from the prefill limit, so the bypass
+    is inert there: two prompts splitting the cap, whose tails are within the
+    cap but above one share, get the chunks the switch-off run produces."""
+    knobs = {"prefill_chunk_with_decodes": ODD_CAP, "max_num_partial_prefills": 2}
+    traces = []
+    for bypass in (False, True):
+        monkeypatch.setenv("VLLM_FAIR_PREFILL_SHORT_BYPASS", str(int(bypass)))
+        scheduler = _mamba_scheduler(ODD_BLOCK, **knobs)
+        assert scheduler.fair_prefill_short_bypass == bypass
+        decodes = _start_decode_streams(scheduler, 3)
+        prompts = []
+        for i, num_tokens in enumerate((1000, 700)):
+            (request,) = create_requests(
+                num_requests=1,
+                num_tokens=num_tokens,
+                max_tokens=4,
+                block_size=scheduler.block_size,
+                req_ids=[f"m{i}"],
+            )
+            scheduler.add_request(request)
+            prompts.append(request)
+        trace = []
+        while any(r.is_prefill_chunk or r.num_computed_tokens == 0 for r in prompts):
+            output, prefill_tokens = _step(scheduler)
+            assert all(n > 0 for n in _decode_tokens(output, decodes))
+            assert prefill_tokens <= ODD_CAP
+            trace.append(
+                tuple(output.num_scheduled_tokens.get(r.request_id, 0) for r in prompts)
+            )
+            assert len(trace) < 100
+        traces.append(trace)
+    assert traces[0] == traces[1]

@@ -3,6 +3,7 @@
 #include "ops.h"
 #include "ple.h"
 #include "dense_splitk.h"
+#include "engram_fetch.h"
 #include <Python.h>
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
@@ -17,13 +18,16 @@ TORCH_LIBRARY(_exl3_C, m) {
         "Tensor(a!) out, Tensor(b!) workspace) -> ()");
   m.def("moe_out(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
-        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace) -> ()");
+        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
+        "float swiglu_limit=0.0) -> ()");
   m.def("moe_out_v2(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
-        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace) -> ()");
+        "int intermediate_size, int bits_x2, Tensor(a!) out, "
+        "Tensor(b!) workspace, float swiglu_limit=0.0) -> ()");
   m.def("moe_out_prefill(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
-        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace) -> ()");
+        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
+        "float swiglu_limit=0.0) -> ()");
   m.def("ple_decode_out(Tensor packed_rows, Tensor global_ids, Tensor head_bias, "
         "Tensor head_offsets, Tensor head_vocab_sizes, int owner_lo, "
         "int owner_hi, int bits, Tensor(a!) out) -> ()");
@@ -32,6 +36,7 @@ TORCH_LIBRARY(_exl3_C, m) {
         "Tensor head_offsets, Tensor head_vocab_sizes, int retries, "
         "int max_threads) -> Tensor");
   register_ple_host_reader(m);
+  register_engram_host_fetch(m);
   // No tensor arguments: these are catch-all CPU arithmetic functions, not
   // CUDA-dispatched ops, and never inspect a device or initialize CUDA.
   m.def("linear_workspace_size(int max_rows, int padded_in, int padded_out) -> int",
@@ -52,7 +57,8 @@ TORCH_LIBRARY(_exl3_C, m) {
         "Tensor(a!) out, Tensor(b!) workspace) -> ()");
   m.def("moe_out_reference(Tensor x, Tensor topk_ids, Tensor topk_weights, "
         "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
-        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace) -> ()");
+        "int intermediate_size, Tensor(a!) out, Tensor(b!) workspace, "
+        "float swiglu_limit=0.0) -> ()");
   m.def("set_gemm_shape_override(int shape) -> ()", &exl3::set_gemm_shape_override);
 }
 
@@ -75,8 +81,10 @@ namespace {
 
 // TORCH_LIBRARY is not the stable ABI: exl3.ops.ensure_extension compares
 // these with the running PyTorch and refuses a library built for another.
+// abi_version 3: moe_out_v2 takes bits_x2 (2: the MoE operators take
+// swiglu_limit).
 PyObject* build_info(PyObject*, PyObject*) {
-  return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 1, "torch_version",
+  return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 3, "torch_version",
                        TORCH_VERSION, "cuda_version", CUDART_VERSION,
                        "cxx11_abi", _GLIBCXX_USE_CXX11_ABI);
 }

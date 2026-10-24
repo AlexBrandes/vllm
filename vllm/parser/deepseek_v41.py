@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """DeepSeek V4.1 reasoning and spaced DSML tool calls."""
 
 import functools
@@ -12,6 +13,7 @@ from vllm.parser.deepseek_v4 import (
     deepseek_v4_config,
 )
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig
+from vllm.sm80.deepseek_v41_recovery import recovering_parser
 
 DSML_TOOL_START = "<｜DSML｜ calls>"
 DSML_TOOL_END = "</｜DSML｜ calls>"
@@ -52,3 +54,6 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
 
 class DeepSeekV41Parser(DeepSeekV4Parser):
     parser_config = staticmethod(deepseek_v41_config)
+
+
+DeepSeekV41Parser = recovering_parser(DeepSeekV41Parser)  # type: ignore[misc]

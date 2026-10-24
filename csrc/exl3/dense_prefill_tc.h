@@ -14,7 +14,8 @@
 //   acc = fma(dh + (dl + dw), 1 / s, acc) in FP32 round-to-nearest, k16 steps in increasing k; when the
 //   schedule splits a tile's k range over blocks (stream-K), each segment accumulates from 0 and the segments
 //   are summed in k order in FP32;
-//   out = bf16_rn(H128(acc) * svh) exactly as linear_out's linear_output (a block owns whole H128 column blocks).
+//   out = H128(acc) * svh in FP32, rounded to BF16 for a BF16 out, exactly as linear_out's linear_output (a block
+//   owns whole H128 column blocks).
 // Deterministic: the schedule and the k split points are a function of the launch shape and the device's
 // multiprocessor count only, the split tiles' partial sums are added in a fixed (k) order whichever block
 // finishes the tile, and no row's value depends on another row's. A row's bits do depend on the row count of

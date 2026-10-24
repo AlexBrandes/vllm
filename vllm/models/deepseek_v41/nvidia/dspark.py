@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 """DSpark draft model for DeepSeek-V4.1 (semi-autoregressive speculative decoding).
 
 See: qwen3_dspark.py for base architecture. This one is specialized to the
@@ -46,6 +47,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.models.deepseek_v41.nvidia.sm80_attention import sm80_dspark_context_kv
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -162,6 +164,7 @@ class DSparkDeepseekV4Model(nn.Module):
         return self.main_norm(self.main_proj(aux_hidden_states))
 
     @torch.inference_mode()
+    @sm80_dspark_context_kv
     def precompute_and_store_context_kv(
         self,
         main_x: torch.Tensor,

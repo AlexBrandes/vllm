@@ -41,10 +41,11 @@ __global__ void linear_input(const __nv_bfloat16* x, const half* suh, int64_t ro
   }
 }
 
-// One warp per (row, 128-column block): H128, then svh and BF16 rounding.
+// One warp per (row, 128-column block): H128, then svh, stored as Out
+// (store_output).
+template <typename Out>
 __global__ void linear_output(const float* result, const half* svh, int64_t rows,
-                              int64_t padded_out, int64_t logical_out,
-                              __nv_bfloat16* out) {
+                              int64_t padded_out, int64_t logical_out, Out* out) {
   const int lane = threadIdx.x & 31;
   const int64_t blocks = padded_out / 128;
   for (int64_t task = int64_t(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
@@ -59,8 +60,8 @@ __global__ void linear_output(const float* result, const half* svh, int64_t rows
     for (int i = 0; i < 4; ++i) {
       const int64_t col = base + 32 * i;
       if (col < logical_out) {
-        out[row * logical_out + col] =
-            __float2bfloat16_rn(__fmul_rn(v[i], __half2float(svh[col])));
+        store_output(out + row * logical_out + col,
+                     __fmul_rn(v[i], __half2float(svh[col])));
       }
     }
   }
@@ -86,7 +87,7 @@ void linear_out(const torch::Tensor& x, const torch::Tensor& trellis,
   check_tensor(trellis, x, at::kShort, "trellis");
   check_tensor(suh, x, at::kHalf, "suh");
   check_tensor(svh, x, at::kHalf, "svh");
-  check_tensor(out, x, at::kBFloat16, "out");
+  check_linear_out(out, x);
   check_tensor(workspace, x, at::kFloat, "workspace");
   TORCH_CHECK(x.dim() == 2 && trellis.dim() == 3 && suh.dim() == 1 &&
                   svh.dim() == 1 && out.dim() == 2,
@@ -140,9 +141,10 @@ void linear_out(const torch::Tensor& x, const torch::Tensor& trellis,
               (rows + block_rows - 1) / block_rows * (padded_out / gemm_block_cols(shape)),
               stream);
 
-  linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
-      result, svh_ptr, rows, padded_out, logical_out,
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+  with_linear_out(out, [&](auto* out_ptr) {
+    linear_output<<<warp_blocks(rows * (padded_out / 128)), 32 * kWarpsPerBlock, 0, stream>>>(
+        result, svh_ptr, rows, padded_out, logical_out, out_ptr);
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

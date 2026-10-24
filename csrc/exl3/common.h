@@ -2,7 +2,11 @@
 
 #include <ATen/MemoryOverlap.h>
 #include <torch/types.h>
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#endif
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -48,6 +52,13 @@ inline void check_integer(const torch::Tensor& t, const torch::Tensor& x,
               name, " must have int32 or int64 dtype");
   check_tensor(t, x, t.scalar_type(), name);
 }
+// The dense linear's out: BF16 (the FP32 result rounded once to nearest) or
+// FP32 (the result itself).
+inline void check_linear_out(const torch::Tensor& out, const torch::Tensor& x) {
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 || out.scalar_type() == at::kFloat,
+              "EXL3 linear out must be BF16 or FP32");
+  check_tensor(out, x, out.scalar_type(), "out");
+}
 inline void check_mutations(const torch::Tensor& out,
                             const torch::Tensor& workspace,
                             std::initializer_list<const torch::Tensor*> inputs) {
@@ -62,5 +73,42 @@ inline void check_mutations(const torch::Tensor& out,
 inline unsigned int launch_blocks(int64_t tasks) {
   return static_cast<unsigned int>(std::min<int64_t>(tasks, 65535));
 }
+// The MoE operators' swiglu_limit: finite and nonnegative, 0 for no clamp.
+inline float checked_swiglu_limit(double limit) {
+  TORCH_CHECK(std::isfinite(limit) && limit >= 0.0,
+              "EXL3 swiglu_limit must be finite and nonnegative");
+  return static_cast<float>(limit);
+}
+#ifdef __CUDACC__
+// SwiGLU clamp before SiLU(gate) * up: the gate from above, up on both sides
+// (limit 0: unclamped).
+__device__ __forceinline__ void swiglu_clamp(float& gate, float& up, float limit) {
+  if (limit > 0.0f) {
+    gate = fminf(gate, limit);
+    up = fminf(fmaxf(up, -limit), limit);
+  }
+}
+__device__ __forceinline__ void swiglu_clamp(double& gate, double& up, float limit) {
+  if (limit > 0.0f) {
+    const double bound = limit;
+    gate = fmin(gate, bound);
+    up = fmin(fmax(up, -bound), bound);
+  }
+}
+// The dense linear's store of one FP32 result (check_linear_out).
+__device__ __forceinline__ void store_output(__nv_bfloat16* out, float value) {
+  *out = __float2bfloat16_rn(value);
+}
+__device__ __forceinline__ void store_output(float* out, float value) { *out = value; }
+// Calls launch(p) with p the data of out as __nv_bfloat16* or float*.
+template <typename Launch>
+void with_linear_out(torch::Tensor& out, Launch&& launch) {
+  if (out.scalar_type() == at::kFloat) {
+    launch(out.data_ptr<float>());
+  } else {
+    launch(reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+  }
+}
+#endif
 
 }  // namespace exl3
