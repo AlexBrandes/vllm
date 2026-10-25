@@ -36,10 +36,10 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/glm5next/nvidia/sm80_kda.py` | 239 |
 | `vllm/models/glm5next/nvidia/sm80_mla.py` | 123 |
 | `vllm/models/glm5next/nvidia/sm80_model.py` | 464 |
-| `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
+| `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 999 |
 | `vllm/models/qwen4_exp/nvidia/mmap_ple.py` | 449 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 65 |
-| **7 files** | **2,401** |
+| **7 files** | **2,452** |
 
 ### `vllm/sm80/kernels/`
 
@@ -311,7 +311,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/kimi_k3/test_kda_zero_draft_rows.py` | 101 |
 | `tests/models/qwen4_exp/test_exl3_construction.py` | 369 |
 | `tests/models/qwen4_exp/test_exl3_ple_decode.py` | 232 |
-| `tests/models/qwen4_exp/test_exl3_ple_reader.py` | 1,683 |
+| `tests/models/qwen4_exp/test_exl3_ple_reader.py` | 1,839 |
 | `tests/models/qwen4_exp/test_mmap_ple.py` | 322 |
 | `tests/models/qwen4_exp/test_mtp_local_argmax.py` | 224 |
 | `tests/models/qwen4_exp/test_mtp_pp.py` | 45 |
@@ -324,7 +324,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/test_native_checkpoint_wrapper_meta.py` | 256 |
 | `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
 | `tests/plugins_tests/conftest.py` | 17 |
-| `tests/sm80/seams.yaml` | 1,176 |
+| `tests/sm80/seams.yaml` | 1,169 |
 | `tests/sm80/test_drafter_registrations.py` | 126 |
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
@@ -370,7 +370,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 171 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **140 files** | **49,472** |
+| **140 files** | **49,621** |
 
 #### `tools/`
 
@@ -389,7 +389,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | Path | Change | + | - | Hunks |
 | --- | --- | ---: | ---: | ---: |
 | `.buildkite/test_areas/kernels.yaml` | modified | 2 | 0 | 1 |
-| `.buildkite/test_areas/models_basic.yaml` | modified | 7 | 0 | 4 |
+| `.buildkite/test_areas/models_basic.yaml` | modified | 17 | 0 | 6 |
 | `CMakeLists.txt` | modified | 47 | 0 | 3 |
 | `csrc/moe/marlin_moe_wna16/kernel.h` | modified | 46 | 0 | 6 |
 | `csrc/moe/marlin_moe_wna16/marlin_template.h` | modified | 320 | 11 | 37 |
@@ -421,9 +421,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/models/kimi_k3/nvidia/ops/recoverssm.py` | modified | 3 | 1 | 3 |
 | `vllm/models/qwen4_exp/common/ngram_embedding.py` | modified | 4 | 0 | 2 |
 | `vllm/models/qwen4_exp/nvidia/model.py` | modified | 42 | 16 | 14 |
-| `vllm/models/qwen4_exp/nvidia/model_state.py` | modified | 39 | 9 | 6 |
+| `vllm/models/qwen4_exp/nvidia/model_state.py` | modified | 44 | 9 | 7 |
 | `vllm/models/qwen4_exp/nvidia/mtp.py` | modified | 31 | 6 | 9 |
-| `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` | modified | 49 | 7 | 9 |
+| `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` | modified | 76 | 12 | 13 |
 | `vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py` | modified | 52 | 0 | 6 |
 | `vllm/parser/abstract_parser.py` | modified | 4 | 0 | 2 |
 | `vllm/parser/glm47_moe.py` | modified | 19 | 0 | 3 |
@@ -451,7 +451,8 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/async_utils.py` | modified | 21 | 0 | 6 |
 | `vllm/v1/worker/gpu/block_table.py` | modified | 11 | 3 | 4 |
 | `vllm/v1/worker/gpu/cudagraph_utils.py` | modified | 131 | 9 | 12 |
-| `vllm/v1/worker/gpu/model_runner.py` | modified | 218 | 14 | 37 |
+| `vllm/v1/worker/gpu/input_batch.py` | modified | 6 | 0 | 3 |
+| `vllm/v1/worker/gpu/model_runner.py` | modified | 219 | 14 | 38 |
 | `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` | modified | 44 | 1 | 7 |
 | `vllm/v1/worker/gpu/model_states/recoverssm.py` | modified | 4 | 9 | 3 |
 | `vllm/v1/worker/gpu/pp_utils.py` | modified | 222 | 10 | 16 |
@@ -463,7 +464,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | modified | 8 | 2 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
 | `vllm/v1/worker/utils.py` | modified | 17 | 4 | 2 |
-| **75 files** | | **3,806** | **295** | **532** |
+| **76 files** | | **3,855** | **300** | **543** |
 
 ### Tests, docs and .github
 
@@ -484,6 +485,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `docs/serving/parallelism_scaling.md` | modified | 48 | 0 | 1 |
 | `tests/models/kimi_k3/test_kda_metadata.py` | modified | 4 | 2 | 2 |
 | `tests/models/qwen4_exp/test_config.py` | modified | 163 | 18 | 11 |
+| `tests/models/qwen4_exp/test_ple.py` | modified | 1 | 0 | 1 |
 | `tests/test_config.py` | modified | 77 | 0 | 3 |
 | `tests/test_envs.py` | modified | 62 | 0 | 3 |
 | `tests/v1/core/test_kv_cache_planning.py` | modified | 123 | 0 | 1 |
@@ -495,15 +497,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_model_runner_v2.py` | modified | 4 | 1 | 4 |
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 9 | 1 | 5 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **26 files** | | **982** | **568** | **94** |
+| **27 files** | | **983** | **568** | **95** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 | --- | ---: | ---: | ---: | ---: |
-| Product code | 75 | 3,806 | 295 | 532 |
-| Tests, docs and .github | 26 | 982 | 568 | 94 |
-| All | 101 | 4,788 | 863 | 626 |
+| Product code | 76 | 3,855 | 300 | 543 |
+| Tests, docs and .github | 27 | 983 | 568 | 95 |
+| All | 103 | 4,838 | 868 | 638 |
 
 ## 3. Fork environment variables
 
@@ -618,11 +620,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 | --- | ---: |
 | Fork-added product files | 128 |
-| Fork-added product lines | 39,533 |
-| Patched upstream files | 101 |
-| Patched upstream lines | +4,788 / -863 |
-| Patched upstream product files | 75 |
-| Patched upstream product lines | +3,806 / -295 |
-| Product lines added (new files and patches) | 43,339 |
+| Fork-added product lines | 39,584 |
+| Patched upstream files | 103 |
+| Patched upstream lines | +4,838 / -868 |
+| Patched upstream product files | 76 |
+| Patched upstream product lines | +3,855 / -300 |
+| Product lines added (new files and patches) | 43,439 |
 | Fork environment variables (flags) | 87 |
 | Unreferenced fork definitions | 1 (39 lines) |

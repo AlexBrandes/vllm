@@ -63,11 +63,11 @@ The MTP count is configurable; this example is not a measured optimum. Keep visi
 
 ### Experimental PP2
 
-Qwen3.8-Flash-Next supports `--pipeline-parallel-size 2 --tensor-parallel-size 1 --mm-encoder-tp-mode data`, with native MTP and prefix caching. The standard multimodal runner encodes images and video on the first stage; later stages receive pipeline intermediates. This layout has been validated with vision enabled, MTP3, prefix reuse, concurrent requests, and PIECEWISE graph replay. The measured configuration uses `--prefix-match-unit 4`, which divides its resolved cache groups. Other EXL3 pipeline layouts remain rejected; the existing TP2 recipe above is unchanged.
+Qwen3.8-Flash-Next supports `--pipeline-parallel-size 2 --tensor-parallel-size 1 --mm-encoder-tp-mode data`, with native MTP and prefix caching. The standard multimodal runner encodes images and video on the first stage; later stages receive pipeline intermediates. This layout has been validated with vision enabled, MTP3, prefix reuse, concurrent requests, and both PIECEWISE and FULL_AND_PIECEWISE graph replay. The measured configuration uses `--prefix-match-unit 4`, which divides its resolved cache groups. Other EXL3 pipeline layouts remain rejected; the existing TP2 recipe above is unchanged.
 
 Every PLE layer must belong to stage zero. Validation checks the actual `VLLM_PP_LAYER_PARTITION` before weights load. The tested 48-layer split is `26,22`; PLE layer 2 belongs to stage zero.
 
-PP2 uses this fork's compressed PLE SSD reader and breakable-graph path. `VLLM_EXL3_DENSE_PREFILL_TC` and `VLLM_EXL3_MOE_PREFILL_TC` support this layout. `VLLM_EXL3_MOE_V2` enables tensor-core MoE decode for its 512 local experts. `VLLM_EXL3_DENSE_MMA` enables tensor-core dense decode for the full-width projections and vocabulary head. Both decode paths have numerical and graph-replay coverage for TP2 and PP2 and retain their hardware, shape and format gates. The serving configuration is:
+PP2 uses this fork's compressed PLE SSD reader. Full decode graphs consume persistent decoded-row buffers prepared before replay; PIECEWISE and eager execution retain the overlapping reader path. `VLLM_EXL3_DENSE_PREFILL_TC` and `VLLM_EXL3_MOE_PREFILL_TC` support this layout. `VLLM_EXL3_MOE_V2` enables tensor-core MoE decode for its 512 local experts. `VLLM_EXL3_DENSE_MMA` enables tensor-core dense decode for the full-width projections and vocabulary head. Both decode paths have numerical and graph-replay coverage for TP2 and PP2 and retain their hardware, shape and format gates. The serving configuration is:
 
 ```bash
 VLLM_PP_LAYER_PARTITION=26,22 \
@@ -91,7 +91,7 @@ vllm serve ./qwen-exl3-checkpoint \
   --max-num-batched-tokens 3460 --max-num-seqs 8 \
   --long-prefill-token-threshold 0 --enable-prompt-tokens-details \
   --enable-prefix-caching --prefix-match-unit 4 \
-  --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"disable_eagle_block_drop":true}'
 ```
 
@@ -109,7 +109,7 @@ The earlier PP work is documented in [AlexBrandes/vllm](https://github.com/AlexB
 
 All modes use the same GPU row decoder. Its layout comes from the PLE file: `K` from the codec metadata, the channel count from the head bias, and the row size (one FP16 scale word plus a ring of `channels * K` bits) from the trellis. Ownership and head padding are masked before bias; only decoded BF16 rows participate in the embedding reduction. Repeated IDs preserve request order. Original auxiliary tensors stay GPU-resident.
 
-SSD reads occur at eager Python breaks between CUDA graph segments: ID completion, CPU reads, H2D readiness, decode and output-copy completion have explicit ordering. This is not a captured CUDA host callback. Staging cannot be reused until the previous output consumer has completed. Warm stable workspaces before capture; growth after capture locking is rejected.
+For PP2 full decode graphs, requested PLE rows are read and decoded into persistent buffers before replay. Graphs consume those buffers without capturing file reads, and padding rows are cleared for each staged batch. This external staging requires an embedding tensor-parallel group that does not gather across data-parallel ranks. PIECEWISE and eager execution keep the original overlapping prefetch, with SSD reads at eager Python breaks between graph segments. ID completion, CPU reads, H2D readiness, decode and output-copy completion have explicit ordering. This is not a captured CUDA host callback. Staging cannot be reused until the previous output consumer has completed. Warm stable workspaces before capture; growth after capture locking is rejected.
 
 A row read that still fails after its retries fails only the requests that use the row; the engine keeps serving the rest. The reader stages the row with an FP16 NaN scale, so the decoder emits a NaN row. NaN survives the tensor-parallel sum of row shards, so every rank sees which tokens failed, whichever rank owns the row. Those tokens' PLE embeddings are zeroed before the forward continues, so NaN cannot reach other requests. The model runner reports the requests that own the tokens. The scheduler finishes them with `FINISHED_ERROR` (finish reason `error`) and drops from the prefix cache the KV blocks they computed from that step on. It also fails any running request that already reused those blocks, so no request is served from a wrong embedding. The worker logs the row and the OS error; the scheduler logs the request IDs. The reader stays usable, and later requests read the row again. Errors while reading the table or its auxiliaries during startup still fail startup. `ram` and `device` read the table only at startup.
 

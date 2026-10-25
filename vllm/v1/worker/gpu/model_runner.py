@@ -2122,6 +2122,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                 input_ids = None
 
+        input_batch.cg_mode = batch_desc.cg_mode
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,

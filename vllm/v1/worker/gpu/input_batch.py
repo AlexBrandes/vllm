@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by AlexBrandes for CMP 170HX support; see repository history.
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
+    from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
 
@@ -122,6 +124,10 @@ class InputBatch:
     # drafts) over existing context and so compute exactly like decodes.
     # None if there are no prefills.
     prefill_runs_as_decode_np: np.ndarray | None = None
+
+    # Actual dispatch, set before model-state input preparation. Model-specific
+    # staging must not infer FULL replay from the batch's eligibility alone.
+    cg_mode: "CUDAGraphMode | None" = None
 
     @classmethod
     def make_dummy(

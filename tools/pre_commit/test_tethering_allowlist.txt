@@ -58,3 +58,40 @@ tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platform
 
 # tests/tools/
 tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
+
+# --- captured 2026-10-25: fork-local test files orphaned before the fork's
+# Buildkite pipelines were reorganized; pre-existing gaps, not orphans created
+# by this change (the change tethered tests/models/qwen4_exp/test_exl3_ple_reader.py).
+tests/distributed/test_custom_all_reduce_flags.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/distributed/test_host_shm_all_reduce.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/distributed/test_host_shm_setup_agreement.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/distributed/test_pcie_p2p_gate.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/qwen4_exp/test_exl3_ple_decode.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/qwen4_exp/test_mtp_local_argmax.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/qwen4_exp/test_precision_switches.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/qwen4_exp/test_qsa_canonical_topk_gpu.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/qwen4_exp/test_qsa_canonical_topk.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/qwen4_exp/test_qsa_sorted_selection.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/test_glm5next_local_logits.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/test_native_checkpoint_config_meta.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/models/test_native_checkpoint_wrapper_meta.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_drafter_registrations.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_exl3_platform_verification.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_exl3_plugin.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_fork_map.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_glm_pp4_kv_plan.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_glm_registrations.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_import_cuda_init.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_indexer_deep_gemm_gates.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_kv_planning.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_modification_notices.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_moe_layers.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_mrv2_prepare_inputs_padding.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_plugin_banner.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_plugin_distribution.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_plugin_guard.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_registrations.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_seams.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_setup_envs_load.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/sm80/test_triton_mla_sparse_block_stride.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25
+tests/test_retired_env_vars.py  # pre-existing orphan; fork-local suite predates current pipelines, full-scan capture 2026-10-25

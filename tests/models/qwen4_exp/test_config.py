@@ -356,7 +356,7 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
     model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
     model_state.ple_query_start_loc = torch.empty(9, dtype=torch.int32)
-    model_state.mmap_ngram_embeddings = []
+    model_state.staged_ngram_embeddings = []
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -412,7 +412,7 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
     model_state.ple_query_start_loc = torch.empty(9, dtype=torch.int32)
-    model_state.mmap_ngram_embeddings = []
+    model_state.staged_ngram_embeddings = []
 
     with patch.object(MambaHybridModelState, "prepare_dummy_inputs", return_value={}):
         first = model_state.prepare_dummy_inputs(num_reqs=3, num_tokens=4)

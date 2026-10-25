@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by AlexBrandes for CMP 170HX support; see repository history.
 """Model-runner state for Qwen4Exp PLE inputs."""
 
 from typing import Any
@@ -29,7 +30,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        self.mmap_ngram_embeddings: list[Qwen4ExpNGramEmbedding] = []
+        self.staged_ngram_embeddings: list[Qwen4ExpNGramEmbedding] = []
         # Config validation keeps every PLE layer on the first pipeline stage.
         # Other stages receive hidden states, not the raw IDs needed by PLE.
         self.uses_ngram_embedding = (
@@ -63,14 +64,16 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
-        self.mmap_ngram_embeddings = [
+        self.staged_ngram_embeddings = [
             module
             for module in self.model.modules()
-            if isinstance(module, Qwen4ExpNGramEmbedding)
-            and isinstance(module.ngram_embedding, Qwen4ExpPLEMmapEmbedding)
+            if isinstance(module, Qwen4ExpNGramEmbedding) and module.staged_rows_enabled
         ]
-        for module in self.mmap_ngram_embeddings:
-            module.ngram_embedding.finalize_load()
+        for module in self.staged_ngram_embeddings:
+            if isinstance(module.ngram_embedding, Qwen4ExpPLEMmapEmbedding):
+                module.ngram_embedding.finalize_load()
+            else:
+                module.ngram_embedding.check_ready()
 
     def _prepare_ngram_context(
         self,
@@ -118,15 +121,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
         )
-        if self.mmap_ngram_embeddings:
+        if self.staged_ngram_embeddings:
             known_requests = [
                 req_id in req_states.req_id_to_index for req_id in input_batch.req_ids
             ]
             if any(known_requests) and not all(known_requests):
                 raise RuntimeError("PLE batch contains unknown active request IDs")
-            for module in self.mmap_ngram_embeddings:
+            for module in self.staged_ngram_embeddings:
+                if not module.uses_staged_rows(input_batch.cg_mode):
+                    continue
                 if all(known_requests):
-                    module.prepare_mmap_rows(
+                    module.prepare_staged_rows(
                         input_batch.input_ids,
                         query_start_loc,
                         model_inputs["ngram_context"],
@@ -169,7 +174,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
-        for module in self.mmap_ngram_embeddings:
+        for module in self.staged_ngram_embeddings:
             module.ngram_embedding.zero_rows(num_tokens)
         return model_inputs
 

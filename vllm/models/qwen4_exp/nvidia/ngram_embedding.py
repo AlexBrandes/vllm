@@ -10,7 +10,9 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm.config import get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_etp_group, get_tp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -214,7 +216,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         embedding_cls: type[Qwen4ExpPLEEmbedding] = (
             Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
@@ -245,15 +248,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 else {}
             ),
         )
-        if self.ngram_embedding.supports_prefetch:
-            # The side-stream lookup outlives eager-break args, whose
-            # graph-pool storage later segments may reuse.
+        graph_mode = vllm_config.compilation_config.cudagraph_mode
+        self.staged_rows_enabled = isinstance(
+            self.ngram_embedding, Qwen4ExpPLEMmapEmbedding
+        ) or (
+            getattr(self.ngram_embedding, "supports_external_staging", False)
+            and graph_mode is not None
+            and graph_mode.has_full_cudagraphs()
+        )
+        if self.ngram_embedding.supports_prefetch or self.staged_rows_enabled:
+            # Keep IDs alive across side-stream reads and eager graph breaks.
             self._prefetch_ids = torch.empty(
                 max_total_tokens, self.ngram_heads, dtype=torch.long
-            )
-        if isinstance(self.ngram_embedding, Qwen4ExpPLEMmapEmbedding):
-            self._mmap_ids = torch.empty(
-                max_total_tokens, self.ngram_heads, dtype=torch.int64
             )
         weight = self.ngram_embedding.weight
         logger.info(
@@ -387,6 +393,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embeddings = sp_shard(embeddings)
         return embeddings.view(output_dtype)
 
+    def uses_staged_rows(self, mode: CUDAGraphMode | None = None) -> bool:
+        """Use external EXL3 rows for FULL capture/replay; mmap always stages."""
+        if not self.staged_rows_enabled:
+            return False
+        if isinstance(self.ngram_embedding, Qwen4ExpPLEMmapEmbedding):
+            return True
+        if mode is None and is_forward_context_available():
+            mode = get_forward_context().cudagraph_runtime_mode
+        # The runner captures FULL graphs with runtime mode NONE to avoid
+        # recursively invoking graph wrappers. PIECEWISE retains its own mode.
+        return mode == CUDAGraphMode.FULL or (
+            mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -396,7 +416,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Return full embeddings or a token shard after combining vocabulary owners."""
         embedding = self.ngram_embedding
-        if isinstance(embedding, Qwen4ExpPLEMmapEmbedding):
+        if self.uses_staged_rows():
             embeddings = embedding.view(input_ids.shape[0])
         elif embedding.supports_prefetch:
             # Prefetch contains full tokens even when hidden states are sharded.
@@ -410,7 +430,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return embeddings
         return self._sp_shard_embeddings(embeddings)
 
-    def prepare_mmap_rows(
+    def prepare_staged_rows(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -420,10 +440,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Stage the current batch's PLE rows before model execution."""
         embedding = self.ngram_embedding
-        assert isinstance(embedding, Qwen4ExpPLEMmapEmbedding)
-        if not 0 <= num_tokens <= num_tokens_after_padding <= self._mmap_ids.shape[0]:
-            raise ValueError("PLE batch exceeds its mmap staging capacity")
-        ids = self._mmap_ids[:num_tokens]
+        assert self.staged_rows_enabled
+        if not (
+            0 <= num_tokens <= num_tokens_after_padding <= self._prefetch_ids.shape[0]
+        ):
+            raise ValueError("PLE batch exceeds its staging capacity")
+        ids = self._prefetch_ids[:num_tokens]
         if num_tokens:
             self.compute_ngram_ids(
                 input_ids[:num_tokens],
@@ -441,7 +463,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
-        if not embedding.supports_prefetch:
+        if self.uses_staged_rows() or not embedding.supports_prefetch:
             return
         ngram_ids = self.compute_ngram_ids(
             input_ids,
