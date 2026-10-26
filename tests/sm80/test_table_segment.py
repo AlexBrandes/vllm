@@ -5,6 +5,7 @@ images, identity and digest checks, the release modes and the client lease."""
 
 import fcntl
 import hashlib
+import json
 import mmap
 import os
 import subprocess
@@ -66,6 +67,16 @@ def holder(tmp_path, files):
         proc.wait(30)
 
 
+def _manifest(label, named):
+    """The manifest hash, spelled out: sha256 of the JSON of the label and
+    each file's name as given, size and digest (sorted keys, no spaces)."""
+    doc = {"label": label, "files": [
+        {"name": os.path.basename(p), "size": os.path.getsize(p), "sha256": s}
+        for p, s in named]}
+    text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def _bytes(path, offset, nbytes):
     with open(path, "rb") as file:
         file.seek(offset)
@@ -75,10 +86,7 @@ def _bytes(path, offset, nbytes):
 def test_holder_serves_exact_sealed_images(holder, files):
     sock, _ = holder
     state = ts.request(str(sock), {"op": "status"})
-    assert state["manifest"] == ts.manifest_hash(
-        "repo@rev",
-        [{"path": p, "size": os.path.getsize(p), "sha256": s} for p, s in files],
-    )
+    assert state["manifest"] == _manifest("repo@rev", files)
     assert state["bytes_done"] == state["bytes_total"] == sum(SIZES)
     assert [f["sha256"] for f in state["files"]] == [s for _, s in files]
     attachment = ts.Attachment(str(sock), [p for p, _ in files])
@@ -103,6 +111,31 @@ def test_holder_serves_exact_sealed_images(holder, files):
             attachment.map(files[1][0], 0, SIZES[1] + 1)
     finally:
         attachment.close()
+
+
+def test_manifest_names_files_as_given(tmp_path, files):
+    """A file named through a link is hashed under the link's name; the
+    image, its identity and the attach are the real file's."""
+    links = tmp_path / "links"
+    links.mkdir()
+    named = []
+    for index, (path, sha) in enumerate(files):
+        link = links / f"table-{index}.safetensors"
+        link.symlink_to(path)
+        named.append((str(link), sha))
+    sock = tmp_path / "l.sock"
+    proc = _hold(sock, named)
+    try:
+        state = _status(sock)
+        assert state["manifest"] == _manifest("repo@rev", named)
+        assert state["manifest"] != _manifest("repo@rev", files)
+        assert [f["path"] for f in state["files"]] == [p for p, _ in files]
+        attachment = ts.Attachment(str(sock), [p for p, _ in named])
+        assert attachment.manifest == state["manifest"]
+        attachment.close()
+    finally:
+        ts.request(str(sock), {"op": "release", "mode": "force"})
+        assert proc.wait(30) == 0
 
 
 def test_attach_refuses_a_changed_file(holder, files):

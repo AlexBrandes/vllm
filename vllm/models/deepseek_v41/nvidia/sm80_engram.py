@@ -1309,6 +1309,11 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         preloaded = preload_row_cache(table.store)
     resident, total = table.page_cache_residency()
     if placement == "ram" and segment:
+        logger.info_once(
+            "VLLM_ENGRAM_SEGMENT on: the ram Engram tables are mapped from the "
+            "table segment held at %s, not read from storage",
+            segment,
+        )
         values = (
             f"attached {table.store.table.nbytes / GiB:.2f} GiB from the table "
             f"segment {segment} (manifest {table.store.attachment.manifest[:12]})"

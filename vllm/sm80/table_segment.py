@@ -26,9 +26,10 @@ Protocol: ``AF_UNIX`` ``SOCK_SEQPACKET``; a client sends one JSON object and
 the holder answers with one.
 
 - ``{"op": "status"}``: the state, the files with their identity and digest,
-  the manifest hash (sha256 of the label and each file's name, size and
-  digest), the bytes filled, the attached clients and whether huge pages
-  backed the fill.
+  the manifest hash (sha256 of the label and each file's name as given,
+  size and digest), the bytes filled, the attached clients and whether huge
+  pages backed the fill. The name is the last part of the path named on the
+  command line, so a file reached through a link is hashed under its name.
 - ``{"op": "release", "mode": ...}``: ``idle`` exits only when no client is
   attached; ``drain`` exits now when none is, otherwise refuses new attaches
   and exits when the last client detaches; ``force`` exits now (attached
@@ -109,12 +110,13 @@ def file_identity(path: str) -> dict:
 
 
 def manifest_hash(label: str, files: list[dict]) -> str:
-    """sha256 of the label and each file's name, size and digest, in order."""
+    """sha256 of the label and each file's name, size and digest, in order,
+    as the JSON of ``{label, files: [{name, size, sha256}, ...]}`` with
+    sorted keys and no spaces."""
     doc = {
         "label": label,
         "files": [
-            {"name": os.path.basename(f["path"]), "size": f["size"], "sha256": f["sha256"]}
-            for f in files
+            {"name": f["name"], "size": f["size"], "sha256": f["sha256"]} for f in files
         ],
     }
     text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
@@ -184,6 +186,8 @@ class HeldFile:
     path: str
     expected_sha256: str
     identity: dict
+    # The last part of the path as given (a link's own name): the manifest's.
+    name: str
     memfd: int = -1
     readonly_fd: int = -1
     segment_bytes: int = 0
@@ -239,7 +243,10 @@ class Holder:
         self.label = label
         self.readers = readers
         self.log = log or (lambda msg: print(f"table_segment: {msg}", file=sys.stderr, flush=True))
-        self.files = [HeldFile(os.path.realpath(p), sha.lower(), file_identity(p)) for p, sha in files]
+        self.files = [
+            HeldFile(os.path.realpath(p), sha.lower(), file_identity(p), os.path.basename(p))
+            for p, sha in files
+        ]
         if len({f.path for f in self.files}) != len(self.files):
             raise ValueError("a file is named twice")
         self.state = "filling"
@@ -375,7 +382,7 @@ class Holder:
     @property
     def manifest(self) -> str:
         return manifest_hash(self.label, [
-            {"path": f.path, "size": f.identity["size"], "sha256": f.expected_sha256}
+            {"name": f.name, "size": f.identity["size"], "sha256": f.expected_sha256}
             for f in self.files])
 
     def status(self) -> dict:
