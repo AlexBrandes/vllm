@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Split-block Marlin W4A16 MoE prefill on sm_80 (PP whole experts, TP4 shards).
 
-WHAT.  Under pipeline parallelism with TP=1 every stage holds all 288 experts
-whole (N=2048, K=4096; ``VLLM_AMPERE_MARLIN_PREFILL_WIDE``); under tensor
-parallel 4 every card holds all 288 sharded to N=512
-(``VLLM_AMPERE_MARLIN_PREFILL_NARROW``).  ``fused_marlin_moe`` aligns the ~64
+WHAT.  ``VLLM_SM80_MARLIN_PREFILL``.  Under pipeline parallelism with TP=1
+every stage holds all 288 experts whole (N=2048, K=4096); under tensor
+parallel 4 every card holds all 288 sharded to N=512; the expert width picks
+the shape.  ``fused_marlin_moe`` aligns the ~64
 rows per expert to one block size, so the last block of each expert is mostly
 padding (~1.55x the useful rows at 2304 tokens).  This path replaces the alignment with
 ``split_align`` (one block list per size 64/48/32/16, cheapest cover per
@@ -35,13 +35,12 @@ activations, uint4b8 group-128 weights without zero points, bias, global
 scales or activation quantisation, E = 288 local = global (no expert map),
 top-8, K = 4096, N = 2048, SiLU with clamp limit 10.0, router weight applied
 on the output, and M at least the moe_prefill/marlin_min_rows row of the sm80
-tuning table at that N (384 without one); or the same with N = 512 under
-VLLM_AMPERE_MARLIN_PREFILL_NARROW.  Everything else falls through to
+tuning table at that N (384 without one); or the same with N = 512.
+Everything else falls through to
 ``fused_marlin_moe`` unchanged.
 
-COMPILED TILES.  At N=2048 (PP whole experts,
-VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED, default off) with the optional
-library's ``prefill_tile_gemm`` present, every list GEMM runs through that op
+COMPILED TILES.  At N=2048 (PP whole experts) with the optional library's
+``prefill_tile_gemm`` present, every list GEMM runs through that op
 (the same Marlin template, its own instantiations) with the per-GEMM tile
 table ``TILE_TABLES[N]``: both GEMMs use the (64,512) tile on the
 64/48/32-row lists, the 16-row list keeps Marlin's own choice, and every list
@@ -83,6 +82,8 @@ from vllm.sm80 import tuning
 
 logger = init_logger(__name__)
 
+FLAG = "VLLM_SM80_MARLIN_PREFILL"
+
 E_GATE = 288
 TOPK_GATE = 8
 K_GATE = 4096
@@ -97,9 +98,10 @@ CLAMP_LIMIT = 10.0
 THREAD_CFG = {64: (64, 256, 1)}
 
 # Compiled tiles (prefill_tile_gemm): N -> (switch, {"w13": table, "w2": table}),
-# tables as THREAD_CFG.  Only the PP whole-expert width has a table.
+# tables as THREAD_CFG.  Only the PP whole-expert width has a table; a width
+# without one runs its lists on the released kernels.
 TILE_TABLES = {
-    N_GATE: ("VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED", {
+    N_GATE: (FLAG, {
         "w13": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
         "w2": {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)},
     }),
@@ -147,16 +149,14 @@ def min_rows(n: int) -> int:
 
 
 def enabled_shapes() -> dict:
-    """{N: (flag, min_tokens)} for the flags that are set: N=2048 under
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE, N=512 under VLLM_AMPERE_MARLIN_PREFILL_NARROW;
-    min_tokens is :func:`min_rows` at that N."""
+    """{N: (switch, min_tokens)} for the widths the split path may take: both
+    N=2048 (whole experts) and N=512 (TP4 shards) when
+    VLLM_SM80_MARLIN_PREFILL is set, none otherwise; min_tokens is
+    :func:`min_rows` at that N."""
     out = {}
-    if envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE:
-        out[N_GATE] = ("VLLM_AMPERE_MARLIN_PREFILL_WIDE",
-                       min_rows(N_GATE))
-    if envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW:
-        out[N_GATE_TP4] = ("VLLM_AMPERE_MARLIN_PREFILL_NARROW",
-                           min_rows(N_GATE_TP4))
+    if envs.VLLM_SM80_MARLIN_PREFILL:
+        out[N_GATE] = (FLAG, min_rows(N_GATE))
+        out[N_GATE_TP4] = (FLAG, min_rows(N_GATE_TP4))
     return out
 
 
@@ -323,7 +323,7 @@ def maybe_apply(layer, output: torch.Tensor, hidden_states: torch.Tensor,
     why = gate_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
                       activation, global_num_experts, expert_map,
                       apply_router_weight_on_input, tuple(shapes))
-    flag = " / ".join(f for f, _ in shapes.values())
+    flag = FLAG
     min_tokens = 0
     if why is None:
         flag, min_tokens = shapes[w2.size(1) * 16]
@@ -475,12 +475,10 @@ def _warmup_capacity(N: int, max_tokens: int) -> int:
 
 def warmup_from_worker(worker) -> int:
     """Pre-capture hook from ``model_executor/warmup/kernel_warmup.py``.
-    No-op unless VLLM_AMPERE_MARLIN_PREFILL_WIDE or VLLM_AMPERE_MARLIN_PREFILL_NARROW
-    is set on an sm_80 device and the model has 288 routed experts; returns
-    the expert count warmed (0 if not)."""
-    if not (
-        envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE or envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW
-    ):
+    No-op unless VLLM_SM80_MARLIN_PREFILL is set on an sm_80 device and the
+    model has 288 routed experts; returns the expert count warmed (0 if
+    not)."""
+    if not envs.VLLM_SM80_MARLIN_PREFILL:
         return 0
     device = torch.device(worker.device)
     if device.type != "cuda" or not _is_sm80(device):

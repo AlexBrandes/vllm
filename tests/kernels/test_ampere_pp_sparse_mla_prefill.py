@@ -3,14 +3,17 @@
 """The 64-head sparse-MLA prefill kernel
 (vllm/sm80/kernels/attention/sparse_prefill_mla_pp.py).
 
-``VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE=1`` sends ``sparse_mla_fwd`` calls with all
-64 heads on one card (pipeline parallel, TP=1) to a Gluon kernel; every other
-call keeps the Triton kernel, and with the flag off nothing changes.
+Under ``VLLM_SM80_SPARSE_MLA_PREFILL=1``, ``sparse_mla_fwd`` sends calls with
+all 64 heads on one card (pipeline parallel, TP=1) to a Gluon kernel; every
+other call keeps the Triton kernel. The tests compare against the Triton
+kernel at 64 heads by setting ``sparse_prefill_mla.PP_HEADS`` to 0 (the
+Triton arm).
 
-CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the flag, the gate and each
-of its fallbacks, the dispatch, the banner lines and the warmup gate.
+CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the switch, the gate and
+each of its fallbacks, the dispatch by head count, the banner lines and the
+warmup gate.
 GPU tests (skip without an sm_80 device): the off path and the gate-closed
-fallbacks bitwise equal to the flag-off path; on-path accuracy against an
+fallbacks bitwise equal to the Triton arm; on-path accuracy against an
 fp64 recomputation, relative to the Triton kernel with the predicated gather
 and to the fp32 reference that rounds P to bf16 before P.V; awkward shapes;
 determinism; CUDA-graph replay equal to eager with no allocation growth; real
@@ -29,7 +32,7 @@ import torch
 
 from vllm.sm80.kernels.attention import sparse_prefill_mla as spm
 
-FLAG = "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE"
+FLAG = "VLLM_SM80_SPARSE_MLA_PREFILL"
 PRED = "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD"
 PP_MOD = "vllm.sm80.kernels.attention.sparse_prefill_mla_pp"
 HEADS, DIM, WIDTH, TOPK, TAIL, GROUP = 64, 512, 2176, 2048, 128, 4
@@ -38,6 +41,12 @@ MEAN_RATIO, MAX_RATIO = 1.10, 1.25
 HAS_GPU = torch.cuda.is_available()
 IS_SM80 = HAS_GPU and torch.cuda.get_device_capability(0) == (8, 0)
 needs_sm80 = pytest.mark.skipif(not IS_SM80, reason="needs an sm_80 GPU")
+
+
+def _gluon(monkeypatch, on):
+    """The 64-head dispatch of sparse_mla_fwd as served (on), or every head
+    count on the Triton kernel (off: the reference arm)."""
+    monkeypatch.setattr(spm, "PP_HEADS", HEADS if on else 0)
 
 
 def _pp():
@@ -119,6 +128,10 @@ def test_flag_declared_default_off(monkeypatch):
     assert envs.environment_variables[FLAG]() is False
     monkeypatch.setenv(FLAG, "1")
     assert envs.environment_variables[FLAG]() is True
+
+
+def test_dispatch_head_count_is_the_kernel_head_count():
+    assert spm.PP_HEADS == _pp().HEADS == HEADS
 
 
 @pytest.fixture
@@ -245,8 +258,8 @@ def _dispatch(monkeypatch, T, heads, width=WIDTH, dim=DIM, block_dpe=0, d_v=DIM)
     return launches, pp_calls, res
 
 
-def test_flag_off_never_consults_the_new_module(monkeypatch, sm80):
-    monkeypatch.delenv(FLAG, raising=False)
+def test_triton_arm_never_consults_the_new_module(monkeypatch, sm80):
+    _gluon(monkeypatch, False)
     pp = _pp()
 
     def boom(*_a, **_k):
@@ -258,15 +271,16 @@ def test_flag_off_never_consults_the_new_module(monkeypatch, sm80):
     assert len(launches) == 1 and not pp_calls
 
 
-def test_flag_off_does_not_import_the_new_module(monkeypatch, sm80):
-    monkeypatch.delenv(FLAG, raising=False)
+@pytest.mark.parametrize("heads,on", [(16, True), (HEADS, False)])
+def test_other_head_counts_do_not_import_the_new_module(monkeypatch, sm80, heads, on):
+    _gluon(monkeypatch, on)
     monkeypatch.delitem(sys.modules, PP_MOD, raising=False)
     import vllm.v1.attention.ops as pkg
     monkeypatch.delattr(pkg, "sparse_prefill_mla_pp", raising=False)
     rec = _Recorder()
     monkeypatch.setattr(spm, "_sparse_mla_kernel", rec)
     monkeypatch.setattr(spm, "num_sms", lambda *_a: 70)
-    spm.sparse_mla_fwd(torch.zeros(2304, HEADS, DIM, dtype=torch.bfloat16),
+    spm.sparse_mla_fwd(torch.zeros(2304, heads, DIM, dtype=torch.bfloat16),
                        torch.zeros(4096, 1, DIM, dtype=torch.bfloat16),
                        torch.zeros(2304, 1, WIDTH, dtype=torch.int32), SM_SCALE,
                        d_v=DIM, block_dpe=0)
@@ -287,17 +301,17 @@ def test_flag_off_does_not_import_the_new_module(monkeypatch, sm80):
 ])
 def test_dispatch_and_unchanged_fallback(monkeypatch, sm80, pred, T, heads, width, dim, dpe,
                                          dv, live):
-    """Flag on: the validated configuration goes to the new kernel and never
+    """As served: the validated configuration goes to the new kernel and never
     launches the Triton kernel; everything else launches exactly what the
-    flag-off call launches (with or without the predicated gather)."""
+    Triton arm launches (with or without the predicated gather)."""
     if pred:
         monkeypatch.setenv(PRED, "1")
     else:
         monkeypatch.delenv(PRED, raising=False)
-    monkeypatch.delenv(FLAG, raising=False)
+    _gluon(monkeypatch, False)
     off, pp_off, _ = _dispatch(monkeypatch, T, heads, width, dim, dpe, dv)
     assert len(off) == 1 and not pp_off
-    monkeypatch.setenv(FLAG, "1")
+    _gluon(monkeypatch, True)
     on, pp_on, res = _dispatch(monkeypatch, T, heads, width, dim, dpe, dv)
     if live:
         assert on == [] and len(pp_on) == 1 and res == ("pp",)
@@ -315,10 +329,9 @@ class _FakeWorker:
             "get_num_attention_heads": lambda _s, _p: heads})()
 
 
-@pytest.mark.parametrize("flag,prefill,heads", [(0, 1, 64), (1, 0, 64), (1, 1, 16)])
-def test_warmup_gate(monkeypatch, sm80, flag, prefill, heads):
+@pytest.mark.parametrize("flag,heads", [(0, 64), (1, 16)])
+def test_warmup_gate(monkeypatch, sm80, flag, heads):
     monkeypatch.setenv(FLAG, str(flag))
-    monkeypatch.setenv("VLLM_GLM5_PREFILL_KERNELS", str(prefill))
     pp = _pp()
     monkeypatch.setattr(pp, "warmup", lambda *_a, **_k: pytest.fail("must not compile"))
     assert pp.warmup_from_worker(_FakeWorker(heads)) is False
@@ -326,7 +339,6 @@ def test_warmup_gate(monkeypatch, sm80, flag, prefill, heads):
 
 def test_warmup_runs_when_open(monkeypatch, sm80):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
     pp = _pp()
     seen = []
     monkeypatch.setattr(pp, "warmup", lambda dev: seen.append(dev))
@@ -335,7 +347,7 @@ def test_warmup_runs_when_open(monkeypatch, sm80):
 
 # --------------------------------------------------------------------- GPU
 def _fwd(q, kv, idx, monkeypatch, flag, pred=True, out=None, block_dpe=0, d_v=DIM):
-    monkeypatch.setenv(FLAG, "1") if flag else monkeypatch.delenv(FLAG, raising=False)
+    _gluon(monkeypatch, flag)
     monkeypatch.setenv(PRED, "1") if pred else monkeypatch.delenv(PRED, raising=False)
     res = spm.sparse_mla_fwd(q, kv, idx, SM_SCALE, d_v=d_v, block_dpe=block_dpe, out=out)
     torch.cuda.synchronize()
@@ -472,7 +484,7 @@ def test_caller_out_buffer_and_determinism(monkeypatch):
     for x, y in zip(a, b):
         assert torch.equal(x, y)
     buf = torch.full((777, HEADS, DIM), float("nan"), dtype=torch.bfloat16, device="cuda")
-    monkeypatch.setenv(FLAG, "1")
+    _gluon(monkeypatch, True)
     res = spm.sparse_mla_fwd(q, kv, idx, SM_SCALE, d_v=DIM, block_dpe=0, out=buf)
     torch.cuda.synchronize()
     assert res[0].data_ptr() == buf.data_ptr() and torch.equal(buf, a[0])

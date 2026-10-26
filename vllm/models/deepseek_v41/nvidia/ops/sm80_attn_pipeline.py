@@ -18,6 +18,10 @@ from vllm.models.deepseek_v41.nvidia.ops.sm80_index_topk import (
 )
 from vllm.triton_utils import tl, triton
 
+# The most padded rows a call may have: the bound the selection and the
+# per-stream scratch are built and validated for.
+MAX_ROWS = 48
+
 
 @triton.jit
 def _rope_row(x, pos, freqs, D: tl.constexpr, RD: tl.constexpr):
@@ -257,7 +261,7 @@ def supports(cfg, max_rows, max_seq_len, qdim, budget):
     if cfg.is_index_source and (cfg.index_n_heads, cfg.index_head_dim,
             cfg.candidate_topk_blocks, cfg.candidate_block_size) != (32, 128, 2048, 8):
         return 'index layout is not (32 heads, 128 dim, 2048 blocks, 8 positions)'
-    if max_rows < 1 or max_rows > 48 or max_seq_len < 1:
+    if max_rows < 1 or max_rows > MAX_ROWS or max_seq_len < 1:
         return 'row or context capacity is outside the supported bound'
     if PipelineWorkspace.bytes(max_rows, max_seq_len, qdim) > budget:
         return 'complete pipeline scratch exceeds the configured score budget'

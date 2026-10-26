@@ -394,6 +394,12 @@ def _use_pred_load(q, kv, index_topk, block_dpe, d_v, config, rotate):
     return True
 
 
+# Calls with this many query heads (all 64 on one card, pipeline parallel)
+# go to the Gluon kernel of sparse_prefill_mla_pp (its HEADS) when it takes
+# the call; every other head count keeps the Triton kernel below.
+PP_HEADS = 64
+
+
 def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
     from vllm.sm80.kernels.attention.triton_mla_sparse import _workspace
     from vllm.triton_utils import LOG2E, LOGE2
@@ -404,9 +410,7 @@ def sparse_mla_fwd(q, kv, indices, sm_scale, d_v=512, block_dpe=None, out=None):
     assert num_heads_kv == 1, "only kv head = 1 is supported"
     index_topk = indices.shape[2]
 
-    from vllm import envs
-
-    if envs.VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE:
+    if num_heads_q == PP_HEADS:
         # 64 heads on one card: the Gluon kernel of sparse_prefill_mla_pp,
         # on exactly the configuration it was validated on.
         from vllm.sm80.kernels.attention import sparse_prefill_mla_pp

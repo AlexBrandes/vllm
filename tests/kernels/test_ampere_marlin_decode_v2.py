@@ -299,9 +299,9 @@ class _Stop(Exception):
 
 
 def test_kernel_warmup_does_not_read_the_v2_switch():
-    from vllm.model_executor.warmup import kernel_warmup as kw
+    from vllm.sm80.kernels import warmup as sm80_warmup
 
-    src = Path(kw.__file__).read_text()
+    src = Path(sm80_warmup.__file__).read_text()
     assert V2 not in src
     assert "    if envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:\n" in src
 

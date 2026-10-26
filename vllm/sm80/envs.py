@@ -22,19 +22,17 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_ALLREDUCE_ALGO: str = ""
     VLLM_CUSTOM_ALLREDUCE_FLAGS: bool = False
     VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S: float = 60.0
-    VLLM_GLM5_PREFILL_KERNELS: bool = False
-    VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE: bool = False
+    VLLM_SM80_MHC_PREFILL: bool = False
+    VLLM_SM80_SPARSE_MLA_PREFILL: bool = False
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
-    VLLM_AMPERE_KDA_PREFILL_WIDE: bool = False
+    VLLM_SM80_KDA_PREFILL: bool = False
     VLLM_STATE_INDEX_CHECK: bool = False
-    VLLM_AMPERE_KDA_PREFILL_NARROW: bool = False
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
     VLLM_MOE_DECODE_ROUTE_V2: bool = False
-    VLLM_GLM5_DECODE_KDA_WIDE: bool = True
     VLLM_AMPERE_KDA_FOLD: bool = False
     VLLM_AMPERE_KDA_RECOVER_OFF: bool = False
     VLLM_FLA_PIN_AUTOTUNE: bool = False
@@ -58,7 +56,6 @@ if TYPE_CHECKING:
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_CUDAGRAPH_ESTIMATE_SPLIT: int = 0
-    VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB: int = 0
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_CONCAT: bool = False
@@ -72,13 +69,9 @@ if TYPE_CHECKING:
     VLLM_PP_SPLIT_DRAFT_EVENT: bool = False
     VLLM_PP_DRAFT_TAIL_STAGE: int = -1
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE: bool = False
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED: bool = False
-    VLLM_AMPERE_MARLIN_PREFILL_NARROW: bool = False
+    VLLM_SM80_MARLIN_PREFILL: bool = False
     VLLM_AMPERE_MARLIN_DECODE_CUDA: bool = False
     VLLM_AMPERE_MARLIN_DECODE_V2: bool = False
-    VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
-    VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_ROUND_ONCE_ALLREDUCE_GROUPED: bool = False
     VLLM_EXL3_DENSE_SPLITK: bool = False
@@ -103,10 +96,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
     VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
-    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
-    VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
     VLLM_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_SM80_TARGET_SHARD_ARGMAX: bool = False
@@ -229,24 +220,30 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S": lambda: float(
         os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "60")
     ),
-    # Opt in to the sm_80 prefill kernels (the mHC pre-norm GEMM in
-    # vllm/sm80/kernels/mhc/ and the sparse-MLA prefill in
-    # vllm/sm80/kernels/attention/;
-    # GA100-class parts only; measured on CMP 170HX, 70 SMs). Default OFF: with
-    # this unset no such kernel is imported and every call site keeps the
-    # upstream code path exactly.
-    "VLLM_GLM5_PREFILL_KERNELS": lambda: bool(
-        int(os.getenv("VLLM_GLM5_PREFILL_KERNELS", "0"))
+    # The sm_80 mHC pre-norm projection GEMM at prefill sizes
+    # (vllm/sm80/kernels/mhc/prenorm.py) in place of the TileLang kernel, for
+    # steps of at least the mhc/prefill_min_rows row of the sm80 tuning table
+    # (GA100-class parts only; measured on CMP 170HX, 70 SMs). Default OFF:
+    # with this unset the kernel is not imported and the call site keeps the
+    # upstream path.
+    "VLLM_SM80_MHC_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_MHC_PREFILL", "0"))
     ),
-    # Sparse-MLA prefill with all 64 heads on one card (pipeline parallel,
-    # TP=1): a Gluon kernel that gathers each cache row once for all heads and
-    # compacts the valid index slots before the loop
-    # (vllm/sm80/kernels/attention/sparse_prefill_mla_pp.py). Taken only on sm_80 with
-    # 64 heads, bf16, the 512-wide NoPE layout, 2176 index slots and 1..2312
-    # query rows; everything else keeps the Triton kernel. Needs
-    # VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
-    "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE", "0"))
+    # The sm_80 sparse-MLA (DSA) prefill attention in place of the Triton
+    # sparse-MLA kernel's prefill schedule, for steps of at least
+    # the attention_prefill/sparse_mla_min_rows row of the sm80 tuning table
+    # and contexts of at least its sparse_mla_min_ctx row (twice index_topk
+    # without one). The head count per
+    # card picks the kernel: all 64 heads on one card (pipeline parallel,
+    # TP=1) take a Gluon kernel that gathers each cache row once for all heads
+    # and compacts the valid index slots before the loop
+    # (vllm/sm80/kernels/attention/sparse_prefill_mla_pp.py; bf16, the
+    # 512-wide NoPE layout, 2176 index slots and 1..2312 query rows), every
+    # other call the retuned Triton kernel of sparse_prefill_mla.py. Default
+    # OFF: with this unset neither is imported and the call site keeps the
+    # upstream path.
+    "VLLM_SM80_SPARSE_MLA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_SPARSE_MLA_PREFILL", "0"))
     ),
     # DSA indexer decode logits (vllm/sm80/kernels/attention/triton_mqa_logits.py,
     # Triton path) on sm_80: dequantize the e4m3 K tiles by bit placement
@@ -269,20 +266,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # card (pipeline parallel, TP=1) or 16 heads per rank (tensor parallel 4)
     # at the 512-wide NoPE layout, 2176 index slots and the schedule that head
     # count gets; every other shape keeps the plain gather.
-    # Needs VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
+    # Needs VLLM_SM80_SPARSE_MLA_PREFILL=1 as well. Off by default.
     "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD": lambda: bool(
         int(os.getenv("VLLM_GLM5_SMLA_PREFILL_PRED_LOAD", "0"))
     ),
     # sm_80 KDA chunked prefill (vllm/models/glm5next/nvidia/ops/kda_prefill.py)
-    # in place of the upstream chunk_kda_with_fused_gate, when all 64 heads live on one
-    # card (pipeline parallel, TP=1): six launches instead of nine, fixed
-    # launch configurations, fp32-exact intermediates where the recurrence
-    # needs them. Taken only on sm_80 with the Triton prefill backend, head
-    # dim 128, bf16 activations, fp32 state, the safe gate at -5, and chunks
-    # of up to 2312 tokens and 16 sequences; everything else keeps the
+    # in place of the upstream chunk_kda_with_fused_gate: six launches instead
+    # of nine, fixed launch configurations, fp32-exact intermediates where the
+    # recurrence needs them. The layer's head count picks the shape: 64 heads
+    # per card (pipeline parallel, TP=1) with chunks of up to 2312 tokens, or
+    # 16 heads per card (tensor parallel 4) with chunks of up to 3460 tokens
+    # (the TP token budget). Taken only on sm_80 with the Triton prefill
+    # backend, head dim 128, bf16 activations, fp32 state, the safe gate at
+    # -5 and at most 16 sequences per chunk; everything else keeps the
     # upstream path. Off by default.
-    "VLLM_AMPERE_KDA_PREFILL_WIDE": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_KDA_PREFILL_WIDE", "0"))
+    "VLLM_SM80_KDA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_KDA_PREFILL", "0"))
     ),
     # Debug: range-check every KDA/Mamba state index (GDN metadata, align-mode
     # pre-/post-copy block columns and block ids) on the host before the
@@ -290,13 +289,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Synchronizes every step. Off by default.
     "VLLM_STATE_INDEX_CHECK": lambda: bool(
         int(os.getenv("VLLM_STATE_INDEX_CHECK", "0"))
-    ),
-    # The same sm_80 KDA chunked prefill with tensor parallel 4 (16 heads per
-    # card), for prefill chunks of up to 3460 tokens (the TP token budget) and
-    # 16 sequences; the other conditions as VLLM_AMPERE_KDA_PREFILL_WIDE. Its own
-    # switch so the two layouts are judged separately. Off by default.
-    "VLLM_AMPERE_KDA_PREFILL_NARROW": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_KDA_PREFILL_NARROW", "0"))
     ),
     # Opt in to the sm_80 decode kernels (mHC and MoE routing in
     # vllm/sm80/kernels/, the KDA decode step in vllm/models/glm5next/nvidia/ops/;
@@ -345,15 +337,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # sm80 tuning table (at most 64).
     "VLLM_MOE_DECODE_ROUTE_V2": lambda: bool(
         int(os.getenv("VLLM_MOE_DECODE_ROUTE_V2", "0"))
-    ),
-    # Kill switch for the fused KDA decode step at 64 heads per card (pipeline
-    # parallel) beyond one sequence of up to 5 tokens: with 1 (default) the
-    # 64-head layout takes vllm/models/glm5next/nvidia/ops/kda_decode.py at every
-    # decode shape its gate covers; 0 restores the earlier split (one sequence of up to
-    # 5 tokens on v2 with the full speculative tile, everything else on the
-    # unfused fla chain). No effect at 16 heads.
-    "VLLM_GLM5_DECODE_KDA_WIDE": lambda: bool(
-        int(os.getenv("VLLM_GLM5_DECODE_KDA_WIDE", "1"))
     ),
     # RecoverSSM commit fold (TP4, vllm/sm80/kernels/kda/recover.py): the
     # replay of a step's accepted tokens over the KDA state runs at the start
@@ -538,13 +521,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_CUDAGRAPH_ESTIMATE_SPLIT": lambda: int(
         os.getenv("VLLM_CUDAGRAPH_ESTIMATE_SPLIT", "0")
     ),
-    # With VLLM_CUDAGRAPH_ESTIMATE_SPLIT: the allocator's max_split_size_mb
-    # for the length of each CUDA-graph capture (profiling and real), so a
-    # small long-lived allocation made during a capture cannot keep a large
-    # free segment from being released. Default 0 (unchanged).
-    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": lambda: int(
-        os.getenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", "0")
-    ),
     # Align-mode Mamba KV reservation under async scheduling or pipeline
     # parallelism: also reserve the state blocks a request holds for the
     # prefill chunks it has in flight (min(max_concurrent_batches,
@@ -633,39 +609,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_PP_FOLD_DRAFT_FC": lambda: bool(
         int(os.getenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"))
     ),
-    # Whole-expert Marlin W4A16 MoE at prefill (pipeline parallel, TP=1: all
-    # 288 experts, N=2048, on one sm_80 card): align the routed rows into one
-    # block list per size 64/48/32/16 (cheapest cover per expert) instead of
-    # padding every expert to one block size, and run each Marlin GEMM once
-    # per list (vllm/sm80/kernels/marlin_moe/prefill.py). Same compiled
-    # Marlin kernels; the split cover changes stream-K boundaries and reduction
-    # order, so output is not bitwise equal to fused_marlin_moe. Taken only
-    # for M >= the moe_prefill/marlin_min_rows row of the sm80 tuning table on
-    # exactly that configuration; everything else keeps fused_marlin_moe (TP4,
-    # N=512, has its own switch, VLLM_AMPERE_MARLIN_PREFILL_NARROW).
-    # Off by default.
-    "VLLM_AMPERE_MARLIN_PREFILL_WIDE": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE", "0"))
-    ),
-    # With VLLM_AMPERE_MARLIN_PREFILL_WIDE: run the split-list Marlin GEMMs of
-    # the whole-expert (N=2048) prefill through the optional library's
-    # prefill_tile_gemm with the tile table of
-    # vllm/sm80/kernels/marlin_moe/prefill.py ((64,512) tiles for the
-    # 64/48/32-row lists in both GEMMs) and the optimistic fast dequant (tiles
-    # with a scale above 2^-5 recomputed by the regular kernel). Without the
-    # library or its op, the released kernels run. The TP4 (N=512) lists
-    # always run on the released kernels. Off by default (the released split
-    # path); serving defaults turn it on where validated.
-    "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED", "0"))
-    ),
-    # The same split-block Marlin MoE prefill under tensor parallel 4 (each
-    # card holds all 288 experts sharded to N=512): taken only for M >=
-    # the moe_prefill/marlin_min_rows row of the sm80 tuning table at N=512 and
-    # otherwise the conditions of VLLM_AMPERE_MARLIN_PREFILL_WIDE. Its own
-    # switch so the two layouts are judged separately. Off by default.
-    "VLLM_AMPERE_MARLIN_PREFILL_NARROW": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "0"))
+    # Split-block Marlin W4A16 MoE prefill on sm_80 for 288 routed experts
+    # (vllm/sm80/kernels/marlin_moe/prefill.py): align the routed rows into
+    # one block list per size 64/48/32/16 (cheapest cover per expert) instead
+    # of padding every expert to one block size, and run each Marlin GEMM once
+    # per list. The expert width per card picks the shape: whole experts
+    # (N=2048, pipeline parallel with TP=1), with the list GEMMs on the
+    # optional library's prefill_tile_gemm tiles ((64,512) on the 64/48/32-row
+    # lists of both GEMMs, the optimistic fast dequant with tiles above a 2^-5
+    # scale recomputed by the regular kernel; without the library or its op the
+    # released kernels); or tensor-parallel-4 shards (N=512) on the released
+    # kernels. Taken for M >= the moe_prefill/marlin_min_rows row of the sm80
+    # tuning table at that N. The split cover changes stream-K boundaries and
+    # reduction order, so output is not bitwise equal to fused_marlin_moe.
+    # Everything else keeps fused_marlin_moe. Off by default.
+    "VLLM_SM80_MARLIN_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_MARLIN_PREFILL", "0"))
     ),
     # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
     # requires vllm._ampere_marlin_C; startup fails if it is missing or
@@ -684,20 +643,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # decode_gemm_orig runs. Off by default.
     "VLLM_AMPERE_MARLIN_DECODE_V2": lambda: bool(
         int(os.getenv("VLLM_AMPERE_MARLIN_DECODE_V2", "0"))
-    ),
-    # Whole-expert (pipeline-parallel, N=2048) compiled decode also at 5-7
-    # rows (draft depths 4-6 of one request), not only at 4 and 8. Needs
-    # VLLM_AMPERE_MARLIN_DECODE_CUDA=1.
-    "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS": lambda: bool(
-        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS", "0"))
-    ),
-    # Whole-expert (N=2048) compiled decode for multi-request batches, at the
-    # rows 9 up to the moe_routed_gemm/marlin_multi_max_rows row of the sm80
-    # tuning table (at most 64; default 32, the most rows one PP4 step verifies
-    # with DEPTHS 7,5 and 8 sequences). The N=2048 scratch grows to that row
-    # count.
-    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": lambda: bool(
-        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MULTI", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
@@ -977,11 +922,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "0"))
     ),
-    # With VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: the most rows (tokens of the
-    # padded step) a layer call may have to take the fused path.
-    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
-    ),
     # DeepSeek-V4.1 on sm_80: the routed experts of the decoder layers run MoE
     # calls of 65..2048 rows in prefill steps on the tensor cores
     # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
@@ -997,12 +937,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
     ),
     # Complete decode/verify attention preparation, stable index selection,
-    # and ordered-value output epilogue. Independent of the qualified seed.
+    # and ordered-value output epilogue, for calls of up to 48 padded rows
+    # (sm80_attn_pipeline.MAX_ROWS). Independent of the qualified seed.
     "VLLM_DEEPSEEK_V41_ATTN_PIPELINE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "0"))
-    ),
-    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", "48")
     ),
     # DeepSeek-V4.1 on sm_80, the attention pipeline's exact index selection:
     # a call of at most 48 rows as one Triton launch (one program per
@@ -1367,19 +1305,13 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": "renamed to VLLM_MOE_DETERMINISTIC_ALIGN",
     "VLLM_GLM5_INDEXER_DECODE_RAW_K": "renamed to VLLM_INDEXER_DECODE_RAW_K",
     "VLLM_GLM5_MARLIN_DECODE_CUDA": "renamed to VLLM_AMPERE_MARLIN_DECODE_CUDA",
-    "VLLM_GLM5_PP_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_WIDE",
-    "VLLM_GLM5_PP_MARLIN_PREFILL": "renamed to VLLM_AMPERE_MARLIN_PREFILL_WIDE",
-    "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": (
-        "renamed to VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED"
-    ),
-    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": (
-        "renamed to VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE"
-    ),
+    "VLLM_GLM5_PP_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
+    "VLLM_GLM5_PP_MARLIN_PREFILL": "merged into VLLM_SM80_MARLIN_PREFILL",
+    "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": "merged into VLLM_SM80_MARLIN_PREFILL",
+    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": "merged into VLLM_SM80_SPARSE_MLA_PREFILL",
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": "renamed to VLLM_TOOL_CHOICE_NONE_MASK",
-    "VLLM_GLM5_TP4_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_NARROW",
-    "VLLM_GLM5_TP4_MARLIN_PREFILL": (
-        "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
-    ),
+    "VLLM_GLM5_TP4_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
+    "VLLM_GLM5_TP4_MARLIN_PREFILL": "merged into VLLM_SM80_MARLIN_PREFILL",
     # Merged: one switch per operation across models.
     "VLLM_GLM5_TOPK_TIEFIX": (
         "merged into VLLM_SM80_TOPK_CANONICAL_TIES (all sparse indexers)"
@@ -1393,6 +1325,49 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_QWEN_QSA_TOPK_SORTED": (
         "merged into VLLM_SM80_TOPK_SORTED (all sparse indexers; default off)"
+    ),
+    # The shape picks the kernel.
+    "VLLM_AMPERE_KDA_PREFILL_WIDE": (
+        "merged into VLLM_SM80_KDA_PREFILL (64 or 16 heads per card, picked "
+        "by the layer's head count)"
+    ),
+    "VLLM_AMPERE_KDA_PREFILL_NARROW": (
+        "merged into VLLM_SM80_KDA_PREFILL (64 or 16 heads per card, picked "
+        "by the layer's head count)"
+    ),
+    "VLLM_AMPERE_MARLIN_PREFILL_WIDE": (
+        "merged into VLLM_SM80_MARLIN_PREFILL (whole experts or TP4 shards, "
+        "picked by the expert width per card)"
+    ),
+    "VLLM_AMPERE_MARLIN_PREFILL_NARROW": (
+        "merged into VLLM_SM80_MARLIN_PREFILL (whole experts or TP4 shards, "
+        "picked by the expert width per card)"
+    ),
+    "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": (
+        "merged into VLLM_SM80_MARLIN_PREFILL (the whole-expert lists run on "
+        "the compiled tiles whenever the library has them)"
+    ),
+    "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": (
+        "merged into VLLM_SM80_SPARSE_MLA_PREFILL (the 64-head kernel is "
+        "picked by the head count per card)"
+    ),
+    # Split: one switch per operation.
+    "VLLM_GLM5_PREFILL_KERNELS": (
+        "split into VLLM_SM80_MHC_PREFILL (the mHC pre-norm GEMM) and "
+        "VLLM_SM80_SPARSE_MLA_PREFILL (the sparse-MLA prefill attention)"
+    ),
+    "VLLM_GLM5_DECODE_KDA_WIDE": (
+        "merged into VLLM_AMPERE_DECODE_KERNELS (64 heads per card take the "
+        "fused KDA decode step at every measured shape)"
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS": (
+        "merged into VLLM_AMPERE_MARLIN_DECODE_CUDA (whole experts take the "
+        "compiled decode at 4..8 rows)"
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": (
+        "merged into VLLM_AMPERE_MARLIN_DECODE_CUDA (whole experts take the "
+        "compiled decode for multi-request rows up to the sm80 tuning table "
+        "row moe_routed_gemm/marlin_multi_max_rows)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (
@@ -1576,6 +1551,18 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_HOST_ALLREDUCE_MAX_SIZE": (
         "moved to the sm80 tuning table, allreduce/host_max_bytes"
+    ),
+    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": (
+        "moved to the sm80 tuning table, cudagraph/capture_max_split_mb"
+    ),
+    # Support limits, now code constants.
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": (
+        "removed; the attention pipeline takes calls of up to 48 padded rows, "
+        "its supported bound (sm80_attn_pipeline.MAX_ROWS)"
+    ),
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": (
+        "removed; the fused attention core takes calls of up to 48 padded "
+        "rows, its validated bound (sm80_attn_fused.MAX_ROWS)"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

@@ -231,8 +231,8 @@ def _kda_layers(runner) -> list:
 def _kda_unavailable(runner) -> str | None:
     if not any(m._pp_kda_prefill for m in _kda_layers(runner)):
         return (
-            "boot with VLLM_AMPERE_KDA_PREFILL_WIDE or _NARROW so a layer takes "
-            "the kernel; its off arm clears the layer gate"
+            "boot with VLLM_SM80_KDA_PREFILL so a layer takes the kernel; its "
+            "off arm clears the layer gate"
         )
     return None
 
@@ -1012,8 +1012,7 @@ SWITCHES: dict[str, Switch] = {
             _flags_unavailable, _flags_current, _flags_apply,
         ),
         Switch(
-            "kda_prefill",
-            "VLLM_AMPERE_KDA_PREFILL_WIDE,VLLM_AMPERE_KDA_PREFILL_NARROW",
+            "kda_prefill", "VLLM_SM80_KDA_PREFILL",
             False, False,
             _kda_unavailable, _kda_current, _kda_apply,
         ),

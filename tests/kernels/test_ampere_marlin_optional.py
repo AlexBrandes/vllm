@@ -19,8 +19,8 @@ DECODE = "VLLM_AMPERE_MARLIN_DECODE_CUDA"
 
 @pytest.fixture(autouse=True)
 def isolated_optional_flags(monkeypatch):
-    for name in (DECODE, "VLLM_AMPERE_MARLIN_PREFILL_WIDE",
-                 "VLLM_AMPERE_MARLIN_PREFILL_NARROW", "VLLM_AMPERE_DECODE_IDX_GLUE"):
+    for name in (DECODE, "VLLM_SM80_MARLIN_PREFILL",
+                 "VLLM_AMPERE_DECODE_IDX_GLUE"):
         monkeypatch.setenv(name, "0")
     monkeypatch.setattr(extension, "_OPS", None)
 
@@ -143,8 +143,7 @@ def test_unsupported_decode_leaves_output_untouched(monkeypatch, case, reason):
 
 
 def test_released_prefill_thresholds(monkeypatch):
-    monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE", "1")
-    monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "1")
+    monkeypatch.setenv("VLLM_SM80_MARLIN_PREFILL", "1")
     use_rows(
         monkeypatch,
         ("moe_prefill", "marlin_min_rows", {"gemm_n": 2048}, 1000),
@@ -160,11 +159,7 @@ def test_released_prefill_thresholds(monkeypatch):
 ])
 def test_warmup_allocations_follow_admitted_width(monkeypatch, width, python_on, budget,
                                                   expected):
-    python_flag = (
-        "VLLM_AMPERE_MARLIN_PREFILL_NARROW" if width == 512
-        else "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
-    )
-    monkeypatch.setenv(python_flag, str(int(python_on)))
+    monkeypatch.setenv("VLLM_SM80_MARLIN_PREFILL", str(int(python_on)))
     assert prefill._warmup_capacity(width, budget) == expected
 
 

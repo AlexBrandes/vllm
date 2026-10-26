@@ -45,11 +45,11 @@ history is recorded for the length of the profiling run and the live blocks
 behind ``held`` are listed by their vLLM call stack (diagnostics: the
 recording slows the profiling capture down).
 
-``VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB`` (default 0, off) sets the allocator's
-``max_split_size_mb`` for the length of both captures, as the worker already
-does for ``profile_run``: blocks above the limit are never split, so a small
-long-lived allocation made during a capture cannot keep a large free segment
-from being released.
+The sm_80 tuning table's ``cudagraph`` / ``capture_max_split_mb`` value
+(default 0, off) sets the allocator's ``max_split_size_mb`` for the length of
+both captures, as the worker already does for ``profile_run``: blocks above
+the limit are never split, so a small long-lived allocation made during a
+capture cannot keep a large free segment from being released.
 
 The worker and model runner subclasses that call in here are in
 ``graph_mem_worker``; without the flag nothing here runs (the fork platform
@@ -449,9 +449,12 @@ def _log_held(
 
 @contextmanager
 def _capture_max_split() -> Iterator[None]:
-    """``max_split_size_mb`` = VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB for the
-    length of a capture (0: unchanged), restoring the settings on exit."""
-    limit = envs.VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB
+    """``max_split_size_mb`` = the tuning table's capture_max_split_mb for the
+    length of a capture (0, the default: unchanged), restoring the settings on
+    exit."""
+    from vllm.sm80 import tuning
+
+    limit = tuning.lookup("cudagraph", "capture_max_split_mb", {}, 0)
     if limit <= 0 or torch.cuda.memory.get_allocator_backend() != "native":
         yield
         return

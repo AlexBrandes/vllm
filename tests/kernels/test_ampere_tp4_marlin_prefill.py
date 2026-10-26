@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E501
-"""Split-block Marlin W4A16 MoE prefill at TP4 shards (VLLM_AMPERE_MARLIN_PREFILL_NARROW).
+"""Split-block Marlin W4A16 MoE prefill at TP4 shards (VLLM_SM80_MARLIN_PREFILL).
 
-The split path of VLLM_AMPERE_MARLIN_PREFILL_WIDE with N=512 (all 288 experts
+The split path of the whole-expert width with N=512 (all 288 experts
 sharded four ways). The helpers (routing model, list-layout model, meta
 layer, fp64 reference with the incumbent's rounding points, the incumbent
 call) are those of ``test_ampere_pp_marlin_prefill.py``, loaded as a separate
-module with N=512 and this flag.
+module with N=512 and the TP4 threshold.
 
-CPU (CUDA_VISIBLE_DEVICES=""): flag defaults; which intermediate sizes each
-flag opens; the N=512 gate and the unchanged N=2048 gate; the hook with the
-TP4 flag off and on; the TP4 minimum-token threshold; the list layout
+CPU (CUDA_VISIBLE_DEVICES=""): flag defaults; the intermediate sizes the
+switch opens; the N=512 gate and the unchanged N=2048 gate; the hook with the
+switch off and on; the TP4 minimum-token threshold; the list layout
 contract at the TP4 call sizes (1728/1732, the halves of a 3456-token
 chunk; 640/642, the halves of a 1282-token tail; 3460, a whole chunk).
 
@@ -37,8 +37,7 @@ from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
 
-FLAG = "VLLM_AMPERE_MARLIN_PREFILL_NARROW"
-PP_FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
+FLAG = "VLLM_SM80_MARLIN_PREFILL"
 
 
 def _min_rows(monkeypatch, **by_n):
@@ -56,8 +55,6 @@ def _helpers():
     for old, new in (
         ("E, TOPK, K, N, G = 288, 8, 4096, 2048, 128",
          "E, TOPK, K, N, G = 288, 8, 4096, 512, 128"),
-        ('FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"',
-         'FLAG = "VLLM_AMPERE_MARLIN_PREFILL_NARROW"'),
     ):
         assert src.count(old) == 1, old
         src = src.replace(old, new)
@@ -85,8 +82,7 @@ TP4_M = [640, 642, 1728, 1732, 3456, 3460]
 
 
 @pytest.fixture(autouse=True)
-def _pp_flag_off(monkeypatch):
-    monkeypatch.delenv(PP_FLAG, raising=False)
+def _table_defaults(monkeypatch):
     use_rows(monkeypatch)
 
 
@@ -98,7 +94,7 @@ def test_flag_defaults(monkeypatch):
     import vllm.envs as envs
 
     monkeypatch.delenv(FLAG, raising=False)
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW is False
+    assert envs.VLLM_SM80_MARLIN_PREFILL is False
     assert pmp.min_rows(512) == 384
     from vllm.sm80 import envs as fork_envs  # typed declarations
 
@@ -106,15 +102,12 @@ def test_flag_defaults(monkeypatch):
     assert f"    {FLAG}: bool = False\n" in src
 
 
-@pytest.mark.parametrize("pp,tp4,want", [
-    ("0", "0", {}),
-    ("1", "0", {2048: (PP_FLAG, 384)}),
-    ("0", "1", {512: (FLAG, 700)}),
-    ("1", "1", {2048: (PP_FLAG, 384), 512: (FLAG, 700)}),
+@pytest.mark.parametrize("value,want", [
+    ("0", {}),
+    ("1", {2048: (FLAG, 384), 512: (FLAG, 700)}),
 ])
-def test_enabled_shapes(monkeypatch, pp, tp4, want):
-    monkeypatch.setenv(PP_FLAG, pp)
-    monkeypatch.setenv(FLAG, tp4)
+def test_enabled_shapes(monkeypatch, value, want):
+    monkeypatch.setenv(FLAG, value)
     _min_rows(monkeypatch, n512=700)
     assert pmp.enabled_shapes() == want
 
@@ -218,10 +211,9 @@ def test_below_min_tokens_is_not_gated(monkeypatch):
     assert pmp.maybe_apply(hp._layer(n=512), **_maybe_args(383)) is False
 
 
-def test_tp4_min_tokens_applies_with_both_flags(monkeypatch):
+def test_tp4_min_tokens_applies_beside_the_pp_threshold(monkeypatch):
     """PP threshold 384, TP4 threshold 1000: an N=512 call of 500 rows passes
     the open gate but stays on the incumbent (TP4's own threshold)."""
-    monkeypatch.setenv(PP_FLAG, "1")
     monkeypatch.setenv(FLAG, "1")
     _min_rows(monkeypatch, n2048=384, n512=1000)
     seen = []

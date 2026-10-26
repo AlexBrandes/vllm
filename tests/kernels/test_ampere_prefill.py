@@ -71,18 +71,23 @@ def sm80(monkeypatch):
 
 # ----------------------------------------------------------------- gates OFF
 
+MHC, SMLA = "VLLM_SM80_MHC_PREFILL", "VLLM_SM80_SPARSE_MLA_PREFILL"
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 512, 1152, 2304])
 @pytest.mark.parametrize("seq_kv", [1024, 2304, 8192, 99328])
 def test_gates_are_off_by_default(sm80, num_tokens, seq_kv):
-    """With VLLM_GLM5_PREFILL_KERNELS unset, nothing dispatches -- ever."""
-    sm80.delenv("VLLM_GLM5_PREFILL_KERNELS", raising=False)
+    """With both switches unset, nothing dispatches -- ever."""
+    sm80.delenv(MHC, raising=False)
+    sm80.delenv(SMLA, raising=False)
     assert use_ampere_prefill_prenorm(num_tokens) is False
     assert _use_ampere_prefill_sparse_mla(num_tokens, seq_kv, 2048, DIM_QK) is False
 
 
 def test_gates_off_on_non_sm80(monkeypatch):
-    """Even with the flag on, a non-sm_80 part keeps the upstream kernels."""
-    monkeypatch.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
+    """Even with the switches on, a non-sm_80 part keeps the upstream kernels."""
+    monkeypatch.setenv(MHC, "1")
+    monkeypatch.setenv(SMLA, "1")
     use_rows(monkeypatch)
     monkeypatch.setattr("vllm.platforms.current_platform", _FakePlatform(cap=90))
     assert use_ampere_prefill_prenorm(1152) is False
@@ -95,8 +100,27 @@ def test_gates_off_on_non_sm80(monkeypatch):
 
 # ------------------------------------------------------------------ gates ON
 
+@pytest.mark.parametrize("mhc,smla", [("1", "0"), ("0", "1")])
+def test_each_switch_opens_only_its_operation(sm80, mhc, smla):
+    """The mHC pre-norm GEMM and the sparse-MLA attention are separate
+    operations with a switch each."""
+    sm80.setenv(MHC, mhc)
+    sm80.setenv(SMLA, smla)
+    use_rows(sm80)
+    assert use_ampere_prefill_prenorm(1152) is (mhc == "1")
+    assert _use_ampere_prefill_sparse_mla(1152, 99328, 2048, DIM_QK) is (smla == "1")
+
+
+def test_switches_declared_default_off():
+    from vllm.sm80 import envs as fork_envs  # typed declarations
+
+    src = open(fork_envs.__file__).read()
+    for name in (MHC, SMLA):
+        assert f"    {name}: bool = False\n" in src
+
+
 def test_prenorm_token_threshold(sm80):
-    sm80.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
+    sm80.setenv(MHC, "1")
     # decode sizes -- these are the captured CUDA-graph sizes, must stay upstream
     for n in (1, 2, 4, 8, 16, 32, 64, 511):
         assert use_ampere_prefill_prenorm(n) is False, n
@@ -107,7 +131,7 @@ def test_prenorm_token_threshold(sm80):
 
 def test_sparse_mla_context_gate(sm80):
     """The measured regression case (ctx ~= topk) must fall back."""
-    sm80.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
+    sm80.setenv(SMLA, "1")
     topk = 2048
     # 0.93x measured here -- must NOT dispatch
     assert _use_ampere_prefill_sparse_mla(1152, 2304, topk, DIM_QK) is False
@@ -122,13 +146,14 @@ def test_sparse_mla_context_gate(sm80):
 
 def test_sparse_mla_gate_scales_with_topk(sm80):
     """The gate is relative to index_topk, not an absolute row count."""
-    sm80.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
+    sm80.setenv(SMLA, "1")
     assert _use_ampere_prefill_sparse_mla(1152, 4096, 4096, DIM_QK) is False
     assert _use_ampere_prefill_sparse_mla(1152, 8192, 4096, DIM_QK) is True
 
 
 def test_thresholds_are_tuning_rows(sm80):
-    sm80.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
+    sm80.setenv(MHC, "1")
+    sm80.setenv(SMLA, "1")
     use_rows(sm80, ("mhc", "prefill_min_rows", {}, 2048))
     assert use_ampere_prefill_prenorm(1152) is False
     use_rows(sm80, ("mhc", "prefill_min_rows", {}, 1024))
@@ -544,7 +569,7 @@ def test_gpu_prenorm_past_int32_takes_tilelang(monkeypatch):
     )
 
     M, K, N, hidden, hc = 131200, 16384, 24, 4096, 4
-    monkeypatch.setenv("VLLM_GLM5_PREFILL_KERNELS", "1")
+    monkeypatch.setenv(MHC, "1")
     use_rows(monkeypatch, ("mhc", "prefill_min_rows", {}, 384))
     if torch.cuda.get_device_capability() == (8, 0):
         assert use_ampere_prefill_prenorm(M)  # the guard decides

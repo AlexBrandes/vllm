@@ -46,9 +46,8 @@ The runtime flags default to `0`:
 
 | Flag | Guarded regime |
 | --- | --- |
-| `VLLM_AMPERE_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, 4 or 8 tokens |
-| `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS=1` (with the above) | PP4 width 2048, also 5–7 tokens |
-| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI=1` (with the above) | PP4 width 2048, 9 tokens up to the `moe_routed_gemm/marlin_multi_max_rows` row of the sm80 tuning table (`vllm/sm80/tuning/`; at most 64, default 32) |
+| `VLLM_AMPERE_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, 4–8 tokens and 9 tokens up to the `moe_routed_gemm/marlin_multi_max_rows` row of the sm80 tuning table (`vllm/sm80/tuning/`; at most 64, default 32) |
+| `VLLM_SM80_MARLIN_PREFILL=1` | split-block MoE prefill: TP4 width 512, PP4 width 2048 with the compiled tiles below |
 
 Decode splits the first projection four ways along K into fixed-order fp32
 partials, which is faster but sums in a different order from the released
@@ -65,17 +64,15 @@ The decode schedule retains routing and padding semantics, slot-order
 summation, shared-expert handling and final reduction. Optional scratch is
 reserved per device and stream before CUDA-graph capture, including PP
 workers: 32 tokens for TP4, and for PP4 8 tokens or the largest row count of
-`moe_routed_gemm/marlin_multi_max_rows` when that switch is on.
+`moe_routed_gemm/marlin_multi_max_rows`.
 Fully masked graph padding rows remain don't-care, as with released kernels.
 
 MoE prefill under TP4 uses the released Marlin kernels (with the split-block
-schedule of `VLLM_AMPERE_MARLIN_PREFILL_NARROW`). Under PP4 the split-block
-prefill of `VLLM_AMPERE_MARLIN_PREFILL_WIDE` runs its list GEMMs through the
+schedule of `VLLM_SM80_MARLIN_PREFILL`). Under PP4 the same split-block
+prefill runs its list GEMMs through the
 library's `prefill_tile_gemm`: (64,512) tiles for the 32–64-row lists and a
 one-HFMA2 dequant whose tiles with a scale above 2^-5 are recomputed by the
-regular kernel. `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (default `0`; the
-PP4 serving defaults set `1`) selects it; `0` keeps the released kernels.
-Without a library that exports the operator, the released kernels run; the
+regular kernel. Without a library that exports the operator, the released kernels run; the
 worker log names the reason.
 
 With the decode flag off and no compiled PP4 prefill, the optional extension

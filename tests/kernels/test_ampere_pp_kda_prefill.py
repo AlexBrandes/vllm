@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""sm_80 KDA chunked prefill with 64 heads per card (VLLM_AMPERE_KDA_PREFILL_WIDE).
+"""sm_80 KDA chunked prefill with 64 heads per card (VLLM_SM80_KDA_PREFILL).
 
 CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the flag is declared and off
 by default, the layer and call gates and their fallbacks, and the warm-up
@@ -30,7 +30,7 @@ import torch
 
 from vllm.models.glm5next.nvidia.ops import kda_prefill as kp
 
-FLAG = "VLLM_AMPERE_KDA_PREFILL_WIDE"
+FLAG = "VLLM_SM80_KDA_PREFILL"
 H, D = kp.HEADS, kp.HEAD_DIM
 P = H * D
 LB = kp.LOWER_BOUND

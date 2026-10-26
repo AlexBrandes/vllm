@@ -30,17 +30,29 @@ def test_switches_default_off(monkeypatch):
     from vllm import envs
 
     monkeypatch.delenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", raising=False)
-    monkeypatch.delenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", raising=False)
     assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE is False
-    assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS == 48
     monkeypatch.delenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", raising=False)
-    monkeypatch.delenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", raising=False)
     assert envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE is False
-    assert envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS == 48
     monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "1")
-    monkeypatch.setenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "16")
     assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE is True
-    assert envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS == 16
+
+
+def test_row_bounds_are_the_validated_support_limits():
+    """Both paths take calls of up to 48 padded rows, the range they were
+    validated on; the bound is code, not a setting."""
+    from vllm import envs
+    from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_pipeline
+
+    assert fused.MAX_ROWS == 48
+    assert sm80_attn_pipeline.MAX_ROWS == 48
+    for name in ("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS",
+                 "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS"):
+        assert name not in envs.environment_variables
+    budget = 1 << 62
+    cfg = SimpleNamespace(compress_ratio=0, is_index_source=False)
+    assert sm80_attn_pipeline.supports(cfg, 48, 1, 128, budget) is None
+    assert "outside the supported bound" in sm80_attn_pipeline.supports(
+        cfg, 49, 1, 128, budget)
 
 
 def test_supports_only_the_validated_configuration():

@@ -5,7 +5,7 @@
   ``decode``             the fused mHC post + pre sublayer boundary at decode
                          sizes, 90 calls/step (``VLLM_GLM5_DECODE_MHC_V2``)
   ``prenorm``            the pre-norm projection GEMM at prefill sizes
-                         (``VLLM_GLM5_PREFILL_KERNELS``)
+                         (``VLLM_SM80_MHC_PREFILL``)
   ``prenorm_workspace``  the prefill scratch owner ``prenorm`` uses
   ``warmup``             compiles ``decode`` before CUDA graph capture
 
@@ -106,7 +106,7 @@ def use_ampere_prefill_prenorm(num_tokens: int) -> bool:
     from vllm import envs
     from vllm.platforms import current_platform
 
-    if not envs.VLLM_GLM5_PREFILL_KERNELS:
+    if not envs.VLLM_SM80_MHC_PREFILL:
         return False
     if num_tokens < tuning.lookup("mhc", "prefill_min_rows", {}, 512):
         return False
