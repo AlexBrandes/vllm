@@ -56,7 +56,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/deepseek_v41/nvidia/dspark_depth_policy.json` | 300 |
 | `vllm/models/deepseek_v41/nvidia/hybrid_capture.py` | 364 |
 | `vllm/models/deepseek_v41/nvidia/sm80_attention.py` | 1,171 |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,314 |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 1,380 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_prefetch.py` | 107 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_projection.py` | 18 |
 | `vllm/models/deepseek_v41/nvidia/sm80_engram_wkv.py` | 196 |
@@ -74,7 +74,7 @@ Model code of one model that the fork plugin registers in place of the upstream 
 | `vllm/models/qwen4_exp/nvidia/exl3_ple.py` | 948 |
 | `vllm/models/qwen4_exp/nvidia/precision.py` | 93 |
 | `vllm/models/qwen4_exp/nvidia/sm80_model.py` | 44 |
-| **21 files** | **7,711** |
+| **21 files** | **7,777** |
 
 ### `vllm/sm80/kernels/`
 
@@ -142,7 +142,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 
 | Path | Lines |
 |---|---:|
-| `vllm/sm80/__init__.py` | 38 |
+| `vllm/sm80/__init__.py` | 41 |
 | `vllm/sm80/attention/__init__.py` | 2 |
 | `vllm/sm80/attention/triton_mla_sparse.py` | 386 |
 | `vllm/sm80/capture.py` | 662 |
@@ -156,7 +156,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm/sm80/distributed/step_errors.py` | 167 |
-| `vllm/sm80/envs.py` | 1,622 |
+| `vllm/sm80/envs.py` | 1,630 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -207,6 +207,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/lilicorr_model.py` | 31 |
 | `vllm/sm80/spec_decode/shard_argmax.py` | 612 |
 | `vllm/sm80/spec_decode/warmup.py` | 184 |
+| `vllm/sm80/table_segment.py` | 707 |
 | `vllm/sm80/tuning.py` | 278 |
 | `vllm/sm80/tuning/nvidia-cmp-170hx.toml` | 330 |
 | `vllm/sm80/worker/__init__.py` | 2 |
@@ -217,7 +218,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 278 |
-| **75 files** | **22,589** |
+| **76 files** | **23,307** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -430,7 +431,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax.py` | 422 |
 | `tests/models/deepseek_v41/sm80/test_dspark_shard_argmax_stats.py` | 111 |
 | `tests/models/deepseek_v41/sm80/test_engram_early_gather.py` | 226 |
-| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,757 |
+| `tests/models/deepseek_v41/sm80/test_engram_storage.py` | 1,900 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica.py` | 459 |
 | `tests/models/deepseek_v41/sm80/test_engram_wkv_replica_gpu.py` | 113 |
 | `tests/models/deepseek_v41/sm80/test_exl3_construction.py` | 129 |
@@ -559,6 +560,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_shard_argmax.py` | 384 |
 | `tests/sm80/test_step_error_copy.py` | 66 |
 | `tests/sm80/test_step_error_dispatch.py` | 69 |
+| `tests/sm80/test_table_segment.py` | 283 |
 | `tests/sm80/test_triton_mla_sparse_block_stride.py` | 151 |
 | `tests/sm80/test_tuning.py` | 277 |
 | `tests/sm80/tuning_rows.py` | 39 |
@@ -601,7 +603,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 569 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **280 files** | **120,214** |
+| **281 files** | **120,640** |
 
 #### `tools/`
 
@@ -791,6 +793,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
 | `VLLM_ENGRAM_ROW_CACHE_PRELOAD` | `bool` | `False` | `'0'` |
+| `VLLM_ENGRAM_SEGMENT` | `str` | `''` | `''` |
 | `VLLM_ENGRAM_TELEMETRY_STEPS` | `int` | `0` | `'0'` |
 | `VLLM_EXL3_DENSE_MMA` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE` | `str` | `''` | `''` |
@@ -860,7 +863,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **107 variables** | | | |
+| **108 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -870,7 +873,7 @@ Functions, methods and classes in fork-added product files whose name occurs now
 |---|---:|---|---:|---|
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_attn_core.py` | 914 | `forward_layer` | 19 | yes |
 | `vllm/models/deepseek_v41/nvidia/ops/sm80_router_mma.py` | 205 | `gate_route` | 14 | yes |
-| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 286 | `engram_telemetry` | 4 | yes |
+| `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 295 | `engram_telemetry` | 4 | yes |
 | `vllm/sm80/dev_ab.py` | 1635 | `get_ab_arm` | 4 | yes |
 | `vllm/sm80/distributed/ce_ring_all_reduce.py` | 98 | `emulate_owner` | 7 | yes |
 | `vllm/sm80/spec_decode/dspark_row_mask.py` | 362 | `_reset_for_tests` | 3 | yes |
@@ -882,12 +885,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 219 |
-| Fork-added product lines | 73,590 |
+| Fork-added product files | 220 |
+| Fork-added product lines | 74,374 |
 | Patched upstream files | 107 |
 | Patched upstream lines | +4,979 / -804 |
 | Patched upstream product files | 80 |
 | Patched upstream product lines | +3,496 / -253 |
-| Product lines added (new files and patches) | 77,086 |
-| Fork environment variables (flags) | 107 |
+| Product lines added (new files and patches) | 77,870 |
+| Fork environment variables (flags) | 108 |
 | Unreferenced fork definitions | 6 (51 lines) |
