@@ -166,8 +166,19 @@ def maybe_configure_aux_fc_fold(
 
 def mark_drafter_aux_fc_folded(speculator: Any) -> None:
     """Tell the last stage's drafter that its aux input is already the fc
-    output (see DFlashQwen3ForCausalLM.combine_hidden_states)."""
+    output (see DFlashQwen3ForCausalLM.combine_hidden_states), and give the
+    speculator's FULL-graph staging buffer that input's shape: the graph
+    combines its context rows from this buffer, which upstream sizes for the
+    concatenated aux states. The fp32 rows are rounded once in the combine,
+    as on the eager path."""
     draft_model = getattr(speculator, "model", None)
     if draft_model is None:
         raise RuntimeError("fc fold: the speculator has no draft model")
     draft_model.aux_fc_folded = True
+    staging = getattr(speculator, "_aux_staging", None)
+    if staging is not None:
+        speculator._aux_staging = torch.zeros(
+            (staging.shape[0], draft_model.model.fc.output_size),
+            dtype=torch.float32,
+            device=staging.device,
+        )
