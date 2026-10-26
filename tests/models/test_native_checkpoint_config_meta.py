@@ -96,6 +96,13 @@ def _model_config(name):
         skip_tokenizer_init=True,
     )
     config.model_arch_config = config.get_model_arch_config()
+    # ModelConfig.__post_init__ (not run here) resolves the registered
+    # architecture's interfaces, which properties such as
+    # supports_kv_cache_grouping read.
+    _register_fork_plugin()
+    config._model_info, config._architecture = config.registry.inspect_model_cls(
+        config.architectures, config
+    )
     return config
 
 
