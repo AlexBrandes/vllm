@@ -217,3 +217,18 @@ exceptions:
   removal: >-
     Drops out at the first base that contains upstream ddefe40e16 (#62199);
     delete this entry and the modification notice then.
+
+- file: vllm/envs.py
+  hunks: [61396cef5c73]
+  reason: >-
+    The registration call of the fork's variables runs only when the file is
+    imported as vllm.envs. setup.py loads it by path in an isolated build,
+    where no vllm package is importable; the guard keeps setup.py upstream's
+    (it previously had to load vllm/sm80/envs.py first). vLLM has no hook
+    for extra variables in its environment table, so the call sits at the
+    end of the table's module.
+  owner: sm_80 fork environment variables
+  removal: >-
+    Remove when vLLM accepts variables from plugins (a registration hook its
+    environment table calls), or when the fork's variables move to a plugin
+    entry point that registers them before vllm.envs is read.

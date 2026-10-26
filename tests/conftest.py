@@ -15,7 +15,7 @@ pickling_support.install()
 
 # GPU tests run only under the GPU lock: outside it, hide the cards before
 # anything can initialise CUDA (tests/sm80/gpu_lock_guard.py).
-from tests.sm80.gpu_lock_guard import hide_cuda, refuse_cuda_tests
+from tests.sm80.gpu_lock_guard import hide_cuda, pytest_configure, refuse_cuda_tests
 
 hide_cuda()
 
