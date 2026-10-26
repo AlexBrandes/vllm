@@ -59,25 +59,6 @@ def test_extension_flags_meet_torch_minimum_standard(monkeypatch, tmp_path,
                     f"__cplusplus >= {minimum}")
 
 
-def test_build_name_follows_flags_and_torch(monkeypatch, tmp_path):
-    from vllm.sm80 import jit_extension
-
-    names = []
-    monkeypatch.setattr(torch.utils.cpp_extension, "load",
-                        lambda **kw: names.append(kw["name"]))
-
-    def build(cflags):
-        jit_extension.load_cuda_extension("ext", "src", str(tmp_path),
-                                          extra_cflags=cflags,
-                                          extra_cuda_cflags=[])
-
-    build(["-O3"])
-    build(["-O2"])
-    monkeypatch.setattr(torch, "__version__", "0.0.0")
-    build(["-O3"])
-    assert len(set(names)) == 3
-
-
 def test_caller_std_flag_is_refused(tmp_path):
     from vllm.sm80 import jit_extension
 

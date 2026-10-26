@@ -484,7 +484,7 @@ _MODULE = None
 
 
 def _build_dir() -> str:
-    """Where the JIT extension is cached; never inside the source tree."""
+    """Base of the JIT build directories; never inside the source tree."""
     d = os.path.join(envs.VLLM_CACHE_ROOT, "custom_all_reduce_flags")
     d = os.path.abspath(d)
     os.makedirs(d, exist_ok=True)

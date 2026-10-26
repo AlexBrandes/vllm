@@ -632,7 +632,7 @@ _MODULE = None
 
 
 def _build_dir() -> str:
-    """Where the JIT extension is cached.
+    """Base of the JIT build directories (one per build, see jit_extension).
 
     Never inside the vLLM source tree: a build artefact there would show up as a
     dirty working tree and be shipped in a wheel. TORCH_EXTENSIONS_DIR, else
