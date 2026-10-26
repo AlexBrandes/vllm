@@ -836,8 +836,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_PP_PACKED_HOP` | `bool` | `False` | `'0'` |
 | `VLLM_PP_SPLIT_DRAFT_EVENT` | `bool` | `False` | `'0'` |
 | `VLLM_PP_SPREAD_DECODES` | `bool` | `False` | `'0'` |
-| `VLLM_QWEN4_MTP_PER_STREAM_NORM` | `bool` | `False` | `'0'` |
-| `VLLM_QWEN4_ROUTER_FP32` | `bool` | `False` | `'0'` |
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_ALLREDUCE_ROUND_ONCE` | `bool` | `False` | `'0'` |

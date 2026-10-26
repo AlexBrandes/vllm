@@ -123,8 +123,6 @@ if TYPE_CHECKING:
     VLLM_SM80_CAPTURE: str = ""
     VLLM_SM80_REPLAY_DIR: str = ""
     VLLM_SM80_REPLAY_LIMIT: int | None = None
-    VLLM_QWEN4_ROUTER_FP32: bool = False
-    VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
     VLLM_DEV_AB_SWITCH: str = ""
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
@@ -1168,14 +1166,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Tests only: the most records a replay test reads from its family; 0
     # reads every record. Default unset: each test's own number.
     "VLLM_SM80_REPLAY_LIMIT": _replay_limit,
-    # Preserve BF16 router operands but accumulate and return logits in FP32.
-    "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
-        int(os.getenv("VLLM_QWEN4_ROUTER_FP32", "0"))
-    ),
-    # Normalize each MTP hidden stream instead of the concatenated stack.
-    "VLLM_QWEN4_MTP_PER_STREAM_NORM": lambda: bool(
-        int(os.getenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", "0"))
-    ),
     # Development server only: the name of one switch in
     # vllm/sm80/dev_ab.py SWITCHES. Both of its arms are captured at boot and
     # POST /collective_rpc set_ab_arm (VLLM_SERVER_DEV_MODE=1) changes the arm
@@ -1428,6 +1418,16 @@ RETIRED_ENV_VARS: dict[str, str] = {
         "replaced by the model config field aux_hidden_state_tensor; for the "
         "branch tensor pass --hf-overrides "
         '{"text_config": {"aux_hidden_state_tensor": "branch"}}'
+    ),
+    "VLLM_QWEN4_ROUTER_FP32": (
+        "replaced by --hf-overrides "
+        '{"text_config": {"moe_router_dtype": "float32"}} (the model config '
+        "field moe_router_dtype, also read by the MTP drafter)"
+    ),
+    "VLLM_QWEN4_MTP_PER_STREAM_NORM": (
+        "replaced by --hf-overrides "
+        '{"text_config": {"mtp_hidden_norm": "per_stream"}} (the model config '
+        'field mtp_hidden_norm, default "flat")'
     ),
     # Removed with the code they selected.
     "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED": (

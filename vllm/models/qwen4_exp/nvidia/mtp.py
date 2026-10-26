@@ -248,7 +248,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.hidden_size, eps=config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = mtp_hidden_norm(
-            self.hidden_size, self.hc_count, eps=config.rms_norm_eps
+            vllm_config, self.hidden_size, self.hc_count, eps=config.rms_norm_eps
         )
         # HC final mixer collapses the multi stream into [T, H] for the LM head.
         hc_config = HyperConnectionConfig(

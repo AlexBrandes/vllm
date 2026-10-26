@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU checks of Qwen4Exp router precision and MTP hidden normalization."""
+"""CPU checks of Qwen4Exp router precision and MTP hidden normalization, both
+selected by text config fields (``moe_router_dtype``, ``mtp_hidden_norm``)."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -9,7 +10,6 @@ import pytest
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.model_executor import parameter as parameter_module
 from vllm.model_executor.layers import linear as linear_module
 from vllm.model_executor.layers.fused_moe.router import gate_linear
@@ -19,14 +19,73 @@ from vllm.models.qwen4_exp.nvidia import mtp as mtp_module
 from vllm.models.qwen4_exp.nvidia import precision as precision_module
 
 
-@pytest.mark.parametrize("name", ["VLLM_QWEN4_ROUTER_FP32", "VLLM_QWEN4_MTP_PER_STREAM_NORM"])
-def test_switch_defaults_and_environment(monkeypatch, name):
-    monkeypatch.delenv(name, raising=False)
-    assert envs.environment_variables[name]() is False
-    monkeypatch.setenv(name, "1")
-    assert envs.environment_variables[name]() is True
-    monkeypatch.setenv(name, "0")
-    assert envs.environment_variables[name]() is False
+def _vllm_config(text_config, target_text_config=None, **fields):
+    """``target_text_config`` set: ``text_config`` is the draft model's, as for
+    the MTP drafter's layers."""
+    speculative = None
+    if target_text_config is not None:
+        speculative = SimpleNamespace(
+            target_model_config=SimpleNamespace(hf_text_config=target_text_config)
+        )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=text_config),
+        speculative_config=speculative,
+        **fields,
+    )
+
+
+def test_target_text_config_is_read_also_from_the_draft():
+    target, draft = SimpleNamespace(), SimpleNamespace()
+    assert precision_module.target_text_config(_vllm_config(target)) is target
+    assert precision_module.target_text_config(_vllm_config(draft, target)) is target
+    no_target = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=draft),
+        speculative_config=SimpleNamespace(target_model_config=None),
+    )
+    assert precision_module.target_text_config(no_target) is draft
+
+
+@pytest.mark.parametrize(
+    "fields,expected",
+    [({}, "flat"), ({"mtp_hidden_norm": "flat"}, "flat"),
+     ({"mtp_hidden_norm": "per_stream"}, "per_stream")],
+)
+def test_mtp_hidden_norm_mode_reads_the_text_config(fields, expected):
+    config = _vllm_config(SimpleNamespace(**fields))
+    assert precision_module.mtp_hidden_norm_mode(config) == expected
+
+
+@pytest.mark.parametrize("value", ["per-stream", "", None, True])
+def test_mtp_hidden_norm_mode_rejects_other_values(value):
+    config = _vllm_config(SimpleNamespace(mtp_hidden_norm=value))
+    with pytest.raises(ValueError, match="mtp_hidden_norm"):
+        precision_module.mtp_hidden_norm_mode(config)
+
+
+def test_hf_overrides_reach_the_text_config():
+    """--hf-overrides '{"text_config": {"moe_router_dtype": "float32",
+    "mtp_hidden_norm": "per_stream"}}' sets both fields on the nested text
+    config the model reads."""
+    from transformers import PretrainedConfig
+
+    from vllm.config import ModelConfig
+
+    config = PretrainedConfig()
+    config.text_config = PretrainedConfig()
+    model_config = SimpleNamespace()
+    model_config._update_nested = lambda target, updates: (
+        ModelConfig._update_nested(model_config, target, updates)
+    )
+    ModelConfig._apply_dict_overrides(
+        model_config,
+        config,
+        {"text_config": {"moe_router_dtype": "float32", "mtp_hidden_norm": "per_stream"}},
+    )
+    vllm_config = _vllm_config(config.text_config)
+    assert precision_module.mtp_hidden_norm_mode(vllm_config) == "per_stream"
+    gate = SimpleNamespace(set_out_dtype=lambda dtype: setattr(gate, "out_dtype", dtype))
+    precision_module.apply_router_precision(vllm_config, gate)
+    assert gate.out_dtype == torch.float32
 
 
 class _GateConsumer(nn.Module):
@@ -39,9 +98,9 @@ class _GateConsumer(nn.Module):
         return hidden_states
 
 
+@pytest.mark.parametrize("drafter", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, default_vllm_config):
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", str(int(enabled)))
+def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, drafter, default_vllm_config):
     # Simulate the device capability, not the GEMM result. The cuBLAS call is
     # executed below as CPU FP32 arithmetic on its actual BF16 operands.
     platform = gate_linear.current_platform
@@ -56,7 +115,7 @@ def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, default
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(qwen3_next, "get_ep_group", lambda: SimpleNamespace(device_group=SimpleNamespace(size=lambda: 2)))
     monkeypatch.setattr(qwen3_next, "FusedMoEFactory", lambda **kw: _GateConsumer(kw["gate"]))
-    config = SimpleNamespace(
+    fields = dict(
         hidden_size=2560,
         num_experts=512,
         shared_expert_intermediate_size=0,
@@ -64,9 +123,16 @@ def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, default
         moe_intermediate_size=640,
         hidden_act="silu",
     )
+    router = {"moe_router_dtype": "float32"} if enabled else {}
     parallel = SimpleNamespace(use_sequence_parallel_moe=False, enable_expert_parallel=True,
                                enable_eplb=False, eplb_config=SimpleNamespace(num_redundant_experts=0))
-    cfg = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config), parallel_config=parallel, quant_config=None)
+    if drafter:
+        # The MTP block is built from the draft config, which dict
+        # --hf-overrides do not reach; the field is read from the target's.
+        cfg = _vllm_config(SimpleNamespace(**fields), SimpleNamespace(**fields, **router),
+                           parallel_config=parallel, quant_config=None)
+    else:
+        cfg = _vllm_config(SimpleNamespace(**fields, **router), parallel_config=parallel, quant_config=None)
     banners = []
     monkeypatch.setattr(precision_module, "logger", SimpleNamespace(info_once=lambda *args: banners.append(args)))
     with torch.device("cpu"):
@@ -108,7 +174,8 @@ def test_router_uses_bf16_operands_and_fp32_output(monkeypatch, enabled, default
     else:
         assert logits.dtype == torch.bfloat16
         assert calls == []
-    assert banners and banners[0][1:] == (("FP32" if enabled else "model dtype"), int(enabled))
+    expected = ("FP32", "float32") if enabled else ("model dtype", None)
+    assert banners and banners[0][1:] == expected
 
 
 class _DraftLayer(nn.Module):
@@ -125,12 +192,12 @@ class _Mixer(nn.Module):
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, default_vllm_config):
-    monkeypatch.setenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", str(int(enabled)))
     config = SimpleNamespace(vocab_size=8, hidden_size=2560, hc_count=4, num_hidden_layers=48,
                              mtp_num_hidden_layers=1, rms_norm_eps=1e-6, hc_lowrank=4)
+    if enabled:
+        config.mtp_hidden_norm = "per_stream"
     parallel = SimpleNamespace(tensor_parallel_size=1, enable_hc_sp=False, use_sequence_parallel_moe=False)
-    cfg = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config), parallel_config=parallel,
-                          quant_config=None)
+    cfg = _vllm_config(config, parallel_config=parallel, quant_config=None)
     monkeypatch.setattr(mtp_module, "_make_draft_vllm_config", lambda *args: cfg)
     monkeypatch.setattr(mtp_module, "set_current_vllm_config", lambda *args, **kw: nullcontext())
     monkeypatch.setattr(mtp_module, "ColumnParallelLinear", lambda *args, **kw: nn.Identity())
@@ -156,9 +223,9 @@ def test_mtp_hidden_norm_selects_real_forward_path(monkeypatch, enabled, dtype, 
     assert predictor.pre_fc_norm_hidden.weight.shape == (10240,)
     assert got.dtype == dtype and got.shape == (2, 10240)
     assert isinstance(predictor.pre_fc_norm_hidden, precision_module.PerStreamGemmaRMSNorm) is enabled
-    assert banners and banners[0][1:] == (("per-stream" if enabled else "flat"), int(enabled))
+    assert banners and banners[0][1:] == (("per_stream" if enabled else "flat"),)
     # The selection is fixed at construction, as it must be for graph replay.
-    monkeypatch.setenv("VLLM_QWEN4_MTP_PER_STREAM_NORM", str(int(not enabled)))
+    config.mtp_hidden_norm = "flat" if enabled else "per_stream"
     _, repeated = predictor.forward(input_ids=None, positions=torch.arange(2), hidden_states=x.flatten(-2),
                                     inputs_embeds=torch.zeros(2, 2560, dtype=dtype))
     torch.testing.assert_close(repeated, got, rtol=0, atol=0)
