@@ -807,7 +807,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DSPARK_CONFIDENCE_DUMP` | `str` | `''` | `''` |
 | `VLLM_DSPARK_DEPTH_HINT` | `str` | `''` | `''` |
 | `VLLM_DSPARK_PER_K_WIDTH` | `bool` | `False` | `'0'` |
-| `VLLM_DSPARK_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_DIRECT_READ` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
@@ -894,7 +893,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS` | `int` | `65` | `'65'` |
 | `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
-| `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |

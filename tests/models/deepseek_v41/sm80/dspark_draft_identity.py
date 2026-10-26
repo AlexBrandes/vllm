@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-SWITCH = "VLLM_DSPARK_SHARD_ARGMAX"
+SWITCH = "VLLM_SM80_SHARD_ARGMAX"
 CASES = ("cross_rank_ties", "nan_ties", "signed_zero", "sequential_markov")
 SHAPES = ((1, 5), (4, 3))
 

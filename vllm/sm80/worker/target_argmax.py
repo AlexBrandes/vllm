@@ -13,14 +13,26 @@ rejection sampler read them. When every request of the step is greedy and
 nothing reads the logits beyond their argmax, that gather only feeds an
 argmax.
 
-With ``VLLM_SM80_TARGET_SHARD_ARGMAX`` the fork's V2 model runner
+With ``VLLM_SM80_SHARD_ARGMAX`` the fork's V2 model runner
 (``vllm/sm80/worker/graph_mem_worker.py``) runs ``sample`` inside
 :func:`step`, which decides from the step's batch, grammar output and sampler
 states whether the step is greedy-only (:func:`greedy_only`). While such a
-step runs (:func:`active`), the sm_80 DeepSeek-V4.1 target's
-``compute_logits`` (``vllm/models/deepseek_v41/nvidia/sm80_model.py``)
-returns :func:`argmax_rows` in place of the gathered logits; every other
-call (other steps, prompt logprobs, the dummy sampler run) gathers.
+step runs (:func:`active`), a target class with :class:`ShardArgmaxLogits`
+(the fork's DeepSeek-V4.1, GLM-5.3 and Qwen4Exp classes) returns
+:func:`argmax_rows` from ``compute_logits`` in place of the gathered logits;
+every other call (other steps, prompt logprobs, the dummy sampler run)
+gathers. With batch-sharded sampling (``--enable-batch-sharded-sampling``) a
+greedy-only step samples every row on every rank from the argmax rows, in
+place of the all-to-all of the vocabulary shards; other steps shard as
+before.
+
+The same switch covers greedy drafting over a vocabulary-parallel head:
+``vllm/sm80/spec_decode/shard_argmax.py`` (:func:`shard_argmax.drafting`)
+says how the runner's drafter takes its greedy drafts, :func:`refusal`
+refuses a drafter the switch cannot serve, and at load (:func:`load`, the
+fork runner's ``load_model``) a drafter that samples through vLLM's
+``sample_draft`` takes its greedy drafts per rank
+(``shard_argmax.adopt_sample_draft``).
 
 :func:`argmax_rows` keeps each rank's own columns
 (``compute_logits_local``), takes their argmax per 4096-column chunk and
@@ -60,16 +72,14 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.sm80.spec_decode import shard_argmax
-from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 logger = init_logger(__name__)
 
-SWITCH = "VLLM_SM80_TARGET_SHARD_ARGMAX"
+SWITCH = shard_argmax.SWITCH
 
 # True while the runner samples a greedy-only step (:func:`step`).
 _active = False
@@ -80,8 +90,25 @@ def _head(model):
     return getattr(model, "language_model", model)
 
 
+class ShardArgmaxLogits:
+    """A target model class whose ``compute_logits`` returns
+    :func:`argmax_rows` while a greedy-only step samples (:func:`active`),
+    and the gathered logits otherwise. Listed before the upstream class; the
+    class also needs ``compute_logits_local`` (this rank's vocabulary shard
+    of the logits, padding columns kept)."""
+
+    # refusal: compute_logits serves greedy-only steps.
+    target_argmax_logits = True
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if _active:
+            return argmax_rows(self, hidden_states)
+        return super().compute_logits(hidden_states)
+
+
 def refusal(runner) -> str | None:
-    """Why the per-rank argmax cannot serve this runner's target."""
+    """Why the switch cannot serve this runner: its target, its head or its
+    drafter (:func:`shard_argmax.drafting`)."""
     if not getattr(runner, "target_argmax_steps", False):
         return (
             f"the model runner {type(runner).__name__} does not sample in "
@@ -110,26 +137,48 @@ def refusal(runner) -> str | None:
         return "the logits processor takes logits as input"
     if processor.org_vocab_size > shard_argmax.MAX_VOCAB:
         return f"a vocabulary above {shard_argmax.MAX_VOCAB} tokens"
+    if head.tp_size == 1:
+        return (
+            "the LM head is not split over tensor-parallel ranks (TP 1): there "
+            "is no all-gather to replace"
+        )
     if getattr(runner, "lora_config", None):
         return "LoRA adapters replace the logits processor"
-    if getattr(runner, "batch_sharder", None) is not None:
-        return "batch-sharded sampling replaces the all-gather already"
-    return None
+    _, reason = shard_argmax.drafting(getattr(runner, "speculator", None))
+    return reason
 
 
 def set_enabled(runner, on: bool) -> None:
     """Turn the per-rank argmax on or off for ``runner``; on is refused
-    (ValueError) for a runner it cannot serve (:func:`refusal`)."""
+    (ValueError) for a runner it cannot serve (:func:`refusal`), and logs
+    the switch's startup line on the last pipeline stage."""
     if on:
         reason = refusal(runner)
         if reason is not None:
             raise ValueError(f"{SWITCH}: {reason}")
-        logger.info_once(
-            "Greedy target sampling takes a per-rank argmax (%s=1): no "
-            "all-gather of the target logits when every request is greedy.",
-            SWITCH,
-        )
+        if getattr(runner, "is_last_pp_rank", True):
+            drafts, _ = shard_argmax.drafting(getattr(runner, "speculator", None))
+            logger.info_once(
+                "%s=1: greedy target sampling takes a per-rank argmax, no "
+                "all-gather of the target logits when every request of a step "
+                "is greedy; greedy drafts: %s.",
+                SWITCH,
+                drafts,
+            )
     runner._target_shard_argmax = on
+
+
+def load(runner) -> None:
+    """At the fork runner's ``load_model``, with the switch on: refuse a
+    runner it cannot serve (:func:`set_enabled`, which also logs the startup
+    line) and, on the last pipeline stage, take the greedy drafts of a
+    ``sample_draft`` drafter per rank before any draft graph is captured
+    (``shard_argmax.adopt_sample_draft``)."""
+    if not getattr(envs, SWITCH):
+        return
+    set_enabled(runner, True)
+    if getattr(runner, "is_last_pp_rank", True):
+        shard_argmax.adopt_sample_draft(getattr(runner, "speculator", None))
 
 
 def enabled(runner) -> bool:
@@ -174,13 +223,21 @@ def greedy_only(runner, input_batch, grammar_output) -> bool:
 @contextmanager
 def step(runner, input_batch, grammar_output) -> Iterator[None]:
     """Run one ``GPUModelRunner.sample``: while it runs, :func:`active` says
-    whether the target's ``compute_logits`` returns the argmax rows."""
+    whether the target's ``compute_logits`` returns the argmax rows. A
+    greedy-only step of a runner with batch-sharded sampling samples
+    unsharded: the argmax rows replace the shards' all-to-all, and every rank
+    holds the same rows."""
     global _active
     _active = enabled(runner) and greedy_only(runner, input_batch, grammar_output)
+    sharder = getattr(runner, "batch_sharder", None) if _active else None
+    if sharder is not None:
+        runner.batch_sharder = None
     try:
         yield
     finally:
         _active = False
+        if sharder is not None:
+            runner.batch_sharder = sharder
 
 
 def active() -> bool:
@@ -190,28 +247,18 @@ def active() -> bool:
 def argmax_rows(model, hidden_states: torch.Tensor) -> torch.Tensor:
     """Rows holding 0.0 at torch.argmax of ``model.compute_logits(
     hidden_states)`` and -inf elsewhere, in its shape and dtype, without
-    gathering the logits."""
+    gathering the logits (``shard_argmax.shard_tokens``)."""
     lm = _head(model)
     local = model.compute_logits_local(hidden_states)
-    rows, width = local.shape
-    rank, tp_size = lm.lm_head.tp_rank, lm.lm_head.tp_size
     vocab = lm.logits_processor.org_vocab_size
-    out = local.new_full((rows, vocab), float("-inf"))
-    if rows == 0:
+    out = local.new_full((local.shape[0], vocab), float("-inf"))
+    if local.shape[0] == 0:
         # Every rank has the same rows: none enters the all-reduce.
         return out
-    # The gathered row is the ranks' columns in rank order, cut at the
-    # vocabulary size.
-    col_start = rank * width
-    n_cols = min(max(vocab - col_start, 0), width)
-    cols = local[:, :n_cols]
-    if cols.dtype != torch.float32:
-        cols = cols.float()  # exact; keeps order, ties and NaN
-    chunks = triton.cdiv(width, shard_argmax.BLOCK)
-    slots = shard_argmax.chunk_slots(cols, col_start, rank, tp_size, chunks)
-    if tp_size > 1:
-        slots = tensor_model_parallel_all_reduce(slots)
-    return out.scatter_(1, shard_argmax.pick(slots, vocab)[:, None], 0.0)
+    tokens = shard_argmax.shard_tokens(
+        local, lm.lm_head.tp_rank, lm.lm_head.tp_size, vocab
+    )
+    return out.scatter_(1, tokens[:, None], 0.0)
 
 
 def warm(runner, hidden_states: torch.Tensor | None = None) -> None:

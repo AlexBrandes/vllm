@@ -8,7 +8,7 @@ without enabling adaptive verification. Nothing it drafts or the target
 verifies changes; the head adds one small FP32 projection per drafted position
 to the captured draft step. Where the drafter samples each position from its
 gathered draft logits (``_sample_logits``; not with
-``VLLM_DSPARK_SHARD_ARGMAX``, which never gathers them), the draft
+``VLLM_SM80_SHARD_ARGMAX``, which never gathers them), the draft
 step also records, per drafted position, the top-1 probability and the entropy
 (nats) of the logits it sampled from, before temperature: a log-sum-exp, a max
 and a softmax-weighted sum over each position's ``[requests, vocab]`` logits.

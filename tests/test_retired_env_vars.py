@@ -43,9 +43,14 @@ RENAMED = {
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": "VLLM_TOOL_CHOICE_NONE_MASK",
     "VLLM_GLM5_TP4_KDA_PREFILL": "VLLM_AMPERE_KDA_PREFILL_NARROW",
     "VLLM_GLM5_TP4_MARLIN_PREFILL": "VLLM_AMPERE_MARLIN_PREFILL_NARROW",
-    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": "VLLM_DSPARK_SHARD_ARGMAX",
-    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": "VLLM_SM80_TARGET_SHARD_ARGMAX",
     "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": "VLLM_DFLASH2_SELECTOR_SHARD",
+}
+
+MERGED = {
+    "VLLM_DSPARK_SHARD_ARGMAX": "VLLM_SM80_SHARD_ARGMAX",
+    "VLLM_SM80_TARGET_SHARD_ARGMAX": "VLLM_SM80_SHARD_ARGMAX",
+    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": "VLLM_SM80_SHARD_ARGMAX",
+    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": "VLLM_SM80_SHARD_ARGMAX",
 }
 
 REPLACED_OR_REMOVED = {
@@ -98,11 +103,15 @@ REPLACED_OR_REMOVED = {
 
 
 def test_table_lists_every_retired_name():
-    assert set(fork_envs.RETIRED_ENV_VARS) == set(RENAMED) | REPLACED_OR_REMOVED
+    assert set(fork_envs.RETIRED_ENV_VARS) == (
+        set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED
+    )
     assert all(fork_envs.RETIRED_ENV_VARS.values())
 
 
-@pytest.mark.parametrize("name", sorted(set(RENAMED) | REPLACED_OR_REMOVED))
+@pytest.mark.parametrize(
+    "name", sorted(set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED)
+)
 def test_retired_name_is_not_declared(name):
     assert name not in envs.environment_variables
 
@@ -113,7 +122,13 @@ def test_renamed_name_points_at_its_replacement(old, new):
     assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"renamed to {new}")
 
 
-@pytest.mark.parametrize("old,new", sorted(RENAMED.items()))
+@pytest.mark.parametrize("old,new", sorted(MERGED.items()))
+def test_merged_name_points_at_its_replacement(old, new):
+    assert new in envs.environment_variables
+    assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"merged into {new}")
+
+
+@pytest.mark.parametrize("old,new", sorted((RENAMED | MERGED).items()))
 def test_retired_value_is_never_used(monkeypatch, old, new):
     monkeypatch.delenv(old, raising=False)
     monkeypatch.delenv(new, raising=False)

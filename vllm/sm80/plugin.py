@@ -14,7 +14,7 @@ _registered = False
 
 
 # ---------------------------------------------------------------------------
-# Model code (GLM, DeepSeek-V4.1)
+# Model code (GLM, DeepSeek-V4.1, Qwen4Exp)
 # ---------------------------------------------------------------------------
 
 # Architectures whose fork classes replace the upstream ones in vLLM's model
@@ -35,6 +35,14 @@ MODEL_OVERRIDES = {
     ),
     "DSparkV41DraftModel": (
         "vllm.models.deepseek_v41.nvidia.sm80_model:DSparkDeepseekV4ForCausalLM"
+    ),
+    # Qwen4Exp's vision wrapper (its text model is built inside it) and its
+    # MTP drafter: compute_logits_local and the greedy target argmax.
+    "Qwen4ExpForConditionalGeneration": (
+        "vllm.models.qwen4_exp.nvidia.sm80_model:Qwen4ExpForConditionalGeneration"
+    ),
+    "Qwen4ExpMTP": (
+        "vllm.models.qwen4_exp.nvidia.sm80_model:Qwen4ExpMTP"
     ),
 }
 
