@@ -724,8 +724,8 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `.github/ISSUE_TEMPLATE/500-feature-request.yml` | deleted | 0 | 38 | 1 |
 | `.github/ISSUE_TEMPLATE/700-performance-discussion.yml` | deleted | 0 | 59 | 1 |
 | `.github/ISSUE_TEMPLATE/750-RFC.yml` | deleted | 0 | 52 | 1 |
-| `.github/ISSUE_TEMPLATE/config.yml` | modified | 6 | 2 | 3 |
-| `README.md` | modified | 258 | 77 | 30 |
+| `.github/ISSUE_TEMPLATE/config.yml` | modified | 12 | 2 | 3 |
+| `README.md` | modified | 292 | 77 | 30 |
 | `docs/features/quantization/README.md` | modified | 64 | 0 | 2 |
 | `docs/features/speculative_decoding/README.md` | modified | 3 | 0 | 2 |
 | `tests/conftest.py` | modified | 9 | 0 | 3 |
@@ -743,15 +743,15 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `tests/v1/worker/test_gpu_warmup_blocks.py` | modified | 9 | 1 | 5 |
 | `tests/v1/worker/test_grammar_invalid_drafts.py` | modified | 6 | 0 | 2 |
 | `tests/v1/worker/test_mamba_hybrid_model_state.py` | modified | 2 | 0 | 1 |
-| **27 files** | | **1,445** | **551** | **89** |
+| **27 files** | | **1,485** | **551** | **89** |
 
 ### Totals
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
 | Product code | 83 | 3,717 | 256 | 528 |
-| Tests, docs and .github | 27 | 1,445 | 551 | 89 |
-| All | 110 | 5,162 | 807 | 617 |
+| Tests, docs and .github | 27 | 1,485 | 551 | 89 |
+| All | 110 | 5,202 | 807 | 617 |
 
 ## 3. Fork environment variables
 
@@ -938,7 +938,7 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Fork-added product files | 221 |
 | Fork-added product lines | 73,367 |
 | Patched upstream files | 110 |
-| Patched upstream lines | +5,162 / -807 |
+| Patched upstream lines | +5,202 / -807 |
 | Patched upstream product files | 83 |
 | Patched upstream product lines | +3,717 / -256 |
 | Product lines added (new files and patches) | 77,084 |

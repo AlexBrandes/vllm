@@ -4,6 +4,12 @@ contact_links:
   - name: "Running a model: GLM-5.3-Flash recipe"
     url: https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/issues
     about: Each supported model has its own recipe repository. Installing, starting, settings, layouts and results belong in that recipe's issues.
+  - name: "Running a model: Qwen3.8-Flash-Next recipe"
+    url: https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe/issues
+    about: Each supported model has its own recipe repository. Installing, starting, settings, layouts and results belong in that recipe's issues.
+  - name: "Running a model: DeepSeek-V4.1-Flash recipe"
+    url: https://github.com/Morrowmake/dsv41-flash-cmp170hx-recipe/issues
+    about: Each supported model has its own recipe repository. Installing, starting, settings, layouts and results belong in that recipe's issues.
   - name: General vLLM questions
     url: https://discuss.vllm.ai
     about: Questions about vLLM itself, not specific to this fork.

@@ -14,8 +14,8 @@ This is a fork of [vLLM](https://github.com/vllm-project/vllm) for the
 **NVIDIA CMP 170HX** (Ampere, sm_80), built to serve models fast on one card
 or several: tensor-parallel and pipeline-parallel layouts across cards, a
 full-precision KV cache and repeatable single-request outputs.
-Two models are supported today: **GLM-5.3-Flash** on four cards and
-**Qwen3.8-Flash-Next** on two.
+Three models are supported today: **GLM-5.3-Flash** and
+**DeepSeek-V4.1-Flash** on four cards, and **Qwen3.8-Flash-Next** on two.
 
 The fork has two layers:
 
@@ -50,14 +50,15 @@ is otherwise ignored.
 
 Each model is served through its own recipe, which pins an exact fork commit,
 ships the engine as a container image, downloads the weights and starts an
-OpenAI-compatible server. Both recipes start with one command from a fresh
-clone, `./start.sh` or `docker compose up`, and run only as a container.
+OpenAI-compatible server. Each recipe starts with one command from a fresh
+clone, `./start.sh` or `docker compose up`, and runs only as a container.
 Questions about running a model belong in its recipe's issues.
 
 | Model | Cards | Recipe |
 |---|---|---|
 | GLM-5.3-Flash | 4 | [Morrowmake/glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe) |
 | Qwen3.8-Flash-Next | 2 | [Morrowmake/qwen38-flash-next-cmp170hx-recipe](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe) |
+| DeepSeek-V4.1-Flash | 4 | [Morrowmake/dsv41-flash-cmp170hx-recipe](https://github.com/Morrowmake/dsv41-flash-cmp170hx-recipe) |
 
 ## Community recipes
 
@@ -163,6 +164,36 @@ switched by `VLLM_EXL3_*`; the model's sparse-attention top-k tie order by
 [engine switches](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe#engine-switches)
 table lists the set it turns on.
 
+### DeepSeek-V4.1-Flash
+
+DeepSeek-V4.1-Flash-1017 with EXL3 2.9 bpw routed experts (every other weight
+DeepSeek's own FP8 or BF16), BF16 KV cache, 262,144-token context and the
+checkpoint's DSpark speculative drafter, on four cards: tensor-parallel 4 with
+whole routed experts on each card. The Engram tables are held in host RAM, or
+read from the SSD on smaller hosts.
+
+```bash
+git clone https://github.com/Morrowmake/dsv41-flash-cmp170hx-recipe.git
+cd dsv41-flash-cmp170hx-recipe && ./start.sh
+```
+
+From the recipe's [release 1.0.0 results](https://github.com/Morrowmake/dsv41-flash-cmp170hx-recipe/blob/main/docs/results.md)
+(peer-to-peer on, 74 SMs and 180 W per card, PCIe x16 links; methods and
+caveats are there):
+
+| | TP4 |
+|---|---:|
+| Decode, 1 user, structured | **up to 319 tok/s** |
+| Decode, 8 users, aggregate, structured | **up to 765 tok/s** |
+| Cold prefill | up to 3,818 tok/s |
+| KV pool at 262,144 context | 1,247,406 tokens |
+
+Quality (release 1.0.0): HumanEval 157/164, GSM8K 1,280/1,319.
+
+The model's code lives in `vllm/models/deepseek_v41/nvidia/`; the recipe's
+[engine switches](https://github.com/Morrowmake/dsv41-flash-cmp170hx-recipe/blob/main/docs/engine-switches.md)
+table lists the set it turns on.
+
 ## General features
 
 **sm_80 kernels and backends.** A sparse-MLA attention backend, an sm_80 path
@@ -242,16 +273,19 @@ The work is one branch, `ampere`, shared by every model. The earlier
 
 A recipe pins an exact fork commit, never the branch. The branch moves to a
 newer upstream from time to time; every commit a recipe release pins is kept
-under a tag `<model>-recipe-<version>`, so older releases keep installing:
+under a tag `<model>-recipe-<version>`, so its source stays available;
+installing an older release is not supported:
 
 | Recipe release | Fork tag | Commit |
 |---|---|---|
 | GLM-5.3-Flash 1.8.0 | `glm53-recipe-1.8.0` | [`819146023f`](https://github.com/Morrowmake/vllm-cmp170hx/commit/819146023facb31c04f1f8512e52464835a10d40) |
 | Qwen3.8-Flash-Next 1.0.0 | `qwen38-recipe-1.0.0` | [`18305948ac`](https://github.com/Morrowmake/vllm-cmp170hx/commit/18305948acba3f4c4d912cdd56f2202d2ebd94e8) |
+| DeepSeek-V4.1-Flash 1.0.0 | `dsv41-flash-recipe-1.0.0` | [`a0c57b5237`](https://github.com/Morrowmake/vllm-cmp170hx/commit/a0c57b52376efd67c57735bc949d4bafa22ae29e) |
 
 Release notes live in each recipe's changelog:
 [GLM-5.3-Flash](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe/blob/main/CHANGELOG.md),
-[Qwen3.8-Flash-Next](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe/blob/main/CHANGELOG.md).
+[Qwen3.8-Flash-Next](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe/blob/main/CHANGELOG.md),
+[DeepSeek-V4.1-Flash](https://github.com/Morrowmake/dsv41-flash-cmp170hx-recipe/blob/main/CHANGELOG.md).
 
 ## Building from source
 
