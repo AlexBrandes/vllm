@@ -371,13 +371,26 @@ class Record:
     in_graph: bool = False
     point_phase: str | None = None
     deferred: list = field(default_factory=list)
+    layout_fields: set[str] = field(default_factory=set)
 
-    def put(self, **values: Any) -> Record:
-        """Keep copies of ``values`` as they are now (tensors are copied on
-        their device, in stream order)."""
+    def put(self, *, preserve_layout: bool = False, **values: Any) -> Record:
+        """Copy values on their device, in stream order.
+
+        Linked producer outputs may opt into their original strides. Only the
+        span from the first to last addressed element is retained, with its
+        origin rebased to zero; relative consumer offsets remain valid. This
+        includes intervening padding, not the whole backing allocation.
+        """
         for name, value in values.items():
+            self.layout_fields.discard(name)
             if isinstance(value, torch.Tensor):
-                value = value.detach().clone()
+                value = value.detach()
+                if preserve_layout:
+                    self.layout_fields.add(name)
+                if preserve_layout and not value.is_contiguous():
+                    value = _flat_span(value).clone().as_strided(value.shape, value.stride())
+                else:
+                    value = value.clone()
             self.tensors[name] = value
         return self
 
@@ -394,7 +407,8 @@ class Record:
         return self
 
     def materialize(self) -> dict:
-        values = {k: _host(v) for k, v in self.tensors.items()}
+        values = {k: _host(v, preserve_layout=k in self.layout_fields)
+                  for k, v in self.tensors.items()}
         for materialize in self.deferred:
             extra = materialize()
             overlap = values.keys() & extra.keys()
@@ -475,8 +489,20 @@ def _full(
     return _counts.get(key, 0) >= limit
 
 
-def _host(value: Any) -> Any:
-    return value.cpu() if isinstance(value, torch.Tensor) else value
+def _flat_span(value: torch.Tensor) -> torch.Tensor:
+    """A view of the minimum storage span, starting at this tensor's origin."""
+    count = 0 if not value.numel() else 1 + sum(
+        (size - 1) * stride for size, stride in zip(value.shape, value.stride())
+    )
+    return value.as_strided((count,), (1,))
+
+
+def _host(value: Any, *, preserve_layout: bool = False) -> Any:
+    if not isinstance(value, torch.Tensor):
+        return value
+    if preserve_layout and not value.is_contiguous():
+        return _flat_span(value).cpu().as_strided(value.shape, value.stride())
+    return value.cpu()
 
 
 def _write(
@@ -500,8 +526,8 @@ def _write(
         n = _counts.get(key, 0)
         tensors = rec.materialize()
         size = sum(
-            t.numel() * t.element_size()
-            for t in tensors.values()
+            t.untyped_storage().nbytes() if name in rec.layout_fields else t.numel() * t.element_size()
+            for name, t in tensors.items()
             if isinstance(t, torch.Tensor)
         )
         line = {

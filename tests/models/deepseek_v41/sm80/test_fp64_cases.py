@@ -1081,17 +1081,17 @@ def test_hybrid_independent_fp8_decode():
 
 def test_hybrid_capture_link_does_not_retain_dead_outputs():
     import gc
-    import weakref
+    from torch.multiprocessing.reductions import StorageWeakRef
     from vllm.models.deepseek_v41.nvidia import hybrid_capture as h
 
     x = torch.ones(2, 32, dtype=BF16)
     key = x.untyped_storage().data_ptr()
     h._outputs[key] = ({"dtype": str(BF16), "storage_offset": 0,
-                        "call_id": 7, "output": "out", "prefix": "projection"}, weakref.ref(x))
+                        "call_id": 7, "output": "out", "prefix": "projection"}, StorageWeakRef(x.untyped_storage()))
     assert h._link(x)["call_id"] == 7
     del x
     gc.collect()
-    assert h._outputs[key][1]() is None
+    assert h._outputs[key][1].expired()
     h._outputs.clear()
 
 

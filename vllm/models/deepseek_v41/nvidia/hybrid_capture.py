@@ -11,9 +11,9 @@ No hook is installed with VLLM_SM80_CAPTURE unset.
 import functools
 import inspect
 import itertools
-import weakref
 
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from vllm.sm80 import capture
 
@@ -46,8 +46,9 @@ def _leaves(value, prefix="out"):
 def _link(value):
     if not isinstance(value, torch.Tensor):
         return None
-    saved = _outputs.get(value.untyped_storage().data_ptr())
-    if saved is None or saved[1]() is None:
+    storage = value.untyped_storage()
+    saved = _outputs.get(storage.data_ptr())
+    if saved is None or saved[1].expired() or saved[1] != StorageWeakRef(storage):
         return None
     source = saved[0]
     if source["dtype"] != str(value.dtype):
@@ -170,13 +171,13 @@ def _record(op, args, run, *, linear=None, boundary=False):
         outputs["out.ring"] = args["ring"][saved["snapshot_blocks"]]
     elif op == "store_rows":
         outputs["out"] = args["cache"][saved["snapshot_blocks"]]
-    rec.put(**outputs)
+    rec.put(preserve_layout=True, **outputs)
     rec.meta["outputs"] = list(outputs)
     for name, value in outputs.items():
         _outputs[value.untyped_storage().data_ptr()] = ({
             "call_id": rec.meta["call_id"], "output": name, "prefix": prefix, "point_phase": rec.point_phase,
             "storage_offset": value.storage_offset(), "dtype": str(value.dtype),
-        }, weakref.ref(value))
+        }, StorageWeakRef(value.untyped_storage()))
     rec.done()
     return result
 
