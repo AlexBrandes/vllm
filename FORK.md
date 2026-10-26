@@ -152,8 +152,8 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/__init__.py` | 2 |
 | `vllm/sm80/distributed/ce_ring_all_reduce.py` | 406 |
 | `vllm/sm80/distributed/communicator.py` | 397 |
-| `vllm/sm80/distributed/custom_all_reduce_flags.py` | 697 |
-| `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
+| `vllm/sm80/distributed/custom_all_reduce_flags.py` | 680 |
+| `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,155 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm/sm80/distributed/step_errors.py` | 167 |
 | `vllm/sm80/envs.py` | 1,638 |
@@ -163,6 +163,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/fla/pinned_autotune.py` | 384 |
 | `vllm/sm80/guard.py` | 68 |
 | `vllm/sm80/hot_swap.py` | 807 |
+| `vllm/sm80/jit_extension.py` | 55 |
 | `vllm/sm80/kv_planning.py` | 588 |
 | `vllm/sm80/launch/__init__.py` | 7 |
 | `vllm/sm80/launch/canon.py` | 107 |
@@ -195,7 +196,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/plugin.py` | 338 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
-| `vllm/sm80/spec_decode/aux_fc_fold.py` | 173 |
+| `vllm/sm80/spec_decode/aux_fc_fold.py` | 184 |
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
 | `vllm/sm80/spec_decode/dspark_confidence.py` | 369 |
 | `vllm/sm80/spec_decode/dspark_depth_hint.py` | 175 |
@@ -219,7 +220,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 278 |
-| **77 files** | **24,479** |
+| **78 files** | **24,517** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -537,7 +538,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/launch/test_launch_resolve.py` | 352 |
 | `tests/sm80/launch/test_launch_single_card_model.py` | 227 |
 | `tests/sm80/launch/test_launch_validated.py` | 483 |
-| `tests/sm80/seams.yaml` | 1,596 |
+| `tests/sm80/seams.yaml` | 1,610 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 288 |
 | `tests/sm80/test_dev_ab.py` | 697 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
@@ -547,6 +548,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
 | `tests/sm80/test_fork_map.py` | 55 |
+| `tests/sm80/test_glm_pp4_draft_fc_staging.py` | 86 |
 | `tests/sm80/test_glm_pp4_kv_plan.py` | 89 |
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
@@ -555,6 +557,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_hot_swap_gpu.py` | 124 |
 | `tests/sm80/test_import_cuda_init.py` | 159 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
+| `tests/sm80/test_jit_extension_std.py` | 87 |
 | `tests/sm80/test_kernel_warmup_call.py` | 69 |
 | `tests/sm80/test_kv_planning.py` | 494 |
 | `tests/sm80/test_modification_notices.py` | 80 |
@@ -614,7 +617,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 571 |
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **288 files** | **122,790** |
+| **290 files** | **122,977** |
 
 #### `tools/`
 
@@ -890,12 +893,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 224 |
-| Fork-added product lines | 78,717 |
+| Fork-added product files | 225 |
+| Fork-added product lines | 78,755 |
 | Patched upstream files | 100 |
 | Patched upstream lines | +4,398 / -799 |
 | Patched upstream product files | 73 |
 | Patched upstream product lines | +2,917 / -249 |
-| Product lines added (new files and patches) | 81,634 |
+| Product lines added (new files and patches) | 81,672 |
 | Fork environment variables (flags) | 109 |
 | Unreferenced fork definitions | 6 (51 lines) |
