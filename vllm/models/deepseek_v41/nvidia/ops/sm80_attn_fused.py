@@ -32,8 +32,8 @@ the caching allocator (CUDA-graph pool under capture).
 
 Validated configuration (:func:`supports`): 16 local heads of 512 with a
 64-dim RoPE tail, 2 local output groups, a 128-slot window, compressed
-top-k width 512 or none, BF16 caches, sm_80. The caller limits it to
-decode-sized steps (``VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS``).
+top-k width 512 or none, BF16 caches, sm_80, calls of 1..``MAX_ROWS`` rows
+(the caller limits it to decode-sized steps of at most that many rows).
 """
 import torch
 from triton.language.extra import libdevice
@@ -48,6 +48,9 @@ ROPE_DIM = 64
 N_LOCAL_GROUPS = 2
 WINDOW = 128
 TOPK = 512
+# The most rows (tokens of the padded step) a call was validated at: decode,
+# verify and draft steps of 1..48 rows.
+MAX_ROWS = 48
 
 # ---------------------------------------------------------------- prologue
 

@@ -58,7 +58,6 @@ if TYPE_CHECKING:
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_CUDAGRAPH_ESTIMATE_SPLIT: int = 0
-    VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB: int = 0
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_PLAN_LOG: bool = False
     VLLM_THIN_GEMM_CONCAT: bool = False
@@ -104,10 +103,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_WO_A_STRIDED: bool = False
     VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
-    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
-    VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS: int = 48
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
     VLLM_DSPARK_SHARD_ARGMAX: bool = False
     VLLM_SM80_TARGET_SHARD_ARGMAX: bool = False
@@ -542,13 +539,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # call stack (diagnostics; slower capture). Default 0 (OFF).
     "VLLM_CUDAGRAPH_ESTIMATE_SPLIT": lambda: int(
         os.getenv("VLLM_CUDAGRAPH_ESTIMATE_SPLIT", "0")
-    ),
-    # With VLLM_CUDAGRAPH_ESTIMATE_SPLIT: the allocator's max_split_size_mb
-    # for the length of each CUDA-graph capture (profiling and real), so a
-    # small long-lived allocation made during a capture cannot keep a large
-    # free segment from being released. Default 0 (unchanged).
-    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": lambda: int(
-        os.getenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", "0")
     ),
     # Align-mode Mamba KV reservation under async scheduling or pipeline
     # parallelism: also reserve the state blocks a request holds for the
@@ -991,11 +981,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "0"))
     ),
-    # With VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: the most rows (tokens of the
-    # padded step) a layer call may have to take the fused path.
-    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS", "48")
-    ),
     # DeepSeek-V4.1 on sm_80: the routed experts of the decoder layers run MoE
     # calls of 65..2048 rows in prefill steps on the tensor cores
     # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
@@ -1011,12 +996,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
     ),
     # Complete decode/verify attention preparation, stable index selection,
-    # and ordered-value output epilogue. Independent of the qualified seed.
+    # and ordered-value output epilogue, for calls of up to 48 padded rows
+    # (sm80_attn_pipeline.MAX_ROWS). Independent of the qualified seed.
     "VLLM_DEEPSEEK_V41_ATTN_PIPELINE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "0"))
-    ),
-    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS", "48")
     ),
     # DeepSeek-V4.1 on sm_80, the attention pipeline's exact index selection:
     # a call of at most 48 rows as one Triton launch (one program per
@@ -1594,6 +1577,18 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_HOST_ALLREDUCE_MAX_SIZE": (
         "moved to the sm80 tuning table, allreduce/host_max_bytes"
+    ),
+    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": (
+        "moved to the sm80 tuning table, cudagraph/capture_max_split_mb"
+    ),
+    # Support limits, now code constants.
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS": (
+        "removed; the attention pipeline takes calls of up to 48 padded rows, "
+        "its supported bound (sm80_attn_pipeline.MAX_ROWS)"
+    ),
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS": (
+        "removed; the fused attention core takes calls of up to 48 padded "
+        "rows, its validated bound (sm80_attn_fused.MAX_ROWS)"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

@@ -92,6 +92,8 @@ REPLACED_OR_REMOVED = {
     "VLLM_ENGRAM_NATIVE_READ",
     "VLLM_GLM5_DFLASH_BOUNDARY_CACHE",
     "VLLM_DFLASH_BOUNDARY_CACHE",
+    "VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS",
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS",
 }
 
 # Size cut-offs moved to the sm80 tuning table (vllm/sm80/tuning.py), with
@@ -132,6 +134,8 @@ MOVED_TO_TABLE = {
         "allreduce/host_max_bytes", {"world_size": 4, "hidden": 5120}, 524288),
     "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": (
         "allreduce/host_max_bytes", {"world_size": 4, "hidden": 5120}, 524288),
+    "VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB": (
+        "cudagraph/capture_max_split_mb", {}, 0),
 }
 
 

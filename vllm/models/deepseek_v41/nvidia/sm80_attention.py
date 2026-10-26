@@ -432,7 +432,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         # Eligibility is independent of the active arm; in-boot capture must
         # be able to select either arm on both target and drafter modules.
-        self._sm80_pipeline_max_rows = envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_pipeline
+
+        self._sm80_pipeline_max_rows = sm80_attn_pipeline.MAX_ROWS
         self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
         self._sm80_is_draft_layer = (
             self.layer_id >= vllm_config.model_config.hf_text_config.num_hidden_layers
@@ -531,7 +533,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 "attention core stays unfused: %s", reason, scope="global",
             )
             return False
-        self._sm80_fused_max_rows = envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS
+        self._sm80_fused_max_rows = sm80_attn_fused.MAX_ROWS
         self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
         # The speculative drafter's layers are numbered after the target's.
         n_target = vllm_config.model_config.hf_text_config.num_hidden_layers
