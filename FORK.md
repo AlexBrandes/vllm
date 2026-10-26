@@ -374,7 +374,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_kda_small_stack.py` | 504 |
 | `tests/kernels/test_ampere_kda_step_tile.py` | 185 |
 | `tests/kernels/test_ampere_marlin_decode_v2.py` | 625 |
-| `tests/kernels/test_ampere_marlin_optional.py` | 230 |
+| `tests/kernels/test_ampere_marlin_optional.py` | 234 |
 | `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 406 |
 | `tests/kernels/test_ampere_marlin_prefill_tiles.py` | 856 |
 | `tests/kernels/test_ampere_moe_route.py` | 405 |
@@ -383,7 +383,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_ampere_pp_sparse_mla_prefill.py` | 618 |
 | `tests/kernels/test_ampere_prefill.py` | 955 |
 | `tests/kernels/test_ampere_prefill_pack_bf16x2.py` | 149 |
-| `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 425 |
+| `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 430 |
 | `tests/kernels/test_ampere_thin_gemm.py` | 241 |
 | `tests/kernels/test_ampere_thin_gemm_concat.py` | 964 |
 | `tests/kernels/test_ampere_thin_gemm_gluon.py` | 995 |
@@ -543,7 +543,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_gpu_lock_guard.py` | 74 |
-| `tests/sm80/test_import_cuda_init.py` | 140 |
+| `tests/sm80/test_import_cuda_init.py` | 159 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
 | `tests/sm80/test_kernel_warmup_call.py` | 69 |
 | `tests/sm80/test_kv_planning.py` | 492 |
@@ -601,7 +601,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 569 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **280 files** | **120,186** |
+| **280 files** | **120,214** |
 
 #### `tools/`
 
