@@ -89,6 +89,7 @@ def vllm_config():
     )
     return SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=4096, hf_config=hf),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=MAX_TOKENS, max_num_seqs=MAX_SEQS
         ),
