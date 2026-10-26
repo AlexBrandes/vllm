@@ -152,7 +152,11 @@ tables = SimpleNamespace(
     input_block_tables=[batch_order], input_block_table_ptrs=ptrs([batch_order]),
     block_table_ptrs=ptrs([req_bt]),
     block_table_strides=torch.tensor([COLS], dtype=torch.int64),
-    num_blocks=SimpleNamespace(gpu=torch.full((1, R), COLS, dtype=torch.int32)))
+    num_blocks=SimpleNamespace(gpu=torch.full((1, R), COLS, dtype=torch.int32)),
+    block_sizes_tensor=torch.tensor([16], dtype=torch.int32),
+    has_sliding_window_groups=False,
+    sliding_window_reach=torch.zeros(1, dtype=torch.int32),
+    _num_dirty_rows=0)
 gather = lambda idx, num_reqs_padded: BlockTables.gather_block_tables(
     tables, idx, num_reqs_padded=num_reqs_padded)
 
