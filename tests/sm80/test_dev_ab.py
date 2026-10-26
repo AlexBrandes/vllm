@@ -612,7 +612,7 @@ def test_router_fp32_switch_sets_every_gate(state, router_model):
     assert switch.current(runner) is True
 
 
-def test_router_fp32_switch_refuses_at_boot(router_model):
+def test_router_fp32_switch_refuses_at_boot(monkeypatch, router_model):
     torch, runner = router_model.torch, router_model.runner
     switch = dev_ab.SWITCHES["qwen4_router_fp32"]
     other = SimpleNamespace(model=torch.nn.Sequential(torch.nn.Linear(2, 2)))
