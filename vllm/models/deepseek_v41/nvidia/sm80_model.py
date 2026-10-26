@@ -199,12 +199,19 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
         }
         if residual is None:
             # Model entry: the embedding repeated hc_mult times; a None
-            # pre-mix is the identity one (stream zero).
-            residual = (
-                x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
-                if x.dim() == 2
-                else x
-            )
+            # pre-mix is the identity one (stream zero). A pipeline stage
+            # entry receives the hc stream, into which an Engram layer
+            # injects before this block's coefficients are computed.
+            if x.dim() == 2:
+                residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+            else:
+                residual = x
+                if self.engram is not None and engram_hashes is not None:
+                    residual = self.engram(
+                        residual,
+                        engram_hashes[:, self.engram.layer_hash_index],
+                        engram_mask,
+                    )
             post_mix, res_mix, x, attn_pre = ops.mhc_pre_delayed(
                 residual, *self._mixes(True), pre_mix=pre_mix, **attn_norm
             )
