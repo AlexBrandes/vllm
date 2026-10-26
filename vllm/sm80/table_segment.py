@@ -58,7 +58,7 @@ import socket
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 VERSION = 1
@@ -80,12 +80,18 @@ _SEALS = (
 )
 # madvise(MADV_POPULATE_READ), Linux 5.14; not every Python names it.
 _MADV_POPULATE_READ = getattr(mmap, "MADV_POPULATE_READ", 22)
+# Received descriptors close on exec, as every other descriptor here.
+_MSG_CMSG_CLOEXEC = getattr(socket, "MSG_CMSG_CLOEXEC", 0x40000000)
 EXIT_VERIFY = 3
 EXIT_NO_HOLDER = 4
 
 
 class SegmentError(RuntimeError):
     """A holder that is absent, refuses a request or fails its checks."""
+
+
+class _FillError(RuntimeError):
+    """A file that could not be read whole."""
 
 
 def file_identity(path: str) -> dict:
@@ -128,10 +134,21 @@ def _send(sock: socket.socket, obj: dict, fds: list[int] | None = None) -> None:
 
 
 def _recv(sock: socket.socket, maxfds: int = 0) -> tuple[dict, list[int]]:
+    fds: list[int] = []
     if maxfds:
-        data, fds, _, _ = socket.recv_fds(sock, MAX_MESSAGE, maxfds)
+        # socket.recv_fds drops its flags argument: recvmsg directly, so the
+        # descriptors arrive close-on-exec.
+        data, ancdata, _, _ = sock.recvmsg(
+            MAX_MESSAGE, socket.CMSG_LEN(maxfds * 4), _MSG_CMSG_CLOEXEC
+        )
+        for level, kind, payload in ancdata:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                fds.extend(
+                    int.from_bytes(payload[i:i + 4], sys.byteorder, signed=True)
+                    for i in range(0, len(payload) - len(payload) % 4, 4)
+                )
     else:
-        data, fds = sock.recv(MAX_MESSAGE), []
+        data = sock.recv(MAX_MESSAGE)
     if not data:
         for fd in fds:
             os.close(fd)
@@ -174,15 +191,20 @@ class HeldFile:
     done: int = 0
 
 
-def _read_into(fd: int, view: memoryview, offset: int, need: int) -> None:
-    """Read from ``offset`` into ``view`` until ``need`` bytes are in (or the
-    file ends, which only the last chunk reaches)."""
+class _Stopped(Exception):
+    """The fill of a file stopped because another failed or the holder ends."""
+
+
+def _read_into(fd: int, view: memoryview, offset: int, need: int) -> int:
+    """Read from ``offset`` into ``view`` until ``need`` bytes are in or the
+    file ends; return the bytes read."""
     got = 0
     while got < need:
         count = os.preadv(fd, [view[got:]], offset + got)
         if count == 0:
-            return
+            break
         got += count
+    return got
 
 
 def _open_for_fill(path: str) -> tuple[int, bool]:
@@ -232,6 +254,8 @@ class Holder:
         self._listener: socket.socket | None = None
         self._listener_ino = 0
         self._filler: threading.Thread | None = None
+        # Set when a file's fill fails or the holder ends: the other fills stop.
+        self._stop = threading.Event()
 
     # -- fill ------------------------------------------------------------
 
@@ -244,6 +268,7 @@ class Holder:
         os.ftruncate(held.memfd, held.segment_bytes)
         mapping = mmap.mmap(held.memfd, held.segment_bytes, flags=mmap.MAP_SHARED,
                             prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        failure = ""
         try:
             try:
                 mapping.madvise(mmap.MADV_HUGEPAGE)
@@ -251,42 +276,74 @@ class Holder:
                 pass
             fd, direct = _open_for_fill(held.path)
             view = memoryview(mapping)
+            futures = []
             try:
                 def read(begin: int) -> int:
+                    if self._stop.is_set():
+                        raise _Stopped()
                     end = min(begin + CHUNK_BYTES, size)
                     length = _round_up(end - begin, _ALIGN)
-                    _read_into(fd, view[begin:begin + length], begin, end - begin)
+                    chunk = view[begin:begin + length]
+                    try:
+                        got = _read_into(fd, chunk, begin, end - begin)
+                    finally:
+                        chunk.release()
                     if not direct:
                         os.posix_fadvise(fd, begin, length, os.POSIX_FADV_DONTNEED)
-                    return end
+                    return begin + min(got, end - begin)
 
                 digest = hashlib.sha256()
                 window = 2 * self.readers
                 starts = list(range(0, size, CHUNK_BYTES))
                 futures = [pool.submit(read, s) for s in starts[:window]]
                 for index, begin in enumerate(starts):
-                    end = futures[index].result()
+                    try:
+                        end = futures[index].result()
+                    except _Stopped:
+                        failure = "stopped"
+                        break
+                    except Exception as exc:  # noqa: BLE001 - a read error ends the fill
+                        failure = f"{held.path}: read failed: {exc}"
+                        break
                     if index + window < len(starts):
                         futures.append(pool.submit(read, starts[index + window]))
                     digest.update(view[begin:end])
                     held.done = end
+                    if end < min(begin + CHUNK_BYTES, size):
+                        failure = f"{held.path} ended at byte {end} of {size}"
+                        break
                 held.sha256 = digest.hexdigest()
-                if held.done != size:
-                    raise SegmentError(f"{held.path} ended at byte {held.done} of {size}")
             finally:
+                if failure:
+                    self._stop.set()
+                # No read may still use the descriptor or the view.
+                for future in futures:
+                    future.cancel()
+                wait(futures)
+                futures.clear()
                 view.release()
                 os.close(fd)
             if _shmem_pmd_bytes() > 0:
                 self.huge_pages = True
         finally:
             mapping.close()
+        if failure == "stopped":
+            raise _Stopped()
+        if failure:
+            raise _FillError(failure)
 
     def fill(self) -> None:
         start = time.monotonic()
         try:
             with ThreadPoolExecutor(self.readers) as pool, ThreadPoolExecutor(len(self.files)) as files:
-                for future in [files.submit(self._fill_file, f, pool) for f in self.files]:
-                    future.result()
+                futures = [files.submit(self._fill_file, f, pool) for f in self.files]
+                wait(futures)
+            errors = [f.exception() for f in futures if f.exception() is not None]
+            real = [e for e in errors if not isinstance(e, _Stopped)]
+            if real:
+                raise real[0]
+            if errors:
+                raise _FillError("the fill stopped: the holder is ending")
             for held in self.files:
                 if held.sha256 != held.expected_sha256:
                     raise SegmentError(
@@ -307,7 +364,8 @@ class Holder:
             with self._lock:
                 self.state = "failed"
                 self.error = str(exc)
-                self.exit_code = EXIT_VERIFY if isinstance(exc, SegmentError) else 1
+                if self.exit_code is None:
+                    self.exit_code = EXIT_VERIFY if isinstance(exc, SegmentError) else 1
             self.log(f"fill failed: {exc}")
         finally:
             os.write(self._wake_w, b"x")
@@ -334,6 +392,7 @@ class Holder:
             "bytes_done": sum(f.done for f in self.files),
             "segment_bytes": sum(_round_up(max(f.identity["size"], 1), _HUGE) for f in self.files),
             "clients": [{"pid": pid} for pid in self.clients.values()],
+            "pending": len(self.pending),
             "huge_pages": self.huge_pages,
             "fill_seconds": self.fill_seconds,
         }
@@ -391,8 +450,11 @@ class Holder:
     def _release(self, mode: str) -> bool:
         if mode not in ("idle", "drain", "force"):
             raise ValueError(f"release mode must be idle, drain or force, not {mode!r}")
-        if mode == "force" or not self.clients:
+        # A server waiting for the fill counts as attached for an idle release.
+        busy = bool(self.clients) or (mode == "idle" and bool(self.pending))
+        if mode == "force" or not busy:
             self.exit_code = 0
+            self._stop.set()
             return True
         if mode == "drain":
             with self._lock:
@@ -407,6 +469,7 @@ class Holder:
         if not data:
             sel.unregister(conn)
             pid = self.clients.pop(conn, None)
+            self.pending = [(c, m) for c, m in self.pending if c is not conn]
             conn.close()
             if pid is not None:
                 self.log(f"client {pid} detached ({len(self.clients)} left)")
@@ -543,6 +606,7 @@ class Attachment:
         self.socket_path = socket_path
         self.manifest = state.get("manifest", "")
         self._sock = _connect(socket_path, None)
+        fds: list[int] = []
         try:
             _send(self._sock, {"op": "attach", "version": VERSION, "files": identities})
             reply, fds = _recv(self._sock, maxfds=len(identities))
@@ -551,6 +615,8 @@ class Attachment:
             if len(fds) != len(identities):
                 raise SegmentError("table segment holder sent the wrong number of descriptors")
         except BaseException:
+            for fd in fds:
+                os.close(fd)
             self._sock.close()
             raise
         self.manifest = reply["manifest"]

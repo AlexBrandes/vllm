@@ -96,6 +96,7 @@ def test_holder_serves_exact_sealed_images(holder, files):
             fd, _ = attachment._fds[os.path.realpath(path)]
             seals = fcntl.fcntl(fd, ts.F_GET_SEALS)
             assert seals & ts._SEALS == ts._SEALS
+            assert not os.get_inheritable(fd)
             with pytest.raises(PermissionError):
                 mmap.mmap(fd, 4096, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
         with pytest.raises(ValueError):
@@ -207,6 +208,10 @@ def test_attach_waits_for_the_fill(tmp_path, files):
         client.start()
         client.join(0.5)
         assert client.is_alive(), "attach answered before the fill"
+        # A server waiting for the fill is not idle.
+        assert ts.request(str(sock), {"op": "status"})["pending"] == 1
+        reply = ts.request(str(sock), {"op": "release", "mode": "idle"})
+        assert reply["released"] is False
         gate.set()
         client.join(30)
         attachment = result["attachment"]
@@ -218,3 +223,28 @@ def test_attach_waits_for_the_fill(tmp_path, files):
         ts.request(str(sock), {"op": "release", "mode": "force"})
         server.join(30)
     assert holder.exit_code == 0
+
+
+def _fill_failure(tmp_path, files, monkeypatch, read_into):
+    monkeypatch.setattr(ts, "_read_into", read_into)
+    holder = ts.Holder(str(tmp_path / "h.sock"), "repo@rev", files, log=lambda msg: None)
+    holder.fill()
+    return holder
+
+
+def test_a_read_error_ends_the_fill_with_its_cause(tmp_path, files, monkeypatch):
+    def fail(fd, view, offset, need):
+        raise OSError(5, "Input/output error")
+
+    holder = _fill_failure(tmp_path, files, monkeypatch, fail)
+    assert holder.state == "failed"
+    assert "read failed" in holder.error and "Input/output error" in holder.error
+    assert holder.exit_code == 1
+
+
+def test_a_file_that_ends_early_ends_the_fill(tmp_path, files, monkeypatch):
+    holder = _fill_failure(
+        tmp_path, files, monkeypatch, lambda fd, view, offset, need: need // 2
+    )
+    assert holder.state == "failed"
+    assert "ended at byte" in holder.error
