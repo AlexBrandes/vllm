@@ -429,7 +429,8 @@ def test_combined_features_keep_default_off(monkeypatch, name):
     assert FORK_ENV_VARS[name]() is False
 
 
-@pytest.mark.parametrize("name", ["VLLM_DEV_AB_SWITCH", "VLLM_SM80_CAPTURE_DIR"])
+@pytest.mark.parametrize("name", ["VLLM_DEV_AB_SWITCH", "VLLM_SM80_CAPTURE",
+                                  "VLLM_SM80_REPLAY_DIR"])
 def test_combined_optional_paths_keep_empty_default(monkeypatch, name):
     from vllm.sm80.envs import FORK_ENV_VARS
 

@@ -21,11 +21,10 @@ an fp64 reference relative to the incumbent's own error (mean <= 1.10x,
 max <= 1.25x) at the TP4 sizes and on small M where lists are empty; bitwise
 run to run; CUDA-graph replay equal to eager with no allocation growth; the
 gate on the device; captured TP4 prefill records when
-VLLM_TP4_MARLIN_CAPTURE_DIR points at a capture (``moe_pre/*.pt`` plus the
+VLLM_SM80_REPLAY_DIR holds a TP4 capture (``moe_pre/*.pt`` plus the
 ``once/`` weights they name).
 """
 
-import glob
 import importlib.util
 import os
 import sys
@@ -33,6 +32,7 @@ import sys
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
 from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
@@ -377,19 +377,16 @@ def test_gate_on_device(weights):
 
 
 def _capture_records():
-    root = os.environ.get("VLLM_TP4_MARLIN_CAPTURE_DIR")
-    if not root:
-        return []
-    files = sorted(glob.glob(os.path.join(root, "moe_pre", "*.pt")))
-    limit = int(os.environ.get("VLLM_TP4_MARLIN_CAPTURE_LIMIT", "10"))
-    return files[:limit]
+    files = replay.files("moe_pre")
+    limit = replay.limit(10)
+    return files[: limit or None]
 
 
 @gpu
-@pytest.mark.skipif(not _capture_records(), reason="VLLM_TP4_MARLIN_CAPTURE_DIR not set")
+@pytest.mark.skipif(not _capture_records(), reason="no moe_pre records in VLLM_SM80_REPLAY_DIR")
 @pytest.mark.parametrize("path", _capture_records())
 def test_captured_prefill_records(monkeypatch, path):
-    root = os.environ["VLLM_TP4_MARLIN_CAPTURE_DIR"]
+    root = replay.root()
     rec = torch.load(path, map_location="cpu", weights_only=False)
     wrec = torch.load(os.path.join(root, rec["weights"]), map_location="cpu",
                       weights_only=False)

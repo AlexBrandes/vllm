@@ -151,9 +151,9 @@ def test_configure_refuses_another_extension(monkeypatch, state):
 def test_configure_refuses_diagnostic_capture(monkeypatch, state, dev_mode):
     monkeypatch.setenv("VLLM_DEV_AB_SWITCH", "exl3_dense_splitk")
     monkeypatch.setenv("VLLM_SERVER_DEV_MODE", dev_mode)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "capture-output")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE", "capture.toml")
     config = SimpleNamespace(parallel_config=SimpleNamespace(worker_extension_cls=""))
-    with pytest.raises(ValueError, match="cannot be combined with VLLM_SM80_CAPTURE_DIR"):
+    with pytest.raises(ValueError, match="cannot be combined with VLLM_SM80_CAPTURE$"):
         dev_ab.configure(config)
     assert config.parallel_config.worker_extension_cls == ""
     assert state == dev_ab._ArmState()
@@ -161,7 +161,7 @@ def test_configure_refuses_diagnostic_capture(monkeypatch, state, dev_mode):
 
 def test_diagnostic_capture_without_ab_leaves_config_untouched(monkeypatch, state):
     monkeypatch.delenv("VLLM_DEV_AB_SWITCH", raising=False)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "capture-output")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE", "capture.toml")
     dev_ab.configure(_Trap())
     assert state == dev_ab._ArmState()
 

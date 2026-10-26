@@ -15,11 +15,10 @@ bitwise run-to-run; CUDA-graph replay equal to eager with no allocation
 growth; the gate-closed fall-throughs on the device.  These run the split
 lists on the released kernels (the compiled tiles are
 test_ampere_marlin_prefill_tiles.py).  Captured prefill
-records are used when VLLM_PP_MARLIN_CAPTURE_DIR points at a capture
+records are used when VLLM_SM80_REPLAY_DIR holds a capture
 (``moe_pre/*.pt`` plus the ``once/`` weights they name).
 """
 
-import glob
 import os
 import random
 from types import SimpleNamespace
@@ -27,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
 from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
@@ -664,11 +664,8 @@ def test_gate_on_device(weights):
 
 
 def _capture_records():
-    root = os.environ.get("VLLM_PP_MARLIN_CAPTURE_DIR")
-    if not root:
-        return []
-    files = sorted(glob.glob(os.path.join(root, "moe_pre", "*.pt")))
-    limit = int(os.environ.get("VLLM_PP_MARLIN_CAPTURE_LIMIT", "4"))
+    files = replay.files("moe_pre")
+    limit = replay.limit(4)
     # one per stage first, largest M first, so a small limit spans the stages
     files.sort(key=lambda f: (-int(f.split("_b")[1].split("_")[0]), f))
     picked, stages = [], set()
@@ -678,15 +675,15 @@ def _capture_records():
             picked.append(f)
             stages.add(st)
     picked += [f for f in files if f not in picked]
-    return picked[:limit]
+    return picked[: limit or None]
 
 
 @gpu
 @pytest.mark.skipif(not _capture_records(),
-                    reason="VLLM_PP_MARLIN_CAPTURE_DIR not set")
+                    reason="no moe_pre records in VLLM_SM80_REPLAY_DIR")
 @pytest.mark.parametrize("path", _capture_records())
 def test_captured_prefill_records(monkeypatch, path):
-    root = os.environ["VLLM_PP_MARLIN_CAPTURE_DIR"]
+    root = replay.root()
     rec = torch.load(path, map_location="cpu", weights_only=False)
     wrec = torch.load(os.path.join(root, rec["weights"]), map_location="cpu",
                       weights_only=False)

@@ -5,7 +5,7 @@
 Weight fingerprints are taken before repacking. Consumer links name the producer
 call and its output view; the exporter must check the bytes, not trust an address
 which the allocator may have reused. Each replay's step/owner/rank scopes the IDs.
-No hook is installed with VLLM_SM80_CAPTURE_DIR unset.
+No hook is installed with VLLM_SM80_CAPTURE unset.
 """
 
 import functools

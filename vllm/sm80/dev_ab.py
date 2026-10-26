@@ -45,7 +45,7 @@ server and a newer generation. RPC replies include the full graph inventory,
 K-table dispatch coverage and per-arm capture bytes. These are allocation deltas,
 not standalone graph-pool measurements; shared pool reuse is charged once.
 
-Diagnostic ``VLLM_SM80_CAPTURE_DIR`` cannot be combined with the A/B switch:
+Diagnostic ``VLLM_SM80_CAPTURE`` cannot be combined with the A/B switch:
 its graph-store bindings do not preserve both arm stores. Configuration refuses
 this composition before installing either A/B extension.
 
@@ -1046,9 +1046,9 @@ def configure(vllm_config) -> None:
     name = envs.VLLM_DEV_AB_SWITCH
     if not name:
         return
-    if envs.VLLM_SM80_CAPTURE_DIR:
+    if envs.VLLM_SM80_CAPTURE:
         raise ValueError(
-            "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE_DIR"
+            "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE"
         )
     if name not in SWITCHES:
         raise ValueError(

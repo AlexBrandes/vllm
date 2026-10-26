@@ -841,16 +841,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_ALLREDUCE_ROUND_ONCE` | `bool` | `False` | `'0'` |
-| `VLLM_SM80_CAPTURE_DIR` | `str` | `''` | `''` |
-| `VLLM_SM80_CAPTURE_FAMILIES` | `str` | `'dense,moe,attn'` | `'dense,moe,attn'` |
-| `VLLM_SM80_CAPTURE_MATCH` | `str` | `''` | `''` |
-| `VLLM_SM80_CAPTURE_MAX_MB` | `int` | `4096` | `'4096'` |
-| `VLLM_SM80_CAPTURE_PER_KEY` | `int` | `2` | `'2'` |
-| `VLLM_SM80_CAPTURE_PREFILL_CALLS` | `str` | `'1'` | `'1'` |
-| `VLLM_SM80_CAPTURE_PREFILL_MATCH` | `str` | `''` | `''` |
-| `VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS` | `int` | `65` | `'65'` |
-| `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
-| `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
 | `VLLM_SM80_KDA_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_MARLIN_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_MHC_PREFILL` | `bool` | `False` | `'0'` |
@@ -860,6 +850,9 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TUNING_FILE` | `str` | `''` | `''` |
+| `VLLM_SM80_CAPTURE` | `str` | `''` | `''` |
+| `VLLM_SM80_REPLAY_DIR` | `str` | `''` | `''` |
+| `VLLM_SM80_REPLAY_LIMIT` | `int \| None` | `None` | - |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |

@@ -351,8 +351,7 @@ def _model(engram, batched=2048):
 
 @pytest.fixture
 def no_capture(monkeypatch):
-    monkeypatch.delenv("VLLM_SM80_CAPTURE_DIR", raising=False)
-    monkeypatch.delenv("VLLM_SM80_CAPTURE_FAMILIES", raising=False)
+    monkeypatch.delenv("VLLM_SM80_CAPTURE", raising=False)
 
 
 def _engram(monkeypatch):
@@ -385,16 +384,17 @@ def test_adopt_refuses_a_replica_no_step_reaches(monkeypatch, no_capture):
     assert type(engram.wkv) is W.ReplicatedPrefillWkv
 
 
-def test_adopt_refuses_a_hybrid_capture(monkeypatch, no_capture):
+def test_adopt_refuses_a_hybrid_capture(monkeypatch, no_capture, tmp_path):
     """Every shard copy carries this rank's capture facts: a hybrid capture
     would record four GEMMs as this rank's."""
     engram = _engram(monkeypatch)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "/nonexistent/capture")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "attn,hybrid")
+    spec = tmp_path / "capture.toml"
+    spec.write_text('dir = "capture"\nfamilies = ["attn", "hybrid"]\n')
+    monkeypatch.setenv("VLLM_SM80_CAPTURE", str(spec))
     with pytest.raises(ValueError, match="hybrid capture"):
         W.adopt_replicated_wkv(_model(engram))
     assert type(engram.wkv) is ColumnParallelLinear
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "attn")
+    spec.write_text('dir = "capture"\nfamilies = ["attn"]\n')
     W.adopt_replicated_wkv(_model(engram))
     assert type(engram.wkv) is W.ReplicatedPrefillWkv
 

@@ -24,6 +24,8 @@ import types
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
+
 HAS_CUDA = torch.cuda.is_available()
 cuda_only = pytest.mark.skipif(not HAS_CUDA, reason="needs a CUDA device")
 
@@ -695,16 +697,14 @@ def test_dual_gemm_fp32_block_no_floor_gpu(spread):
 
 
 @cuda_only
-@pytest.mark.skipif(not os.environ.get("VLLM_GLM5_IDX_GLUE_CAPTURE"),
-                    reason="set VLLM_GLM5_IDX_GLUE_CAPTURE to a directory of "
-                    "captured (x, w, head_dim) .pt files")
+@pytest.mark.skipif(not replay.files("idx_glue"),
+                    reason="no idx_glue records (captured (x, w, head_dim) .pt "
+                    "files) in VLLM_SM80_REPLAY_DIR")
 def test_dual_gemm_fp32_block_real_inputs_gpu():
     """The same gate on real captured decode inputs: each ``*.pt`` file holds
     ``x`` (bf16 [M, hidden]), ``w`` (the wk+weights_proj weight, bf16) and
     ``head_dim``, taken at the ``thin_gemm_dual`` call site."""
-    import glob
-
-    files = sorted(glob.glob(os.path.join(os.environ["VLLM_GLM5_IDX_GLUE_CAPTURE"], "*.pt")))
+    files = replay.files("idx_glue")
     assert files
     cases = []
     for f in files:

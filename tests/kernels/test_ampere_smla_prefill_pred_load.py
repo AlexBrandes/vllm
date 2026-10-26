@@ -11,19 +11,17 @@ CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the flag, the gate and its
 fallbacks, and that the launch is unchanged whenever the gate is closed.
 GPU tests (skip without a device): on vs off bitwise on production-layout
 inputs at 64 heads (pipeline parallel) and 16 heads (tensor parallel 4), on
-real captured prefill records when ``SMLA_PRE_CAPTURE_DIR`` points at them,
+real captured prefill records when ``VLLM_SM80_REPLAY_DIR`` holds them in ``smla_pre/``,
 and CUDA-graph replay.
 
     CUDA_VISIBLE_DEVICES="" pytest -q tests/kernels/test_ampere_smla_prefill_pred_load.py
     pytest -q tests/kernels/test_ampere_smla_prefill_pred_load.py
 """
 
-import glob
-import os
-
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
 from vllm.sm80.kernels.attention import sparse_prefill_mla as spm
 
 FLAG = "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD"
@@ -301,13 +299,11 @@ def test_8_heads_fall_through(monkeypatch):
 
 
 def _capture_dir():
-    d = os.environ.get("SMLA_PRE_CAPTURE_DIR", "")
-    files = sorted(glob.glob(os.path.join(d, "p*_b*_*.pt"))) if d else []
-    return files
+    return replay.files("smla_pre", "p*_b*_*.pt")
 
 
 @needs_sm80
-@pytest.mark.skipif(not _capture_dir(), reason="SMLA_PRE_CAPTURE_DIR has no records")
+@pytest.mark.skipif(not _capture_dir(), reason="no smla_pre records in VLLM_SM80_REPLAY_DIR")
 def test_real_records_on_equals_off_equals_live(monkeypatch):
     """Each captured record replayed at its original row positions inside a
     full-size chunk (the other rows all -1), so every row keeps its rotated
@@ -331,7 +327,7 @@ def test_real_records_on_equals_off_equals_live(monkeypatch):
         assert torch.equal(off[0][rows], c["out_out"].cuda()), f
         n += 1
     if n == 0:
-        pytest.skip("no 64- or 16-head records in SMLA_PRE_CAPTURE_DIR")
+        pytest.skip("no 64- or 16-head smla_pre records in VLLM_SM80_REPLAY_DIR")
 
 
 def _graph_growth(fn):

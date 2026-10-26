@@ -66,6 +66,7 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
+from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3.quant import set_moe_prefill_v2
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia.ops import sm80_gate_gemv, sm80_route, sm80_router_mma
@@ -350,7 +351,7 @@ def _adopt_router_mma(ffn: nn.Module, router: "Sm80DeepseekV41Router") -> None:
     )
     if reason is not None:
         raise ValueError(f"VLLM_DEEPSEEK_V41_ROUTER_MMA: {reason}")
-    if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+    if capture.captures("hybrid"):
         raise ValueError("VLLM_DEEPSEEK_V41_ROUTER_MMA: the hybrid capture records the FP32 gate GEMM; capture with it off")
     weight = gate.weight
     weight.weight_loader = _bf16_valued_loader(
@@ -428,7 +429,7 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         reason = sm80_gate_gemv.supports(*gate.weight.shape)
         if reason is not None:
             raise ValueError(f"VLLM_DEEPSEEK_V41_GATE_GEMV: {reason}")
-        if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+        if capture.captures("hybrid"):
             # The hybrid capture records the gate through GateLinear.forward,
             # which the kernel bypasses: its gate and route cases would vanish.
             raise ValueError(

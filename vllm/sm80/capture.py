@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Diagnostic capture of served kernel calls (VLLM_SM80_CAPTURE_DIR).
+"""Diagnostic capture of served kernel calls (VLLM_SM80_CAPTURE).
 
-Off by default: with the directory unset ``active`` is False, nothing is
-patched and no capture point does any work. With it set, the capture points
-(the dense EXL3 linear, the EXL3 routed experts, model attention layers,
-model mHC ops)
+Off by default: with VLLM_SM80_CAPTURE unset ``active`` is False, nothing is
+patched and no capture point does any work. With it set to the path of a
+capture spec (below), the capture points (the dense EXL3 linear, the EXL3
+routed experts, model attention layers, model mHC ops)
 hand selected calls to :func:`begin`; the returned :class:`Record` keeps
 copies of the call's arguments and outputs, and every kept call becomes one
 file
@@ -28,27 +28,41 @@ and wrote), and after a replay of that graph the copies are read back. The
 graph is the served one plus these copies; nothing it computes changes.
 Reading back waits for the stream: diagnostic boots only.
 
-Selection (vllm.sm80.envs):
-- VLLM_SM80_CAPTURE_FAMILIES: the families recorded (dense, moe, attn, mhc).
-- VLLM_SM80_CAPTURE_MATCH: a regex searched in the call's prefix (the
-  checkpoint prefix for dense matrices, the module prefix otherwise) for
-  every call outside prefill steps.
-- VLLM_SM80_CAPTURE_ROWS: the row counts whose graph captures get copies.
-- VLLM_SM80_CAPTURE_PER_KEY: files per (family, prefix, rows, phase, owner,
-  context), where the context is ``long`` when some request of the step had
-  computed at least LONG_CONTEXT tokens before it, else ``short``.
-- VLLM_SM80_CAPTURE_PREFILL_MATCH (default: _MATCH), _PREFILL_CALLS,
-  _PREFILL_MIN_ROWS: in prefill steps, the prefixes and the ordinals (per
-  family and prefix, from 1, over calls of at least _PREFILL_MIN_ROWS rows)
-  that are kept.
-- VLLM_SM80_CAPTURE_PREFILL_PER_KEY: default 0 keeps the ordinal policy.
-  Positive N instead keeps the first N eligible attempts per (family, point,
-  exact prefix, rows, phase, owner, short/long context). Quota refusals also
-  consume an attempt; the reached-row census and actual prefill call ordinal
-  continue counting. These records use the semantic key hash in their filename
-  so different points at the same prefix cannot overwrite one another.
-- VLLM_SM80_CAPTURE_MAX_MB: bytes of tensors written per process; past it
-  the index says ``saved: false``.
+The capture spec is a TOML file; every key but ``dir`` is optional, shown
+here with its default, and any other key is refused (:func:`spec`):
+
+    dir = "<directory>"
+    families = ["dense", "moe", "attn"]
+    match = ""
+    rows = []
+    per_key = 2
+    prefill_match = ""
+    prefill_calls = [1]
+    prefill_per_key = 0
+    prefill_min_rows = 65
+    max_mb = 4096
+
+- dir: where the files go; a relative path is taken from the spec's
+  directory.
+- families: the families recorded (FAMILIES).
+- match: a regex searched in the call's prefix (the checkpoint prefix for
+  dense matrices, the module prefix otherwise) for every call outside
+  prefill steps; empty matches every prefix.
+- rows: the row counts whose graph captures get copies.
+- per_key: files per (family, prefix, rows, phase, owner, context), where the
+  context is ``long`` when some request of the step had computed at least
+  LONG_CONTEXT tokens before it, else ``short``.
+- prefill_match (empty: match), prefill_calls, prefill_min_rows: in prefill
+  steps, the prefixes and the ordinals (per family and prefix, from 1, over
+  calls of at least prefill_min_rows rows) that are kept.
+- prefill_per_key: default 0 keeps the ordinal policy. Positive N instead
+  keeps the first N eligible attempts per (family, point, exact prefix, rows,
+  phase, owner, short/long context). Quota refusals also consume an attempt;
+  the reached-row census and actual prefill call ordinal continue counting.
+  These records use the semantic key hash in their filename so different
+  points at the same prefix cannot overwrite one another.
+- max_mb: MiB of tensors written per process; past it the index says
+  ``saved: false``.
 
 The step phase is the scheduler's, from the step the model runner executes:
 a step that schedules some request more than 1 + num_speculative_tokens
@@ -77,6 +91,7 @@ import hashlib
 import json
 import os
 import re
+import tomllib
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -94,7 +109,92 @@ FAMILIES = ("dense", "moe", "attn", "mhc", "hybrid")
 # Context, in tokens, from which a step's records count as long-context ones.
 LONG_CONTEXT = 4096
 
-active = bool(envs.VLLM_SM80_CAPTURE_DIR)
+active = bool(envs.VLLM_SM80_CAPTURE)
+
+# The capture spec's keys: (type, item type of a list, default); dir has no
+# default.
+SPEC_KEYS: dict[str, tuple[type, type | None, Any]] = {
+    "dir": (str, None, None),
+    "families": (list, str, ["dense", "moe", "attn"]),
+    "match": (str, None, ""),
+    "rows": (list, int, []),
+    "per_key": (int, None, 2),
+    "prefill_match": (str, None, ""),
+    "prefill_calls": (list, int, [1]),
+    "prefill_per_key": (int, None, 0),
+    "prefill_min_rows": (int, None, 65),
+    "max_mb": (int, None, 4096),
+}
+
+
+@dataclass(frozen=True)
+class Spec:
+    """The settings of a capture spec (module docstring)."""
+
+    path: str
+    dir: str
+    families: frozenset
+    match: str
+    rows: frozenset
+    per_key: int
+    prefill_match: str
+    prefill_calls: frozenset
+    prefill_per_key: int
+    prefill_min_rows: int
+    max_mb: int
+
+
+def _typed(value: Any, kind: type) -> bool:
+    # TOML booleans are not integers here.
+    return isinstance(value, kind) and not (kind is int and isinstance(value, bool))
+
+
+def spec(path: str | None = None) -> Spec:
+    """The capture spec at ``path`` (default: VLLM_SM80_CAPTURE). An unknown
+    key, a value of another type, no ``dir``, an unknown family or a negative
+    ``prefill_per_key`` raises ValueError naming the file."""
+    path = path or envs.VLLM_SM80_CAPTURE
+    where = f"VLLM_SM80_CAPTURE {path}"
+    with open(path, "rb") as f:
+        raw = tomllib.load(f)
+    unknown = sorted(set(raw) - set(SPEC_KEYS))
+    if unknown:
+        raise ValueError(f"{where}: unknown keys {unknown}; known: {sorted(SPEC_KEYS)}")
+    values = {}
+    for key, (kind, item, default) in SPEC_KEYS.items():
+        value = raw.get(key, default)
+        if value is None or (key == "dir" and not value):
+            raise ValueError(f"{where}: {key} is required")
+        if not _typed(value, kind) or (
+            item is not None and not all(_typed(v, item) for v in value)
+        ):
+            what = f"a list of {item.__name__}" if item else kind.__name__
+            raise ValueError(f"{where}: {key} must be {what}, not {value!r}")
+        values[key] = value
+    unknown = sorted(set(values["families"]) - set(FAMILIES))
+    if unknown:
+        raise ValueError(f"{where}: unknown families {unknown}; known: {list(FAMILIES)}")
+    if values["prefill_per_key"] < 0:
+        raise ValueError(f"{where}: prefill_per_key must be nonnegative")
+    base = os.path.dirname(os.path.abspath(path))
+    return Spec(
+        path=path,
+        dir=os.path.join(base, values["dir"]),
+        families=frozenset(values["families"]),
+        match=values["match"],
+        rows=frozenset(values["rows"]),
+        per_key=values["per_key"],
+        prefill_match=values["prefill_match"],
+        prefill_calls=frozenset(values["prefill_calls"]),
+        prefill_per_key=values["prefill_per_key"],
+        prefill_min_rows=values["prefill_min_rows"],
+        max_mb=values["max_mb"],
+    )
+
+
+def captures(family: str) -> bool:
+    """Whether VLLM_SM80_CAPTURE is set and its spec records ``family``."""
+    return bool(envs.VLLM_SM80_CAPTURE) and family in spec().families
 
 
 _point_phase = ContextVar("sm80_capture_point_phase", default=None)
@@ -129,10 +229,6 @@ class _Config:
     prefill_per_key: int
 
 
-def _ints(text: str) -> frozenset:
-    return frozenset(int(v) for v in text.split(",") if v.strip())
-
-
 def _ranks() -> tuple[int, int, int]:
     """(global rank, tensor parallel rank, tensor parallel size)."""
     rank = tp_rank = 0
@@ -160,41 +256,34 @@ def config() -> _Config:
     at weight loading); the first call installs the hooks."""
     global _cfg
     if _cfg is None:
-        families = frozenset(
-            f.strip() for f in envs.VLLM_SM80_CAPTURE_FAMILIES.split(",") if f.strip()
-        )
-        unknown = families - set(FAMILIES)
-        if unknown:
-            raise ValueError(f"VLLM_SM80_CAPTURE_FAMILIES: unknown {sorted(unknown)}")
+        settings = spec()
         rank, tp_rank, tp_size = _ranks()
         cfg = _Config(
-            root=os.path.join(envs.VLLM_SM80_CAPTURE_DIR, f"r{rank}"),
-            families=families,
-            match=re.compile(envs.VLLM_SM80_CAPTURE_MATCH),
-            prefill_match=re.compile(
-                envs.VLLM_SM80_CAPTURE_PREFILL_MATCH or envs.VLLM_SM80_CAPTURE_MATCH
-            ),
-            rows=_ints(envs.VLLM_SM80_CAPTURE_ROWS),
-            per_key=envs.VLLM_SM80_CAPTURE_PER_KEY,
-            prefill_calls=_ints(envs.VLLM_SM80_CAPTURE_PREFILL_CALLS),
-            prefill_min_rows=envs.VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS,
-            max_bytes=envs.VLLM_SM80_CAPTURE_MAX_MB << 20,
+            root=os.path.join(settings.dir, f"r{rank}"),
+            families=settings.families,
+            match=re.compile(settings.match),
+            prefill_match=re.compile(settings.prefill_match or settings.match),
+            rows=settings.rows,
+            per_key=settings.per_key,
+            prefill_calls=settings.prefill_calls,
+            prefill_min_rows=settings.prefill_min_rows,
+            max_bytes=settings.max_mb << 20,
             rank=rank,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            prefill_per_key=envs.VLLM_SM80_CAPTURE_PREFILL_PER_KEY,
+            prefill_per_key=settings.prefill_per_key,
         )
-        if cfg.prefill_per_key < 0:
-            raise ValueError("VLLM_SM80_CAPTURE_PREFILL_PER_KEY must be nonnegative")
         os.makedirs(cfg.root, exist_ok=True)
-        _install()
+        _install(cfg.families)
         _cfg = cfg
         logger.info(
-            "Kernel call capture active (VLLM_SM80_CAPTURE_DIR=%s): families %s, "
-            "graph rows %s, %d per key, prefill calls %s, %d prefill attempts "
-            "per semantic key (0 uses ordinals); diagnostic boots only.",
-            cfg.root, ",".join(sorted(families)), sorted(cfg.rows), cfg.per_key,
-            sorted(cfg.prefill_calls), cfg.prefill_per_key,
+            "Kernel call capture active (VLLM_SM80_CAPTURE=%s): writing %s, "
+            "families %s, graph rows %s, %d per key, prefill calls %s, %d "
+            "prefill attempts per semantic key (0 uses ordinals), at most %d "
+            "MiB; diagnostic boots only.",
+            settings.path, cfg.root, ",".join(sorted(cfg.families)),
+            sorted(cfg.rows), cfg.per_key, sorted(cfg.prefill_calls),
+            cfg.prefill_per_key, settings.max_mb,
         )
     return _cfg
 
@@ -537,7 +626,7 @@ def _drain(manager, desc) -> None:
     _write(records, phase, owner, graph)
 
 
-def _install() -> None:
+def _install(families: frozenset) -> None:
     """Patch the model runner (the step's phase) and the CUDA graph managers
     (records inside graphs)."""
     from vllm.sm80.kernels.exl3.step_phase import max_decode_query_len
@@ -567,7 +656,7 @@ def _install() -> None:
         return execute(self, scheduler_output, *args, **kwargs)
 
     runner.execute_model = execute_model
-    if "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+    if "hybrid" in families:
         from vllm.models.deepseek_v41.nvidia.hybrid_capture import install
 
         install()
