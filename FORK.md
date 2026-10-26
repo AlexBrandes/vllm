@@ -153,8 +153,6 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
-| `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
-| `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 166 |
 | `vllm/sm80/envs.py` | 1,671 |
 | `vllm/sm80/failed_inputs.py` | 144 |
@@ -407,6 +405,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/construct.py` | 209 |
 | `tests/models/deepseek_v41/sm80/dspark_draft_identity.py` | 201 |
 | `tests/models/deepseek_v41/sm80/dsv41_ref.py` | 764 |
+| `tests/models/deepseek_v41/sm80/exact_round.py` | 52 |
 | `tests/models/deepseek_v41/sm80/exl3_fixture.py` | 284 |
 | `tests/models/deepseek_v41/sm80/export_attn_pipeline_cases.py` | 306 |
 | `tests/models/deepseek_v41/sm80/export_mhc_consumer_cases.py` | 225 |
@@ -441,6 +440,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_mhc_consumer_cases.py` | 115 |
 | `tests/models/deepseek_v41/sm80/test_no_host_sync.py` | 117 |
 | `tests/models/deepseek_v41/sm80/test_official_reference.py` | 1,402 |
+| `tests/models/deepseek_v41/sm80/test_round_once_identity.py` | 275 |
 | `tests/models/deepseek_v41/sm80/test_row_mask_moe.py` | 641 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attention_wiring.py` | 513 |
 | `tests/models/deepseek_v41/sm80/test_sm80_attn_fused.py` | 212 |
@@ -525,8 +525,6 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/launch/test_launch_resolve.py` | 352 |
 | `tests/sm80/launch/test_launch_single_card_model.py` | 227 |
 | `tests/sm80/launch/test_launch_validated.py` | 483 |
-| `tests/sm80/round_once_allreduce_bits.py` | 207 |
-| `tests/sm80/round_once_unchecked.py` | 46 |
 | `tests/sm80/seams.yaml` | 1,603 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 289 |
 | `tests/sm80/test_dev_ab.py` | 649 |
@@ -551,10 +549,6 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_plugin_distribution.py` | 112 |
 | `tests/sm80/test_plugin_guard.py` | 299 |
 | `tests/sm80/test_registrations.py` | 139 |
-| `tests/sm80/test_round_once_all_reduce.py` | 203 |
-| `tests/sm80/test_round_once_all_reduce_gpu.py` | 89 |
-| `tests/sm80/test_round_once_kernels.py` | 88 |
-| `tests/sm80/test_round_once_span.py` | 102 |
 | `tests/sm80/test_seams.py` | 57 |
 | `tests/sm80/test_setup_envs_load.py` | 79 |
 | `tests/sm80/test_step_error_copy.py` | 66 |
@@ -765,8 +759,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_MARLIN_DECODE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_CUDAGRAPH_ESTIMATE_SPLIT` | `int` | `0` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `str` | `''` | `None` |
-| `VLLM_CUSTOM_ALLREDUCE_FLAGS` | `bool` | `False` | `'0'` |
-| `VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S` | `float` | `60.0` | `'60'` |
 | `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_ATTN_PIPELINE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED` | `bool` | `False` | `'0'` |
@@ -781,14 +773,10 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE` | `bool` | `False` | `'0'` |
-| `VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE` | `bool` | `False` | `'0'` |
-| `VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_ROUTER_MMA` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_SWA_META_BATCH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM` | `bool` | `False` | `'0'` |
-| `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
-| `VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
 | `VLLM_DSPARK_ADAPTIVE_DEPTH` | `str` | `''` | `''` |
@@ -836,7 +824,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_GLM5_MOE_ROUTE_V2_MASK` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD` | `bool` | `False` | `'0'` |
-| `VLLM_HOST_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DECODE_RAW_K` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DSA_REF` | `bool` | `False` | `'0'` |
 | `VLLM_KV_MAMBA_INFLIGHT_STATES` | `bool` | `False` | `'0'` |
@@ -852,8 +839,9 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_PP_SPREAD_DECODES` | `bool` | `False` | `'0'` |
 | `VLLM_QWEN4_MTP_PER_STREAM_NORM` | `bool` | `False` | `'0'` |
 | `VLLM_QWEN4_ROUTER_FP32` | `bool` | `False` | `'0'` |
-| `VLLM_ROUND_ONCE_ALLREDUCE_GROUPED` | `bool` | `False` | `'0'` |
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_ALLREDUCE` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_ALLREDUCE_ROUND_ONCE` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_CAPTURE_DIR` | `str` | `''` | `''` |
 | `VLLM_SM80_CAPTURE_FAMILIES` | `str` | `'dense,moe,attn'` | `'dense,moe,attn'` |
 | `VLLM_SM80_CAPTURE_MATCH` | `str` | `''` | `''` |
@@ -868,6 +856,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_MARLIN_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_MHC_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_SPARSE_MLA_PREFILL` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_PREFILL_REDUCE_OVERLAP` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
@@ -878,7 +867,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **146 variables** | | | |
+| **141 variables** | | | |
 
 ## 4. Unreferenced fork code
 

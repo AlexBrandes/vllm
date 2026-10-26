@@ -279,9 +279,8 @@ def test_owner_sum_kernel_compiles_and_accumulates_in_fp32() -> None:
 def test_step_error_word_names_the_ring_timeout() -> None:
     from vllm.sm80.distributed import step_errors
 
-    assert step_errors.CE_RING_TIMEOUT & step_errors.ROUND_ONCE_SPAN == 0
     for word, text in ((step_errors.CE_RING_TIMEOUT, "copy-engine ring"),
-                       (step_errors.ROUND_ONCE_SPAN, "finite exponent span"),
+                       (1, "device step error word 0x1"),
                        (3, "copy-engine ring")):
         check = step_errors.ErrorCheck([torch.tensor(word, dtype=torch.int32)])
         with pytest.raises(ValueError, match=text):

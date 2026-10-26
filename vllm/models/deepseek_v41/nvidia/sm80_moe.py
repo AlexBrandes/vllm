@@ -73,7 +73,6 @@ from vllm.models.deepseek_v41.nvidia.ops import sm80_mhc_side
 from vllm.models.deepseek_v41.nvidia.sm80_attention import (
     large_round_once_all_reduce,
     prefill_all_reduce,
-    round_once_transport,
 )
 from vllm.sm80.spec_decode import dspark_row_mask
 
@@ -453,8 +452,8 @@ def adopt_moe(ffn: nn.Module, config) -> None:
             )
     if (
         envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
-        or envs.VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE
-        or envs.VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE
+        or envs.VLLM_SM80_PREFILL_REDUCE_OVERLAP
+        or envs.VLLM_SM80_ALLREDUCE
     ):
         _adopt_layer_all_reduce(
             ffn, round_once=envs.VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
@@ -514,7 +513,7 @@ def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:
     """The layer, not the runner, all-reduces the MoE output, where the runner
     would: rounded once with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE
     (``round_once``), else through the runner's all-reduce
-    (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE alone)."""
+    (VLLM_SM80_PREFILL_REDUCE_OVERLAP or VLLM_SM80_ALLREDUCE alone)."""
     if type(ffn) is not upstream_model.DeepseekV4MoE:
         raise TypeError(f"Unexpected DeepSeek-V4.1 MoE: {type(ffn).__name__}")
     moe_config = ffn.experts.moe_config
@@ -529,8 +528,9 @@ def _adopt_layer_all_reduce(ffn: nn.Module, *, round_once: bool) -> None:
         logger.info_once(
             "DeepSeek-V4.1 sm_80: MoE outputs too large for the custom all-reduce "
             "whole are all-reduced with one rounding per element on eager steps, "
-            "over %s (VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
+            "over the copy-engine ring's owner sum (VLLM_SM80_ALLREDUCE=1) or "
+            "else the custom all-reduce in pieces "
+            "(VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE=1; set 0 for the "
             "runner's all-reduce)",
-            round_once_transport(),
             scope="global",
         )

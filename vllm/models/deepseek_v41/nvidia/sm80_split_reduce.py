@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1 prefill all-reduces beside compute, in two row slices
-(``VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE``).
+(``VLLM_SM80_PREFILL_REDUCE_OVERLAP``).
 
 A decoder layer sums two TP partials: ``wo_b`` after the attention and the
 MoE output (routed experts plus the shared-expert shard) after the FFN. In a
@@ -75,7 +75,7 @@ def adopt_split_reduce(layers: Iterable) -> None:
     logger.info_once(
         "DeepSeek-V4.1 sm_80: %d decoder layers run the wo_b, FFN and both "
         "all-reduces of eager steps of at least %d rows in two row slices, the "
-        "all-reduces on a side stream (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE=1)",
+        "all-reduces on a side stream (VLLM_SM80_PREFILL_REDUCE_OVERLAP=1)",
         count,
         2 * SLICE_ALIGN,
         scope="global",

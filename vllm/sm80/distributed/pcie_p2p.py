@@ -36,7 +36,7 @@ def pcie_p2p_custom_allreduce_allowed() -> bool:
     custom_all_reduce.cuh with nothing to connect it to the allocator.
 
     Refusing here instead leaves the host-staged path serving (with
-    VLLM_HOST_ALLREDUCE=1; NCCL otherwise), so the flag is safe to leave
+    VLLM_SM80_ALLREDUCE=1; NCCL otherwise), so the flag is safe to leave
     set: it simply does nothing until the allocator allows it.
     """
     if not envs.VLLM_CUSTOM_ALLREDUCE_PCIE_P2P:

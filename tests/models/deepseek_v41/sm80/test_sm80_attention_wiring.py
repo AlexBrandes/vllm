@@ -185,7 +185,7 @@ def test_o_proj_grouped_wo_a_and_fp32_reduce(monkeypatch) -> None:
     layer = _bare_layer(
         n_local_groups=G, o_lora_rank=R, gemm_rs=None,
         wo_a=_Linear(wo_a), wo_b=_Linear(wo_b, tp_size=4),
-        _wo_b_bf16_allreduce=False, _wo_b_bf16_pieces=False,
+        _wo_b_round_once=False,
     )
     got = layer._o_proj(attn_out, torch.arange(T))
     want = (torch.nn.functional.linear(z, wo_b).float() * 3).to(BF16)
@@ -229,11 +229,12 @@ def test_dspark_context_kv_hook_dispatch() -> None:
 
 
 class _FakeComm:
-    """A TP communicator whose custom all-reduce accepts what ``takes`` says."""
+    """A TP communicator whose custom all-reduce accepts what ``takes`` says
+    (whole messages and pieces alike)."""
 
     def __init__(self, takes: bool, host_takes: bool = False, preempt=None):
         self.ca_comm = SimpleNamespace(
-            disabled=False, should_custom_ar=lambda t: takes
+            disabled=False, should_custom_ar=lambda t: takes, max_size=1024
         )
         self.hostshm_comm = SimpleNamespace(should_host_ar=lambda t: host_takes)
         self.pynccl_comm = None
@@ -251,11 +252,14 @@ class _FakeComm:
         (True, _FakeComm(True, preempt=SimpleNamespace(disabled=True)), True),
     ],
 )
-def test_wo_b_bf16_allreduce_switch(monkeypatch, switch, comm, bf16_message) -> None:
-    """VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE sends the BF16 partial to the all-reduce
-    only when the custom all-reduce's own predicate takes it; otherwise, and
-    with the switch off, today's FP32 sum rounded once."""
+def test_wo_b_round_once_whole_message(monkeypatch, switch, comm, bf16_message) -> None:
+    """VLLM_SM80_ALLREDUCE_ROUND_ONCE sends the BF16 partial to the all-reduce
+    when the custom all-reduce's own predicate takes it whole (and the
+    host-staged path does not); otherwise with no round-once transport left
+    (no ring, no pieces), and with the switch off, the FP32 sum rounded once."""
     seen = []
+    monkeypatch.delenv("VLLM_SM80_ALLREDUCE", raising=False)
+    monkeypatch.setattr(sm80.ce_ring_all_reduce, "_RING", None)
 
     def all_reduce(t):
         seen.append(t.dtype)
@@ -267,20 +271,32 @@ def test_wo_b_bf16_allreduce_switch(monkeypatch, switch, comm, bf16_message) -> 
     )
     g = torch.Generator().manual_seed(2)
     partial = torch.randn(5, 64, generator=g).to(BF16)
-    got = sm80.wo_b_all_reduce(partial, switch, False)
+    got = sm80.wo_b_all_reduce(partial, switch)
     assert seen == [BF16 if bf16_message else torch.float32]
     assert got.dtype == BF16
     if not bf16_message:
         assert torch.equal(got, (partial.float() * 3).to(BF16))
 
 
-def test_wo_b_bf16_allreduce_default_off(monkeypatch) -> None:
+def test_allreduce_round_once_default_off(monkeypatch) -> None:
     import vllm.envs as envs
 
-    monkeypatch.delenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", raising=False)
-    assert envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE is False
-    monkeypatch.setenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "1")
-    assert envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE is True
+    monkeypatch.delenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", raising=False)
+    assert envs.VLLM_SM80_ALLREDUCE_ROUND_ONCE is False
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", "1")
+    assert envs.VLLM_SM80_ALLREDUCE_ROUND_ONCE is True
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_allreduce_round_once_banner(monkeypatch, on) -> None:
+    """The layer reads the switch through one call that says so at start."""
+    said = []
+    monkeypatch.setattr(sm80.logger, "info_once", lambda msg, *a, **_: said.append(msg))
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", "1" if on else "0")
+    assert sm80.wo_b_round_once_switch() is on
+    assert len(said) == int(on)
+    if on:
+        assert "VLLM_SM80_ALLREDUCE_ROUND_ONCE=1" in said[0]
 
 
 class _PieceCustomAllreduce:
@@ -328,28 +344,31 @@ _MAX = 1024
 
 
 @pytest.mark.parametrize(
-    "case,rows,cols,in_pieces",
+    "case,rows,cols,path",
     [
-        ("switch_off", 40, 64, False),
-        ("too_large", 40, 64, True),
-        ("one_row_over", 9, 64, True),
-        ("whole_fits", 7, 64, False),
-        ("host_takes", 40, 64, False),
-        ("preempted", 40, 64, False),
-        ("not_fully_connected", 40, 64, False),
-        ("capture_warmup", 40, 64, False),
-        ("not_contiguous", 40, 64, False),
-        ("odd_bytes", 41, 63, False),
+        ("switch_off", 40, 64, "fp32"),
+        ("too_large", 40, 64, "pieces"),
+        ("one_row_over", 9, 64, "pieces"),
+        ("whole_fits", 7, 64, "bf16"),
+        ("host_takes", 40, 64, "fp32"),
+        ("preempted", 40, 64, "fp32"),
+        ("not_fully_connected", 40, 64, "fp32"),
+        ("capture_warmup", 40, 64, "fp32"),
+        ("not_contiguous", 40, 64, "fp32"),
+        ("odd_bytes", 41, 63, "fp32"),
     ],
 )
-def test_wo_b_bf16_prefill_allreduce_pieces(
-    monkeypatch, case, rows, cols, in_pieces
+def test_wo_b_round_once_pieces(
+    monkeypatch, case, rows, cols, path
 ) -> None:
-    """VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE sends a BF16 partial too
-    large for the custom all-reduce whole through it in storage-order pieces
-    below its buffer, each taken by its own predicate, into one output; any
-    other message keeps the FP32 sum rounded once."""
+    """VLLM_SM80_ALLREDUCE_ROUND_ONCE sends a BF16 partial too large for the
+    custom all-reduce whole through it in storage-order pieces below its
+    buffer, each taken by its own predicate, into one output; one the custom
+    all-reduce takes whole goes to the communicator as BF16; any other
+    message keeps the FP32 sum rounded once."""
     ca = _PieceCustomAllreduce(_MAX, fully_connected=case != "not_fully_connected")
+    monkeypatch.delenv("VLLM_SM80_ALLREDUCE", raising=False)
+    monkeypatch.setattr(sm80.ce_ring_all_reduce, "_RING", None)
     if case == "capture_warmup":
         ca._IS_CAPTURING = True
     comm = _piece_comm(
@@ -371,12 +390,15 @@ def test_wo_b_bf16_prefill_allreduce_pieces(
     partial = torch.randn(rows, cols, generator=g).to(BF16)
     if case == "not_contiguous":
         partial = torch.randn(cols, rows, generator=g).to(BF16).t()
-    got = sm80.wo_b_all_reduce(partial, False, case != "switch_off")
+    got = sm80.wo_b_all_reduce(partial, case != "switch_off")
     want = (partial.float() * 4).to(BF16)
     assert got.dtype == BF16 and got.shape == partial.shape
     assert torch.equal(got, want)
-    if not in_pieces:
+    if path == "fp32":
         assert seen == [torch.float32] and not ca.pieces
+        return
+    if path == "bf16":
+        assert seen == [BF16] and not ca.pieces
         return
     assert not seen
     sizes = [p.numel() * p.element_size() for p in ca.pieces]
@@ -390,11 +412,11 @@ def test_wo_b_bf16_prefill_allreduce_pieces(
         start += p.numel()
 
 
-def test_wo_b_bf16_prefill_allreduce_whole_message_keeps_custom_path(
+def test_wo_b_round_once_whole_message_keeps_custom_path(
     monkeypatch,
 ) -> None:
-    """With both switches on, a message the custom all-reduce takes whole goes
-    to the communicator as BF16 (the decode switch), never in pieces."""
+    """A message the custom all-reduce takes whole goes to the communicator as
+    BF16, never in pieces."""
     ca = _PieceCustomAllreduce(_MAX)
     comm = _piece_comm(ca)
     seen = []
@@ -407,15 +429,15 @@ def test_wo_b_bf16_prefill_allreduce_whole_message_keeps_custom_path(
     monkeypatch.setattr(
         sm80, "get_tp_group", lambda: SimpleNamespace(device_communicator=comm)
     )
-    sm80.wo_b_all_reduce(torch.ones(7, 64, dtype=BF16), True, True)
+    sm80.wo_b_all_reduce(torch.ones(7, 64, dtype=BF16), True)
     assert seen == [BF16] and not ca.pieces
 
 
-def test_o_proj_passes_the_pieces_switch(monkeypatch) -> None:
+def test_o_proj_passes_the_round_once_switch(monkeypatch) -> None:
     calls = []
 
-    def wo_b_all_reduce(partial, whole, pieces):
-        calls.append((whole, pieces))
+    def wo_b_all_reduce(partial, round_once):
+        calls.append(round_once)
         return partial
 
     monkeypatch.setattr(sm80, "wo_b_all_reduce", wo_b_all_reduce)
@@ -424,10 +446,10 @@ def test_o_proj_passes_the_pieces_switch(monkeypatch) -> None:
         n_local_groups=1, o_lora_rank=K, gemm_rs=None,
         wo_a=_Linear(torch.eye(K, dtype=BF16)),
         wo_b=_Linear(torch.ones(H, K, dtype=BF16), tp_size=4),
-        _wo_b_bf16_allreduce=False, _wo_b_bf16_pieces=True,
+        _wo_b_round_once=True,
     )
     layer._o_proj(torch.ones(2, 1, K, dtype=BF16), torch.arange(2))
-    assert calls == [(False, True)]
+    assert calls == [True]
 
 
 @pytest.mark.parametrize(
@@ -449,7 +471,7 @@ def test_o_proj_is_reduce_of_wo_b_partial_by_rows(
         wo_a=_Linear((torch.randn(G * R, D, generator=g) / 4).to(BF16)),
         wo_b=_Linear((torch.randn(H, G * R, generator=g) / 4).to(BF16),
                      reduce_results=reduce_results, tp_size=tp_size),
-        _wo_b_bf16_allreduce=False, _wo_b_bf16_pieces=False,
+        _wo_b_round_once=False,
     )
     assert layer.reduces_wo_b() is reduces
     if not reduces:
@@ -462,22 +484,12 @@ def test_o_proj_is_reduce_of_wo_b_partial_by_rows(
     assert torch.equal(torch.cat(halves), whole)
 
 
-def test_wo_b_bf16_prefill_allreduce_default_off(monkeypatch) -> None:
-    import vllm.envs as envs
-
-    name = "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE"
-    monkeypatch.delenv(name, raising=False)
-    assert getattr(envs, name) is False
-    monkeypatch.setenv(name, "1")
-    assert getattr(envs, name) is True
-
-
 def _frexp_exponent(x: torch.Tensor) -> torch.Tensor:
     return torch.frexp(x)[1]
 
 
 def test_wo_b_fp32_sum_of_bf16_partials_is_order_free_within_2_14() -> None:
-    """The basis of both BF16 wo_b switches: four BF16 partials whose nonzero
+    """The basis of the round-once BF16 wo_b message: four BF16 partials whose nonzero
     magnitudes lie within a factor 2^14 of each other have an exact FP32 sum
     (every partial sum is a multiple of the smallest one's last bit and needs
     at most 24 bits), so every summation order (the FP32 ring's, the custom

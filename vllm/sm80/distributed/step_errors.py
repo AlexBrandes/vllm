@@ -16,12 +16,10 @@ import inspect
 import torch
 
 _buffers: dict[tuple[int, int], torch.Tensor] = {}
-MESSAGE = "round-once all-reduce requires a finite exponent span; device validation rejected this step"
-# Bits of the sticky word: each producer ORs its own (round_once_kernels: 1).
-ROUND_ONCE_SPAN = 1
+# Bits of the sticky word: each producer ORs its own (ce_ring_all_reduce: 2;
+# bit 1 is free).
 CE_RING_TIMEOUT = 2
 MESSAGES = (
-    (ROUND_ONCE_SPAN, MESSAGE),
     (CE_RING_TIMEOUT, "copy-engine ring all-reduce: a peer flag did not arrive within the wait bound; "
                       "the ranks' collectives are out of step"),
 )
@@ -34,7 +32,7 @@ def error_buffer(device: torch.device) -> torch.Tensor:
     error = _buffers.get(key)
     if error is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("initialize round-once error state on this stream before graph capture")
+            raise RuntimeError("initialize the step error state on this stream before graph capture")
         error = torch.zeros((), dtype=torch.int32, device=device)
         _buffers[key] = error
     return error
@@ -50,7 +48,10 @@ class ErrorCheck:
         for flag in self.host_flags:
             word |= int(flag.item())
         if word:
-            raise ValueError("; ".join(text for bit, text in MESSAGES if word & bit) or MESSAGE)
+            raise ValueError(
+                "; ".join(text for bit, text in MESSAGES if word & bit)
+                or f"device step error word {word:#x}"
+            )
 
 
 def copy_error_flags(

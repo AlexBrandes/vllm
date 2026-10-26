@@ -55,14 +55,14 @@ sanitised anyway.
 
 Only bf16, two or four ranks, compute capability 8.0 and the opt-in PCIe
 peer-to-peer custom all-reduce. Messages above
-VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES (default 256 KiB, the largest measured)
-and other dtypes keep the incumbent kernel.
+allreduce/flags_max_bytes in the sm80 tuning table (default 256 KiB, the
+largest measured) and other dtypes keep the incumbent kernel.
 
 Safety
 ------
 A wait never gives up quietly. Every wait is bounded by
-VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S (default 60 s, measured on the GPU's
-global timer, far above any normal skew between ranks). On overrun the
+:data:`WAIT_S` (60 s, measured on the GPU's global timer, far above any
+normal skew between ranks). On overrun the
 first timed-out thread writes rank, call, stage, size, phase, the awaited
 peer and the wait time into a host-mapped error record and the kernel
 executes a trap, so the CUDA context fails and no partial result is ever
@@ -526,11 +526,14 @@ def load_module():
     return _MODULE
 
 
+# Longest a flags-in-data all-reduce waits for a peer before it records the
+# overrun and traps (the process then exits with the record logged).
+WAIT_S = 60.0
+
+
 def wait_limit_ns() -> int:
-    s = float(envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S)
-    if not s > 0:
-        raise ValueError(f"VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S must be > 0, got {s}")
-    return int(s * 1e9)
+    """:data:`WAIT_S` in nanoseconds, read at call time."""
+    return int(WAIT_S * 1e9)
 
 
 _PHASES = {1: "reduce-scatter", 2: "all-gather"}
@@ -542,7 +545,7 @@ def describe(rec) -> str | None:
         return None
     return (
         "Custom all-reduce flags-in-data wait timed out on rank %d after %.1f s "
-        "(limit %.1f s, VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S): call %d, stage %d, "
+        "(limit %.1f s, custom_all_reduce_flags.WAIT_S): call %d, stage %d, "
         "%d packs, %s wait for rank %d (block %d, thread %d). The kernel trapped "
         "instead of returning a partial result; rank %d never delivered its data."
         % (rec[1], rec[7] / 1e9, rec[10] / 1e9, rec[3], rec[2], rec[4],
