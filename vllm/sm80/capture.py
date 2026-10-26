@@ -19,12 +19,12 @@ file
 step, bytes, saved, path, sha256). ``point`` names the operator the call
 went through (the family id of the FP64 case driver where it has one).
 
-Eager calls (prefill steps, decode steps outside a CUDA graph) are copied to
-the host right after the call. Calls inside a FULL CUDA graph are recorded
+Eager calls (prefill steps, decode steps outside a CUDA graph) copy snapshots
+directly to the host at each capture point. FULL CUDA graph calls are recorded
 inside the graph: while a graph is captured, a selected call's copies are
-captured with it (device copies into the graph's memory pool, in stream
+captured with it (asynchronous copies into pinned host buffers, in stream
 order, so on every replay they hold exactly what the graph's kernels read
-and wrote), and after a replay of that graph the copies are read back. The
+and wrote), and after synchronizing a replay the host copies are read. The
 graph is the served one plus these copies; nothing it computes changes.
 Reading back waits for the stream: diagnostic boots only.
 
@@ -374,7 +374,10 @@ class Record:
     layout_fields: set[str] = field(default_factory=set)
 
     def put(self, *, preserve_layout: bool = False, **values: Any) -> Record:
-        """Copy values on their device, in stream order.
+        """Snapshot CUDA values directly into host memory in stream order.
+
+        Eager copies use owned pageable memory and complete before returning.
+        Graph copies use pinned memory and complete at drain.
 
         Linked producer outputs may opt into their original strides. Only the
         span from the first to last addressed element is retained, with its
@@ -387,7 +390,16 @@ class Record:
                 value = value.detach()
                 if preserve_layout:
                     self.layout_fields.add(name)
-                if preserve_layout and not value.is_contiguous():
+                if value.is_cuda:
+                    shape, stride = value.shape, value.stride()
+                    # A non-dense D2H copy otherwise packs through a CUDA temporary.
+                    # Transfer its flat span and leave any export packing to the host.
+                    if not value.is_contiguous():
+                        value = _flat_span(value)
+                    snapshot = torch.empty_like(value, device="cpu", pin_memory=self.in_graph)
+                    snapshot.copy_(value, non_blocking=self.in_graph)
+                    value = snapshot.as_strided(shape, stride)
+                elif preserve_layout and not value.is_contiguous():
                     value = _flat_span(value).clone().as_strided(value.shape, value.stride())
                 else:
                     value = value.clone()
@@ -500,9 +512,12 @@ def _flat_span(value: torch.Tensor) -> torch.Tensor:
 def _host(value: Any, *, preserve_layout: bool = False) -> Any:
     if not isinstance(value, torch.Tensor):
         return value
+    # Graph replay overwrites pinned snapshots; materialized records own their data.
+    copy = value.device.type == "cpu" and value.is_pinned()
     if preserve_layout and not value.is_contiguous():
-        return _flat_span(value).cpu().as_strided(value.shape, value.stride())
-    return value.cpu()
+        return _flat_span(value).to(device="cpu", copy=copy).as_strided(value.shape, value.stride())
+    return value.to(device="cpu", copy=copy or not value.is_contiguous(),
+                    memory_format=torch.contiguous_format)
 
 
 def _write(

@@ -158,6 +158,7 @@ def test_hybrid_mutating_snapshot_still_keeps_pre_post_and_guard_blocks(monkeypa
     saved = record.materialize()
     ids = saved["snapshot_blocks"]
     assert set(ids.tolist()) == {0, 1, 2, 3}
+    assert saved[name].shape[0] == 4
     assert torch.equal(saved[name], before[ids])
     assert torch.equal(saved["out.ring" if op == "compress_rows" else "out"], after[ids])
     assert record.meta["parents"][input_name]["call_id"] == records[0].meta["call_id"]
@@ -333,3 +334,16 @@ def test_hybrid_storage_identity_rejects_stale_entries(monkeypatch):
     gc.collect()
     assert reference() is None and entry[1].expired()
     assert hybrid._link(other) is None
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+def test_pageable_snapshot_exports_only_required_storage(preserve):
+    owned = torch.arange(74, dtype=torch.float32).as_strided((8, 4), (10, 1))
+    record = Record("hybrid", "snapshot", "layer", 8, {}, tensors={"x": owned})
+    if preserve:
+        record.layout_fields.add("x")
+    exported = record.materialize()["x"]
+    assert torch.equal(exported, owned)
+    expected_elements = 74 if preserve else 32
+    assert exported.untyped_storage().nbytes() == expected_elements * owned.element_size()
+    assert exported.stride() == ((10, 1) if preserve else (4, 1))
