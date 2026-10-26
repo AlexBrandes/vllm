@@ -29,8 +29,10 @@ itself, so the unflagged path is byte-identical rather than merely equivalent.
 
 The M bound
 -----------
-``VLLM_THIN_GEMM_MAX_TOKENS`` defaults to **32**, which is measured, not
-assumed. Count-weighted step time over the whole 16-shape table:
+The largest M per weight [N, K] is the ``dense_gemm/thin_max_rows`` row of the
+sm80 tuning table (``vllm/sm80/tuning.py``); without a row it is **32**, which
+is measured, not assumed. Count-weighted step time over the whole 16-shape
+table:
 
 ===== ============ ========= ======== ==============
     M    candidate    cuBLAS    ratio  shapes losing
@@ -63,6 +65,7 @@ import torch
 
 from vllm import envs
 from vllm.platforms import current_platform
+from vllm.sm80 import tuning
 
 # Below this K the weight is too small to amortise the launch and cuBLAS wins
 # outright; also keeps the split-K heuristic out of its degenerate corner.
@@ -70,8 +73,8 @@ _MIN_K = 128
 
 __all__ = [
     "ampere_thin_gemm",
-    "dispatch_threshold",
     "impl",
+    "max_rows",
     "thin_gemm_supported",
     "thin_linear",
     "use_ampere_thin_gemm",
@@ -106,9 +109,13 @@ def impl():
     return thin_gemm_v74
 
 
-def dispatch_threshold() -> int:
-    """Largest M dispatched to the kernel; see the table in the module docstring."""
-    return envs.VLLM_THIN_GEMM_MAX_TOKENS
+def max_rows(n: int, k: int) -> int:
+    """Largest M dispatched to the kernel for an [n, k] weight: the
+    dense_gemm/thin_max_rows row of the sm80 tuning table, else the 32 of the
+    table in the module docstring."""
+    return tuning.lookup(
+        "dense_gemm", "thin_max_rows", {"gemm_n": int(n), "gemm_k": int(k)}, 32
+    )
 
 
 # (N, K) -> smallest M sent to cuBLAS instead. Measured under pipeline
@@ -139,7 +146,7 @@ def thin_gemm_supported(
         and weight.stride(1) == 1
         and x.shape[1] == weight.shape[1]
         and x.shape[1] >= _MIN_K
-        and x.shape[0] <= dispatch_threshold()
+        and x.shape[0] <= max_rows(weight.shape[0], weight.shape[1])
         and x.shape[0] < _CUBLAS_FROM_M.get(tuple(weight.shape), 1 << 30)
     )
 

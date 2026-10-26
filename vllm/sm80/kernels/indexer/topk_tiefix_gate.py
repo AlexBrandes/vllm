@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Host side of the indexer top-k tie fix (``VLLM_GLM5_TOPK_TIEFIX``, with
-``VLLM_GLM5_TOPK_SORTED`` and ``VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS``).
+``VLLM_GLM5_TOPK_SORTED`` and the split row bound, the topk_select/split_rows
+row of the sm80 tuning table).
 
 The GLM kpool sparse indexer (``vllm/models/glm5next/nvidia/sparse_indexer.py``)
 asks these after its prefill top-k and after its decode top-k
@@ -16,6 +17,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
+from vllm.sm80 import tuning
 
 logger = init_logger(__name__)
 
@@ -69,26 +71,26 @@ def use_tiefix_topk() -> bool:
 
 
 @functools.cache
-def tiefix_split_rows() -> int:
-    """Row bound of the split tie fix + sort (VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS;
-    0 = off). Only meaningful with the tie fix and the sort both on. Read
-    once per process; tests call cache_clear."""
-    import vllm.envs as envs
-
-    rows = max(0, int(envs.VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS))
+def tiefix_split_rows(top_k: int) -> int:
+    """Row bound of the split tie fix + sort at ``top_k`` selected slots per
+    row (the topk_select/split_rows row of the sm80 tuning table; 0 = off,
+    the default). Only meaningful with the tie fix and the sort both on. Read
+    once per process and width; tests call cache_clear."""
+    rows = max(0, tuning.lookup("topk_select", "split_rows", {"top_k": top_k}, 0))
     if rows and not (use_tiefix_topk() and use_sorted_topk()):
         logger.info_once(
-            "GLM-5 split tie-fix scan NOT active: VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS "
-            "needs VLLM_GLM5_TOPK_TIEFIX=1 and VLLM_GLM5_TOPK_SORTED=1"
+            "GLM-5 split tie-fix scan NOT active: the topk_select/split_rows "
+            "row needs VLLM_GLM5_TOPK_TIEFIX=1 and VLLM_GLM5_TOPK_SORTED=1"
         )
         return 0
     if rows:
         logger.info_once(
             "GLM-5 split tie-fix scan active: batches of at most %d rows over "
             "wide logits run the tie fix + sort over (row, chunk) programs "
-            "(VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS=%d; set 0 to disable)",
+            "(topk_select/split_rows = %d at top_k %d in the sm80 tuning table)",
             rows,
             rows,
+            top_k,
         )
     return rows
 
@@ -113,7 +115,9 @@ def tiefix_topk_(
     )
 
     split = sort and use_split(
-        topk_indices.shape[0], logits.shape[1], tiefix_split_rows()
+        topk_indices.shape[0],
+        logits.shape[1],
+        tiefix_split_rows(int(topk_indices.shape[1])),
     )
     return topk_tiefix_(
         logits,

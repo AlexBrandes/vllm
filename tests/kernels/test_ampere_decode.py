@@ -31,6 +31,7 @@ if pytest is None:  # minimal stand-ins so the module still imports and runs
 
     pytest = _Pytest()
 
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels import _platform
 from vllm.sm80.kernels.mhc import use_ampere_mhc_decode_v3
 from vllm.sm80.kernels.moe import use_ampere_moe_routing
@@ -161,11 +162,19 @@ def test_kda_bound(on):
     assert use_ampere_kda_decode_v2(9, 36, KDA_HEADS, KDA_DIM) is False
 
 
-def test_bounds_are_configurable(on):
-    on.setenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", "8")
+def test_bounds_are_tuning_rows(on):
+    use_rows(on)
+    assert use_ampere_mhc_decode_v3(16, HC, HIDDEN) is True
+    assert use_ampere_moe_routing(8, EXPERTS, TOPK) is True
+    use_rows(
+        on,
+        ("mhc", "decode_v2_max_rows", {"hidden": HIDDEN, "hc_mult": HC}, 8),
+        ("moe_router", "fused_route_max_rows", {"top_k": TOPK}, 4),
+    )
     assert use_ampere_mhc_decode_v3(16, HC, HIDDEN) is False
-    on.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "4")
+    assert use_ampere_mhc_decode_v3(8, HC, HIDDEN) is True
     assert use_ampere_moe_routing(8, EXPERTS, TOPK) is False
+    assert use_ampere_moe_routing(4, EXPERTS, TOPK) is True
 
 
 # ------------------------------------------------------- per-family contracts

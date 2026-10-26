@@ -21,6 +21,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.mhc import decode as v3
 from vllm.sm80.kernels.mhc import use_ampere_mhc_decode_v3
 
@@ -39,7 +40,7 @@ def clean(monkeypatch):
     from vllm.sm80.kernels import _platform
 
     monkeypatch.delenv("VLLM_GLM5_DECODE_MHC_V2", raising=False)
-    monkeypatch.delenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", raising=False)
+    use_rows(monkeypatch)
     monkeypatch.setattr(_platform, "_SM80_CACHE", True)
 
 
@@ -72,8 +73,13 @@ def test_gate_range_is_1_to_32(monkeypatch):
         assert _gate(m) is True, m
     for m in (0, 33, 64, 1152):
         assert _gate(m) is False, m
-    monkeypatch.setenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", "8")
+    use_rows(
+        monkeypatch,
+        ("mhc", "decode_v2_max_rows", {"hidden": HIDDEN, "hc_mult": HC}, 8),
+    )
     assert _gate(8) is True and _gate(9) is False
+    # Keyed by the shape: another hidden size keeps the default 32.
+    assert _gate(9, hidden=2048) is True
 
 
 def test_gate_shape_conditions(monkeypatch):

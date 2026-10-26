@@ -35,6 +35,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sm80 import capture
+from vllm.sm80 import tuning
 from vllm.sm80.kernels.exl3.hybrid import (
     EXL3,
     UNQUANTIZED,
@@ -1057,7 +1058,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         max_rows = dispatched_rows(prepare, self.moe)
         # Its workspace holds one moe_out launch, which may be a row chunk.
-        moe_out_rows = moe_out_launch_rows(max_rows)
+        moe_out_rows = moe_out_launch_rows(max_rows, self.hidden_size)
         workspace = exl3_ops.moe_workspace_size(
             moe_out_rows,
             self.hidden_size,
@@ -1098,8 +1099,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if moe_out_rows < max_rows:
             logger.info_once(
                 "EXL3 moe_out runs MoE calls of more than %d rows in chunks of "
-                "at most %d (VLLM_EXL3_MOE_CHUNK_ROWS); its workspace holds %d "
-                "rows instead of %d.",
+                "at most %d (moe_routed_gemm/exl3_chunk_rows); its workspace "
+                "holds %d rows instead of %d.",
                 moe_out_rows,
                 moe_out_rows,
                 moe_out_rows,
@@ -1485,7 +1486,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.workspace_elements = workspace
         self.max_rows = max_rows
         # moe_out takes at most this many rows per launch (its workspace size;
-        # VLLM_EXL3_MOE_CHUNK_ROWS); larger calls run in chunks.
+        # moe_routed_gemm/exl3_chunk_rows); larger calls run in chunks.
         self.moe_out_rows = max_rows if moe_out_rows is None else moe_out_rows
         # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2) with
         # the layer's routed-matrix bits_x2.
@@ -1754,14 +1755,17 @@ def _unaligned_trellis_reason(pointers) -> str | None:
     return None
 
 
-def moe_out_launch_rows(max_rows: int) -> int:
+def moe_out_launch_rows(max_rows: int, hidden: int) -> int:
     """Most rows one moe_out launch takes for calls of up to ``max_rows``
-    rows: VLLM_EXL3_MOE_CHUNK_ROWS when it is set and smaller (larger calls
-    then run in row chunks), else ``max_rows``."""
-    chunk_rows = envs.VLLM_EXL3_MOE_CHUNK_ROWS
+    rows: the moe_routed_gemm/exl3_chunk_rows row of the sm80 tuning table at
+    this hidden size when it is nonzero and smaller (larger calls then run in
+    row chunks), else ``max_rows``. Without a row, 0: whole calls."""
+    chunk_rows = tuning.lookup(
+        "moe_routed_gemm", "exl3_chunk_rows", {"hidden": int(hidden)}, 0
+    )
     if chunk_rows < 0:
         raise ValueError(
-            f"VLLM_EXL3_MOE_CHUNK_ROWS must be 0 or positive, not {chunk_rows}"
+            f"moe_routed_gemm/exl3_chunk_rows must be 0 or positive, not {chunk_rows}"
         )
     return min(max_rows, chunk_rows) if chunk_rows else max_rows
 

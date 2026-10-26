@@ -21,14 +21,11 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_ALLREDUCE_PCIE_P2P: bool = False
     VLLM_CUSTOM_ALLREDUCE_ALGO: str = ""
     VLLM_CUSTOM_ALLREDUCE_FLAGS: bool = False
-    VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES: int = 262144
     VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S: float = 60.0
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE: bool = False
-    VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
-    VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT: float = 2.0
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
     VLLM_AMPERE_KDA_PREFILL_WIDE: bool = False
     VLLM_STATE_INDEX_CHECK: bool = False
@@ -36,10 +33,7 @@ if TYPE_CHECKING:
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
-    VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
-    VLLM_MOE_MASK_PADDING_MAX_TOKENS: int = 8
     VLLM_MOE_DECODE_ROUTE_V2: bool = False
-    VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS: int = 32
     VLLM_GLM5_DECODE_KDA_WIDE: bool = True
     VLLM_AMPERE_KDA_FOLD: bool = False
     VLLM_AMPERE_KDA_RECOVER_OFF: bool = False
@@ -51,7 +45,6 @@ if TYPE_CHECKING:
     VLLM_MOE_DETERMINISTIC_ALIGN: int = 0
     VLLM_GLM5_TOPK_SORTED: bool = False
     VLLM_GLM5_TOPK_TIEFIX: bool = False
-    VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS: int = 0
     VLLM_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_THIN_GEMM: bool = False
@@ -68,7 +61,6 @@ if TYPE_CHECKING:
     VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB: int = 0
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_PLAN_LOG: bool = False
-    VLLM_THIN_GEMM_MAX_TOKENS: int = 32
     VLLM_THIN_GEMM_CONCAT: bool = False
     VLLM_THIN_GEMM_GLUON: bool = False
     VLLM_THIN_GEMM_GLUON_FORCE_M: int = 0
@@ -81,18 +73,14 @@ if TYPE_CHECKING:
     VLLM_PP_DRAFT_TAIL_STAGE: int = -1
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
     VLLM_AMPERE_MARLIN_PREFILL_WIDE: bool = False
-    VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED: bool = False
     VLLM_AMPERE_MARLIN_PREFILL_NARROW: bool = False
-    VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_AMPERE_MARLIN_DECODE_CUDA: bool = False
     VLLM_AMPERE_MARLIN_DECODE_V2: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
-    VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_ROUND_ONCE_ALLREDUCE_GROUPED: bool = False
-    VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_EXL3_DENSE_SPLITK: bool = False
     VLLM_EXL3_DENSE_MMA: bool = False
     VLLM_EXL3_DENSE_MMA_SHAPE_OVERRIDE: str = ""
@@ -148,7 +136,6 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
-    VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
     VLLM_SM80_CAPTURE_DIR: str = ""
     VLLM_SM80_CAPTURE_FAMILIES: str = "dense,moe,attn"
     VLLM_SM80_CAPTURE_MATCH: str = ""
@@ -159,6 +146,7 @@ if TYPE_CHECKING:
     VLLM_SM80_CAPTURE_PREFILL_PER_KEY: int = 0
     VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS: int = 65
     VLLM_SM80_CAPTURE_MAX_MB: int = 4096
+    VLLM_SM80_TUNING_FILE: str = ""
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
     VLLM_DEV_AB_SWITCH: str = ""
@@ -174,18 +162,6 @@ def _env_with_choices(*args: Any, **kwargs: Any) -> Callable[[], str | None]:
     from vllm.envs import env_with_choices
 
     return env_with_choices(*args, **kwargs)
-
-
-def _glm5_route_v2_max_tokens() -> int:
-    """VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS, rejected above 64: the fused
-    router (vllm/sm80/kernels/moe/route.py) has no path for more rows."""
-    value = int(os.getenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "32"))
-    if value > 64:
-        raise ValueError(
-            f"VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS={value} exceeds 64, the "
-            "most rows the sm_80 fused MoE router handles"
-        )
-    return value
 
 
 def _custom_allreduce_algo() -> str:
@@ -239,8 +215,9 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # whitespace stripping, raising on anything else the way the kernel
     # throws at its first all-reduce.
     "VLLM_CUSTOM_ALLREDUCE_ALGO": lambda: _custom_allreduce_algo(),
-    # Flags-in-data two-shot all-reduce for bf16 messages up to
-    # VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES at TP2 or TP4 over PCIe peer-to-peer
+    # Flags-in-data two-shot all-reduce for bf16 messages up to the
+    # allreduce/flags_max_bytes row of the sm80 tuning table at TP2 or TP4 over
+    # PCIe peer-to-peer
     # (vllm/sm80/distributed/custom_all_reduce_flags.py). Bitwise identical to
     # cross_device_reduce_2stage at TP4 (the kernel it replaces only under
     # VLLM_CUSTOM_ALLREDUCE_ALGO=2stage; the default one-stage kernel sums in a
@@ -248,9 +225,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Off unless set.
     "VLLM_CUSTOM_ALLREDUCE_FLAGS": lambda: bool(
         int(os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", "0"))
-    ),
-    "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES": lambda: int(
-        os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", "262144")
     ),
     # Longest a flags-in-data all-reduce waits for a peer before it records
     # the overrun and traps (the process then exits with the record logged).
@@ -276,11 +250,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": lambda: bool(
         int(os.getenv("VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE", "0"))
     ),
-    # Token threshold. Below it the upstream kernels win (they are tuned for
-    # decode shapes) and every captured CUDA graph keeps the upstream kernel.
-    "VLLM_GLM5_PREFILL_MIN_TOKENS": lambda: int(
-        os.getenv("VLLM_GLM5_PREFILL_MIN_TOKENS", "512")
-    ),
     # DSA indexer decode logits (vllm/sm80/kernels/attention/triton_mqa_logits.py,
     # Triton path) on sm_80: dequantize the e4m3 K tiles by bit placement
     # (raw bf16 = value * 2^-120, 2^60 folded into Q and the head weights)
@@ -295,14 +264,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # (vllm/sm80/kernels/attention/triton_mqa_logits.py) for their pure-torch
     # references.
     "VLLM_INDEXER_DSA_REF": lambda: os.getenv("VLLM_INDEXER_DSA_REF", "0") == "1",
-    # Sparse MLA only: require seq_kv >= this multiple of index_topk. The tuned
-    # kernel wins by manufacturing L2 reuse across queries; when the context is
-    # barely larger than top-k almost every row is selected by almost every
-    # query, so it is L2-resident already and the extra index arithmetic costs
-    # ~7 % (measured 0.93x at ctx 2304 / topk 2048, 1.39x at ctx 8192).
-    "VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT": lambda: float(
-        os.getenv("VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT", "2.0")
-    ),
     # Predicate the row gather of the sm_80 sparse-MLA prefill kernel
     # (vllm/sm80/kernels/attention/sparse_prefill_mla.py) on the index mask, so that
     # invalid (-1) top-k slots fetch nothing instead of all reading cache row
@@ -371,40 +332,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         "VLLM_GLM5_DECODE_IDX_GLUE_PARTS", "weights,glue,fwht,cache,moesum"
     ),
     # mHC v3 (vllm/sm80/kernels/mhc/decode.py): one implementation for
-    # 1 <= M <= VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS that replaces TileLang in
-    # that range. Off by default; needs VLLM_AMPERE_DECODE_KERNELS=1 as well.
+    # 1 <= M <= the mhc/decode_v2_max_rows row of the sm80 tuning table that
+    # replaces TileLang in that range. Off by default; needs
+    # VLLM_AMPERE_DECODE_KERNELS=1 as well.
     "VLLM_GLM5_DECODE_MHC_V2": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_MHC_V2", "0"))
-    ),
-    "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS", "32")
-    ),
-    # Row bound shared by the sm_80 fused MoE router (use_ampere_moe_routing)
-    # and the MoE padding mask. The router never dispatches above it: 8 is the
-    # top of its measured win region (0.93x at M=32), not a shared cap; mHC's
-    # is VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS. The fused KDA decode step has no
-    # token bound of its own; its shape gate is use_ampere_kda_decode_v2 in
-    # vllm/models/glm5next/nvidia/ops/kda_decode.py, where the per-M table also
-    # lives. With VLLM_MOE_MASK_PADDING=1, batches of up to this many rows are
-    # left unmasked whether or not VLLM_AMPERE_DECODE_KERNELS is on (the fused
-    # router hands its own block alignment over for them); set 0 to mask every
-    # batch.
-    "VLLM_MOE_MASK_PADDING_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "8")
     ),
     # Opt in to vllm/sm80/kernels/moe/route.py: the MoE router GEMV, the
     # sigmoid/bias top-k and the Marlin block alignment as one op (one launch
     # for 2 <= M <= 64), replacing GateLinear's cuBLAS split-K GEMM + reduce and
     # the routing kernels. Needs VLLM_AMPERE_DECODE_KERNELS=1 as well. Default
     # OFF: with it unset nothing in vllm/sm80/kernels/moe/route.py is imported
-    # or called.
+    # or called. Its row bound is the moe_router/route_v2_max_rows row of the
+    # sm80 tuning table (at most 64).
     "VLLM_MOE_DECODE_ROUTE_V2": lambda: bool(
         int(os.getenv("VLLM_MOE_DECODE_ROUTE_V2", "0"))
     ),
-    # Upper token bound for VLLM_MOE_DECODE_ROUTE_V2: the largest decode
-    # batch it was validated and timed at (M = 1..32, 33 validated). Values
-    # above 64, the most rows the fused router covers, are rejected.
-    "VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS": lambda: _glm5_route_v2_max_tokens(),
     # Kill switch for the fused KDA decode step at 64 heads per card (pipeline
     # parallel) beyond one sequence of up to 5 tokens: with 1 (default) the
     # 64-head layout takes vllm/models/glm5next/nvidia/ops/kda_decode.py at every
@@ -496,21 +439,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_TOPK_TIEFIX": lambda: bool(
         int(os.getenv("VLLM_GLM5_TOPK_TIEFIX", "0"))
     ),
-    # With VLLM_GLM5_TOPK_TIEFIX and VLLM_GLM5_TOPK_SORTED both set: for
-    # batches of at most this many rows over wide logits (decode at small
-    # concurrency over a long context), run the tie fix + sort as two launches
-    # over (row, chunk) instead of one program per row, so a few long rows
-    # use many SMs. Same bytes. 0 (default) = off: one program per row.
-    "VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS": lambda: int(
-        os.getenv("VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS", "0")
-    ),
     # Route the padding rows of a padded batch (CUDA-graph sizes) to no
     # expert (topk_ids = -1) before the fused MoE. Their hidden states come
     # from stale input buffers, and where they land in the expert blocks
     # changes how Marlin splits K for the real rows next to them, so the same
     # request otherwise gets last-bit different MoE outputs depending on what
     # ran before. Uses the forward context's is_padding mask; batches of up to
-    # VLLM_MOE_MASK_PADDING_MAX_TOKENS rows are left unmasked. Default OFF.
+    # the moe_router/fused_route_max_rows row of the sm80 tuning table are left
+    # unmasked. Default OFF.
     "VLLM_MOE_MASK_PADDING": lambda: bool(
         int(os.getenv("VLLM_MOE_MASK_PADDING", "0"))
     ),
@@ -705,15 +641,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # per list (vllm/sm80/kernels/marlin_moe/prefill.py). Same compiled
     # Marlin kernels; the split cover changes stream-K boundaries and reduction
     # order, so output is not bitwise equal to fused_marlin_moe. Taken only
-    # for M >= VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS on exactly that
-    # configuration; everything else keeps fused_marlin_moe (TP4, N=512, has
-    # its own switch, VLLM_AMPERE_MARLIN_PREFILL_NARROW).
+    # for M >= the moe_prefill/marlin_min_rows row of the sm80 tuning table on
+    # exactly that configuration; everything else keeps fused_marlin_moe (TP4,
+    # N=512, has its own switch, VLLM_AMPERE_MARLIN_PREFILL_NARROW).
     # Off by default.
     "VLLM_AMPERE_MARLIN_PREFILL_WIDE": lambda: bool(
         int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE", "0"))
-    ),
-    "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
-        os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "384")
     ),
     # With VLLM_AMPERE_MARLIN_PREFILL_WIDE: run the split-list Marlin GEMMs of
     # the whole-expert (N=2048) prefill through the optional library's
@@ -729,14 +662,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     ),
     # The same split-block Marlin MoE prefill under tensor parallel 4 (each
     # card holds all 288 experts sharded to N=512): taken only for M >=
-    # VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS with N=512 and otherwise the
-    # conditions of VLLM_AMPERE_MARLIN_PREFILL_WIDE. Its own switch so the two
-    # layouts are judged separately. Off by default.
+    # the moe_prefill/marlin_min_rows row of the sm80 tuning table at N=512 and
+    # otherwise the conditions of VLLM_AMPERE_MARLIN_PREFILL_WIDE. Its own
+    # switch so the two layouts are judged separately. Off by default.
     "VLLM_AMPERE_MARLIN_PREFILL_NARROW": lambda: bool(
         int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "0"))
-    ),
-    "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
-        os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
     ),
     # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
     # requires vllm._ampere_marlin_C; startup fails if it is missing or
@@ -763,15 +693,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS", "0"))
     ),
     # Whole-expert (N=2048) compiled decode for multi-request batches, at the
-    # row ranges of _ROWS ("lo-hi[,lo-hi...]" within 9..64; default 9-32, the
-    # most rows one PP4 step verifies with DEPTHS 7,5 and 8 sequences). The
-    # N=2048 scratch grows to the largest row count named there.
+    # rows 9 up to the moe_routed_gemm/marlin_multi_max_rows row of the sm80
+    # tuning table (at most 64; default 32, the most rows one PP4 step verifies
+    # with DEPTHS 7,5 and 8 sequences). The N=2048 scratch grows to that row
+    # count.
     "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": lambda: bool(
         int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MULTI", "0"))
     ),
-    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS": lambda: os.getenv(
-        "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS", "9-32"
-    ).strip(),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
     # VLLM_CUSTOM_ALLREDUCE_PCIE_P2P is also set *and* peer access is
@@ -794,22 +722,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vllm/sm80/distributed/round_once_all_reduce.py.
     "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED": lambda: bool(
         int(os.getenv("VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "0"))
-    ),
-    # Largest message the host path serves; anything above goes to NCCL. 512 KiB
-    # is where the measured curve stops paying: at 8-256 KiB the host path is
-    # 1.06-2.04x NCCL, while prefill-sized messages (>= 2 MiB) already run near
-    # PCIe wire speed on the ring and must not be taken away from it.
-    "VLLM_HOST_ALLREDUCE_MAX_SIZE": lambda: int(
-        os.getenv("VLLM_HOST_ALLREDUCE_MAX_SIZE", str(512 * 1024))
-    ),
-    # Never dispatch above this M (= num_seqs * (1 + num_spec)). 32 is measured,
-    # and it is a cudagraph capture size, so the bound lands exactly on one.
-    # Count-weighted over the whole shape table: M=32 is 1.157x with 0 of 16
-    # shapes losing, M=40 is 0.799x with 10 of 16 losing. Raising it one capture
-    # size costs ~43 % of the step. Re-run the token-bound measurements before
-    # touching this.
-    "VLLM_THIN_GEMM_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_THIN_GEMM_MAX_TOKENS", "32")
     ),
     # Run each MLA layer's two thin-GEMM concat groups (q_b_proj + the
     # indexer's wq_b on q_c; fused_qkv_a_proj + the indexer's kpool gate on
@@ -1365,13 +1277,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
     ),
 
-    # EXL3 routed experts: moe_out runs MoE calls of more than this many rows
-    # in row chunks of at most this many, so its workspace is sized for one
-    # chunk (vllm/sm80/kernels/exl3/quant.py). moe_out computes every row from
-    # its own input, so the output bits do not change. Default 0: whole calls.
-    "VLLM_EXL3_MOE_CHUNK_ROWS": lambda: int(
-        os.getenv("VLLM_EXL3_MOE_CHUNK_ROWS", "0")
-    ),
     # Diagnostic: a directory to which selected served kernel calls (inputs
     # and outputs) are saved (vllm/sm80/capture.py). Saving waits for the
     # stream: diagnostic boots only. Default empty: nothing is captured and
@@ -1412,6 +1317,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_SM80_CAPTURE_MAX_MB": lambda: int(
         os.getenv("VLLM_SM80_CAPTURE_MAX_MB", "4096")
     ),
+    # Diagnostic: the path of a size cut-off table (schema sm80-tuning/1, see
+    # vllm/sm80/tuning.py) read instead of the card's own table in
+    # vllm/sm80/tuning/, for tuning runs. Unset by default.
+    "VLLM_SM80_TUNING_FILE": lambda: os.getenv("VLLM_SM80_TUNING_FILE", ""),
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
         int(os.getenv("VLLM_QWEN4_ROUTER_FP32", "0"))
@@ -1444,23 +1353,26 @@ RETIRED_ENV_VARS: dict[str, str] = {
         "sm_80 worker)"
     ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": (
-        "renamed to VLLM_MOE_MASK_PADDING_MAX_TOKENS, which is now also the MoE "
-        "padding mask cutoff whether or not VLLM_AMPERE_DECODE_KERNELS is on"
+        "moved to the sm80 tuning table, moe_router/fused_route_max_rows"
     ),
     "VLLM_GLM5_FLA_PIN_AUTOTUNE": "renamed to VLLM_FLA_PIN_AUTOTUNE",
     "VLLM_GLM5_HOST_ALLREDUCE": "renamed to VLLM_HOST_ALLREDUCE",
-    "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": "renamed to VLLM_HOST_ALLREDUCE_MAX_SIZE",
+    "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": (
+        "moved to the sm80 tuning table, allreduce/host_max_bytes"
+    ),
     "VLLM_GLM5_MEM_ATTRIBUTION": "renamed to VLLM_MEM_ATTRIBUTION",
     "VLLM_GLM5_MOE_MASK_PADDING": (
         "renamed to VLLM_MOE_MASK_PADDING. Batches of up to "
-        "VLLM_MOE_MASK_PADDING_MAX_TOKENS rows (default 8) are now left unmasked "
-        "even with VLLM_AMPERE_DECODE_KERNELS off; set that cutoff to 0 to mask "
-        "every batch"
+        "moe_router/fused_route_max_rows rows of the sm80 tuning table (default "
+        "8) are now left unmasked even with VLLM_AMPERE_DECODE_KERNELS off; a "
+        "row of 0 masks every batch"
     ),
     "VLLM_GLM5_SHARED_EXPERT_REORDER": "renamed to VLLM_SHARED_EXPERT_REORDER",
     "VLLM_GLM5_STATE_INDEX_CHECK": "renamed to VLLM_STATE_INDEX_CHECK",
     "VLLM_GLM5_THIN_GEMM": "renamed to VLLM_THIN_GEMM",
-    "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": "renamed to VLLM_THIN_GEMM_MAX_TOKENS",
+    "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": (
+        "moved to the sm80 tuning table, dense_gemm/thin_max_rows"
+    ),
     "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE": (
         "renamed to VLLM_CUSTOM_ALLREDUCE_PCIE_P2P"
     ),
@@ -1533,7 +1445,7 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_GLM5_DECODE_MHC_MAX_TOKENS": (
         "removed with the v1 sm_80 mHC decode kernel; the v3 bound is "
-        "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS"
+        "mhc/decode_v2_max_rows in the sm80 tuning table"
     ),
     "VLLM_GLM5_DECODE_MHC_V3": (
         "removed; v3 is the only sm_80 mHC decode kernel, opted in with "
@@ -1557,7 +1469,7 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "THIN_GEMM_MAX_M": (
         "removed; it was read only by uncalled code. The thin GEMM bound is "
-        "VLLM_THIN_GEMM_MAX_TOKENS"
+        "dense_gemm/thin_max_rows in the sm80 tuning table"
     ),
     "VLLM_KV_SWA_INFLIGHT_SCRATCH": (
         "removed; the KV capacity report charges sliding-window in-flight "
@@ -1626,6 +1538,47 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_EXL3_EXPERT_REPLICAS_SHA256": "removed; no expert is replicated",
     "VLLM_DEEPSEEK_V41_WO_A_STRIDED": (
         "removed; the grouped wo_a GEMM reads the attention output directly"
+    ),
+    # Size cut-offs: tuned data per card and shape (vllm/sm80/tuning.py).
+    "VLLM_THIN_GEMM_MAX_TOKENS": (
+        "moved to the sm80 tuning table, dense_gemm/thin_max_rows"
+    ),
+    "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS": (
+        "moved to the sm80 tuning table, mhc/decode_v2_max_rows"
+    ),
+    "VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS": (
+        "moved to the sm80 tuning table, moe_router/route_v2_max_rows"
+    ),
+    "VLLM_MOE_MASK_PADDING_MAX_TOKENS": (
+        "moved to the sm80 tuning table, moe_router/fused_route_max_rows"
+    ),
+    "VLLM_GLM5_PREFILL_MIN_TOKENS": (
+        "moved to the sm80 tuning table, attention_prefill/sparse_mla_min_rows "
+        "and mhc/prefill_min_rows"
+    ),
+    "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS": (
+        "moved to the sm80 tuning table, moe_prefill/marlin_min_rows"
+    ),
+    "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": (
+        "moved to the sm80 tuning table, moe_prefill/marlin_min_rows"
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS": (
+        "moved to the sm80 tuning table, moe_routed_gemm/marlin_multi_max_rows"
+    ),
+    "VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT": (
+        "moved to the sm80 tuning table, attention_prefill/sparse_mla_min_ctx"
+    ),
+    "VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS": (
+        "moved to the sm80 tuning table, topk_select/split_rows"
+    ),
+    "VLLM_EXL3_MOE_CHUNK_ROWS": (
+        "moved to the sm80 tuning table, moe_routed_gemm/exl3_chunk_rows"
+    ),
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES": (
+        "moved to the sm80 tuning table, allreduce/flags_max_bytes"
+    ),
+    "VLLM_HOST_ALLREDUCE_MAX_SIZE": (
+        "moved to the sm80 tuning table, allreduce/host_max_bytes"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

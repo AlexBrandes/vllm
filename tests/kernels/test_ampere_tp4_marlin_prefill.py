@@ -33,13 +33,20 @@ import sys
 import pytest
 import torch
 
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
 
 FLAG = "VLLM_AMPERE_MARLIN_PREFILL_NARROW"
 PP_FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
-MIN_TOKENS = "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS"
-PP_MIN_TOKENS = "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS"
+
+
+def _min_rows(monkeypatch, **by_n):
+    """moe_prefill/marlin_min_rows rows, by expert width: _min_rows(n512=700)."""
+    use_rows(monkeypatch, *(
+        ("moe_prefill", "marlin_min_rows", {"gemm_n": int(n[1:])}, rows)
+        for n, rows in by_n.items()
+    ))
 
 
 def _helpers():
@@ -51,8 +58,6 @@ def _helpers():
          "E, TOPK, K, N, G = 288, 8, 4096, 512, 128"),
         ('FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"',
          'FLAG = "VLLM_AMPERE_MARLIN_PREFILL_NARROW"'),
-        ('MIN_TOKENS = "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS"',
-         'MIN_TOKENS = "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS"'),
     ):
         assert src.count(old) == 1, old
         src = src.replace(old, new)
@@ -67,7 +72,7 @@ def _helpers():
 
 hp = _helpers()
 E, TOPK, K, N = hp.E, hp.TOPK, hp.K, hp.N
-assert N == 512 and hp.FLAG == FLAG and hp.MIN_TOKENS == MIN_TOKENS
+assert N == 512 and hp.FLAG == FLAG
 gpu = hp.gpu
 weights = hp.weights          # the module fixture, at N=512
 
@@ -82,7 +87,7 @@ TP4_M = [640, 642, 1728, 1732, 3456, 3460]
 @pytest.fixture(autouse=True)
 def _pp_flag_off(monkeypatch):
     monkeypatch.delenv(PP_FLAG, raising=False)
-    monkeypatch.delenv(PP_MIN_TOKENS, raising=False)
+    use_rows(monkeypatch)
 
 
 # --------------------------------------------------------------------------
@@ -93,14 +98,12 @@ def test_flag_defaults(monkeypatch):
     import vllm.envs as envs
 
     monkeypatch.delenv(FLAG, raising=False)
-    monkeypatch.delenv(MIN_TOKENS, raising=False)
     assert envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW is False
-    assert envs.VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS == 384
+    assert pmp.min_rows(512) == 384
     from vllm.sm80 import envs as fork_envs  # typed declarations
 
     src = open(fork_envs.__file__).read()
     assert f"    {FLAG}: bool = False\n" in src
-    assert f"    {MIN_TOKENS}: int = 384\n" in src
 
 
 @pytest.mark.parametrize("pp,tp4,want", [
@@ -112,7 +115,7 @@ def test_flag_defaults(monkeypatch):
 def test_enabled_shapes(monkeypatch, pp, tp4, want):
     monkeypatch.setenv(PP_FLAG, pp)
     monkeypatch.setenv(FLAG, tp4)
-    monkeypatch.setenv(MIN_TOKENS, "700")
+    _min_rows(monkeypatch, n512=700)
     assert pmp.enabled_shapes() == want
 
 
@@ -210,7 +213,7 @@ def _maybe_args(M):
 
 def test_below_min_tokens_is_not_gated(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_rows(monkeypatch, n512=384)
     monkeypatch.setattr(pmp, "gate_reason", lambda *a, **k: pytest.fail("gate consulted"))
     assert pmp.maybe_apply(hp._layer(n=512), **_maybe_args(383)) is False
 
@@ -219,9 +222,8 @@ def test_tp4_min_tokens_applies_with_both_flags(monkeypatch):
     """PP threshold 384, TP4 threshold 1000: an N=512 call of 500 rows passes
     the open gate but stays on the incumbent (TP4's own threshold)."""
     monkeypatch.setenv(PP_FLAG, "1")
-    monkeypatch.setenv(PP_MIN_TOKENS, "384")
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "1000")
+    _min_rows(monkeypatch, n2048=384, n512=1000)
     seen = []
     monkeypatch.setattr(pmp, "gate_reason", lambda *a, **k: seen.append(1))
     monkeypatch.setattr(pmp, "run", lambda *a, **k: pytest.fail("split path ran"))
@@ -231,7 +233,7 @@ def test_tp4_min_tokens_applies_with_both_flags(monkeypatch):
 
 def test_open_gate_runs_the_split_path(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_rows(monkeypatch, n512=384)
     monkeypatch.setattr(pmp, "gate_reason", lambda *a, **k: None)
     monkeypatch.setattr(pmp, "_buffers", lambda *a, **k: {"t_max": 1 << 20})
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -333,7 +335,7 @@ def test_graph_replay_equals_eager_without_allocation_growth(weights, monkeypatc
     layer = _gpu_layer(weights)
     x, tw, ti = hp._inputs(M, 3)
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_rows(monkeypatch, n512=384)
     pmp.warmup(x.device, E, 3460, TOPK)
     eager = hp._apply(layer, weights, x, tw, ti, monkeypatch, "1")
     out = torch.empty_like(x)

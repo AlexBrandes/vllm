@@ -24,10 +24,11 @@ import sys
 
 import torch
 
+from tests.sm80.tuning_rows import use_rows
 from vllm import envs
 from vllm.sm80.kernels.thin_gemm import (
     ampere_thin_gemm,
-    dispatch_threshold,
+    max_rows,
     thin_gemm_supported,
     thin_linear,
     use_ampere_thin_gemm,
@@ -93,9 +94,10 @@ def test_kernel_module_not_imported_when_off():
 
 
 # ------------------------------------------------------- dispatch predicate
-def test_threshold_is_the_measured_value():
-    """32, and it is a cudagraph capture size."""
-    assert dispatch_threshold() == 32
+def test_threshold_is_the_measured_value(monkeypatch):
+    """32 without a tuning row, and it is a cudagraph capture size."""
+    use_rows(monkeypatch)
+    assert max_rows(4096, 4096) == 32
 
 
 def test_supported_in_win_region():
@@ -115,12 +117,18 @@ def test_rejected_above_threshold():
         assert not thin_gemm_supported(x, w, None), M
 
 
-def test_threshold_follows_env():
-    with setattr_temporarily(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 8):
-        x, w = _xw(16, 4096, 4096)
-        assert not thin_gemm_supported(x, w, None)
-        x, w = _xw(8, 4096, 4096)
-        assert thin_gemm_supported(x, w, None)
+def test_threshold_is_the_tuning_row_of_the_shape(monkeypatch):
+    use_rows(
+        monkeypatch,
+        ("dense_gemm", "thin_max_rows", {"gemm_n": 4096, "gemm_k": 4096}, 8),
+    )
+    x, w = _xw(16, 4096, 4096)
+    assert not thin_gemm_supported(x, w, None)
+    x, w = _xw(8, 4096, 4096)
+    assert thin_gemm_supported(x, w, None)
+    # Another weight shape keeps the default 32.
+    x, w = _xw(16, 2048, 4096)
+    assert thin_gemm_supported(x, w, None)
 
 
 def test_rejects_bias():

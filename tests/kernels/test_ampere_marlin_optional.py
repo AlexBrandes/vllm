@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import decode, extension, prefill
 from tests.kernels import test_ampere_pp_marlin_prefill as pp_helpers
 from tests.kernels import test_ampere_tp4_marlin_prefill as tp_helpers
@@ -143,9 +144,12 @@ def test_unsupported_decode_leaves_output_untouched(monkeypatch, case, reason):
 
 def test_released_prefill_thresholds(monkeypatch):
     monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE", "1")
-    monkeypatch.setenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "1000")
     monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "1")
-    monkeypatch.setenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "700")
+    use_rows(
+        monkeypatch,
+        ("moe_prefill", "marlin_min_rows", {"gemm_n": 2048}, 1000),
+        ("moe_prefill", "marlin_min_rows", {"gemm_n": 512}, 700),
+    )
     assert prefill.enabled_shapes()[2048][1] == 1000
     assert prefill.enabled_shapes()[512][1] == 700
 

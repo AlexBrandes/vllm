@@ -158,7 +158,7 @@ def _topk_tiefix_kernel(
 # Rows whose window is no longer than k and fully selected are written as the
 # identity. The bytes equal the one-program kernel with SORT (the tie fix,
 # then each row ascending with the -1 fill last). Taken only when enabled with
-# VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS and the batch has at most that many rows.
+# the topk_select/split_rows tuning row and the batch has at most that many rows.
 
 # Split geometry: at most SPLIT_MAX_CHUNKS chunks per row, each a power of
 # two >= SPLIT_CHUNK_MIN columns; tile and warps per chunk program.

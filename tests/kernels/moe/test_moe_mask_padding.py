@@ -16,6 +16,7 @@ import torch
 
 import vllm.envs as envs
 from tests.kernels.moe_align_reference import align
+from tests.sm80.tuning_rows import use_rows
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.sm80.layers.moe import routed_experts as mr
 
@@ -27,8 +28,19 @@ def fake_ctx(monkeypatch):
     monkeypatch.setattr(mr, "get_forward_context",
                         lambda: SimpleNamespace(is_padding=state["is_padding"]))
     monkeypatch.setattr(mr, "_MASK_PADDING", None)
-    monkeypatch.setattr(mr, "_MASK_MIN_ROWS", 0)
+    use_rows(monkeypatch)
     return state
+
+
+def _cutoff(monkeypatch, rows):
+    """The moe_router/fused_route_max_rows row at top-8 (None: no row)."""
+    if rows is None:
+        use_rows(monkeypatch)
+    else:
+        use_rows(
+            monkeypatch,
+            ("moe_router", "fused_route_max_rows", {"top_k": 8}, int(rows)),
+        )
 
 
 def _ids(n, k=8, seed=0):
@@ -61,7 +73,7 @@ def test_off_leaves_ids_untouched(fake_ctx, monkeypatch):
 
 def test_on_masks_padding_rows_in_place(fake_ctx, monkeypatch):
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "0")
+    _cutoff(monkeypatch, 0)
     fake_ctx["is_padding"] = _pad(25, 32)
     ids = _ids(32)
     ref = ids.clone()
@@ -73,7 +85,7 @@ def test_on_masks_padding_rows_in_place(fake_ctx, monkeypatch):
 
 def test_mask_view_of_the_persistent_buffer(fake_ctx, monkeypatch):
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "0")
+    _cutoff(monkeypatch, 0)
     fake_ctx["is_padding"] = _pad(10, 64)[:16]   # the runner passes [:padded]
     ids = _ids(16)
     mr.mask_padding_topk_ids(ids)
@@ -84,7 +96,7 @@ def test_row_slice_of_the_batch_is_not_masked(fake_ctx, monkeypatch):
     # A call on a row slice of the batch: the batch mask does not line up
     # with it, so the call is left alone.
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "0")
+    _cutoff(monkeypatch, 0)
     fake_ctx["is_padding"] = _pad(30, 32)
     ids = _ids(16)
     ref = ids.clone()
@@ -95,7 +107,7 @@ def test_row_slice_of_the_batch_is_not_masked(fake_ctx, monkeypatch):
 @pytest.mark.parametrize("case", ["no_ctx", "no_mask", "short_mask"])
 def test_no_usable_mask_is_a_no_op(fake_ctx, monkeypatch, case):
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "0")
+    _cutoff(monkeypatch, 0)
     if case == "no_ctx":
         fake_ctx["available"] = False
         fake_ctx["is_padding"] = _pad(1, 16)
@@ -109,7 +121,7 @@ def test_no_usable_mask_is_a_no_op(fake_ctx, monkeypatch, case):
 
 def test_sizes_up_to_the_cutoff_are_skipped(fake_ctx, monkeypatch):
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "8")
+    _cutoff(monkeypatch, 8)
     fake_ctx["is_padding"] = _pad(3, 8)
     small = _ids(8)
     ref = small.clone()
@@ -146,10 +158,7 @@ def test_mask_truth_table(fake_ctx, monkeypatch, mask, decode_kernels, cutoff, r
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", str(mask))
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", str(decode_kernels))
     monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "1")
-    if cutoff is None:
-        monkeypatch.delenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", cutoff)
+    _cutoff(monkeypatch, cutoff)
     fake_ctx["is_padding"] = _pad(rows - 1, rows)
     ids = _ids(rows)
     ref = ids.clone()

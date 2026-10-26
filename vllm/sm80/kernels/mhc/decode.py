@@ -5,7 +5,7 @@
 Drop-in for `vllm.model_executor.kernels.mhc.tilelang.mhc_fused_post_pre_tilelang`:
 same signature, same four outputs, same dtypes. Dispatched by
 `vllm.sm80.kernels.mhc.use_ampere_mhc_decode_v3` (`VLLM_GLM5_DECODE_MHC_V2`,
-1 <= M <= `VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS`).
+1 <= M <= the `mhc/decode_v2_max_rows` row of the sm80 tuning table).
 
 v3 is the earlier v2 kernel pair with a faster finish, measured on the 74-SM
 part and held to an fp64 error gate (mean <= 1.10x, max <= 1.25x of v2) and

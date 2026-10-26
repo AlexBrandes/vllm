@@ -173,7 +173,7 @@ def test_unchunked_prefill_workspace_fits_the_served_buffer(monkeypatch):
     try_size = torch.ops._exl3_C.moe_workspace_size_prefill_try(2048, *args)
     assert sizes[False] == torch.ops._exl3_C.moe_workspace_size_prefill_v2(2048, *args)
     assert sizes[True] == max(sizes[False], try_size)
-    # Served at --max-num-batched-tokens 2048 and VLLM_EXL3_MOE_CHUNK_ROWS 2048:
+    # Served at --max-num-batched-tokens 2048 and exl3_chunk_rows 2048:
     # the switch takes no KV cache memory.
     assert sizes[True] <= served
 

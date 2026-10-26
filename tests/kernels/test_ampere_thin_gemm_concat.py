@@ -42,6 +42,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tests.sm80.tuning_rows import use_rows
 from vllm import envs
 
 BF16 = torch.bfloat16
@@ -636,7 +637,7 @@ def concat_env(monkeypatch):
     monkeypatch.setattr(concat, "_device_supported", lambda: True)
     monkeypatch.setattr(concat, "logger", log)
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM", True, raising=False)
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    use_rows(monkeypatch)
     yield concat, fake, log
     concat._MEMBERS.clear()
     concat._SLOTS.clear()
@@ -785,7 +786,7 @@ def test_m_outside_the_group_runs_solo_without_a_miss(concat_env):
     assert [c[0] for c in fake.calls] == ["solo"] * 4
     assert concat._SLOTS["qb_wqb"].misses == 0
     assert concat._SLOTS["qkva_kpool"].misses == 0
-    hs = torch.randn(40, HID, dtype=BF16)  # past VLLM_THIN_GEMM_MAX_TOKENS
+    hs = torch.randn(40, HID, dtype=BF16)  # past dense_gemm/thin_max_rows
     fake.calls.clear()
     model.layers[0](hs)
     assert fake.calls == []
@@ -823,7 +824,7 @@ def test_gate_closed_says_why(concat_env, monkeypatch, case):
         "not_sm80": "not an sm_80 device",
         "compiled": "compilation mode VLLM_COMPILE, needs NONE",
         "no_group": "no MLA layer with an indexer on the thin GEMM",
-        "no_size": "no token size within VLLM_THIN_GEMM_MAX_TOKENS",
+        "no_size": "no token size within dense_gemm/thin_max_rows",
     }[case]
     if case == "thin_gemm_off":
         monkeypatch.setattr(envs, "VLLM_THIN_GEMM", False, raising=False)
@@ -834,7 +835,7 @@ def test_gate_closed_says_why(concat_env, monkeypatch, case):
     elif case == "no_group":
         model = nn.Sequential(_Lin(64, HID, 0, concat.ampere_thin_gemm))
     else:
-        monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 0, raising=False)
+        use_rows(monkeypatch, ("dense_gemm", "thin_max_rows", {}, 0))
         sizes = []
     concat.register_groups(_worker(model, mode), sizes)
     assert concat._MEMBERS == {}
@@ -902,7 +903,7 @@ def test_gpu_pairing_capture_replay(monkeypatch, M):
     log = _Log()
     monkeypatch.setattr(concat, "logger", log)
     monkeypatch.setattr(envs, "VLLM_THIN_GEMM", True, raising=False)
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    use_rows(monkeypatch)
     try:
         layers = nn.ModuleList([_MLA(s, TP4_DIMS) for s in (0, 10)]).cuda()
         model = nn.Module()
