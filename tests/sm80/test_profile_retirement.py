@@ -85,6 +85,7 @@ def test_real_width_managers_retire_and_reinitialize(monkeypatch, speculator_cls
     config = MagicMock(spec=VllmConfig)
     config.scheduler_config = SimpleNamespace(max_num_seqs=8)
     config.parallel_config = SimpleNamespace(tensor_parallel_size=4)
+    config.model_config = SimpleNamespace(max_model_len=128)
     config.speculative_config = _config().speculative_config
     config.num_speculative_tokens = 5
     config.compilation_config = CompilationConfig(
@@ -175,6 +176,9 @@ def test_real_width_managers_retire_and_reinitialize(monkeypatch, speculator_cls
     # A disabled profiling path does not touch live real-capture managers.
     live = dict(speculator._cg_managers)
     runner.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    # Profiling is off only when no graph (the drafter's included) still needs
+    # capturing; the live managers here are already captured.
+    runner.needs_cudagraph_capture = lambda: False
     assert cgu.profile_cudagraph_memory(runner) == 0
     assert speculator._cg_managers == live
     assert all(m.graphs for m in live.values())

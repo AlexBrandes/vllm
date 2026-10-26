@@ -213,7 +213,7 @@ def test_hybrid_padded_scores_export_and_select(monkeypatch, tmp_path, n_cols, o
     for rank in range(4):
         cfg = cap._Config(str(root / f"r{rank}"), frozenset({"hybrid"}),
                           re.compile(".*"), re.compile(".*"), frozenset({2, 4}),
-                          2, frozenset({1}), 65, 1 << 26, rank, rank, prefill_per_key=0)
+                          2, frozenset({1}), 65, 1 << 26, rank, rank, 4, prefill_per_key=0)
         monkeypatch.setattr(cap, "_cfg", cfg)
         monkeypatch.setattr(cap, "_capturing", lambda: False)
         monkeypatch.setattr(cap.torch.cuda, "is_available", lambda: False)
