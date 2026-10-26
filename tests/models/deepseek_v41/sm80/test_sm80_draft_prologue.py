@@ -248,10 +248,16 @@ def test_kernel_compiles_for_sm80(lanes):
 
 def test_squares_do_not_contract_into_the_sum():
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "D": "constexpr", "BW": "constexpr"}
+    contracted = []
     for lanes in LANES:
         consts = {"D": WIDTH, "BW": lanes}
         assert "fma" not in _compile(_guarded_squares, sig, consts).asm["ptx"]
-        assert "fma.rn.f32" in _compile(_plain_squares, sig, consts).asm["ptx"]
+        if "fma.rn.f32" in _compile(_plain_squares, sig, consts).asm["ptx"]:
+            contracted.append(lanes)
+    # The control: unguarded squares fuse into the sum, so the check above can
+    # fail. Whether they fuse at a width depends on the layout Triton picks:
+    # Triton 3.8 moves the 128-lane squares through shared memory first.
+    assert contracted
 
 
 def test_switch_default_and_supports(monkeypatch):
