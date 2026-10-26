@@ -125,7 +125,6 @@ def _wrapper_runtime_config(tmp_path, name, tp_size, pp_size):
         spec.draft_tensor_parallel_size = SpeculativeConfig._verify_and_get_draft_tp(
             spec.target_parallel_config,
             spec.draft_tensor_parallel_size,
-            spec.draft_model_config.hf_config,
         )
         spec.draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
             spec.target_parallel_config,
