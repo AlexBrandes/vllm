@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
     VLLM_MOE_DECODE_ROUTE_V2: bool = False
-    VLLM_GLM5_DECODE_KDA_WIDE: bool = True
     VLLM_AMPERE_KDA_FOLD: bool = False
     VLLM_AMPERE_KDA_RECOVER_OFF: bool = False
     VLLM_FLA_PIN_AUTOTUNE: bool = False
@@ -73,8 +72,6 @@ if TYPE_CHECKING:
     VLLM_SM80_MARLIN_PREFILL: bool = False
     VLLM_AMPERE_MARLIN_DECODE_CUDA: bool = False
     VLLM_AMPERE_MARLIN_DECODE_V2: bool = False
-    VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
-    VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
     VLLM_HOST_ALLREDUCE: bool = False
     VLLM_ROUND_ONCE_ALLREDUCE_GROUPED: bool = False
     VLLM_EXL3_DENSE_SPLITK: bool = False
@@ -345,15 +342,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # sm80 tuning table (at most 64).
     "VLLM_MOE_DECODE_ROUTE_V2": lambda: bool(
         int(os.getenv("VLLM_MOE_DECODE_ROUTE_V2", "0"))
-    ),
-    # Kill switch for the fused KDA decode step at 64 heads per card (pipeline
-    # parallel) beyond one sequence of up to 5 tokens: with 1 (default) the
-    # 64-head layout takes vllm/models/glm5next/nvidia/ops/kda_decode.py at every
-    # decode shape its gate covers; 0 restores the earlier split (one sequence of up to
-    # 5 tokens on v2 with the full speculative tile, everything else on the
-    # unfused fla chain). No effect at 16 heads.
-    "VLLM_GLM5_DECODE_KDA_WIDE": lambda: bool(
-        int(os.getenv("VLLM_GLM5_DECODE_KDA_WIDE", "1"))
     ),
     # RecoverSSM commit fold (TP4, vllm/sm80/kernels/kda/recover.py): the
     # replay of a step's accepted tokens over the KDA state runs at the start
@@ -660,20 +648,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # decode_gemm_orig runs. Off by default.
     "VLLM_AMPERE_MARLIN_DECODE_V2": lambda: bool(
         int(os.getenv("VLLM_AMPERE_MARLIN_DECODE_V2", "0"))
-    ),
-    # Whole-expert (pipeline-parallel, N=2048) compiled decode also at 5-7
-    # rows (draft depths 4-6 of one request), not only at 4 and 8. Needs
-    # VLLM_AMPERE_MARLIN_DECODE_CUDA=1.
-    "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS": lambda: bool(
-        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS", "0"))
-    ),
-    # Whole-expert (N=2048) compiled decode for multi-request batches, at the
-    # rows 9 up to the moe_routed_gemm/marlin_multi_max_rows row of the sm80
-    # tuning table (at most 64; default 32, the most rows one PP4 step verifies
-    # with DEPTHS 7,5 and 8 sequences). The N=2048 scratch grows to that row
-    # count.
-    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": lambda: bool(
-        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_PP_MULTI", "0"))
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if
@@ -1410,6 +1384,19 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_PREFILL_KERNELS": (
         "split into VLLM_SM80_MHC_PREFILL (the mHC pre-norm GEMM) and "
         "VLLM_SM80_SPARSE_MLA_PREFILL (the sparse-MLA prefill attention)"
+    ),
+    "VLLM_GLM5_DECODE_KDA_WIDE": (
+        "merged into VLLM_AMPERE_DECODE_KERNELS (64 heads per card take the "
+        "fused KDA decode step at every measured shape)"
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS": (
+        "merged into VLLM_AMPERE_MARLIN_DECODE_CUDA (whole experts take the "
+        "compiled decode at 4..8 rows)"
+    ),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI": (
+        "merged into VLLM_AMPERE_MARLIN_DECODE_CUDA (whole experts take the "
+        "compiled decode for multi-request rows up to the sm80 tuning table "
+        "row moe_routed_gemm/marlin_multi_max_rows)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (

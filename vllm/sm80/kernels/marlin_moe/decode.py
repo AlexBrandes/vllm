@@ -79,11 +79,8 @@ def multi_max_rows() -> int:
 
 
 def pp_multi_ranges() -> tuple[tuple[int, int], ...]:
-    """((PP_MULTI_MIN, multi_max_rows()),) with VLLM_GLM5_MARLIN_DECODE_PP_MULTI;
-    () without it or when the row lies outside PP_MULTI_MIN..PP_MULTI_MAX
-    (the gate then stays closed)."""
-    if not envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI:
-        return ()
+    """((PP_MULTI_MIN, multi_max_rows()),), or () when the row lies outside
+    PP_MULTI_MIN..PP_MULTI_MAX (the gate then stays closed)."""
     hi = multi_max_rows()
     if not PP_MULTI_MIN <= hi <= PP_MULTI_MAX:
         return ()
@@ -100,13 +97,11 @@ def _scratch_tokens(N: int) -> int:
 
 def compiled_regime(num_tokens: int, intermediate_size: int) -> bool:
     """TP4 small batches and the measured whole-expert PP4 decode batches
-    (4 and 8 rows; 5-7 rows too with VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS; the
-    multi-request rows of pp_multi_ranges)."""
+    (4..8 rows, and the multi-request rows of pp_multi_ranges)."""
     return (
         intermediate_size == 512 and 1 <= num_tokens <= MAX_TOKENS
         or intermediate_size == 2048 and (
-            num_tokens in (4, 8)
-            or 5 <= num_tokens <= 7 and envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS
+            4 <= num_tokens <= 8
             or num_tokens >= PP_MULTI_MIN and any(
                 lo <= num_tokens <= hi for lo, hi in pp_multi_ranges())
         )
@@ -292,8 +287,7 @@ def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights,
         return False
     logger.info_once(
         "Compiled Marlin MoE decode active (VLLM_AMPERE_MARLIN_DECODE_CUDA): "
-        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in %s%s.",
-        "4..8" if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS else "{4, 8}",
+        "sm_80, N=512 with 1 <= M <= 32 or N=2048 with M in 4..8%s.",
         "".join(", %d..%d" % r for r in pp_multi_ranges()),
     )
     gemm_v2 = None
@@ -401,31 +395,19 @@ def warmup_from_worker(worker):
         return
     tp = worker.vllm_config.parallel_config.tensor_parallel_size
     N = int(getattr(cfg, "moe_intermediate_size", 0)) // tp
-    if envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS:
-        if N == 2048:
-            logger.info_once(
-                "[ampere-marlin] whole-expert compiled decode at 4..8 rows "
-                "(VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS).",
-            )
-        else:
-            logger.info_once(
-                "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS is set but the gate is closed "
-                "(expert width N=%d per rank, not the whole-expert 2048).", N,
-            )
-    if envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI:
+    if N == 2048:
         ranges = pp_multi_ranges()
-        if N != 2048 or not ranges:
+        if not ranges:
             logger.info_once(
-                "VLLM_GLM5_MARLIN_DECODE_PP_MULTI is set but the gate is closed "
-                "(%s).", "expert width N=%d per rank, not the whole-expert 2048" % N
-                if N != 2048 else "moe_routed_gemm/marlin_multi_max_rows = %d is "
-                "not within %d..%d" % (multi_max_rows(), PP_MULTI_MIN, PP_MULTI_MAX),
+                "[ampere-marlin] whole-expert compiled decode at 4..8 rows only: "
+                "moe_routed_gemm/marlin_multi_max_rows = %d is not within %d..%d.",
+                multi_max_rows(), PP_MULTI_MIN, PP_MULTI_MAX,
             )
         else:
             logger.info_once(
-                "[ampere-marlin] whole-expert compiled decode for multi-request rows "
-                "%s (VLLM_GLM5_MARLIN_DECODE_PP_MULTI, moe_routed_gemm/"
-                "marlin_multi_max_rows), scratch %d rows.",
+                "[ampere-marlin] whole-expert compiled decode for multi-request "
+                "rows %s (moe_routed_gemm/marlin_multi_max_rows) and at 4..8 "
+                "rows, scratch %d rows.",
                 ",".join("%d..%d" % r for r in ranges), _scratch_tokens(N),
             )
     capacity = _scratch_tokens(N)

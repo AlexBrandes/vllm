@@ -870,15 +870,13 @@ def warmup(plans=((1, 4), (4, 4)), device=None, heads=16, recover=False,
 # beyond one sequence of up to 4 tokens, see kda_decode.wide_schedule)
 # measured no slower than the unfused chain (one CMP 170HX, graph replay, 10
 # layers per graph, 6 alternating rounds, mean <= 1.01x; the other shapes are
-# 1.02-1.15x slower there and keep the unfused chain). VLLM_GLM5_DECODE_KDA_WIDE=0
-# restores the earlier bound of one sequence of up to 5 tokens.
+# 1.02-1.15x slower there and keep the unfused chain).
 _KDA_V2_HEADS = 16
 _KDA_V2_WIDE_HEADS = 64
 _KDA_V2_HEAD_DIM = 128
 _KDA_V2_MAX_TOKENS_PER_SEQ = 8
 _KDA_V2_DEEP_FROM = 6          # 16 heads: tokens per sequence from here ...
 _KDA_V2_DEEP_MAX_SEQS = 4      # ... only up to this many sequences
-_KDA_V2_WIDE_OFF_MAX_TOKENS = 5
 _KDA_V2_WIDE_SHAPES = frozenset({
     (1, 1), (2, 1), (3, 1), (4, 1),
     (1, 2), (2, 2), (3, 2), (4, 2),
@@ -926,10 +924,7 @@ def use_ampere_kda_decode_v2(
         if tokens_per_seq >= _KDA_V2_DEEP_FROM and num_seqs > _KDA_V2_DEEP_MAX_SEQS:
             return False
     elif num_heads == _KDA_V2_WIDE_HEADS:
-        if envs.VLLM_GLM5_DECODE_KDA_WIDE:
-            if (num_seqs, tokens_per_seq) not in _KDA_V2_WIDE_SHAPES:
-                return False
-        elif num_seqs > 1 or tokens_per_seq > _KDA_V2_WIDE_OFF_MAX_TOKENS:
+        if (num_seqs, tokens_per_seq) not in _KDA_V2_WIDE_SHAPES:
             return False
     else:
         return False

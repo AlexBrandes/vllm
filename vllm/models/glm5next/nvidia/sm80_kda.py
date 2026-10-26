@@ -9,7 +9,7 @@ every KDA layer the GLM decoder builds is this subclass. It adds:
 
 - the decode attributes the fused sm_80 KDA decode step and the KDA chunked
   prefill read in the layer's forward (``VLLM_AMPERE_DECODE_KERNELS``,
-  ``VLLM_GLM5_DECODE_KDA_WIDE``, ``VLLM_SM80_KDA_PREFILL``), and the deferred ``g_b_proj`` fill;
+  ``VLLM_SM80_KDA_PREFILL``), and the deferred ``g_b_proj`` fill;
 - RecoverSSM (``vllm/sm80/kernels/kda/recover.py``): the per-layer record
   buffer, no draft-position state pages in the KV spec, and the builder's
   commit metadata;
@@ -127,21 +127,14 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
 
         self._kda_v2 = bool(_envs.VLLM_AMPERE_DECODE_KERNELS)
         # 64 heads per card (pipeline parallel): the measured decode shapes on
-        # v2 (wide schedule beyond one short sequence), token tile sized per
-        # step (VLLM_GLM5_DECODE_KDA_WIDE); 0 keeps the earlier split.
-        self._kda_wide = bool(
-            self._kda_v2
-            and self.local_num_heads == 64
-            and _envs.VLLM_GLM5_DECODE_KDA_WIDE
-        )
-        # Token tile from the step's bound on tokens per request; the
-        # full speculative window only for 64 heads with the wide path off.
-        self._kda_step_tile = self._kda_v2 and (
-            self.local_num_heads != 64 or self._kda_wide
-        )
+        # v2, with the wide schedule beyond one short sequence.
+        self._kda_wide = bool(self._kda_v2 and self.local_num_heads == 64)
+        # Token tile from the step's bound on tokens per request, at every
+        # head count.
+        self._kda_step_tile = self._kda_v2
         if self._kda_v2:
             # Imported here rather than on first use so that the pre-capture
-            # warmup in kernel_warmup.py, which does not import model
+            # warmup in vllm/sm80/kernels/warmup.py, which does not import model
             # packages, finds it among the loaded modules.
             from vllm.models.glm5next.nvidia.ops import kda_decode  # noqa: F401
 
@@ -150,18 +143,11 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
                 "gated delta rule + gated RMSNorm in one kernel, token tile "
                 "sized per step."
             )
-        if self._kda_v2 and self.local_num_heads == 64:
-            if self._kda_wide:
-                logger.info_once(
-                    "sm_80 KDA decode v2 wide: 64 heads, the measured shapes "
-                    "of up to 8 sequences of up to 8 tokens "
-                    "(VLLM_GLM5_DECODE_KDA_WIDE=1)."
-                )
-            else:
-                logger.info_once(
-                    "sm_80 KDA decode v2 wide off (VLLM_GLM5_DECODE_KDA_WIDE=0): "
-                    "64 heads take v2 for one sequence of up to 5 tokens only."
-                )
+        if self._kda_wide:
+            logger.info_once(
+                "sm_80 KDA decode v2 wide: 64 heads, the measured shapes "
+                "of up to 8 sequences of up to 8 tokens."
+            )
 
         # RecoverSSM (vllm/sm80/kernels/kda/recover.py): one state per
         # request; the verify stores per-token records instead of states.

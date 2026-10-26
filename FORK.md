@@ -838,14 +838,11 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_FLA_AUTOTUNE_SKIP_SPILLING` | `bool` | `False` | `'0'` |
 | `VLLM_FLA_PIN_AUTOTUNE` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_DECODE_IDX_GLUE_PARTS` | `str` | `'weights,glue,fwht,cache,moesum'` | `'weights,glue,fwht,cache,moesum'` |
-| `VLLM_GLM5_DECODE_KDA_WIDE` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_DECODE_MHC_V2` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_DECODE_MOE_ROUTING` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE` | `str` | `''` | `''` |
 | `VLLM_GLM5_DRAFTER_ROPE_FIT` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_DRAFTER_SELECTOR_SHARD` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MOE_ROUTE_V2_MASK` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD` | `bool` | `False` | `'0'` |
@@ -891,7 +888,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **145 variables** | | | |
+| **142 variables** | | | |
 
 ## 4. Unreferenced fork code
 

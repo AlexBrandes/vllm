@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Whole-expert compiled Marlin decode at 5-7 rows (VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS) and
-for multi-request rows 9..64 (VLLM_GLM5_MARLIN_DECODE_PP_MULTI, up to the
-moe_routed_gemm/marlin_multi_max_rows row of the sm80 tuning table).
+"""Whole-expert compiled Marlin decode (VLLM_AMPERE_MARLIN_DECODE_CUDA) at 4..8
+rows and for multi-request rows 9 up to the moe_routed_gemm/marlin_multi_max_rows
+row of the sm80 tuning table (at most 64).
 
-CPU: the regime with the flag off is the released one; on, it adds exactly
-M = 5, 6, 7 at N = 2048; the banners go through the real vLLM logger.
+CPU: the regime at N = 2048 is M = 4..8 plus the multi-request rows, the TP4
+regime unchanged; the former MID_ROWS and MULTI switches are retired and
+change nothing; the banners go through the real vLLM logger.
 GPU (sm_80 and the optional extension; skipped otherwise): every row's output
 does not depend on M (rows of an M-row call equal the same rows of the 8-row
 call) and stays inside the fp64 accuracy gate; CUDA-graph replay equals eager
@@ -23,7 +24,9 @@ from tests.kernels import test_ampere_pp_marlin_prefill as pp_helpers
 from tests.sm80.tuning_rows import use_rows
 
 DECODE = "VLLM_AMPERE_MARLIN_DECODE_CUDA"
-MID = "VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS"
+# The switches the whole-expert rows had before they joined the decode switch.
+RETIRED = ("VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS",
+           "VLLM_GLM5_MARLIN_DECODE_PP_MULTI")
 
 
 @pytest.fixture(autouse=True)
@@ -31,40 +34,45 @@ def isolated_flags(monkeypatch):
     for name in (DECODE, "VLLM_SM80_MARLIN_PREFILL",
                  "VLLM_AMPERE_DECODE_KERNELS"):
         monkeypatch.setenv(name, "0")
-    monkeypatch.delenv(MID, raising=False)
+    for name in RETIRED:
+        monkeypatch.delenv(name, raising=False)
     use_rows(monkeypatch)
-    monkeypatch.delenv("VLLM_GLM5_MARLIN_DECODE_PP_MULTI", raising=False)
     monkeypatch.setattr(extension, "_OPS", None)
 
 
-def test_flag_defaults_off():
-    assert envs.VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS is False
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_retired_switches_change_nothing(monkeypatch, value):
+    for name in RETIRED:
+        assert name not in envs.environment_variables
+        monkeypatch.setenv(name, value)
+    assert [m for m in range(1, 70) if decode.compiled_regime(m, 2048)] == \
+        list(range(4, 9)) + list(range(9, 33))
 
 
-@pytest.mark.parametrize("mid", [False, True])
 @pytest.mark.parametrize("tokens,width,released", [
     (1, 512, True), (5, 512, True), (32, 512, True), (33, 512, False),
     (0, 2048, False), (3, 2048, False), (4, 2048, True), (5, 2048, False),
     (6, 2048, False), (7, 2048, False), (8, 2048, True), (9, 2048, False),
     (16, 2048, False), (6, 1024, False),
 ])
-def test_regime(monkeypatch, mid, tokens, width, released):
-    monkeypatch.setenv(MID, str(int(mid)))
-    expected = released or (mid and width == 2048 and 5 <= tokens <= 7)
+def test_regime(monkeypatch, tokens, width, released):
+    """Without multi-request rows: the released regime plus M = 5, 6, 7 at
+    N = 2048."""
+    _multi(monkeypatch, 0)
+    expected = released or (width == 2048 and 5 <= tokens <= 7)
     assert decode.compiled_regime(tokens, width) is expected
 
 
-@pytest.mark.parametrize("mid,reason", [
-    (False, "outside the compiled decode token/width regime"),
-    (True, "not sm_80"),  # past the regime: only the device check remains
+@pytest.mark.parametrize("M,reason", [
+    (6, "not sm_80"),  # past the regime: only the device check remains
+    (3, "outside the compiled decode token/width regime"),
 ])
-def test_gate_admits_mid_rows_only_with_flag(monkeypatch, mid, reason):
+def test_gate_admits_mid_rows(monkeypatch, M, reason):
     monkeypatch.setenv(DECODE, "1")
-    monkeypatch.setenv(MID, str(int(mid)))
-    args = pp_helpers._meta_args(M=6, n=2048)
+    args = pp_helpers._meta_args(M=M, n=2048)
     layer = pp_helpers._layer(n=2048)
     assert reason in decode.gate_reason(layer, **args)
-    output = torch.full((6, 4096), 5.0)
+    output = torch.full((M, 4096), 5.0)
     assert not decode.maybe_apply(layer, output, **args)
     assert torch.equal(output, torch.full_like(output, 5.0))
 
@@ -78,15 +86,13 @@ class _Capture(logging.Handler):
         self.lines.append(record.getMessage())
 
 
-@pytest.mark.parametrize("width,text", [
-    (2048, "whole-expert compiled decode at 4..8 rows"),
-    (512, "is set but the gate is closed (expert width N=512"),
-])
-def test_warmup_banner_real_logger(monkeypatch, width, text):
+@pytest.mark.parametrize("width,logged", [(2048, True), (512, False)])
+def test_warmup_banner_real_logger(monkeypatch, width, logged):
+    """Whole experts name their rows once; TP4 shards have no such line."""
     from types import SimpleNamespace
 
     monkeypatch.setenv(DECODE, "1")
-    monkeypatch.setenv(MID, "1")
+    _multi(monkeypatch, 64)
     monkeypatch.setattr(decode, "_is_sm80", lambda _device: True)
     monkeypatch.setattr(decode, "warmup", lambda *a, **k: None)
     from vllm.logger import _print_info_once
@@ -110,7 +116,10 @@ def test_warmup_banner_real_logger(monkeypatch, width, text):
     finally:
         lg.removeHandler(handler)
         lg.setLevel(level)
-    assert any(text in line for line in handler.lines), handler.lines
+    text = ("whole-expert compiled decode for multi-request rows 9..64 "
+            "(moe_routed_gemm/marlin_multi_max_rows) and at 4..8 rows")
+    assert any(text in line for line in handler.lines) is logged, handler.lines
+    assert logged or not any("whole-expert" in line for line in handler.lines)
 
 
 # ---------------------------------------------------------------- GPU ------
@@ -149,7 +158,6 @@ def test_rows_do_not_depend_on_m(weights, monkeypatch, M):
     )
 
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
-    monkeypatch.setenv(MID, "1")
     deterministic_moe_align_mode.cache_clear()
     layer = pp_helpers._gpu_layer(weights)
     x8, tw8, ids8 = pp_helpers._inputs(8, 900 + M)
@@ -176,7 +184,6 @@ def test_graph_replay_mid_rows(weights, monkeypatch, M):
     )
 
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
-    monkeypatch.setenv(MID, "1")
     deterministic_moe_align_mode.cache_clear()
     layer = pp_helpers._gpu_layer(weights)
     x, tw, ids = pp_helpers._inputs(M, 1300 + M)
@@ -202,8 +209,6 @@ def test_graph_replay_mid_rows(weights, monkeypatch, M):
 
 # ------------------------------------- multi-request rows (CPU) -------------
 
-MULTI_ON = "VLLM_GLM5_MARLIN_DECODE_PP_MULTI"
-
 
 def _multi(monkeypatch, hi):
     """The moe_routed_gemm/marlin_multi_max_rows row (None: no row)."""
@@ -217,9 +222,8 @@ def _multi(monkeypatch, hi):
 
 
 @pytest.fixture
-def multi_off(monkeypatch):
+def multi_default(monkeypatch):
     use_rows(monkeypatch)
-    monkeypatch.delenv(MULTI_ON, raising=False)
 
 
 @pytest.mark.parametrize("hi,ranges", [
@@ -228,30 +232,14 @@ def multi_off(monkeypatch):
 ])
 def test_multi_row_bounds(monkeypatch, hi, ranges):
     _multi(monkeypatch, hi)
-    monkeypatch.setenv(MULTI_ON, "1")
     assert decode.pp_multi_ranges() == ranges
 
 
-def test_multi_defaults_off(multi_off):
-    assert envs.VLLM_GLM5_MARLIN_DECODE_PP_MULTI is False
+def test_multi_default_rows(multi_default):
     assert decode.multi_max_rows() == 32
-    assert decode.pp_multi_ranges() == ()
-    assert decode._scratch_tokens(2048) == 8
-    assert decode._scratch_tokens(512) == 32
-    for m in range(9, 65):
-        assert not decode.compiled_regime(m, 2048)
-
-
-def test_multi_rows_alone_do_nothing(monkeypatch):
-    _multi(monkeypatch, 64)
-    assert decode.pp_multi_ranges() == ()
-    assert decode._scratch_tokens(2048) == 8
-
-
-def test_multi_switch_default_rows(monkeypatch, multi_off):
-    monkeypatch.setenv(MULTI_ON, "1")
     assert decode.pp_multi_ranges() == ((9, 32),)
     assert decode._scratch_tokens(2048) == 32
+    assert decode._scratch_tokens(512) == 32
     assert decode.compiled_regime(32, 2048) and not decode.compiled_regime(33, 2048)
 
 
@@ -263,9 +251,8 @@ def test_multi_switch_default_rows(monkeypatch, multi_off):
 ])
 def test_multi_regime(monkeypatch, hi, on):
     _multi(monkeypatch, hi)
-    monkeypatch.setenv(MULTI_ON, "1")
     for m in range(1, 70):
-        expected = m in (4, 8) or m in on
+        expected = 4 <= m <= 8 or m in on
         assert decode.compiled_regime(m, 2048) is expected, m
         assert decode.compiled_regime(m, 512) is (1 <= m <= 32), m
 
@@ -276,7 +263,6 @@ def test_multi_scratch_sizing(monkeypatch, hi, rows):
     from types import SimpleNamespace
 
     _multi(monkeypatch, hi)
-    monkeypatch.setenv(MULTI_ON, "1")
     monkeypatch.setattr(decode, "_WORKSPACES", {})
     monkeypatch.setattr(torch.cuda, "current_stream",
                         lambda _device: SimpleNamespace(cuda_stream=0))
@@ -290,9 +276,8 @@ def test_multi_scratch_sizing(monkeypatch, hi, rows):
 
 @pytest.mark.parametrize("width,hi,text", [
     (2048, 32, "whole-expert compiled decode for multi-request rows 9..32"),
-    (2048, 8, "is set but the gate is closed (moe_routed_gemm/"
-     "marlin_multi_max_rows = 8 is not within 9..64"),
-    (512, 32, "is set but the gate is closed (expert width N=512"),
+    (2048, 8, "at 4..8 rows only: moe_routed_gemm/marlin_multi_max_rows = 8 "
+     "is not within 9..64"),
 ])
 def test_multi_banner_real_logger(monkeypatch, width, hi, text):
     from types import SimpleNamespace
@@ -300,7 +285,6 @@ def test_multi_banner_real_logger(monkeypatch, width, hi, text):
 
     monkeypatch.setenv(DECODE, "1")
     _multi(monkeypatch, hi)
-    monkeypatch.setenv(MULTI_ON, "1")
     monkeypatch.setattr(decode, "_is_sm80", lambda _device: True)
     monkeypatch.setattr(decode, "warmup", lambda *a, **k: None)
     _print_info_once.cache_clear()
@@ -335,7 +319,6 @@ def test_multi_rows_do_not_depend_on_m(weights, monkeypatch, M):
 
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
     _multi(monkeypatch, 64)
-    monkeypatch.setenv(MULTI_ON, "1")
     deterministic_moe_align_mode.cache_clear()
     layer = pp_helpers._gpu_layer(weights)
     x, tw, ids = pp_helpers._inputs(64, 2100 + M)
@@ -362,7 +345,6 @@ def test_multi_graph_replay(weights, monkeypatch, M):
 
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
     _multi(monkeypatch, 64)
-    monkeypatch.setenv(MULTI_ON, "1")
     deterministic_moe_align_mode.cache_clear()
     layer = pp_helpers._gpu_layer(weights)
     x, tw, ids = pp_helpers._inputs(M, 2500 + M)
@@ -393,8 +375,6 @@ def test_decode_scratch_waits_for_kv_sizing(monkeypatch, width, M):
     from types import SimpleNamespace
 
     monkeypatch.setenv(DECODE, "1")
-    monkeypatch.setenv(MID, "1")
-    monkeypatch.setenv(MULTI_ON, "1")
     monkeypatch.setattr(decode, "_WORKSPACES", {})
     monkeypatch.setattr(decode, "_late_scratch_open", False)
     monkeypatch.setattr(decode, "gate_reason", lambda *a, **k: None)
