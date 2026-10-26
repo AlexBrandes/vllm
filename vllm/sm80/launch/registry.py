@@ -16,8 +16,12 @@ exactly is a refusal naming it, never a shorter list. Each file is read by
 the two ways the engine registers options: every literal ``--name`` passed
 to ``add_argument`` (with the aliases of a call that names several), and
 the options a frontend class generates from its dataclass fields (see
-``_generated_options``). The negative ``--no-X`` forms of boolean options
-are not listed; a ``no-`` spelling the tree does not declare is read as
+``_generated_options``). Negative forms of boolean options are not listed:
+they are read as the option they negate, by the negation prefixes of the
+tree's own parser (``_negations``): argparse's ``no-X``, and each prefix
+table of a boolean action class in the module the serve command takes its
+parser class from (``disable-X`` for ``enable-X`` and the reverse, where
+the tree has one). A negative form the tree does not declare is read as
 the flag it negates.
 """
 
@@ -33,6 +37,10 @@ from errors import Refusal
 CAPABILITIES = ("sm80", "plain-upstream")
 SERVE_COMMAND = "vllm/entrypoints/cli/serve.py"
 PARSER_FACTORY = "make_arg_parser"
+PARSER_CLASS = "FlexibleArgumentParser"
+BOOLEAN_ACTION = "BooleanOptionalAction"
+INVERSE_TABLE = "_inverse_prefixes"
+ARGPARSE_NEGATION = ("", "no-")             # argparse's BooleanOptionalAction: --X and --no-X
 
 
 @dataclass
@@ -71,7 +79,7 @@ class Registry:
         }
 
 
-def _dict_node(tree: ast.Module, var: str) -> ast.Dict | None:
+def _dict_node(tree: ast.Module | ast.ClassDef, var: str) -> ast.Dict | None:
     for node in tree.body:
         target = None
         value = None
@@ -162,10 +170,27 @@ def read_registry(tree: str, capability: str) -> Registry:
 
 @dataclass
 class ArgOptions:
-    """Long option names (without ``--``) and alias → first name (argparse
-    takes an argument's destination from its first long name)."""
+    """Long option names (without ``--``), alias → first name (argparse
+    takes an argument's destination from its first long name), and the
+    (prefix, negative prefix) pairs by which the tree's boolean actions
+    spell an option's negative form (``X``/``no-X``; ``enable-X``/
+    ``disable-X`` in a tree whose parser pairs them)."""
     options: set[str] = field(default_factory=set)
     aliases: dict[str, str] = field(default_factory=dict)
+    negations: tuple[tuple[str, str], ...] = (ARGPARSE_NEGATION,)
+
+    def destination(self, spelling: str) -> str:
+        """The first name of the option a full spelling sets: a declared
+        name or alias, else the option a negative form negates (a declared
+        one first; an undeclared one reads as the spelling it negates)."""
+        if spelling not in self.options:
+            bases = [pos + spelling[len(neg):] for pos, neg in self.negations if spelling.startswith(neg)]
+            spelling = next((b for b in bases if b in self.options), bases[0] if bases else spelling)
+        return self.aliases.get(spelling, spelling)
+
+    def negative_forms(self, spelling: str) -> set[str]:
+        """The negative spellings the tree's boolean actions give a name."""
+        return {neg + spelling[len(pos):] for pos, neg in self.negations if spelling.startswith(pos)}
 
 
 def _from_imports(module: ast.Module) -> dict[str, tuple[str, int, str]]:
@@ -237,9 +262,49 @@ def arg_sources(tree: str) -> dict[str, ast.Module]:
     return sources
 
 
+def _negations(tree: str, serve: ast.Module) -> tuple[tuple[str, str], ...]:
+    """argparse's own (``X``/``no-X``) and every prefix table (``{"--enable-":
+    "--disable-", ...}``) of a boolean action class (one derived from
+    BooleanOptionalAction) in the module the serve command imports its
+    parser class from: the classes that pair an option with an inverse
+    spelling. A boolean action class that builds its option strings (has an
+    ``__init__``) without a table the launcher can read refuses: its negative
+    forms are unknown."""
+    origins = {o for o in _from_imports(serve).values() if o[2] == PARSER_CLASS}
+    if len(origins) != 1:
+        raise Refusal(f"{SERVE_COMMAND}: {'more than one' if origins else 'no'} 'from ... import "
+                      f"{PARSER_CLASS}'; the negative forms of the server's boolean options cannot be found")
+    rel = _module_file(tree, origins.pop(), SERVE_COMMAND)
+    classes = {c.name: c for c in _parse(os.path.join(tree, rel)).body if isinstance(c, ast.ClassDef)}
+
+    def boolean(cls: ast.ClassDef, seen: set[str]) -> bool:
+        names = [_type_name(b) for b in cls.bases]
+        return BOOLEAN_ACTION in names or any(
+            n in classes and n not in seen and boolean(classes[n], seen | {n}) for n in names)
+
+    out = [ARGPARSE_NEGATION]
+    for cls in classes.values():
+        if not boolean(cls, {cls.name}):
+            continue
+        table = _dict_node(cls, INVERSE_TABLE)
+        if table is None:
+            if any(isinstance(f, ast.FunctionDef) and f.name == "__init__" for f in cls.body):
+                raise Refusal(f"{rel}: {cls.name} builds its option strings without an {INVERSE_TABLE} table "
+                              "the launcher can read; the negative forms of boolean options are unknown")
+            continue
+        for k, v in zip(table.keys, table.values):
+            if not all(isinstance(x, ast.Constant) and isinstance(x.value, str) and x.value.startswith("--")
+                       for x in (k, v)):
+                raise Refusal(f"{rel}: {cls.name}.{INVERSE_TABLE} is not a table of literal --prefixes")
+            out.append((k.value[2:], v.value[2:]))
+    return tuple(out)
+
+
 def read_arg_options(tree: str) -> ArgOptions:
-    out = ArgOptions(options={"help"})          # argparse's own
-    for module in arg_sources(tree).values():
+    sources = arg_sources(tree)
+    out = ArgOptions(options={"help"},          # argparse's own
+                     negations=_negations(tree, sources[SERVE_COMMAND]))
+    for module in sources.values():
         out.options |= _generated_options(module)
         for node in ast.walk(module):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)

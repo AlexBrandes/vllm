@@ -19,8 +19,8 @@ from contextlib import redirect_stderr, redirect_stdout
 import pytest
 
 from canon import sha256_file
-from helpers import (MODEL_TOML, UPSTREAM_VARS, VERSION_TEXT, World, add_build, envs_py, git,
-                     head, promote, write, write_stamp)
+from helpers import (ARGPARSE, MODEL_TOML, PAIRED_ARGPARSE, UPSTREAM_VARS, VERSION_TEXT, World, add_build,
+                     envs_py, git, head, promote, write, write_stamp)
 from test_launch_guards2 import linked
 from treestate import MANIFEST, STAMP, VERSION_FILE, build_owned_sha256
 
@@ -493,9 +493,8 @@ class AsyncEngineArgs:
 '''
 
 
-@pytest.fixture
-def aw(tmp_path):
-    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS})
+def lora_world(tmp_path, extra_files: dict[str, str] | None = None) -> World:
+    w = World(tmp_path, extra_files={"vllm/engine/arg_utils.py": ARG_UTILS, **(extra_files or {})})
     text = model_text(w).replace(
         'fixed = ["args.max-model-len",',
         'fixed = ["args.enable-lora", "args.compilation-config", "args.max-model-len",').replace(
@@ -506,6 +505,11 @@ def aw(tmp_path):
     d = w.resolve()
     assert "--enable-lora" in d["argv_functional"]
     return w
+
+
+@pytest.fixture
+def aw(tmp_path):
+    return lora_world(tmp_path)
 
 
 RAW = [["--no-enable-lora"], ["--no_enable_lora"], ["--no-enable-l"],
@@ -538,6 +542,22 @@ def test_protected_spellings_on_set(aw, item):
 def test_protected_spellings_in_overlay(aw, tmp_path, body):
     ov = write(str(tmp_path / "ov.toml"), 'schema = "launch-overlay/1"\n[args]\n' + body)
     aw.refused("--overlay", ov)
+
+
+@pytest.mark.parametrize("tokens", [["--disable-lora"], ["--disable_lora"], ["--disable-lo"],
+                                    ["--no-enable-lora"]])
+def test_paired_negative_forms_reach_the_flag(tmp_path, tokens):
+    """A tree whose parser pairs --enable-X with --disable-X: the inverse
+    spelling (full, underscored or abbreviated) sets the protected flag,
+    on every channel."""
+    pw = lora_world(tmp_path / "w", {ARGPARSE: PAIRED_ARGPARSE})
+    pw.refused("--", *tokens)
+    env = write(str(tmp_path / "u.env"), "EXTRA_ARGS=" + " ".join(tokens) + "\n")
+    pw.refused("--env-file", env)
+    pw.refused("--set", f"args.{tokens[0][2:]}=true")
+    ov = write(str(tmp_path / "ov.toml"), f'schema = "launch-overlay/1"\n[args]\n"{tokens[0][2:]}" = true\n')
+    pw.refused("--overlay", ov)
+    pw.resolve("--experiment", "e", "--", *tokens)
 
 
 @pytest.mark.parametrize("args", [("--", "--config", "x.yaml"), ("--", "--config=x.yaml"),

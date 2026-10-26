@@ -10,8 +10,8 @@ import os
 import pytest
 
 from errors import Refusal
-from helpers import (FORK_VARS, NEW_PARSER, OLD_PARSER, PARSER, ROOT, SERVE, World, make_tree,
-                     serve_py, write)
+from helpers import (ARG_UTILS, ARGPARSE, FORK_VARS, NEW_PARSER, OLD_PARSER, PAIRED_ARGPARSE, PARSER, ROOT,
+                     SERVE, World, make_tree, serve_py, write)
 from registry import read_arg_options, read_registry
 
 
@@ -83,6 +83,12 @@ def test_parser_module_found_from_the_serve_command(tmp_path, parser_file):
 def test_unfollowable_argument_source_refused(tmp_path, changes, want):
     """A file the serve command's imports lead to that is missing, or a link
     that cannot be followed, is a refusal naming it: never a shorter list."""
+    assert want in refusal_after(tmp_path, changes)
+
+
+def refusal_after(tmp_path, changes: dict[str, str | None]) -> str:
+    """The refusal of read_arg_options on a fixture tree with files replaced
+    (None: removed)."""
     tree = make_tree(str(tmp_path / "t"))
     for rel, text in changes.items():
         if text is None:
@@ -91,7 +97,56 @@ def test_unfollowable_argument_source_refused(tmp_path, changes, want):
             write(os.path.join(tree, rel), text)
     with pytest.raises(Refusal) as exc:
         read_arg_options(tree)
-    assert want in str(exc.value)
+    return str(exc.value)
+
+
+NEGATION_REFUSALS = [
+    ({SERVE: serve_py().replace("from vllm.utils.argparse_utils import FlexibleArgumentParser\n", "")},
+     "no 'from ... import FlexibleArgumentParser'; the negative forms of the server's boolean options"),
+    ({ARGPARSE: None}, "FlexibleArgumentParser comes from vllm.utils.argparse_utils, which this engine tree lacks"),
+    ({ARGPARSE: PAIRED_ARGPARSE.replace('    _inverse_prefixes = {"--enable-": "--disable-", '
+                                        '"--disable-": "--enable-"}\n', "")},
+     "EnableDisableAction builds its option strings without an _inverse_prefixes table"),
+    ({ARGPARSE: PAIRED_ARGPARSE.replace("class EnableDisableAction(BooleanOptionalAction):\n    _inverse_prefixes",
+                                        "class Base(BooleanOptionalAction):\n    pass\n\n\n"
+                                        "class EnableDisableAction(Base):\n    _prefixes")},
+     "EnableDisableAction builds its option strings without an _inverse_prefixes table"),
+    ({ARGPARSE: PAIRED_ARGPARSE.replace('"--disable-": "--enable-"', '"--disable-": ENABLE')},
+     "EnableDisableAction._inverse_prefixes is not a table of literal --prefixes"),
+]
+
+
+@pytest.mark.parametrize("changes, want", NEGATION_REFUSALS)
+def test_unreadable_negative_forms_refused(tmp_path, changes, want):
+    """The parser class module that gives boolean options their negative
+    forms is found from the serve command's imports; a boolean action class
+    whose negative forms cannot be read refuses."""
+    assert want in refusal_after(tmp_path, changes)
+
+
+BOOLEANS = "from argparse import BooleanOptionalAction\n\n\n" + ARG_UTILS + """\
+        parser.add_argument("--enable-lora", action=BooleanOptionalAction)
+        parser.add_argument("--disable-log-stats", "--quiet-stats", action=BooleanOptionalAction)
+"""
+
+
+def test_negative_forms_come_from_the_tree_parser(tmp_path):
+    """argparse's --no-X in every tree; --disable-X for --enable-X and the
+    reverse only where the tree's parser class module pairs them."""
+    files = {"vllm/engine/arg_utils.py": BOOLEANS}
+    plain = read_arg_options(make_tree(str(tmp_path / "plain"), extra_files=files))
+    paired = read_arg_options(make_tree(str(tmp_path / "paired"), extra_files={**files, ARGPARSE: PAIRED_ARGPARSE}))
+    assert plain.negations == (("", "no-"),)
+    assert paired.negations == (("", "no-"), ("enable-", "disable-"), ("disable-", "enable-"))
+    for opts in (plain, paired):
+        assert opts.destination("no-enable-lora") == opts.destination("enable-lora") == "enable-lora"
+        assert opts.destination("no-quiet-stats") == "disable-log-stats"
+        assert opts.destination("disable-log-stats") == "disable-log-stats"
+    assert plain.destination("disable-lora") == "disable-lora"
+    assert paired.destination("disable-lora") == "enable-lora"
+    assert paired.destination("enable-log-stats") == "disable-log-stats"
+    assert paired.negative_forms("enable-lora") == {"no-enable-lora", "disable-lora"}
+    assert plain.negative_forms("enable-lora") == {"no-enable-lora"}
 
 
 def test_launch_refused_without_the_parser_import(tmp_path):

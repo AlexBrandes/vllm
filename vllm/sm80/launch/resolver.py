@@ -19,8 +19,8 @@ a checkpoint reference, as are drafter, Engram and override-sidecar paths;
 the reference (not its directory) is part of the functional argv; [fixed] keys and controlled arguments change only
 under --experiment, whatever the channel (overlay, .env, ambient, --set,
 extra arguments, unset) and whatever the spelling: arguments are compared
-by the engine argument they set (an alias, the --no-X form, a dotted
-option or an abbreviation of a protected one sets that one); only the
+by the engine argument they set (an alias, a negative form such as --no-X,
+a dotted option or an abbreviation of a protected one sets that one); only the
 launcher's own instrumentation list and the host/port location are
 excluded from the functional hash, and their values must be plain scalars;
 no argument value may carry an option token; every child environment name
@@ -845,18 +845,15 @@ def _apply_user(final: Final, knob: str, spec: dict, raw: str, extra_args: list[
 
 def arg_destination(name: str, opts: ArgOptions) -> str:
     """The engine argument a spelling sets: a dotted option (a.b) sets its
-    parent a, an alias its first name, --no-X the flag X."""
-    head = normalize_arg_name(name).split(".", 1)[0]
-    head = opts.aliases.get(head, head)
-    if head.startswith("no-") and head not in opts.options:
-        head = opts.aliases.get(head[3:], head[3:])
-    return head
+    parent a, an alias its first name, a negative form of the tree's parser
+    (--no-X; --disable-X where it pairs --enable-X) the flag X."""
+    return opts.destination(normalize_arg_name(name).split(".", 1)[0])
 
 
 def reaches(name: str, guarded: set[str] | frozenset[str], opts: ArgOptions) -> str | None:
     """The guarded argument a spelling sets, if any: by its destination, or
     as an abbreviation argparse expands to a guarded option (or its alias or
-    --no- form). A spelling the tree declares exactly is never an
+    a negative form of either). A spelling the tree declares exactly is never an
     abbreviation. Both sides are compared as destinations: the guarded
     names are canonicalised the same way as the incoming one."""
     guarded = {arg_destination(g, opts) for g in guarded}
@@ -868,7 +865,7 @@ def reaches(name: str, guarded: set[str] | frozenset[str], opts: ArgOptions) -> 
         return None
     for g in sorted(guarded):
         forms = {g} | {a for a, c in opts.aliases.items() if c == g}
-        if any(f.startswith(spelled) or f"no-{f}".startswith(spelled) for f in forms):
+        if any(f.startswith(spelled) for f in forms | {n for f in forms for n in opts.negative_forms(f)}):
             return g
     return None
 
@@ -877,7 +874,7 @@ def check_protected_spellings(ms: ModelSettings, opts: ArgOptions,
                               absent: dict[str, str] | None = None) -> None:
     """A fixed or controlled argument is declared by a full option name the
     engine tree declares (its own name or an alias), so it names exactly one
-    destination; an abbreviation, a --no- form or a name the tree does not
+    destination; an abbreviation, a negative form or a name the tree does not
     declare is refused rather than resolved, unless a plain-upstream variant
     declares it absent from this engine ([absent_args], with its reason)."""
     declared = [k[5:].split(".", 1)[0] for k in sorted(ms.fixed) if k.startswith("args.")]
