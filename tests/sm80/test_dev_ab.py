@@ -16,7 +16,7 @@ MODEL_RUNNER = REPO / "vllm" / "v1" / "worker" / "gpu" / "model_runner.py"
 # sha256 of GPUModelRunner.capture_model (decorator to end, dedented) in the
 # upstream-derived tree the hook was added to; the hook is the only change.
 UPSTREAM_CAPTURE_MODEL_SHA256 = (
-    "14f78e5a457fc366b63170a7b0e87868dda176c2e6dbe541ef30c750307c4158"
+    "392a6e7106e7409c488b8e1e99af914294957b78c1427614feb4ca87124229b7"
 )
 HOOK = "@with_ab_capture\n"
 
