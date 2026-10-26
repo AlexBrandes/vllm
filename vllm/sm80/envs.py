@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
     VLLM_ENGRAM_ROW_CACHE_PRELOAD: bool = False
     VLLM_ENGRAM_DIRECT_READ: bool = False
+    VLLM_ENGRAM_SEGMENT: str = ""
     VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
     VLLM_EXL3_MOE_V2: bool = False
     VLLM_EXL3_MOE_V2_FOLD: bool = False
@@ -1056,6 +1057,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_ENGRAM_DIRECT_READ": lambda: bool(
         int(os.getenv("VLLM_ENGRAM_DIRECT_READ", "0"))
     ),
+    # Socket of a table segment holder (vllm.sm80.table_segment) that
+    # holds the Engram checkpoint files in memory: with placement "ram" each
+    # rank maps its rows of the held files instead of reading them from
+    # storage. A missing holder, or a file that is not the one it read, is
+    # refused at startup; there is no fallback to reading. Refused with
+    # "ssd". Default empty: off.
+    "VLLM_ENGRAM_SEGMENT": lambda: os.getenv("VLLM_ENGRAM_SEGMENT", ""),
     # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
     # hits and misses, page-cache and storage bytes, host read and wait
     # time) every N steps, and at close and exit

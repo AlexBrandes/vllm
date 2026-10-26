@@ -22,6 +22,11 @@ shards them, i.e. one contiguous row range ``[vocab_start, vocab_end)``:
   the page cache, after a startup check that the host (and every memory
   limit of the process's cgroups) can hold them, which refuses to start
   rather than fall back;
+- with ``VLLM_ENGRAM_SEGMENT`` (placement ``ram`` only) the scales and
+  values are not read: the rank maps its rows of the files a table segment
+  holder (``vllm.sm80.table_segment``) already holds in sealed memory,
+  read-only; a missing holder, or a file other than the one it read, is
+  refused at startup;
 - with ``VLLM_ENGRAM_DIRECT_READ`` the rows the cache misses are read with
   O_DIRECT through aligned 4 KiB spans, so they leave no pages in the page
   cache; a file system that refuses O_DIRECT is refused at startup, never
@@ -35,7 +40,10 @@ pinned staging, so they are neither pinned nor registered with CUDA: the
 caching pinned allocator rounds a block up to a power of two (a 22.9 GiB
 value share would take 32 GiB), and registration buys nothing for host
 reads. They are anonymous mappings of their exact size, advised to use
-transparent huge pages, which the random row gathers walk with fewer misses.
+transparent huge pages, which the random row gathers walk with fewer misses;
+attached ones are read-only shared mappings of the holder's sealed memory
+files, populated at startup and advised the same way (shared memory takes
+huge pages only where the host's ``shmem_enabled`` allows them).
 
 The host part of a lookup (owned mask, scales gather, cache probe, reads of
 the missed rows, cache insert, values gather) is one native call without the
@@ -85,6 +93,7 @@ import os
 import socket
 import struct
 import time
+import warnings
 import weakref
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -535,13 +544,30 @@ def _gather_over_tp(obj: object) -> list:
     return out
 
 
+def _attached(attachment, path: str, offset: int, rows: int, width: int) -> torch.Tensor:
+    """A read-only [rows, width] uint8 view of bytes at ``offset`` of the
+    held image of ``path``. The tensor keeps the mapping alive; nothing
+    writes it (the native fetch only reads its tables)."""
+    if rows * width == 0:
+        return torch.empty((rows, width), dtype=torch.uint8)
+    mapping, skip = attachment.map(path, offset, rows * width)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*not writable.*")
+        table = torch.frombuffer(
+            mapping, dtype=torch.uint8, count=rows * width, offset=skip
+        )
+    return table.view(rows, width)
+
+
 class EngramRowStore:
     """One rank's rows of one Engram table on the host, fetched by the
     native ``EngramHostFetch`` into this store's staging.
 
     Scales are always resident. Values come from the file through the row
     cache (``ssd``) or from a resident copy (``ram``); resident data is of
-    its exact size and read past the page cache. A fetch fills the
+    its exact size and read past the page cache, or, with ``segment`` (the
+    socket of a table segment holder, ``ram`` only), mapped read-only from
+    the holder's images of the files. A fetch fills the
     staging for global row ids: unowned ids get zero values and the scale
     byte of 1.0, which dequantize to +0 as the reference's mask does; rows
     that cannot be read are poisoned. With ``direct_read`` (``ssd`` only)
@@ -560,6 +586,7 @@ class EngramRowStore:
         capacity: int,
         pin: bool = False,
         direct_read: bool = False,
+        segment: str = "",
     ):
         from vllm.models.qwen4_exp.nvidia.exl3_ple import (
             _read_error,
@@ -571,6 +598,8 @@ class EngramRowStore:
             raise ValueError(f"Engram placement must be ssd or ram, not {placement!r}")
         if direct_read and placement != "ssd":
             raise ValueError("Engram direct reads apply to placement ssd only")
+        if segment and placement != "ram":
+            raise ValueError("VLLM_ENGRAM_SEGMENT applies to placement ram only")
         if not 0 <= owner_lo <= owner_hi <= files.rows:
             raise ValueError("Engram owner range exceeds the table rows")
         if files.dim % ENGRAM_QUANT_BLOCK:
@@ -593,24 +622,43 @@ class EngramRowStore:
         # Fetches queued or finished but not yet taken. Counted here, so a
         # lookup calls into the fetch once (each call may hand off the GIL).
         self.in_flight = 0
+        # The table segment lease (its connection), when attached.
+        self.attachment = None
         self.fd = os.open(files.values_path, os.O_RDONLY | os.O_CLOEXEC)
         try:
             # Rows are read at random; readahead would only fetch unused rows.
             os.posix_fadvise(
                 self.fd, self.extent_offset, self.extent_bytes, os.POSIX_FADV_RANDOM
             )
-            self.scales = _resident_empty(rows, self.scale_bytes)
-            self.direct_load = _read_resident(
-                files.scales_path,
-                files.scales_offset + owner_lo * self.scale_bytes,
-                self.scales,
-            )
             self.table: torch.Tensor | None = None
-            if placement == "ram":
-                self.table = _resident_empty(rows, self.row_bytes)
-                self.direct_load &= _read_resident(
-                    self.path, self.extent_offset, self.table
+            scales_at = files.scales_offset + owner_lo * self.scale_bytes
+            if segment:
+                from vllm.sm80.table_segment import Attachment
+
+                self.attachment = Attachment(
+                    segment,
+                    sorted({files.values_path, files.scales_path}),
+                    log=logger.info,
                 )
+                self.scales = _attached(
+                    self.attachment, files.scales_path, scales_at, rows,
+                    self.scale_bytes,
+                )
+                self.table = _attached(
+                    self.attachment, self.path, self.extent_offset, rows,
+                    self.row_bytes,
+                )
+                self.direct_load = True
+            else:
+                self.scales = _resident_empty(rows, self.scale_bytes)
+                self.direct_load = _read_resident(
+                    files.scales_path, scales_at, self.scales
+                )
+                if placement == "ram":
+                    self.table = _resident_empty(rows, self.row_bytes)
+                    self.direct_load &= _read_resident(
+                        self.path, self.extent_offset, self.table
+                    )
             self.ids = _host_empty((capacity,), torch.int64, pin)
             self.values = _host_empty((capacity, self.row_bytes), torch.uint8, pin)
             self.scales_out = _host_empty(
@@ -817,6 +865,10 @@ class EngramRowStore:
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
+        if self.attachment is not None:
+            # Detach; the mappings stay valid while the tensors live.
+            self.attachment.close()
+            self.attachment = None
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +903,7 @@ class Sm80EngramEmbedding(nn.Module):
         placement: str,
         cache_bytes: int,
         direct_read: bool = False,
+        segment: str = "",
         device: torch.device | str = "cpu",
         block_size: int = ENGRAM_QUANT_BLOCK,
         label: str = "engram",
@@ -897,6 +950,7 @@ class Sm80EngramEmbedding(nn.Module):
             capacity=self.capacity_rows,
             pin=cuda,
             direct_read=direct_read,
+            segment=segment,
         )
         # Tokens of the last forward whose rows failed, on any rank.
         self._failed_tokens = torch.zeros(
@@ -1220,7 +1274,8 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     )
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
-    if placement == "ram":
+    segment = envs.VLLM_ENGRAM_SEGMENT
+    if placement == "ram" and not segment:
         # Every rank measures its host before any allocates this table.
         _, _, lo, hi = engram_owner_range(head_sizes, tp_rank, tp_size)
         check_ram_placement_fits(
@@ -1238,6 +1293,7 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
         placement=placement,
         cache_bytes=int(cache_gib * GiB) // len(layout.layer_ids),
         direct_read=placement == "ssd" and envs.VLLM_ENGRAM_DIRECT_READ,
+        segment=segment,
         device=torch.device("cuda", torch.cuda.current_device()),
         label=f"layer {layer_id}",
         log_every=log_every,
@@ -1252,7 +1308,12 @@ def build_sm80_engram_embedding(layout, layer_hash_index: int) -> Sm80EngramEmbe
     if placement == "ssd" and envs.VLLM_ENGRAM_ROW_CACHE_PRELOAD:
         preloaded = preload_row_cache(table.store)
     resident, total = table.page_cache_residency()
-    if placement == "ram":
+    if placement == "ram" and segment:
+        values = (
+            f"attached {table.store.table.nbytes / GiB:.2f} GiB from the table "
+            f"segment {segment} (manifest {table.store.attachment.manifest[:12]})"
+        )
+    elif placement == "ram":
         values = (
             f"resident {table.store.table.nbytes / GiB:.2f} GiB, read "
             f"{'direct' if table.store.direct_load else 'buffered'}"
