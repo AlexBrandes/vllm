@@ -11,8 +11,9 @@ include_dirs = ["csrc"]
 
 # EXL3 and the compiled Marlin library are built only by their standalone
 # builders. CMakeLists.txt and setup.py add neither directory to a wheel
-# target; shared build-driver changes, and the upstream csrc headers they
-# include, still fail the wheel comparison.
+# target (earlier commits had an opt-in Marlin target, off in every wheel and
+# native build: [[cmake_option]]); shared build-driver changes, and the
+# upstream csrc headers the sources include, still fail the wheel comparison.
 [[extensions]]
 artifact = "vllm/_exl3_C*.so"
 builder = "csrc/exl3/build_standalone.py"
@@ -48,6 +49,18 @@ paths = []
 source_inputs = ["CMakeLists.txt", "cmake", "csrc"]
 wheel = true
 
+# A changed CMake file (CMakeLists.txt, *.cmake) whose statements differ only in
+# comments and in statements of a fork build option (each if() block without
+# else/elseif whose condition names one of `tokens`, and each set/option/unset
+# whose first argument is one and that sets no true constant) changes no wheel
+# target: the option is off in the wheel's build and in native_build.py's CMake
+# builds (their environment never sets it). It makes stale the `native` of each
+# entry whose statements differ (none for a comment change); any other CMake
+# change goes by [[stale]] below.
+[[cmake_option]]
+tokens = ["VLLM_AMPERE_MARLIN_BUILD", "_AMPERE_MARLIN_DEFAULT"]
+native = "vllm/_ampere_marlin_C*.so"
+
 # Which natives a changed build input (the source_inputs above, differing
 # between a base commit and a candidate) makes stale. `native` is one artifact
 # glob or a list. A changed header (.h .cuh .hpp ...) makes stale every native
@@ -59,9 +72,9 @@ wheel = true
 # match it; no match is refused (unattributed). native "wheel": an input of the
 # wheel natives native_build.py does not build (spinloop, fs_io_C,
 # cumem_allocator and the FetchContent extensions' registration files; the
-# CMake files configure every target): a change to one, or to a header one of
-# them includes, is refused, naming the files, never run on the wheel's stale
-# binary.
+# CMake files beyond [[cmake_option]] configure every target): a change to one,
+# or to a header one of them includes, is refused, naming the files, never run
+# on the wheel's stale binary.
 [[stale]]
 paths = ["csrc/exl3/**"]
 native = "vllm/_exl3_C*.so"

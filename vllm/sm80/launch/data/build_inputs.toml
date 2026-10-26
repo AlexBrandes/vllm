@@ -30,13 +30,14 @@ patterns = [
 # registration code, imports, build entries, eager initializers) counts. A
 # missing file reduces from ""; a file that does not parse counts as changed.
 [env_modules]
-paths = ["vllm/envs.py"]
-tables = ["environment_variables"]
+paths = ["vllm/envs.py", "vllm/sm80/envs.py"]
+tables = ["environment_variables", "FORK_ENV_VARS", "RETIRED_ENV_VARS"]
 names = [
   "CMAKE_BUILD_TYPE",
   "MAX_JOBS",
   "NVCC_THREADS",
   "VERBOSE",
+  "VLLM_AMPERE_MARLIN_BUILD",
   "VLLM_DOCKER_BUILD_CONTEXT",
   "VLLM_MAIN_CUDA_VERSION",
   "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX",
