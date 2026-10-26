@@ -159,7 +159,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
 | `vllm/sm80/distributed/step_errors.py` | 166 |
-| `vllm/sm80/envs.py` | 1,675 |
+| `vllm/sm80/envs.py` | 1,693 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -195,7 +195,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/model_registry.py` | 78 |
 | `vllm/sm80/parser_recovery.py` | 321 |
 | `vllm/sm80/platform.py` | 156 |
-| `vllm/sm80/plugin.py` | 330 |
+| `vllm/sm80/plugin.py` | 348 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
 | `vllm/sm80/spec_decode/aux_fc_fold.py` | 184 |
@@ -213,13 +213,15 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/warmup.py` | 184 |
 | `vllm/sm80/worker/__init__.py` | 2 |
 | `vllm/sm80/worker/cudagraph_mem.py` | 474 |
+| `vllm/sm80/worker/execution_trace.py` | 150 |
 | `vllm/sm80/worker/graph_mem_worker.py` | 87 |
 | `vllm/sm80/worker/mem_attribution.py` | 276 |
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **76 files** | **22,236** |
+| `vllm/sm80/worker/trace_export.py` | 200 |
+| **78 files** | **22,622** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -538,7 +540,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/launch/test_launch_validated.py` | 483 |
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
-| `tests/sm80/seams.yaml` | 1,610 |
+| `tests/sm80/seams.yaml` | 1,645 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 289 |
 | `tests/sm80/test_dev_ab.py` | 649 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
@@ -611,8 +613,10 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_hop.py` | 187 |
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 564 |
+| `tests/v1/worker/test_sm80_execution_trace.py` | 124 |
+| `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **286 files** | **120,872** |
+| **288 files** | **121,247** |
 
 #### `tools/`
 
@@ -899,6 +903,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS` | `int` | `65` | `'65'` |
 | `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
+| `VLLM_SM80_EXECUTION_TRACE` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_SERIAL_TRACE_EXPORT` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
@@ -907,7 +913,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **150 variables** | | | |
+| **152 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -930,12 +936,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 224 |
-| Fork-added product lines | 76,666 |
+| Fork-added product files | 226 |
+| Fork-added product lines | 77,052 |
 | Patched upstream files | 100 |
 | Patched upstream lines | +4,539 / -787 |
 | Patched upstream product files | 73 |
 | Patched upstream product lines | +3,056 / -237 |
-| Product lines added (new files and patches) | 79,722 |
-| Fork environment variables (flags) | 150 |
+| Product lines added (new files and patches) | 80,108 |
+| Fork environment variables (flags) | 152 |
 | Unreferenced fork definitions | 7 (59 lines) |
