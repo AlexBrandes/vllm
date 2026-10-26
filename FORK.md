@@ -778,12 +778,12 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_SWA_META_BATCH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM` | `bool` | `False` | `'0'` |
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
+| `VLLM_DFLASH2_SELECTOR_SHARD` | `bool` | `False` | `'0'` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
 | `VLLM_DSPARK_ADAPTIVE_DEPTH` | `str` | `''` | `''` |
 | `VLLM_DSPARK_CONFIDENCE_DUMP` | `str` | `''` | `''` |
 | `VLLM_DSPARK_DEPTH_HINT` | `str` | `''` | `''` |
 | `VLLM_DSPARK_PER_K_WIDTH` | `bool` | `False` | `'0'` |
-| `VLLM_DSPARK_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_DIRECT_READ` | `bool` | `False` | `'0'` |
 | `VLLM_ENGRAM_PLACEMENT` | `str` | `'ssd'` | `'ssd'` |
 | `VLLM_ENGRAM_ROW_CACHE_GIB` | `float` | `1.0` | `'1'` |
@@ -820,7 +820,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_GLM5_DECODE_MOE_ROUTING` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE` | `str` | `''` | `''` |
 | `VLLM_GLM5_DRAFTER_ROPE_FIT` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_DRAFTER_SELECTOR_SHARD` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MOE_ROUTE_V2_MASK` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD` | `bool` | `False` | `'0'` |
@@ -857,7 +856,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_MHC_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_SPARSE_MLA_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_PREFILL_REDUCE_OVERLAP` | `bool` | `False` | `'0'` |
-| `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TUNING_FILE` | `str` | `''` | `''` |

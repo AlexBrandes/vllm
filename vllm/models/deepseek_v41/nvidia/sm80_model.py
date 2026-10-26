@@ -31,10 +31,10 @@ What changes on sm_80:
   (``vllm.sm80.plugin.HF_CONFIG_DEFAULTS``), the EXL3 head stores its FP32
   result in that dtype and both models' logits processors serve it
   (``Exl3HeadLogitsProcessor``);
-- with ``VLLM_SM80_TARGET_SHARD_ARGMAX`` the target's
-  ``compute_logits`` returns, inside a greedy-only sampling step of the fork
-  runner, rows that hold only the vocabulary-parallel argmax instead of the
-  all-gathered logits (``vllm/sm80/worker/target_argmax.py``).
+- with ``VLLM_SM80_SHARD_ARGMAX`` the target's ``compute_logits`` returns,
+  inside a greedy-only sampling step of the fork runner, rows that hold only
+  the vocabulary-parallel argmax instead of the all-gathered logits
+  (``vllm/sm80/worker/target_argmax.py``: ``ShardArgmaxLogits``).
 
 The attention layers are the platform's (``_select_dsv4_attn_cls``); the
 layer topology this supports is TP with whole-expert EP and no sequence
@@ -422,7 +422,9 @@ def _init_ce_ring(model) -> None:
     )
 
 
-class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
+class DeepseekV41ForCausalLM(
+    target_argmax.ShardArgmaxLogits, upstream_vl.DeepseekV41ForCausalLM
+):
     """The DeepSeek-V4.1 vision wrapper with the sm_80 text model.
 
     The vision tower and aligner stay upstream's (BF16, replicated: EXL3 runs
@@ -443,18 +445,6 @@ class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
             prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
         )
         Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
-
-    # target_argmax.refusal: compute_logits serves greedy-only steps.
-    target_argmax_logits = True
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        """Upstream's gathered logits; inside a greedy-only sampling step
-        (``VLLM_SM80_TARGET_SHARD_ARGMAX``) the rows that hold only
-        their argmax, without the all-gather
-        (``vllm/sm80/worker/target_argmax.py``)."""
-        if target_argmax.active():
-            return target_argmax.argmax_rows(self, hidden_states)
-        return super().compute_logits(hidden_states)
 
 
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):

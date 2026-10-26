@@ -276,7 +276,7 @@ def _argmax_apply(runner, on: bool) -> None:
     speculator._validate_local_argmax_reduction()
 
 
-_TARGET_ARGMAX_ENV = "VLLM_SM80_TARGET_SHARD_ARGMAX"
+_TARGET_ARGMAX_ENV = "VLLM_SM80_SHARD_ARGMAX"
 
 
 def _target_argmax_unavailable(runner) -> str | None:
@@ -293,7 +293,9 @@ def _target_argmax_current(runner) -> bool:
 
 def _target_argmax_apply(runner, on: bool) -> None:
     """Eager sampling only (no graph holds it); the on arm compiles the slot
-    kernels here, on one dummy row, so its first greedy step does not."""
+    kernels here, on one dummy row, so its first greedy step does not. The
+    arm is the switch's target half: the drafts keep the boot value (DSpark
+    reads the switch once, before its draft graphs are captured)."""
     from vllm.sm80.worker import target_argmax
 
     target_argmax.set_enabled(runner, on)
@@ -1023,7 +1025,7 @@ SWITCHES: dict[str, Switch] = {
             _argmax_unavailable, _argmax_current, _argmax_apply,
         ),
         Switch(
-            "dsv41_target_shard_argmax", _TARGET_ARGMAX_ENV, False, True,
+            "target_shard_argmax", _TARGET_ARGMAX_ENV, False, True,
             _target_argmax_unavailable, _target_argmax_current,
             _target_argmax_apply,
         ),

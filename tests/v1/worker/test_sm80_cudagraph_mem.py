@@ -225,7 +225,7 @@ def test_levels(monkeypatch):
 @pytest.mark.parametrize("flag", ["0", "1", "2"])
 def test_select_worker(monkeypatch, flag):
     monkeypatch.setenv(FLAG, flag)
-    monkeypatch.delenv("VLLM_SM80_TARGET_SHARD_ARGMAX", raising=False)
+    monkeypatch.delenv("VLLM_SM80_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
     cudagraph_mem.select_worker(parallel)
     expected = cudagraph_mem.WORKER if flag != "0" else cudagraph_mem.UPSTREAM_WORKER
@@ -239,7 +239,7 @@ def test_select_worker(monkeypatch, flag):
 
 def test_select_worker_keeps_a_custom_worker(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.delenv("VLLM_SM80_TARGET_SHARD_ARGMAX", raising=False)
+    monkeypatch.delenv("VLLM_SM80_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls="my.Worker")
     cudagraph_mem.select_worker(parallel)
     assert parallel.worker_cls == "my.Worker"

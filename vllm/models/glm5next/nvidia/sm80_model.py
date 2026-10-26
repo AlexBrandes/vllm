@@ -18,6 +18,9 @@ What the subclasses add:
 - the target embedding on the last pipeline stage when a drafter there
   shares it;
 - ``compute_logits_local`` for ``--enable-batch-sharded-sampling``;
+- with ``VLLM_SM80_SHARD_ARGMAX``, the argmax rows from ``compute_logits``
+  in a greedy-only sampling step of the fork runner
+  (``vllm/sm80/worker/target_argmax.py``: ``ShardArgmaxLogits``);
 - the model-runner state (``model_state.py``) with the fork's KDA RecoverSSM.
 
 Importing this module also registers the fork's GLM layer overrides
@@ -48,6 +51,7 @@ from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.models.glm5next.common import model as glm_model
 from vllm.sequence import IntermediateTensors
 from vllm.sm80 import plugin
+from vllm.sm80.worker.target_argmax import ShardArgmaxLogits
 
 # Which per-layer tensor is handed to an EAGLE3/DFlash drafter as the
 # "hidden state" of an auxiliary layer, from the text config field
@@ -401,7 +405,7 @@ class Glm5NextModel(glm_model.Glm5NextModel):
         return hidden_states
 
 
-class Glm5NextForCausalLM(glm_model.Glm5NextForCausalLM):
+class Glm5NextForCausalLM(ShardArgmaxLogits, glm_model.Glm5NextForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         embed_tokens = _drafter_target_embedding(
             vllm_config, maybe_prefix(prefix, "model")
@@ -430,7 +434,9 @@ class Glm5NextForCausalLM(glm_model.Glm5NextForCausalLM):
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
 
-class Glm5NextForConditionalGeneration(glm_model.Glm5NextForConditionalGeneration):
+class Glm5NextForConditionalGeneration(
+    ShardArgmaxLogits, glm_model.Glm5NextForConditionalGeneration
+):
     """The multimodal wrapper. Its ``language_model`` is built through the
     registry under ``Glm5NextForCausalLM``, so it is this module's text model
     whenever the fork plugin has registered it."""

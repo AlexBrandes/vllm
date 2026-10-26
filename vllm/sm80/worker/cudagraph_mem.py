@@ -89,11 +89,11 @@ def tracing() -> bool:
 
 def select_worker(parallel_config: Any) -> None:
     """With this flag or the greedy target argmax
-    (``VLLM_SM80_TARGET_SHARD_ARGMAX``), run the fork worker in place
+    (``VLLM_SM80_SHARD_ARGMAX``), run the fork worker in place
     of upstream's GPU worker (called by the fork platform's
     ``check_and_update_config``). The argmax refuses another worker; the
     estimate split only warns."""
-    argmax = bool(envs.VLLM_SM80_TARGET_SHARD_ARGMAX)
+    argmax = bool(envs.VLLM_SM80_SHARD_ARGMAX)
     if not (enabled() or argmax):
         return
     if parallel_config.worker_cls == UPSTREAM_WORKER:
@@ -101,7 +101,7 @@ def select_worker(parallel_config: Any) -> None:
     elif parallel_config.worker_cls != WORKER:
         if argmax:
             raise ValueError(
-                "VLLM_SM80_TARGET_SHARD_ARGMAX: the greedy target "
+                "VLLM_SM80_SHARD_ARGMAX: the greedy target "
                 f"argmax needs the fork GPU worker, not {parallel_config.worker_cls}"
             )
         logger.warning(

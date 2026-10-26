@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_ADAPTIVE_DEPTH: str = ""
     VLLM_DSPARK_DEPTH_HINT: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
-    VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
+    VLLM_DFLASH2_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_CUDAGRAPH_ESTIMATE_SPLIT: int = 0
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
@@ -94,8 +94,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
     VLLM_DEEPSEEK_V41_ATTN_PIPELINE: bool = False
     VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
-    VLLM_DSPARK_SHARD_ARGMAX: bool = False
-    VLLM_SM80_TARGET_SHARD_ARGMAX: bool = False
+    VLLM_SM80_SHARD_ARGMAX: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
     VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
     VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
@@ -497,8 +496,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vocab rows across the tensor-parallel ranks instead of replicating them.
     # Each rank looks up the rows it owns, zero elsewhere, and one all-reduce
     # of the two gathered row sets rebuilds them exactly (x + 0 = x).
-    "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": lambda: bool(
-        int(os.getenv("VLLM_GLM5_DRAFTER_SELECTOR_SHARD", "0"))
+    "VLLM_DFLASH2_SELECTOR_SHARD": lambda: bool(
+        int(os.getenv("VLLM_DFLASH2_SELECTOR_SHARD", "0"))
     ),
     # Log where device memory goes at start-up: resident bytes per module
     # group after loading, the peak of each profile_run stage, the KV sizing
@@ -905,41 +904,37 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
     ),
-    # The DSpark drafter's greedy Markov sampling (DeepSeek-V4.1 on sm_80):
-    # each TP rank takes the argmax of its own vocabulary shard of the draft
-    # logits (base logits + Markov bias), and the ranks exchange one
-    # (value, index) pair per 4096-column chunk through a 16-byte all-reduce
-    # slot, instead of all-gathering the full-vocabulary base logits once per
-    # draft step. Precision: none changes. The logits are the same values the
-    # gathered path builds (the same head and the same addition on this
-    # rank's columns), and the pick is torch.argmax's over the gathered row,
-    # ties and NaN included: the first index of the largest value, the first
-    # NaN when any is NaN, -0.0 equal to +0.0. Greedy drafts only (no
-    # probabilistic drafting, draft top-k or acceptance estimator). Default
+    # Greedy argmax over a vocabulary-parallel head without the all-gather of
+    # the logits, for greedy target sampling and greedy drafting. Each TP rank
+    # takes the argmax of its own vocabulary shard, the ranks exchange one
+    # (value, index) pair per 4096-column chunk through 16-byte all-reduce
+    # slots, and the pick is torch.argmax's over the gathered row, ties and
+    # NaN included (the first index of the largest value, the first NaN, -0.0
+    # equal to +0.0). Precision: none changes.
+    # - Target: when every request of a step is greedy (temperature 0) and
+    #   nothing reads the logits beyond their argmax (no logprobs, logits
+    #   processing, grammar bitmask, top-k/top-p, NaN count, sampling mask or
+    #   watermarking), the samplers get rows holding 0.0 at the token and -inf
+    #   elsewhere; every other step gathers. A greedy-only step with
+    #   batch-sharded sampling samples unsharded from those rows. Needs a
+    #   target class with ShardArgmaxLogits (DeepSeek-V4.1, GLM-5.3, Qwen4Exp
+    #   on sm_80) and TP > 1. It selects the fork GPU worker
+    #   (vllm/sm80/worker/graph_mem_worker.py, V2 runner; another worker or
+    #   runner is refused at boot) and warms the kernels in the dummy sampler
+    #   run.
+    # - Drafts: the DSpark Markov sampler takes its greedy drafts per rank
+    #   (no probabilistic drafting, draft top-k, acceptance estimator or
+    #   reduced draft vocabulary); so does a greedy drafter sampling through
+    #   vLLM's sample_draft (MTP, EAGLE, DFlash) whose draft model has
+    #   compute_logits_local (Qwen4Exp's MTP on sm_80), set up at load and
+    #   refused with speculative_config.use_local_argmax_reduction (two
+    #   per-rank argmaxes) or an acceptance estimator; a candidate drafter
+    #   (DFlash2) has no draft argmax over the vocabulary.
+    # A config it cannot serve is refused at boot with the reason. Default
     # OFF: unset, the full-vocabulary all-gather and torch.argmax run. Read in
-    # vllm/sm80/spec_decode/shard_argmax.py.
-    "VLLM_DSPARK_SHARD_ARGMAX": lambda: bool(
-        int(os.getenv("VLLM_DSPARK_SHARD_ARGMAX", "0"))
-    ),
-    # Greedy target sampling without the all-gather of the target logits: when
-    # every request of a step is greedy (temperature 0)
-    # and nothing reads the logits beyond their argmax (no logprobs, logits
-    # processing, grammar bitmask, NaN count, sampling mask or watermarking),
-    # each TP rank takes the argmax of its own vocabulary shard of the target
-    # logits, the ranks exchange one (value, index) pair per 4096-column chunk
-    # through the DSpark drafter's 16-byte all-reduce slots, and the samplers
-    # get rows holding 0.0 at that token and -inf elsewhere. Precision: none
-    # changes. The token is torch.argmax's over the gathered row, ties and NaN
-    # included (the first index of the largest value, the first NaN, -0.0
-    # equal to +0.0), so the sampled and accepted tokens are the gathered
-    # path's whenever its rows hold no NaN. Every other step takes the gather.
-    # Set, it selects the fork GPU worker (vllm/sm80/worker/graph_mem_worker.py,
-    # V2 runner; another worker or runner is refused at boot) and warms the
-    # kernels in the dummy sampler run. Default OFF: unset, the full-vocabulary
-    # all-gather always runs. Read in vllm/sm80/worker/target_argmax.py and
-    # vllm/models/deepseek_v41/nvidia/sm80_model.py.
-    "VLLM_SM80_TARGET_SHARD_ARGMAX": lambda: bool(
-        int(os.getenv("VLLM_SM80_TARGET_SHARD_ARGMAX", "0"))
+    # vllm/sm80/worker/target_argmax.py and vllm/sm80/spec_decode/shard_argmax.py.
+    "VLLM_SM80_SHARD_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_SM80_SHARD_ARGMAX", "0"))
     ),
     # Drop the compressed PLE table from the page cache at setup so a run
     # starts cold (reads come from storage). Residency is logged either way.
@@ -1220,14 +1215,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
 # warn_retired_env_vars() and its call below in the next release.
 RETIRED_ENV_VARS: dict[str, str] = {
     # Renamed: shared code is named after the feature, not the model.
-    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": (
-        "renamed to VLLM_DSPARK_SHARD_ARGMAX (read by the shared DSpark "
-        "drafting code)"
-    ),
-    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": (
-        "renamed to VLLM_SM80_TARGET_SHARD_ARGMAX (read by the shared "
-        "sm_80 worker)"
-    ),
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": (
         "moved to the sm80 tuning table, moe_router/fused_route_max_rows"
     ),
@@ -1345,6 +1332,26 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": (
         "merged into VLLM_SM80_ALLREDUCE_ROUND_ONCE (wo_b partials summed with "
         "one rounding, in BF16 where the transport rounds once)"
+    ),
+    "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": (
+        "renamed to VLLM_DFLASH2_SELECTOR_SHARD (read by the shared DFlash2 "
+        "drafter code)"
+    ),
+    "VLLM_DSPARK_SHARD_ARGMAX": (
+        "merged into VLLM_SM80_SHARD_ARGMAX (greedy target sampling and "
+        "greedy drafting over a vocabulary-parallel head)"
+    ),
+    "VLLM_SM80_TARGET_SHARD_ARGMAX": (
+        "merged into VLLM_SM80_SHARD_ARGMAX (greedy target sampling and "
+        "greedy drafting over a vocabulary-parallel head)"
+    ),
+    "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": (
+        "merged into VLLM_SM80_SHARD_ARGMAX (greedy target sampling and "
+        "greedy drafting over a vocabulary-parallel head)"
+    ),
+    "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": (
+        "merged into VLLM_SM80_SHARD_ARGMAX (greedy target sampling and "
+        "greedy drafting over a vocabulary-parallel head)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (

@@ -91,7 +91,7 @@ def make(monkeypatch, tmp_path):
     monkeypatch.setattr(upstream.DSparkSpeculator, "__init__", _init_cpu)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_PER_K_WIDTH", False)
     monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_CONFIDENCE_DUMP", "")
-    monkeypatch.setattr(width_module.envs, "VLLM_DSPARK_SHARD_ARGMAX", False)
+    monkeypatch.setattr(width_module.envs, "VLLM_SM80_SHARD_ARGMAX", False)
     monkeypatch.setattr(
         width_module.envs, "VLLM_DSPARK_ADAPTIVE_DEPTH", _policy(tmp_path / "p.json")
     )
@@ -264,7 +264,7 @@ def test_draft_logit_features_keep_statistics_and_refuse_draft_topk(make, monkey
     for shard_argmax in (False, True):
         state_module._reset_for_tests()
         monkeypatch.setattr(
-            width_module.envs, "VLLM_DSPARK_SHARD_ARGMAX", shard_argmax
+            width_module.envs, "VLLM_SM80_SHARD_ARGMAX", shard_argmax
         )
         drafter = make()
         drafter._draft_topk = None

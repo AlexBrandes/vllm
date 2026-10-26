@@ -31,7 +31,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[4]
-SWITCH = "VLLM_DSPARK_SHARD_ARGMAX"
+SWITCH = "VLLM_SM80_SHARD_ARGMAX"
 
 
 def _sum_slots(per_rank: list[torch.Tensor]) -> torch.Tensor:
