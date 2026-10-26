@@ -123,18 +123,6 @@ class _Layer(torch.nn.Module):
         return self.owned.index(expert) if expert in self.owned else -1
 
 
-@pytest.fixture(autouse=True)
-def _no_plans(monkeypatch):
-    """The whole-expert plans are off unless a test sets one."""
-    for name in (
-        "VLLM_EXL3_EXPERT_REPLICAS",
-        "VLLM_EXL3_EXPERT_REPLICAS_SHA256",
-        "VLLM_EXL3_EXPERT_PLACEMENT",
-        "VLLM_EXL3_EXPERT_PLACEMENT_SHA256",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-
 def _build_and_load(
     monkeypatch, config, prefix, moe, layer, contiguous, experts=None
 ):
@@ -307,15 +295,6 @@ def test_whole_expert_ep_is_unchanged():
 
 
 @pytest.mark.parametrize(
-    "name", ["VLLM_EXL3_EXPERT_REPLICAS", "VLLM_EXL3_EXPERT_PLACEMENT"]
-)
-def test_whole_expert_plans_are_refused_under_tp(monkeypatch, tmp_path, name):
-    monkeypatch.setenv(name, str(tmp_path / "plan.json"))
-    with pytest.raises(ValueError, match=f"{name} plans whole experts per rank"):
-        quant.Exl3MoEMethod(None, "model.layers.0.ffn.experts", _moe_config(2304, 4, 0))
-
-
-@pytest.mark.parametrize(
     "option", [{"dp_size": 2}, {"pcp_size": 2}, {"sp_size": 2}, {"enable_eplb": True}]
 )
 def test_unsupported_dispatch_is_refused_under_tp(option):
@@ -388,7 +367,7 @@ def test_synthetic_ranks_hold_their_chunk_and_reassemble(
             columns = block_shard(intermediate, intermediate, rank, size, layer_index)
             # Every expert under its own id; nothing is left to another rank.
             assert method.global_expert_ids == list(range(EXPERTS))
-            assert method.local_experts == method.home_experts == EXPERTS
+            assert method.local_experts == EXPERTS
             assert method.nonlocal_keys == []
             assert method.intermediate_size == columns.stop - columns.start
             _check_layout(layer, contiguous)

@@ -99,9 +99,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/loader.py` | 230 |
 | `vllm/sm80/kernels/exl3/ops.py` | 1,383 |
 | `vllm/sm80/kernels/exl3/override.py` | 128 |
-| `vllm/sm80/kernels/exl3/placement.py` | 131 |
 | `vllm/sm80/kernels/exl3/quant.py` | 1,848 |
-| `vllm/sm80/kernels/exl3/replicas.py` | 389 |
 | `vllm/sm80/kernels/exl3/step_phase.py` | 98 |
 | `vllm/sm80/kernels/exl3/utils.py` | 401 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
@@ -135,7 +133,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/thin_gemm_v74.py` | 1,037 |
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 152 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **54 files** | **18,746** |
+| **52 files** | **18,226** |
 
 ### `vllm/sm80/`
 
@@ -361,8 +359,6 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/quantization/test_exl3_moe_v2_hidden5120.py` | 594 |
 | `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
 | `tests/kernels/quantization/test_exl3_moe_v2_switches.py` | 415 |
-| `tests/kernels/quantization/test_exl3_placement.py` | 202 |
-| `tests/kernels/quantization/test_exl3_replicas.py` | 409 |
 | `tests/kernels/quantization/test_exl3_step_phase.py` | 147 |
 | `tests/kernels/quantization/test_sm80_capture.py` | 438 |
 | `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
@@ -484,7 +480,6 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/models/deepseek_v41/sm80/test_target_shard_argmax.py` | 730 |
 | `tests/models/deepseek_v41/sm80/test_target_shard_argmax_gpu.py` | 72 |
 | `tests/models/deepseek_v41/sm80/test_topk_width.py` | 54 |
-| `tests/models/deepseek_v41/sm80/test_wo_a_strided.py` | 261 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_allreduce_bits_gpu.py` | 123 |
 | `tests/models/deepseek_v41/sm80/test_wo_b_bits_verdict.py` | 84 |
 | `tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py` | 364 |
@@ -606,7 +601,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 562 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **283 files** | **120,459** |
+| **280 files** | **119,587** |
 
 #### `tools/`
 
@@ -803,7 +798,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_SWA_META_BATCH` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM` | `bool` | `False` | `'0'` |
-| `VLLM_DEEPSEEK_V41_WO_A_STRIDED` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
@@ -824,10 +818,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_DENSE_PREFILL_TC_SCHEDULE` | `str` | `'planned'` | `'planned'` |
 | `VLLM_EXL3_DENSE_SPLITK` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_EXPERTS_CONTIGUOUS` | `bool` | `False` | `'0'` |
-| `VLLM_EXL3_EXPERT_PLACEMENT` | `str` | `''` | `''` |
-| `VLLM_EXL3_EXPERT_PLACEMENT_SHA256` | `str` | `''` | `''` |
-| `VLLM_EXL3_EXPERT_REPLICAS` | `str` | `''` | `''` |
-| `VLLM_EXL3_EXPERT_REPLICAS_SHA256` | `str` | `''` | `''` |
 | `VLLM_EXL3_HYBRID` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_CHUNK_ROWS` | `int` | `0` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
@@ -912,7 +902,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **151 variables** | | | |
+| **146 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -925,9 +915,8 @@ Functions, methods and classes in fork-added product files whose name occurs now
 | `vllm/models/deepseek_v41/nvidia/sm80_engram.py` | 286 | `engram_telemetry` | 4 | yes |
 | `vllm/sm80/dev_ab.py` | 1683 | `get_ab_arm` | 4 | yes |
 | `vllm/sm80/distributed/ce_ring_all_reduce.py` | 98 | `emulate_owner` | 7 | yes |
-| `vllm/sm80/kernels/exl3/replicas.py` | 249 | `expert_map_reference` | 8 | yes |
 | `vllm/sm80/spec_decode/dspark_row_mask.py` | 362 | `_reset_for_tests` | 3 | yes |
-| **7 definitions** | | | **59** | |
+| **6 definitions** | | | **51** | |
 
 ## 5. Health numbers
 
@@ -935,12 +924,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 221 |
-| Fork-added product lines | 73,367 |
+| Fork-added product files | 219 |
+| Fork-added product lines | 72,847 |
 | Patched upstream files | 110 |
 | Patched upstream lines | +5,202 / -807 |
 | Patched upstream product files | 83 |
 | Patched upstream product lines | +3,717 / -256 |
-| Product lines added (new files and patches) | 77,084 |
-| Fork environment variables (flags) | 151 |
-| Unreferenced fork definitions | 7 (59 lines) |
+| Product lines added (new files and patches) | 76,564 |
+| Fork environment variables (flags) | 146 |
+| Unreferenced fork definitions | 6 (51 lines) |

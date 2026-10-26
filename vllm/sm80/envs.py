@@ -115,7 +115,6 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
-    VLLM_DEEPSEEK_V41_WO_A_STRIDED: bool = False
     VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS: int = 48
@@ -149,10 +148,6 @@ if TYPE_CHECKING:
     VLLM_EXL3_MOE_PREFILL_TC: bool = False
     VLLM_EXL3_MOE_PREFILL_UNCHUNKED: bool = False
     VLLM_EXL3_EXPERTS_CONTIGUOUS: bool = False
-    VLLM_EXL3_EXPERT_PLACEMENT: str = ""
-    VLLM_EXL3_EXPERT_PLACEMENT_SHA256: str = ""
-    VLLM_EXL3_EXPERT_REPLICAS: str = ""
-    VLLM_EXL3_EXPERT_REPLICAS_SHA256: str = ""
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
     VLLM_SM80_CAPTURE_DIR: str = ""
     VLLM_SM80_CAPTURE_FAMILIES: str = "dense,moe,attn"
@@ -1068,15 +1063,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_DEEPSEEK_V41_GATE_GEMV": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "0"))
     ),
-    # DeepSeek-V4.1 on sm_80: the grouped FP8 wo_a (one Marlin GEMM per
-    # group) reads each group's rows of the attention output in place, as a
-    # row-strided view (Marlin's A row stride), instead of copying them to a
-    # contiguous tensor first: two copy kernels fewer per layer, the same
-    # GEMMs on the same values, so the same bytes. Default OFF. Read in
-    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
-    "VLLM_DEEPSEEK_V41_WO_A_STRIDED": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_STRIDED", "0"))
-    ),
     # DeepSeek-V4.1 on sm_80: the grouped MXFP8 wo_a (one Marlin GEMM per
     # group and a concat) as one grouped Triton W8A16 GEMM over all groups
     # that writes the [T, groups * o_lora_rank] result directly
@@ -1378,21 +1364,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_EXPERTS_CONTIGUOUS": lambda: bool(
         int(os.getenv("VLLM_EXL3_EXPERTS_CONTIGUOUS", "0"))
     ),
-    # SHA-pinned boot-time whole-expert EP permutation; empty is disabled.
-    "VLLM_EXL3_EXPERT_PLACEMENT": lambda: os.getenv(
-        "VLLM_EXL3_EXPERT_PLACEMENT", ""
-    ),
-    "VLLM_EXL3_EXPERT_PLACEMENT_SHA256": lambda: os.getenv(
-        "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", ""
-    ),
-    # SHA-pinned replicated hot routed experts under whole-expert EP
-    # (vllm/sm80/kernels/exl3/replicas.py); empty is disabled.
-    "VLLM_EXL3_EXPERT_REPLICAS": lambda: os.getenv(
-        "VLLM_EXL3_EXPERT_REPLICAS", ""
-    ),
-    "VLLM_EXL3_EXPERT_REPLICAS_SHA256": lambda: os.getenv(
-        "VLLM_EXL3_EXPERT_REPLICAS_SHA256", ""
-    ),
 
     # EXL3 routed experts: moe_out runs MoE calls of more than this many rows
     # in row chunks of at most this many, so its workspace is sized for one
@@ -1644,6 +1615,17 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_DFLASH_BOUNDARY_CACHE": (
         "removed; DFlash and DSpark never drop the last prefix-cache block "
         "(upstream vLLM #54163)"
+    ),
+    "VLLM_EXL3_EXPERT_PLACEMENT": (
+        "removed; the routed experts keep the checkpoint placement"
+    ),
+    "VLLM_EXL3_EXPERT_PLACEMENT_SHA256": (
+        "removed; the routed experts keep the checkpoint placement"
+    ),
+    "VLLM_EXL3_EXPERT_REPLICAS": "removed; no expert is replicated",
+    "VLLM_EXL3_EXPERT_REPLICAS_SHA256": "removed; no expert is replicated",
+    "VLLM_DEEPSEEK_V41_WO_A_STRIDED": (
+        "removed; the grouped wo_a GEMM reads the attention output directly"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

@@ -179,7 +179,6 @@ def test_allowlist():
         "dsv41_fused_route",
         "dsv41_draft_prologue_fused",
         "dsv41_gate_gemv",
-        "dsv41_wo_a_strided",
         "dsv41_wo_a_grouped_gemm",
         "dsv41_engram_wkv_replicated_prefill",
         "dsv41_swa_meta_batch",

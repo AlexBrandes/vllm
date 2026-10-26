@@ -412,8 +412,7 @@ def test_method_keeps_the_loaded_codes_and_runs_the_kernel(monkeypatch):
 def test_dev_ab_adoption_builds_both_arms(monkeypatch):
     groups, rank_out, k = 2, 128, 256
     layer, processed, codes, scales = _mxfp8_layer(monkeypatch, groups, rank_out, k)
-    wg.WoAGroupedGemmMethod.adopt(layer, groups, strided_input=True, gemm=False,
-                                  keep_groups=True)
+    wg.WoAGroupedGemmMethod.adopt(layer, groups, gemm=False, keep_groups=True)
     method = layer.quant_method
     method.process_weights_after_loading(layer)
     assert processed == [(rank_out, k)] * groups and len(layer.grouped) == groups
@@ -421,7 +420,7 @@ def test_dev_ab_adoption_builds_both_arms(monkeypatch):
     calls = _kernel_stand_in(monkeypatch)
     x = torch.randn(4, groups * k).to(BF16).view(4, groups, k)
     want = _official(x, codes, scales, groups)
-    # Off arm: the per-group Marlin GEMMs (strided rows), no kernel call.
+    # Off arm: the per-group Marlin GEMMs, no kernel call.
     # (FP64 stand-ins summing per group; the einsum may sum in another order.)
     torch.testing.assert_close(method.apply_grouped(layer, x), want,
                                rtol=1e-12, atol=1e-12)
@@ -526,24 +525,3 @@ def test_dev_ab_switch_sets_every_grouped_gemm_wo_a(monkeypatch):
         speculator=None,
     )
     assert switch.unavailable(plain)
-
-
-def test_strided_switch_refuses_a_grouped_gemm_wo_a():
-    """The strided-rows switch changes only the per-group Marlin path: with
-    the grouped GEMM serving any wo_a it would arm and change nothing."""
-    from vllm.sm80 import dev_ab
-
-    strided = dev_ab.SWITCHES["dsv41_wo_a_strided"]
-
-    def runner(*methods):
-        return SimpleNamespace(
-            model=nn.ModuleList([_attention(m) for m in methods]), speculator=None
-        )
-
-    marlin = GroupedLinearMethod(object(), 2)
-    both_off = wg.WoAGroupedGemmMethod(object(), 2, gemm=False, keep_groups=True)
-    gemm = wg.WoAGroupedGemmMethod(object(), 2)
-    assert strided.unavailable(runner(marlin)) is None
-    assert strided.unavailable(runner(both_off)) is None
-    for served in (runner(gemm), runner(marlin, gemm)):
-        assert "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM" in strided.unavailable(served)

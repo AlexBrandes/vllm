@@ -85,58 +85,6 @@ A row read that still fails after its retries fails only the requests that use t
 
 The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel does not read ahead around requested rows. Buffered reads still hit the page cache, so warm runs mostly read RAM. Set `VLLM_EXL3_PLE_COLD=1` to call `POSIX_FADV_DONTNEED` on the table at setup (no root needed; pages that another process has mapped stay resident). Page-cache residency of the table (via `mincore`) is logged at setup, after the cold drop and at process exit. `Exl3PLEEmbedding.page_cache_residency()` returns `(resident, total)` pages for sampling between runs.
 
-## Fixed expert placement
-
-`VLLM_EXL3_EXPERT_PLACEMENT` defaults to the empty string (disabled). Set it
-to a JSON file and set `VLLM_EXL3_EXPERT_PLACEMENT_SHA256` to that file's
-SHA256 to install a fixed whole-expert permutation before loading. The schema is
-`{"version":1,"ep_size":2,"layers":{"model.layers.0.mlp.experts":[[0,2],[1,3]]}}`.
-Layer keys are **checkpoint** expert prefixes, not necessarily runtime module
-names. Each ordered rank list gives its local slots in order; every logical ID
-must occur exactly once, with the existing number of slots per rank. Unlisted
-layers keep their ordinary placement. Unknown checkpoint prefixes, missing or
-duplicate experts, wrong capacities and digest mismatches fail at startup.
-
-This is supported only with whole-expert EP, no data parallelism, dynamic EPLB,
-all-to-all dispatch or fused shared experts. It does not replicate experts or
-change the router's IDs, weights or top-k order. The loader and native kernels
-share the same expert map; no per-step map allocation or lookup is added.
-Packed tensors and each expert's arithmetic are unchanged. **Rank partials
-group different experts**, so final MoE bits need not match ordinary placement.
-Validate reduction error and downstream routing before enabling. Equal-sized
-expert permutations add no resident weight or workspace memory; heterogeneous
-experts require a separate per-rank byte ledger despite equal slot counts.
-
-## Replicated hot experts
-
-`VLLM_EXL3_EXPERT_REPLICAS` defaults to the empty string (disabled). Set it to
-a JSON file and set `VLLM_EXL3_EXPERT_REPLICAS_SHA256` to that file's SHA256.
-The schema is `{"version":1,"ep_size":4,"layers":{"layers.1.ffn.experts":[17,5,203]}}`:
-per **checkpoint** expert prefix, the replicated experts, hottest first. Every
-rank then also holds a copy of each listed expert whose home is another rank,
-in local slots after its home slots.
-
-In a MoE call of 1 to 64 rows, each listed expert the call uses gets exactly
-one owner rank, chosen by the same rule on every rank from the call's top-k
-ids. The rule first counts each rank's distinct used experts that are not
-listed. The target is the larger of the busiest count and the call's distinct
-experts divided evenly over the ranks. Listed experts are then taken in plan
-order: one stays home while its home rank is below the target; otherwise it
-goes to the rank with the fewest experts so far. A small kernel writes the
-call's expert map from that rule before the routed-expert operator runs.
-Larger calls keep ordinary placement. Router ids, weights and top-k order are
-unchanged, and so is each expert's arithmetic. **Which rank's partial sum
-carries an expert changes** whenever an expert leaves its home, so final MoE
-bits need not match ordinary placement.
-
-Replicas add resident weight memory: one whole expert per listed expert that
-is not already local, per layer. vLLM's memory profile takes them out of the
-KV cache pool, and the startup log reports the bytes per layer. Supported with
-whole-expert EP at a power-of-two EP size and the linear expert placement, and
-not with data parallelism, EPLB, all-to-all dispatch, fused shared experts or
-`VLLM_EXL3_EXPERT_PLACEMENT`. Unknown checkpoint prefixes or experts and digest
-mismatches fail at startup.
-
 ## Tensor-parallel routed experts
 
 With `--tensor-parallel-size` above 1 and without `--enable-expert-parallel`,
@@ -155,9 +103,8 @@ each rank routes the same rows over all experts with the identity expert map,
 and the MoE's tensor-parallel all-reduce adds the ranks' partial outputs, so
 final MoE bits need not match whole-expert EP. The startup log names each
 rank's widths. Not supported with data, context or sequence parallelism,
-EPLB, all-to-all dispatch, `VLLM_EXL3_EXPERT_REPLICAS` or
-`VLLM_EXL3_EXPERT_PLACEMENT` (both plan whole experts per rank). Whether the
-decode and prefill operators take a rank width is up to their gates
+EPLB or all-to-all dispatch. Whether the decode and prefill operators take a
+rank width is up to their gates
 (`ops.MOE_V2_CONFIGS`, `ops.MOE_PREFILL_V2_CONFIGS`); `moe_out` takes any.
 The block-aligned split rotated per layer follows the idea of the
 DeepSeek-V4.1-Flash CMP 170HX recipes of GNmac-lab and Curtis White
@@ -191,7 +138,7 @@ Attention pipeline selection reserves both implementations' scratch before
 profiling. None of these selectors changes the speculative-width policy,
 graph-size ladder, checkpoint, or loaded expert placement.
 
-Hybrid checkpoint selection, expert-placement maps and digests, true per-K
+Hybrid checkpoint selection, true per-K
 DSpark construction, reduction transports/output dtypes, early Engram gathers,
 and draft-only shard argmax require a new process. Environment changes alone
 cannot update their constructed modules, storage, graph geometry, or cached

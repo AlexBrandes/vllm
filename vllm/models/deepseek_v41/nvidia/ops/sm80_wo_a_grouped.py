@@ -277,11 +277,10 @@ class WoAGroupedGemmMethod(GroupedLinearMethod):
         self,
         inner,
         groups: int,
-        strided_input: bool = False,
         gemm: bool = True,
         keep_groups: bool = False,
     ):
-        super().__init__(inner, groups, strided_input)
+        super().__init__(inner, groups)
         self.gemm = gemm
         self.keep_groups = keep_groups
 
@@ -290,7 +289,6 @@ class WoAGroupedGemmMethod(GroupedLinearMethod):
         cls,
         layer: nn.Module,
         groups: int,
-        strided_input: bool = False,
         gemm: bool = True,
         keep_groups: bool = False,
     ) -> None:
@@ -305,9 +303,7 @@ class WoAGroupedGemmMethod(GroupedLinearMethod):
                 "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: the hybrid capture records "
                 "the per-group Marlin GEMMs, not this kernel; capture with the flag off"
             )
-        layer.quant_method = cls(
-            layer.quant_method, groups, strided_input, gemm, keep_groups
-        )
+        layer.quant_method = cls(layer.quant_method, groups, gemm, keep_groups)
         if gemm:
             _ADOPTED.add(layer)
             WO_A_GROUPED_WARMUP.register_warmup()

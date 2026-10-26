@@ -360,21 +360,18 @@ def test_grouped_wo_a_is_the_official_block_diagonal_einsum(monkeypatch):
     torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
 
 
-@pytest.mark.parametrize("strided", ["0", "1"])
-def test_wo_a_strided_switch_reaches_every_grouped_wo_a(
+def test_every_grouped_wo_a_runs_its_groups(
     monkeypatch,
     meta_platform,  # noqa: F811
     hybrid_on,
     hybrid,
-    strided,
 ):
-    """VLLM_DEEPSEEK_V41_WO_A_STRIDED sets how every grouped wo_a of the
-    target and the drafter takes its groups' rows (TP4: 2 local groups)."""
+    """Every grouped wo_a of the target and the drafter runs its groups as
+    GEMMs of its own method (TP4: 2 local groups)."""
     from vllm.sm80 import plugin
     from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
 
     plugin._register_exl3()
-    monkeypatch.setenv("VLLM_DEEPSEEK_V41_WO_A_STRIDED", strided)
     construct.set_groups(monkeypatch, 4, 0)
     construct.stub_engram_tables(monkeypatch, 4)
     methods = []
@@ -384,7 +381,6 @@ def test_wo_a_strided_switch_reaches_every_grouped_wo_a(
                     if n.endswith(".wo_a")]  # fmt: skip
     assert methods and all(type(m) is GroupedLinearMethod for m in methods)
     assert {m.groups for m in methods} == {2}
-    assert {m.strided_input for m in methods} == {strided == "1"}
 
 
 @pytest.mark.parametrize(
