@@ -828,7 +828,7 @@ seams:
 - id: idx-topk-forward
   kind: method
   target: vllm.model_executor.layers.indexer_topk:SparseIndexerTopk.forward
-  why: the GLM decode tie fix (topk_tiefix_gate.tiefix_decode_topk_) runs right after this call in sparse_attn_indexer_kpool, before the DCP merge; it relies on forward writing the exact top-k into topk_indices in place (int32, -1 fill) with no tie or order work of its own
+  why: the GLM decode tie fix and sort (topk_tiefix_gate.canonical_decode_topk_) run right after this call in sparse_attn_indexer_kpool, before the DCP merge; they rely on forward writing the exact top-k into topk_indices in place (int32, -1 fill) with no tie or order work of its own
   sha256: 8fcff0107c3c95902dc718193a6542fdf2e28c350b735d4d769d9487bf710f30
   signature: '(self, logits: torch.Tensor, seq_lens: torch.Tensor, next_n: int, topk_indices: torch.Tensor, topk_tokens: int, max_seq_len: int) -> None'
 

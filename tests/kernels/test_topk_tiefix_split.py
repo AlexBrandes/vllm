@@ -117,8 +117,8 @@ def _split_rows(monkeypatch, top_k, rows):
 
 def test_split_defaults_off(monkeypatch):
     use_rows(monkeypatch)
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
-    monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
     _clear()
     try:
         assert tiefix_split_rows(512) == 0
@@ -128,11 +128,12 @@ def test_split_defaults_off(monkeypatch):
 
 def test_gate_needs_tiefix_and_sorted(monkeypatch):
     _split_rows(monkeypatch, 512, 4)
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.delenv("VLLM_SM80_TOPK_SORTED", raising=False)
     _clear()
     try:
         assert tiefix_split_rows(512) == 0  # sort off
-        monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+        monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
         _clear()
         assert tiefix_split_rows(512) == 4
         # Keyed by the selected width: another width keeps the default 0.
@@ -158,8 +159,8 @@ def test_dispatch_passes_split(monkeypatch, mod):
 
     monkeypatch.setattr(mod, "topk_tiefix_", spy)
     _split_rows(monkeypatch, 16, 4)  # idx below selects 16 per row
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
-    monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
     _clear()
     try:
         wide = torch.zeros(8, mod.SPLIT_MIN_COLS)

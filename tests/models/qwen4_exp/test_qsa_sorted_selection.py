@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen QSA selected-index order: the sorted selection, the
-VLLM_QWEN_QSA_TOPK_SORTED switch and the native top-k contract."""
-
-import importlib
+"""Qwen QSA selected-index order: the sorted selection (the shared sort
+launch), the VLLM_SM80_TOPK_SORTED switch on the QSA path and the native
+top-k contract."""
 
 import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
+from vllm.sm80.kernels.indexer import topk_tiefix as tiefix_mod
+from vllm.sm80.kernels.indexer import topk_tiefix_gate as gate
 
 from .test_qsa_reference import _expand_qsa_indices_reference, requires_qsa_kernels
 
@@ -16,6 +17,26 @@ from .test_qsa_reference import _expand_qsa_indices_reference, requires_qsa_kern
 requires_cuda_device = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a visible CUDA device"
 )
+
+
+def _clear_gate() -> None:
+    for f in (gate.use_tiefix_topk, gate.use_sorted_topk, gate.tiefix_split_rows):
+        f.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_gate():
+    """The gate caches its reads; drop them around each test (after the
+    environment is restored)."""
+    _clear_gate()
+    yield
+    _clear_gate()
+
+
+def _switches(monkeypatch, *, canonical: bool, sort: bool) -> None:
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1" if canonical else "0")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1" if sort else "0")
+    _clear_gate()
 
 
 @requires_qsa_kernels
@@ -35,7 +56,7 @@ def test_qsa_sorted_selection_preserves_packed_expansion(block_topk: int) -> Non
     expected_storage = storage.clone()
     expected_storage[1:4, 1 : 2 * block_topk + 1 : 2] = expected_blocks
 
-    qsa_indexer_ops._sort_qsa_selected_indices_(blocks)
+    tiefix_mod.sort_topk_rows_(blocks)
 
     torch.testing.assert_close(storage, expected_storage)
     positions = torch.tensor([2, 10, 4 * (block_topk + 5) + 2], device="cuda")
@@ -62,19 +83,15 @@ def test_qsa_sorted_selection_preserves_packed_expansion(block_topk: int) -> Non
     torch.testing.assert_close(packed_storage, expected_packed_storage)
 
 
-@pytest.mark.parametrize("value,expected", [(None, True), ("1", True), ("0", False)])
+@pytest.mark.parametrize("value,expected", [(None, False), ("1", True), ("0", False)])
 def test_qsa_sort_switch_is_read_from_the_environment(
     monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
 ) -> None:
     if value is None:
-        monkeypatch.delenv("VLLM_QWEN_QSA_TOPK_SORTED", raising=False)
+        monkeypatch.delenv("VLLM_SM80_TOPK_SORTED", raising=False)
     else:
-        monkeypatch.setenv("VLLM_QWEN_QSA_TOPK_SORTED", value)
-    try:
-        assert importlib.reload(qsa_indexer_ops)._QSA_TOPK_SORTED is expected
-    finally:
-        monkeypatch.undo()
-        importlib.reload(qsa_indexer_ops)
+        monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", value)
+    assert gate.use_sorted_topk() is expected
 
 
 def _native_topk_case(width: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -105,7 +122,7 @@ def test_qsa_native_topk_fills_exactly_min_visible_k_leading_slots(
 ) -> None:
     """Sorting keeps membership only if the native top-k writes exactly
     min(visible, K) distinct valid ids into the leading slots, -1 after."""
-    monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_SORTED", False)
+    _switches(monkeypatch, canonical=False, sort=False)
     logits, lengths = _native_topk_case(width)
     block_topk = 512
     out = torch.full(
@@ -137,17 +154,17 @@ def test_qsa_sort_kill_switch_keeps_native_order(
     torch.ops._C.persistent_topk(
         logits, lengths, native, workspace, 512, logits.shape[1]
     )
-    sort = qsa_indexer_ops._sort_qsa_selected_indices_
+    sort = tiefix_mod.sort_topk_rows_
     calls = []
 
     def counted_sort(block_indices: torch.Tensor) -> None:
         calls.append(block_indices.data_ptr())
         sort(block_indices)
 
-    monkeypatch.setattr(qsa_indexer_ops, "_sort_qsa_selected_indices_", counted_sort)
+    monkeypatch.setattr(tiefix_mod, "sort_topk_rows_", counted_sort)
     outputs = {}
     for flag in (False, True):
-        monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_SORTED", flag)
+        _switches(monkeypatch, canonical=False, sort=flag)
         calls.clear()
         outputs[flag] = torch.full(shape, -7, dtype=torch.int32, device="cuda")
         qsa_indexer_ops._topk(logits, lengths, 2048, 4, outputs[flag], workspace)

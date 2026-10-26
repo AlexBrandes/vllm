@@ -43,8 +43,8 @@ if TYPE_CHECKING:
     VLLM_AMPERE_KDA_SMALL_STACK: bool = False
     VLLM_GLM5_DECODE_IDX_GLUE_PARTS: str = "weights,glue,fwht,cache,moesum"
     VLLM_MOE_DETERMINISTIC_ALIGN: int = 0
-    VLLM_GLM5_TOPK_SORTED: bool = False
-    VLLM_GLM5_TOPK_TIEFIX: bool = False
+    VLLM_SM80_TOPK_SORTED: bool = False
+    VLLM_SM80_TOPK_CANONICAL_TIES: bool = False
     VLLM_MOE_MASK_PADDING: bool = False
     VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_THIN_GEMM: bool = False
@@ -88,8 +88,6 @@ if TYPE_CHECKING:
     VLLM_EXL3_OVERRIDE: str = ""
     VLLM_EXL3_OVERRIDE_SHA256: str = ""
     VLLM_EXL3_HYBRID: bool = False
-    VLLM_QWEN_QSA_TOPK_SORTED: bool = True
-    VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
@@ -420,29 +418,30 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_DETERMINISTIC_ALIGN": lambda: int(
         _env_with_choices("VLLM_MOE_DETERMINISTIC_ALIGN", "0", ["0", "1"])()
     ),
-    # Put each row of the sparse indexer's selected top-k (token or pool ids)
-    # in ascending order before attention reads it. The stock top-k kernels
-    # return the right set in an arrival-dependent order, and the sparse MLA
-    # kernel accumulates its online softmax in index order, so the same
-    # prompt otherwise gets a different attention output from run to run
+    # Put each row of a sparse indexer's selected top-k (token, pool or block
+    # ids) in ascending order, -1 fill last, before attention reads it: the
+    # GLM kpool and Qwen QSA indexers (vllm/sm80/kernels/indexer/). The stock
+    # top-k kernels return the right set in an arrival-dependent order, and
+    # sparse attention accumulates its online softmax in index order, so the
+    # same prompt otherwise gets a different attention output from run to run
     # (last-bit differences that the rest of the model amplifies). Only the
-    # order changes, never the set. The sort runs inside the tie-fix launch,
-    # so this needs VLLM_GLM5_TOPK_TIEFIX=1; set alone, the first indexer
-    # forward raises. Default OFF: unset, the indexer is byte-identical to
-    # upstream.
-    "VLLM_GLM5_TOPK_SORTED": lambda: bool(
-        int(os.getenv("VLLM_GLM5_TOPK_SORTED", "0"))
+    # order changes, never the set. With VLLM_SM80_TOPK_CANONICAL_TIES the
+    # sort runs inside the tie-fix launch, otherwise as a launch of its own.
+    # Default OFF: unset, the indexers keep the top-k kernel's order.
+    "VLLM_SM80_TOPK_SORTED": lambda: bool(
+        int(os.getenv("VLLM_SM80_TOPK_SORTED", "0"))
     ),
     # Keep the fast indexer top-k kernels but make the selected SET a function
     # of the scores alone: where entries tied with the k-th score straddle the
-    # selection boundary, the tied slots go to the lowest column indices.
-    # The stock kernels resolve such ties by atomic arrival order, and which
-    # kernel runs depends on the row count and length, so the set otherwise
-    # depends on batch shape. One extra read of the logits per row;
+    # selection boundary, the tied slots go to the lowest indices (the GLM
+    # kpool and Qwen QSA indexers, vllm/sm80/kernels/indexer/). The stock
+    # kernels resolve such ties by atomic arrival order, and which kernel
+    # runs depends on the row count and length, so the set otherwise depends
+    # on batch shape and timing. One extra read of the logits per row;
     # uncontested rows are left untouched.
-    # Default OFF: unset, the indexer is byte-identical to upstream.
-    "VLLM_GLM5_TOPK_TIEFIX": lambda: bool(
-        int(os.getenv("VLLM_GLM5_TOPK_TIEFIX", "0"))
+    # Default OFF: unset, the indexers keep the top-k kernel's set.
+    "VLLM_SM80_TOPK_CANONICAL_TIES": lambda: bool(
+        int(os.getenv("VLLM_SM80_TOPK_CANONICAL_TIES", "0"))
     ),
     # Route the padding rows of a padded batch (CUDA-graph sizes) to no
     # expert (topk_ids = -1) before the fused MoE. Their hidden states come
@@ -809,22 +808,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # selected by its index. Unset: such a config is refused; EXL3
     # checkpoints without those keys load as before either way.
     "VLLM_EXL3_HYBRID": lambda: bool(int(os.getenv("VLLM_EXL3_HYBRID", "0"))),
-    # Order Qwen QSA's native-selected blocks before expansion/attention.
-    # Set 0 to retain native traversal order without changing selection.
-    "VLLM_QWEN_QSA_TOPK_SORTED": lambda: bool(
-        int(os.getenv("VLLM_QWEN_QSA_TOPK_SORTED", "1"))
-    ),
-    # Make Qwen QSA's selected block SET a function of the scores alone: after
-    # the prefill and decode top-k, entries tied with the k-th score that
-    # straddle the selection boundary go to the lowest block indices (the
-    # shared indexer tie fix, vllm/sm80/kernels/indexer/topk_tiefix.py; with
-    # VLLM_QWEN_QSA_TOPK_SORTED the sort runs in the same launch). The stock
-    # top-k places tied entries by atomic arrival order, so identical scores
-    # can otherwise select a different set from run to run and rank to rank.
-    # Default OFF: unset, the QSA top-k path is unchanged.
-    "VLLM_QWEN4_QSA_TOPK_CANONICAL": lambda: bool(
-        int(os.getenv("VLLM_QWEN4_QSA_TOPK_CANONICAL", "0"))
-    ),
     # DeepSeek-V4.1 on sm_80: all-reduce the wo_b partials in BF16 when the
     # custom all-reduce takes that message (its own should_custom_ar, and the
     # host-staged path not taking it first). That kernel accumulates in FP32
@@ -1425,6 +1408,20 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_TP4_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_NARROW",
     "VLLM_GLM5_TP4_MARLIN_PREFILL": (
         "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
+    ),
+    # Merged: one switch per operation across models.
+    "VLLM_GLM5_TOPK_TIEFIX": (
+        "merged into VLLM_SM80_TOPK_CANONICAL_TIES (all sparse indexers)"
+    ),
+    "VLLM_QWEN4_QSA_TOPK_CANONICAL": (
+        "merged into VLLM_SM80_TOPK_CANONICAL_TIES (all sparse indexers)"
+    ),
+    "VLLM_GLM5_TOPK_SORTED": (
+        "merged into VLLM_SM80_TOPK_SORTED (all sparse indexers; no longer "
+        "needs the tie fix)"
+    ),
+    "VLLM_QWEN_QSA_TOPK_SORTED": (
+        "merged into VLLM_SM80_TOPK_SORTED (all sparse indexers; default off)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (

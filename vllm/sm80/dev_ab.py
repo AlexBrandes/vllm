@@ -142,39 +142,39 @@ def _set_env(name: str, on: bool) -> None:
 
 _QSA_MODULE = "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
 _QSA_MODEL_MODULE = "vllm.models.qwen4_exp.nvidia.indexer_qsa"
+_TOPK_GATE = "vllm.sm80.kernels.indexer.topk_tiefix_gate"
+_TOPK_ENV = "VLLM_SM80_TOPK_CANONICAL_TIES"
 
 
-def _qsa_module():
-    """The QSA indexer ops module, or None when the served model has no QSA
-    indexer. The model imports the ops module lazily (first attention step, or
-    the warmup after KV sizing), which is after the profiling capture resolves
-    the switch; importing it here reads the same boot value."""
-    if _QSA_MODEL_MODULE not in sys.modules:
-        return None
-    module = sys.modules.get(_QSA_MODULE)
-    if module is None:
+def _topk_gate():
+    """The shared indexer top-k gate, or None when the served model has no
+    indexer that calls it. The GLM sparse indexer imports it with the model;
+    the Qwen model imports its QSA ops module (and with it the gate) lazily
+    (first attention step, or the warmup after KV sizing), which is after the
+    profiling capture resolves the switch, so a loaded QSA model has its ops
+    module imported here; the gate reads the same boot value."""
+    if _TOPK_GATE not in sys.modules and _QSA_MODEL_MODULE in sys.modules:
         try:
-            module = importlib.import_module(_QSA_MODULE)
+            importlib.import_module(_QSA_MODULE)
         except ImportError:
             return None
-    return module
+    return sys.modules.get(_TOPK_GATE)
 
 
-def _qsa_unavailable(runner) -> str | None:
-    module = _qsa_module()
-    if module is None:
-        return "the Qwen QSA indexer is not loaded"
-    if not hasattr(module, "_QSA_TOPK_CANONICAL"):
-        return "this tree has no VLLM_QWEN4_QSA_TOPK_CANONICAL"
+def _topk_unavailable(runner) -> str | None:
+    if _topk_gate() is None:
+        return "no sparse indexer using the shared top-k gate is loaded"
     return None
 
 
-def _qsa_apply(runner, on: bool) -> None:
-    module = _qsa_module()
-    _set_env("VLLM_QWEN4_QSA_TOPK_CANONICAL", on)
-    module._QSA_TOPK_CANONICAL = on
-    if on:
-        module._canonical_topk_fix()
+def _topk_apply(runner, on: bool) -> None:
+    """Both arms keep VLLM_SM80_TOPK_SORTED as booted: off sorts alone (when
+    on), on sorts inside the tie-fix launch."""
+    gate = _topk_gate()
+    _set_env(_TOPK_ENV, on)
+    for cached in (gate.use_sorted_topk, gate.use_tiefix_topk, gate.tiefix_split_rows):
+        cached.cache_clear()
+    gate.use_tiefix_topk()  # warms the kernels when on
 
 
 def _marlin_unavailable(runner) -> str | None:
@@ -197,25 +197,6 @@ def _marlin_apply(runner, on: bool) -> None:
     for (device, _stream, n), ws in list(decode._WORKSPACES.items()):
         if n == decode._V2_N:
             decode._warm_v2(torch.device(device), ws)
-
-
-_TIEFIX_GATE = "vllm.sm80.kernels.indexer.topk_tiefix_gate"
-
-
-def _tiefix_unavailable(runner) -> str | None:
-    if _env_flag("VLLM_GLM5_TOPK_SORTED"):
-        return "VLLM_GLM5_TOPK_SORTED needs the tie fix in both arms; unset it"
-    if _TIEFIX_GATE not in sys.modules:
-        return "the GLM sparse indexer is not loaded"
-    return None
-
-
-def _tiefix_apply(runner, on: bool) -> None:
-    gate = sys.modules[_TIEFIX_GATE]
-    _set_env("VLLM_GLM5_TOPK_TIEFIX", on)
-    for cached in (gate.use_sorted_topk, gate.use_tiefix_topk, gate.tiefix_split_rows):
-        cached.cache_clear()
-    gate.use_tiefix_topk()  # warms the kernels when on
 
 
 def _custom_allreduce():
@@ -1041,20 +1022,14 @@ SWITCHES: dict[str, Switch] = {
             lambda runner: _env_flag("VLLM_EXL3_DENSE_SPLITK"), _splitk_apply,
         ),
         Switch(
-            "qsa_topk_canonical", "VLLM_QWEN4_QSA_TOPK_CANONICAL", True, False,
-            _qsa_unavailable,
-            lambda runner: bool(_qsa_module()._QSA_TOPK_CANONICAL),
-            _qsa_apply,
+            "topk_canonical_ties", _TOPK_ENV, True, False,
+            _topk_unavailable,
+            lambda runner: _env_flag(_TOPK_ENV), _topk_apply,
         ),
         Switch(
             "marlin_decode_v2", "VLLM_AMPERE_MARLIN_DECODE_V2", True, True,
             _marlin_unavailable,
             lambda runner: _env_flag("VLLM_AMPERE_MARLIN_DECODE_V2"), _marlin_apply,
-        ),
-        Switch(
-            "glm5_topk_tiefix", "VLLM_GLM5_TOPK_TIEFIX", True, False,
-            _tiefix_unavailable,
-            lambda runner: _env_flag("VLLM_GLM5_TOPK_TIEFIX"), _tiefix_apply,
         ),
         Switch(
             "custom_allreduce_flags", "VLLM_CUSTOM_ALLREDUCE_FLAGS", True, False,

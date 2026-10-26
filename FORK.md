@@ -106,7 +106,6 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/exl3/utils.py` | 401 |
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
 | `vllm/sm80/kernels/indexer/__init__.py` | 10 |
-| `vllm/sm80/kernels/indexer/qsa_topk_gate.py` | 56 |
 | `vllm/sm80/kernels/indexer/topk_tiefix.py` | 528 |
 | `vllm/sm80/kernels/indexer/topk_tiefix_gate.py` | 145 |
 | `vllm/sm80/kernels/kda/__init__.py` | 17 |
@@ -860,8 +859,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_PREFILL_KERNELS` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_TOPK_SORTED` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_TOPK_TIEFIX` | `bool` | `False` | `'0'` |
 | `VLLM_HOST_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DECODE_RAW_K` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DSA_REF` | `bool` | `False` | `'0'` |
@@ -877,9 +874,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_PP_SPLIT_DRAFT_EVENT` | `bool` | `False` | `'0'` |
 | `VLLM_PP_SPREAD_DECODES` | `bool` | `False` | `'0'` |
 | `VLLM_QWEN4_MTP_PER_STREAM_NORM` | `bool` | `False` | `'0'` |
-| `VLLM_QWEN4_QSA_TOPK_CANONICAL` | `bool` | `False` | `'0'` |
 | `VLLM_QWEN4_ROUTER_FP32` | `bool` | `False` | `'0'` |
-| `VLLM_QWEN_QSA_TOPK_SORTED` | `bool` | `True` | `'1'` |
 | `VLLM_ROUND_ONCE_ALLREDUCE_GROUPED` | `bool` | `False` | `'0'` |
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_CAPTURE_DIR` | `str` | `''` | `''` |
@@ -893,6 +888,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TUNING_FILE` | `str` | `''` | `''` |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
