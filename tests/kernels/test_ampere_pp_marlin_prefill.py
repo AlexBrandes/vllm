@@ -235,6 +235,7 @@ def test_gate_open_config_only_misses_the_device():
     ("no_clamp", "clamp None"),
     ("gelu", "activation MoEActivation.GELU"),
     ("global_e", "E=288 (global 576)"),
+    ("post_gemm2_hook", "post-GEMM2 hook"),
 ])
 def test_gate_closed_reasons(case, expect):
     from vllm.model_executor.layers.fused_moe.activation import (
@@ -273,6 +274,8 @@ def test_gate_closed_reasons(case, expect):
     elif case == "global_e":
         args["global_num_experts"] = 576
     layer = layer or _layer(**kw)
+    if case == "post_gemm2_hook":
+        layer.post_gemm2_hook = lambda unfinalized, output: None
     why = pmp.gate_reason(layer, **args)
     assert why is not None and expect in why, why
 

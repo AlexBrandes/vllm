@@ -160,8 +160,9 @@ def require_extension():
         raise RuntimeError(
             "Optional compiled Marlin was requested, but vllm._ampere_marlin_C "
             "is missing or incompatible. Install a matching prebuilt package or "
-            "rebuild this vLLM installation with VLLM_AMPERE_MARLIN_BUILD=1 "
-            "using the current PyTorch/CUDA environment. To use the released "
+            "build it with its standalone builder (build_standalone.py beside "
+            "its sources, VLLM_AMPERE_MARLIN_BUILD=1) in the current "
+            "PyTorch/CUDA environment. To use the released "
             "kernels instead, set VLLM_AMPERE_MARLIN_DECODE_CUDA=0 before "
             f"restarting. Detail: {exc}"
         ) from exc

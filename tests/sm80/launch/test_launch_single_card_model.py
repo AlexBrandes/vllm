@@ -79,9 +79,9 @@ REPO, REVISION = "LiquidAI/LFM2.5-24B-A2B", "89abcdef0123456789abcdef0123456789a
 
 # the tree declares the options the settings protect
 PARSER_ARGS = ARG_UTILS + """\
-    parser.add_argument("--reasoning-parser", type=str)
-    parser.add_argument("--tool-call-parser", type=str)
-    parser.add_argument("--enable-auto-tool-choice", action="store_true")
+        parser.add_argument("--reasoning-parser", type=str)
+        parser.add_argument("--tool-call-parser", type=str)
+        parser.add_argument("--enable-auto-tool-choice", action="store_true")
 """
 
 FILES = {

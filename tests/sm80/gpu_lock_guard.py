@@ -9,6 +9,8 @@ run on cards in use by a timed job have raised Xid errors there.
 
 ``tests/conftest.py`` calls:
 
+* ``pytest_configure(config)`` (imported as its hook): registers the ``cuda``
+  marker;
 * ``hide_cuda()`` before anything can initialise CUDA: outside the lock it
   empties ``CUDA_VISIBLE_DEVICES``, so no test, worker or child process of the
   run sees a card, and tests that skip without CUDA skip;
@@ -37,6 +39,13 @@ CALLER_ENV = "GPU_LOCK_GUARD_CALLER_DEVICES"
 
 def locked() -> bool:
     return bool(os.environ.get(LOCK_ENV, "").strip())
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        f"{MARKER}: needs a CUDA device; outside the GPU lock refused or skipped",
+    )
 
 
 def hide_cuda() -> None:

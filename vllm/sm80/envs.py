@@ -168,8 +168,9 @@ def _custom_allreduce_algo() -> str:
 
 
 FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
-    # If set to 1, build the optional sm_80 Marlin decode and prefill library
-    # (_ampere_marlin_C); see docs/features/quantization/README.md.
+    # Must be 1 for the standalone builder of the optional sm_80 Marlin decode
+    # and prefill library (_ampere_marlin_C, build_standalone.py beside its
+    # sources); see docs/features/quantization/README.md.
     "VLLM_AMPERE_MARLIN_BUILD": lambda: (
         os.getenv("VLLM_AMPERE_MARLIN_BUILD", "0") == "1"
     ),

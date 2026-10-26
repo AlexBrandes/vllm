@@ -159,6 +159,8 @@ def _setup(monkeypatch, dev: FakeDevice, cap: Capture) -> tuple[Any, dict]:
         cudagraph_mode=CUDAGraphMode.PIECEWISE
     )
     runner.cudagraph_manager = _FakeManager(cap)
+    # needs_cudagraph_capture: a text-only model, so no encoder graphs.
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
     runner.vllm_config = SimpleNamespace()
     state: dict[str, Any] = {}
 

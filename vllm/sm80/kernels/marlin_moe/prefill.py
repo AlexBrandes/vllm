@@ -269,6 +269,9 @@ def gate_reason(layer, hidden_states: torch.Tensor, w1: torch.Tensor,
 
     if expert_map is not None:
         return "expert map (expert parallelism)"
+    if layer._uses_post_gemm2_hook(hidden_states.size(0)):
+        # The hook consumes fused_marlin_moe's unweighted GEMM2 rows.
+        return "post-GEMM2 hook"
     E = w1.size(0)
     if E != E_GATE or global_num_experts not in (-1, E):
         return f"E={E} (global {global_num_experts}), validated only E={E_GATE}"

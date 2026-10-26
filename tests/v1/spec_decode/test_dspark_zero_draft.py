@@ -302,7 +302,7 @@ def _dspark(monkeypatch, calls):
     """A DSpark drafter with host state only; every device step is recorded."""
     s = _host_state(DSparkSpeculator, num_query_per_req=NUM_SPEC)
     max_tokens = 64
-    s.max_model_len = 4096
+    s.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096))
     s.max_num_reqs = MAX_NUM_SEQS
     s.max_num_tokens = max_tokens
     s.hidden_states = torch.zeros(max_tokens, 4)

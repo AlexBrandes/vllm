@@ -199,7 +199,8 @@ def _glm5_like_specs(
 ) -> dict[str, KVCacheSpec]:
     """A GLM-5.3-Flash-shaped hybrid: MLA attention, indexer and ring tail on
     every fourth layer (3, 7, ..., 43), KDA state on the other 34, in layer
-    order, plus DFlash drafter sliding-window layers numbered after them.
+    order, plus DFlash drafter sliding-window layers numbered after them,
+    marked ``is_draft`` as the worker marks a drafter's layers.
 
     The MLA page is 1152 B/token; the default drafter (9 KV heads of 128,
     bf16) is 4608 B/token, so its exact-fit block is 1024 / 4 = 256 tokens.
@@ -240,6 +241,7 @@ def _glm5_like_specs(
             head_size=128,
             dtype=torch.bfloat16,
             sliding_window=512,
+            is_draft=True,
         )
     return specs
 

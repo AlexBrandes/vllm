@@ -87,6 +87,8 @@ def _sampler(num_slots: int, temperature: float, seeds: torch.Tensor):
         num_speculative_tokens=K,
         enable_adaptive_verification=False,
         rejection_sample_method="standard",
+        fly_entropy_threshold=0.3,
+        fly_entropy_top_k=3,
     )
     return RejectionSampler(sampler, spec, torch.device("cpu"))
 

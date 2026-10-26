@@ -763,7 +763,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     return
                 self.moe_sum(input, output, topk_ids, expert_map)
 
-            if not hooked and envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:
+            if envs.VLLM_AMPERE_MARLIN_DECODE_CUDA:
                 from vllm.sm80.kernels.marlin_moe.decode import (
                     maybe_apply as decode_apply,
                 )
@@ -774,7 +774,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     apply_router_weight_on_input,
                 ):
                     return
-            if not hooked and envs.VLLM_SM80_MARLIN_PREFILL:
+            if envs.VLLM_SM80_MARLIN_PREFILL:
                 from vllm.sm80.kernels.marlin_moe.prefill import maybe_apply
 
                 if maybe_apply(

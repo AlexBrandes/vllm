@@ -7,7 +7,7 @@
 namespace {
 PyObject* build_info(PyObject*, PyObject*) {
   // prefill_schedule_version 2: prefill_tile_gemm hands out stream-K CTA
-  // indices in start order (MARLIN_MOE_ORDERED_STREAM_K, common_tiles.h).
+  // indices in start order (marlin_moe_template.h, common_tiles.h).
   return Py_BuildValue("{s:i,s:s,s:i,s:i,s:i}", "abi_version", 1,
                        "torch_version", TORCH_VERSION,
                        "cuda_version", CUDART_VERSION,

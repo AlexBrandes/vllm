@@ -2489,7 +2489,9 @@ def compile_factors() -> dict[str, object]:
     return factors
 
 
-# Variables of the CMP 170HX (sm_80) fork: vllm/sm80/envs.py.
-from vllm.sm80.envs import register_env_vars  # noqa: E402
+# Variables of the CMP 170HX (sm_80) fork: vllm/sm80/envs.py. setup.py loads
+# this file by path outside the vllm package and reads only vLLM's variables.
+if __name__ == "vllm.envs":
+    from vllm.sm80.envs import register_env_vars
 
-register_env_vars(environment_variables)
+    register_env_vars(environment_variables)

@@ -41,7 +41,8 @@ def test_selector_takes_sm80_on_compute_capability_8(monkeypatch) -> None:
     cfg = SimpleNamespace(
         attention_config=SimpleNamespace(
             backend=AttentionBackendEnum.FLASHMLA_SPARSE_DSV41
-        )
+        ),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
     )
     monkeypatch.setattr(sm80, "current_platform", _Platform(8))
     assert (

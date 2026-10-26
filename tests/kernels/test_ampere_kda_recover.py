@@ -417,7 +417,10 @@ def _recovery_control_path(dev):
         KDARecoverSSMCommitMetadata,
         KimiK3KDAMetadata,
     )
-    from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMCommitContext
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+        KDARecoverSSMCommitContext,
+        KDARecoverSSMRecords,
+    )
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.single_type_kv_cache_manager import MambaManager
     from vllm.v1.kv_cache_interface import MambaSpec
@@ -629,9 +632,12 @@ def _recovery_control_path(dev):
                 native_conv = (
                     conv.transpose(-1, -2) if is_conv_state_dim_first() else conv
                 )
-                layer = types.SimpleNamespace(kv_cache=(native_conv, rec,
-                    torch.zeros(3, H, 8, D, device=dev),
-                    torch.zeros(3, H, 8, 2 * D, device=dev)),
+                # The verify records live outside the KV cache, one row per
+                # request of the step.
+                layer = types.SimpleNamespace(kv_cache=(native_conv, rec),
+                    recoverssm_records=KDARecoverSSMRecords(
+                        torch.zeros(1, H, 8, D, device=dev),
+                        torch.zeros(1, H, 8, 2 * D, device=dev)),
                     A_log=torch.zeros(H, device=dev),
                     dt_bias=torch.zeros(H * D, device=dev),
                     local_num_heads=H, head_dim=D, gate_lower_bound=None)

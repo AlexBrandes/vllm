@@ -113,6 +113,7 @@ def make_rejection_sampler(sampler, device):
     config = SimpleNamespace(
         num_speculative_tokens=NUM_SPEC, enable_adaptive_verification=False,
         rejection_sample_method="standard", synthetic_acceptance_rates=None,
+        fly_entropy_threshold=0.3, fly_entropy_top_k=3,
     )
     return RejectionSampler(sampler, config, device)
 
@@ -267,8 +268,8 @@ def _rank_main(rank: int, tp: int, init_file: str, result_file: str,
             os.environ[ta.SWITCH] = "1" if on else "0"
             runner = make_runner(full, filters, per_req)
             batch = make_batch(num_reqs, per_req, input_ids, device)
-            top_k, top_p = runner.sampler.sampling_states.get_top_k_top_p(
-                batch.expanded_idx_mapping, batch.idx_mapping_np
+            top_k, top_p, _ = runner.sampler.sampling_states.get_top_k_top_p(
+                batch.expanded_idx_mapping, batch.idx_mapping_np, full.shape[-1]
             )
             out["filtered"] = top_k is not None or top_p is not None
             calls.clear()

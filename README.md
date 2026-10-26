@@ -304,8 +304,7 @@ VLLM_AMPERE_MARLIN_BUILD=1 python csrc/libtorch_stable/moe/ampere_marlin/build_s
 ```
 
 The optional library needs a CUDA toolkit (12.8 or newer), a C++20 compiler and
-Ninja; no GPU is needed to build it. `VLLM_AMPERE_MARLIN_BUILD=1` cannot be
-combined with `VLLM_USE_PRECOMPILED=1` in one install. Each recipe names the
+Ninja; no GPU is needed to build it. Each recipe names the
 upstream wheel that supplies the precompiled extensions for its pin.
 
 ## Licence and credit

@@ -204,7 +204,8 @@ def _fake_worker(monkeypatch, verify_calls, prepare_calls):
         parallel_drafting_token_id=7,
         max_num_reqs=8,
         max_num_tokens=2048,
-        max_model_len=4096,
+        # Speculator.max_model_len reads the model config.
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096)),
         sample_from_anchor=True,
     ).items():
         object.__setattr__(spec, name, value)

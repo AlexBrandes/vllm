@@ -125,7 +125,6 @@ def _wrapper_runtime_config(tmp_path, name, tp_size, pp_size):
         spec.draft_tensor_parallel_size = SpeculativeConfig._verify_and_get_draft_tp(
             spec.target_parallel_config,
             spec.draft_tensor_parallel_size,
-            spec.draft_model_config.hf_config,
         )
         spec.draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
             spec.target_parallel_config,
@@ -224,22 +223,37 @@ def test_declared_checkpoint_architecture_with_vision_meta(
     assert model.config is root_config
     assert model.config.text_config is config.model_config.hf_text_config
     assert root_config.to_dict() == root_before
-    assert not isinstance(model.visual, StageMissingLayer)
     _assert_meta_model(model)
-    _assert_meta_model(model.visual)
-    assert isinstance(model.visual.input_norm, FusedMMInputNorm)
-    assert model.visual.input_norm.channel == 3
-    assert len(model.visual.blocks) == root_config.vision_config.depth
-    assert model.visual.hidden_size == root_config.vision_config.hidden_size
-    assert model.visual.out_hidden_size == root_config.vision_config.out_hidden_size
-    assert model.visual.patch_size == root_config.vision_config.patch_size
-    assert model.visual.spatial_merge_size == root_config.vision_config.spatial_merge_size
     assert boundary["hidden_states"].is_meta
+    if pp_rank > 0:
+        # Model Runner V2 runs the encoders on the first stage only, so later
+        # stages build no vision tower.
+        assert config.use_v2_model_runner
+        assert isinstance(model.visual, StageMissingLayer)
+        assert model.visual.stage_name == "vision_tower"
+    else:
+        assert not isinstance(model.visual, StageMissingLayer)
+        _assert_meta_model(model.visual)
+        assert isinstance(model.visual.input_norm, FusedMMInputNorm)
+        assert model.visual.input_norm.channel == 3
+        assert len(model.visual.blocks) == root_config.vision_config.depth
+        assert model.visual.hidden_size == root_config.vision_config.hidden_size
+        assert (
+            model.visual.out_hidden_size == root_config.vision_config.out_hidden_size
+        )
+        assert model.visual.patch_size == root_config.vision_config.patch_size
+        assert (
+            model.visual.spatial_merge_size
+            == root_config.vision_config.spatial_merge_size
+        )
+        assert type(model.visual).__name__ == {
+            "glm53_flash": "Glm5NextVisionTransformer",
+            "qwen38_flash_next": "Qwen3_VisionTransformer",
+        }[name]
+        assert len(model.visual.blocks) == (24 if name == "glm53_flash" else 27)
 
     backbone = model.language_model.model
     if name == "glm53_flash":
-        assert type(model.visual).__name__ == "Glm5NextVisionTransformer"
-        assert len(model.visual.blocks) == 24
         expected_range = (0, 45) if pp_size == 1 else [
             (0, 11), (11, 22), (22, 34), (34, 45)
         ][pp_rank]
@@ -248,8 +262,6 @@ def test_declared_checkpoint_architecture_with_vision_meta(
         assert boundary["hidden_states"].shape == (2, 4, 4096)
         assert model.num_moe_layers > 0
     else:
-        assert type(model.visual).__name__ == "Qwen3_VisionTransformer"
-        assert len(model.visual.blocks) == 27
         assert model.language_model_only is False
         assert (backbone.start_layer, backbone.end_layer) == (0, 48)
         assert backbone.layers[1].ple is not None

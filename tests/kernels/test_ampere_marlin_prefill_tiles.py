@@ -539,13 +539,19 @@ def test_library_declares_the_explicit_tiles():
                 want = (f"{pre}{threads}, {bs // 16}, {tn // 16}, {tk // 16}, "
                         "false, 4, 8, false, false")
                 assert want in ks, (bs, tk, tn)
-    assert "#define MARLIN_MOE_FAST_DEQUANT_REDO" in (LIB / "common_tiles.h").read_text()
+    template = (LIB / "marlin_moe_template.h").read_text()
+    assert "const bool fast_dequant" in template and "int* __restrict__ redo" in template
     units = {"decode_orig.cu", "decode_v2.cu", "prefill_tiles.cu",
              "kernels_tiles_sm80.cu", "module.cpp"}
     assert {p.name for p in LIB.iterdir() if p.suffix in (".cu", ".cpp")} == units
-    cmake = (ROOT / "CMakeLists.txt").read_text()
-    assert set(re.findall(r'"csrc/libtorch_stable/moe/ampere_marlin/([^"]+)"',
-                          cmake)) == units
+    # Built only by its own builder, from this directory's copy of the Marlin
+    # MoE GEMM: vLLM's CMake build names none of it, and no unit reaches
+    # vLLM's own Marlin MoE sources.
+    assert "ampere_marlin" not in (ROOT / "CMakeLists.txt").read_text()
+    for path in LIB.iterdir():
+        if path.suffix in (".cu", ".cuh", ".h", ".cpp"):
+            assert "marlin_moe_wna16/" not in "".join(re.findall(
+                r'#include\s+[<"]([^>"]+)[>"]', path.read_text())), path.name
     build = (LIB / "build_standalone.py").read_text()
     assert set(re.findall(r'"(\w+\.(?:cu|cpp))"', build)) == units
     assert '"prefill_schedule_version", 2' in (LIB / "module.cpp").read_text()

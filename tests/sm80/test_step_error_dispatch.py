@@ -23,6 +23,9 @@ class CheckedOutput(AsyncModelRunnerOutput):
             raise ValueError("copy-engine ring all-reduce: a peer flag did not arrive")
         return "valid output"
 
+    def get_kv_connector_output(self):
+        return None
+
 
 def _worker(output, rank=3):
     worker = object.__new__(WorkerProc)

@@ -124,6 +124,7 @@ def test_decode_regime_boundaries(monkeypatch, tokens, width, expected):
 @pytest.mark.parametrize("case,reason", [
     ("expert_map", "expert map"), ("fp8", "activation quantisation"),
     ("lora", "LoRA"), ("int64_ids", "int32"), ("bias", "w1_bias"),
+    ("post_gemm2_hook", "post-GEMM2 hook"),
 ])
 def test_unsupported_decode_leaves_output_untouched(monkeypatch, case, reason):
     monkeypatch.setenv(DECODE, "1")
@@ -139,6 +140,8 @@ def test_unsupported_decode_leaves_output_untouched(monkeypatch, case, reason):
         args["topk_ids"] = args["topk_ids"].to(torch.int64)
     elif case == "bias":
         layer.quant_config.w1_bias = torch.empty(1, device="meta")
+    elif case == "post_gemm2_hook":
+        layer.post_gemm2_hook = lambda unfinalized, output: None
     # Structural rejection must happen before the metadata-only device gate.
     assert reason in decode.gate_reason(layer, **args)
     output = torch.full((4, 4096), 3.0)
