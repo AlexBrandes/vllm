@@ -449,7 +449,7 @@ def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
     from vllm.platforms import current_platform
     from vllm.sm80 import tuning
 
-    if not envs.VLLM_GLM5_PREFILL_KERNELS:
+    if not envs.VLLM_SM80_SPARSE_MLA_PREFILL:
         return False
     if num_tokens < tuning.lookup(
         "attention_prefill", "sparse_mla_min_rows", {"head_dim": head_dim}, 512

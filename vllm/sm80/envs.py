@@ -22,8 +22,8 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_ALLREDUCE_ALGO: str = ""
     VLLM_CUSTOM_ALLREDUCE_FLAGS: bool = False
     VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S: float = 60.0
-    VLLM_GLM5_PREFILL_KERNELS: bool = False
-    VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE: bool = False
+    VLLM_SM80_MHC_PREFILL: bool = False
+    VLLM_SM80_SPARSE_MLA_PREFILL: bool = False
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
@@ -228,24 +228,30 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S": lambda: float(
         os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "60")
     ),
-    # Opt in to the sm_80 prefill kernels (the mHC pre-norm GEMM in
-    # vllm/sm80/kernels/mhc/ and the sparse-MLA prefill in
-    # vllm/sm80/kernels/attention/;
-    # GA100-class parts only; measured on CMP 170HX, 70 SMs). Default OFF: with
-    # this unset no such kernel is imported and every call site keeps the
-    # upstream code path exactly.
-    "VLLM_GLM5_PREFILL_KERNELS": lambda: bool(
-        int(os.getenv("VLLM_GLM5_PREFILL_KERNELS", "0"))
+    # The sm_80 mHC pre-norm projection GEMM at prefill sizes
+    # (vllm/sm80/kernels/mhc/prenorm.py) in place of the TileLang kernel, for
+    # steps of at least the mhc/prefill_min_rows row of the sm80 tuning table
+    # (GA100-class parts only; measured on CMP 170HX, 70 SMs). Default OFF:
+    # with this unset the kernel is not imported and the call site keeps the
+    # upstream path.
+    "VLLM_SM80_MHC_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_MHC_PREFILL", "0"))
     ),
-    # Sparse-MLA prefill with all 64 heads on one card (pipeline parallel,
-    # TP=1): a Gluon kernel that gathers each cache row once for all heads and
-    # compacts the valid index slots before the loop
-    # (vllm/sm80/kernels/attention/sparse_prefill_mla_pp.py). Taken only on sm_80 with
-    # 64 heads, bf16, the 512-wide NoPE layout, 2176 index slots and 1..2312
-    # query rows; everything else keeps the Triton kernel. Needs
-    # VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
-    "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE", "0"))
+    # The sm_80 sparse-MLA (DSA) prefill attention in place of the Triton
+    # sparse-MLA kernel's prefill schedule, for steps of at least
+    # the attention_prefill/sparse_mla_min_rows row of the sm80 tuning table
+    # and contexts of at least its sparse_mla_min_ctx row (twice index_topk
+    # without one). The head count per
+    # card picks the kernel: all 64 heads on one card (pipeline parallel,
+    # TP=1) take a Gluon kernel that gathers each cache row once for all heads
+    # and compacts the valid index slots before the loop
+    # (vllm/sm80/kernels/attention/sparse_prefill_mla_pp.py; bf16, the
+    # 512-wide NoPE layout, 2176 index slots and 1..2312 query rows), every
+    # other call the retuned Triton kernel of sparse_prefill_mla.py. Default
+    # OFF: with this unset neither is imported and the call site keeps the
+    # upstream path.
+    "VLLM_SM80_SPARSE_MLA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_SPARSE_MLA_PREFILL", "0"))
     ),
     # DSA indexer decode logits (vllm/sm80/kernels/attention/triton_mqa_logits.py,
     # Triton path) on sm_80: dequantize the e4m3 K tiles by bit placement
@@ -268,7 +274,7 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # card (pipeline parallel, TP=1) or 16 heads per rank (tensor parallel 4)
     # at the 512-wide NoPE layout, 2176 index slots and the schedule that head
     # count gets; every other shape keeps the plain gather.
-    # Needs VLLM_GLM5_PREFILL_KERNELS=1 as well. Off by default.
+    # Needs VLLM_SM80_SPARSE_MLA_PREFILL=1 as well. Off by default.
     "VLLM_GLM5_SMLA_PREFILL_PRED_LOAD": lambda: bool(
         int(os.getenv("VLLM_GLM5_SMLA_PREFILL_PRED_LOAD", "0"))
     ),
@@ -1357,9 +1363,7 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_PP_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
     "VLLM_GLM5_PP_MARLIN_PREFILL": "merged into VLLM_SM80_MARLIN_PREFILL",
     "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": "merged into VLLM_SM80_MARLIN_PREFILL",
-    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": (
-        "renamed to VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE"
-    ),
+    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": "merged into VLLM_SM80_SPARSE_MLA_PREFILL",
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": "renamed to VLLM_TOOL_CHOICE_NONE_MASK",
     "VLLM_GLM5_TP4_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
     "VLLM_GLM5_TP4_MARLIN_PREFILL": "merged into VLLM_SM80_MARLIN_PREFILL",
@@ -1397,6 +1401,15 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": (
         "merged into VLLM_SM80_MARLIN_PREFILL (the whole-expert lists run on "
         "the compiled tiles whenever the library has them)"
+    ),
+    "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": (
+        "merged into VLLM_SM80_SPARSE_MLA_PREFILL (the 64-head kernel is "
+        "picked by the head count per card)"
+    ),
+    # Split: one switch per operation.
+    "VLLM_GLM5_PREFILL_KERNELS": (
+        "split into VLLM_SM80_MHC_PREFILL (the mHC pre-norm GEMM) and "
+        "VLLM_SM80_SPARSE_MLA_PREFILL (the sparse-MLA prefill attention)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (

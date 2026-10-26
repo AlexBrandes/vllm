@@ -77,11 +77,20 @@ def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
     from vllm.sm80.kernels.thin_gemm.warmup import warmup_ampere_thin_gemm
 
     warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
-    # The 64-head sparse-MLA prefill kernel (sparse_prefill_mla_pp.py). Prefill
-    # runs eagerly, but compiling here keeps the Gluon JIT off the first
-    # request. No-op unless VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE and
-    # VLLM_GLM5_PREFILL_KERNELS are set and this rank runs 64 heads on sm_80.
-    if envs.VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE:
+    # The prefill mHC pre-norm GEMM and sparse-MLA attention gates are
+    # resolved per call; their switches are named here once at startup.
+    if envs.VLLM_SM80_MHC_PREFILL:
+        logger.info_once(
+            "sm_80 mHC prefill pre-norm GEMM on (VLLM_SM80_MHC_PREFILL=1): "
+            "steps from the mhc/prefill_min_rows row on sm_80.")
+    if envs.VLLM_SM80_SPARSE_MLA_PREFILL:
+        logger.info_once(
+            "sm_80 sparse-MLA prefill on (VLLM_SM80_SPARSE_MLA_PREFILL=1): "
+            "steps and contexts from the attention_prefill/sparse_mla_min_rows "
+            "and sparse_mla_min_ctx rows on sm_80.")
+        # The 64-head sparse-MLA prefill kernel (sparse_prefill_mla_pp.py).
+        # Prefill runs eagerly, but compiling here keeps the Gluon JIT off the
+        # first request. No-op unless this rank runs 64 heads on sm_80.
         from vllm.sm80.kernels.attention.sparse_prefill_mla_pp import (
             warmup_from_worker as warmup_sparse_mla_prefill,
         )

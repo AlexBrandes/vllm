@@ -33,7 +33,6 @@ RENAMED = {
     "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": "VLLM_MOE_DETERMINISTIC_ALIGN",
     "VLLM_GLM5_INDEXER_DECODE_RAW_K": "VLLM_INDEXER_DECODE_RAW_K",
     "VLLM_GLM5_MARLIN_DECODE_CUDA": "VLLM_AMPERE_MARLIN_DECODE_CUDA",
-    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE",
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": "VLLM_TOOL_CHOICE_NONE_MASK",
     "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": "VLLM_DSPARK_SHARD_ARGMAX",
     "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": "VLLM_SM80_TARGET_SHARD_ARGMAX",
@@ -54,6 +53,14 @@ MERGED = {
     "VLLM_AMPERE_MARLIN_PREFILL_WIDE": "VLLM_SM80_MARLIN_PREFILL",
     "VLLM_AMPERE_MARLIN_PREFILL_NARROW": "VLLM_SM80_MARLIN_PREFILL",
     "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": "VLLM_SM80_MARLIN_PREFILL",
+    "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": "VLLM_SM80_SPARSE_MLA_PREFILL",
+    "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE": "VLLM_SM80_SPARSE_MLA_PREFILL",
+}
+
+# Split into one switch per operation.
+SPLIT = {
+    "VLLM_GLM5_PREFILL_KERNELS": ("VLLM_SM80_MHC_PREFILL",
+                                  "VLLM_SM80_SPARSE_MLA_PREFILL"),
 }
 
 REPLACED_OR_REMOVED = {
@@ -146,14 +153,18 @@ MOVED_TO_TABLE = {
 
 def test_table_lists_every_retired_name():
     assert set(fork_envs.RETIRED_ENV_VARS) == (
-        set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED | set(MOVED_TO_TABLE)
+        set(RENAMED) | set(MERGED) | set(SPLIT) | REPLACED_OR_REMOVED
+        | set(MOVED_TO_TABLE)
     )
     assert all(fork_envs.RETIRED_ENV_VARS.values())
 
 
 @pytest.mark.parametrize(
     "name",
-    sorted(set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED | set(MOVED_TO_TABLE)),
+    sorted(
+        set(RENAMED) | set(MERGED) | set(SPLIT) | REPLACED_OR_REMOVED
+        | set(MOVED_TO_TABLE)
+    ),
 )
 def test_retired_name_is_not_declared(name):
     assert name not in envs.environment_variables
@@ -197,7 +208,18 @@ def test_moved_value_is_never_used(monkeypatch, old, row):
     assert tuning.lookup(op, param, key, default) == default
 
 
-@pytest.mark.parametrize("old,new", sorted((RENAMED | MERGED).items()))
+@pytest.mark.parametrize("old,new", sorted(SPLIT.items()))
+def test_split_name_points_at_its_replacements(old, new):
+    assert all(name in envs.environment_variables for name in new)
+    assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"split into {new[0]} ")
+    assert all(name in fork_envs.RETIRED_ENV_VARS[old] for name in new)
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    sorted((RENAMED | MERGED).items())
+    + [(old, name) for old, names in sorted(SPLIT.items()) for name in names],
+)
 def test_retired_value_is_never_used(monkeypatch, old, new):
     monkeypatch.delenv(old, raising=False)
     monkeypatch.delenv(new, raising=False)

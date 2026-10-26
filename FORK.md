@@ -768,7 +768,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_MARLIN_BUILD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_CUDA` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_V2` | `bool` | `False` | `'0'` |
-| `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_CUDAGRAPH_ESTIMATE_SPLIT` | `int` | `0` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `str` | `''` | `None` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS` | `bool` | `False` | `'0'` |
@@ -849,7 +848,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_GLM5_MARLIN_DECODE_PP_MULTI` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MOE_ROUTE_V2_MASK` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_PREFILL_KERNELS` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD` | `bool` | `False` | `'0'` |
 | `VLLM_HOST_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DECODE_RAW_K` | `bool` | `False` | `'0'` |
@@ -881,6 +879,8 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
 | `VLLM_SM80_KDA_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_MARLIN_PREFILL` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_MHC_PREFILL` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_SPARSE_MLA_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
