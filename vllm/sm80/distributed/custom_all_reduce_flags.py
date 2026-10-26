@@ -76,7 +76,6 @@ outside the source tree, in $VLLM_CACHE_ROOT/custom_all_reduce_flags.
 
 import atexit
 import ctypes
-import hashlib
 import math
 import os
 import sys
@@ -497,31 +496,15 @@ def load_module():
     global _MODULE
     if _MODULE is not None:
         return _MODULE
-    from torch.utils.cpp_extension import load
+    from vllm.sm80.jit_extension import load_cuda_extension
 
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
-    build = _build_dir()
-    tag = hashlib.sha1(CUDA_SRC.encode()).hexdigest()[:10]
-    name = f"custom_ar_flags_{tag}"
-    src = os.path.join(build, f"{name}.cu")
-    if not os.path.exists(src):
-        tmp = src + f".{os.getpid()}"
-        with open(tmp, "w") as f:
-            f.write(CUDA_SRC)
-        os.replace(tmp, src)
-    _MODULE = load(
-        name=name,
-        sources=[src],
-        build_directory=build,
-        extra_cflags=["-O3", "-std=c++17"],
+    _MODULE = load_cuda_extension(
+        "custom_ar_flags",
+        CUDA_SRC,
+        _build_dir(),
+        extra_cflags=["-O3"],
         # No --use_fast_math: the reduction must round exactly as the incumbent.
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++17",
-            "-gencode",
-            "arch=compute_80,code=sm_80",
-        ],
-        verbose=False,
+        extra_cuda_cflags=["-O3", "-gencode", "arch=compute_80,code=sm_80"],
     )
     return _MODULE
 

@@ -153,8 +153,8 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/__init__.py` | 2 |
 | `vllm/sm80/distributed/ce_ring_all_reduce.py` | 406 |
 | `vllm/sm80/distributed/communicator.py` | 356 |
-| `vllm/sm80/distributed/custom_all_reduce_flags.py` | 694 |
-| `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,166 |
+| `vllm/sm80/distributed/custom_all_reduce_flags.py` | 677 |
+| `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,155 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm/sm80/distributed/round_once_all_reduce.py` | 171 |
 | `vllm/sm80/distributed/round_once_kernels.py` | 71 |
@@ -218,7 +218,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **75 files** | **22,198** |
+| **75 files** | **22,170** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -928,11 +928,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 223 |
-| Fork-added product lines | 76,628 |
+| Fork-added product lines | 76,600 |
 | Patched upstream files | 100 |
 | Patched upstream lines | +4,539 / -787 |
 | Patched upstream product files | 73 |
 | Patched upstream product lines | +3,056 / -237 |
-| Product lines added (new files and patches) | 79,684 |
+| Product lines added (new files and patches) | 79,656 |
 | Fork environment variables (flags) | 150 |
 | Unreferenced fork definitions | 7 (59 lines) |
