@@ -13,7 +13,10 @@ The model and drafter classes the plugin registers extend upstream modules
 whose import already initialises CUDA (the GLM model package through FLA's
 platform check, the drafters through flashinfer). Those fork modules must
 import completely and make no more CUDA initialisation calls than their
-upstream module.
+upstream module. For a model override that is the upstream registry entry
+it replaces, loaded as the registry loads it (the module, then the class):
+a package that defers its classes to first access (Qwen4Exp) initialises
+CUDA only then.
 """
 import json
 import os
@@ -52,6 +55,10 @@ try:
             from vllm.sm80 import plugin
             plugin.register()
             plugin.platform_plugin()
+        elif ":" in name:
+            module, _, attr = name.partition(":")
+            __import__(module)
+            getattr(sys.modules[module], attr)
         else:
             __import__(name)
 except Exception:
@@ -84,13 +91,25 @@ def _model_package(module: str) -> str:
     return ".".join(parts[:3])
 
 
+def _upstream_entry(architecture: str) -> str:
+    """The upstream registry entry of ARCHITECTURE, as "<module>:<class>"."""
+    from vllm.model_executor.models.registry import _VLLM_MODELS
+
+    module, cls = _VLLM_MODELS[architecture]
+    if not module.startswith("vllm."):
+        module = f"vllm.model_executor.models.{module}"
+    return f"{module}:{cls}"
+
+
 def _upstream_based() -> dict[str, str]:
-    """Registered fork module -> the upstream module its classes extend."""
+    """Registered fork module -> the upstream module (or registry entry) its
+    classes extend."""
     based = {}
-    for qualified in (*plugin.MODEL_OVERRIDES.values(),
-                      *plugin.GLM_LAYER_OVERRIDES.values()):
+    for qualified in plugin.GLM_LAYER_OVERRIDES.values():
         module = _module(qualified)
         based[module] = _model_package(module)
+    for architecture, qualified in plugin.MODEL_OVERRIDES.items():
+        based.setdefault(_module(qualified), _upstream_entry(architecture))
     for qualified, upstream in plugin.DRAFTER_OVERRIDES.values():
         based[_module(qualified)] = upstream
     return based
