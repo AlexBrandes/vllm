@@ -574,7 +574,6 @@ def router_model(monkeypatch):
         dev_ab._QWEN4_MODEL_MODULE,
         SimpleNamespace(Qwen4ExpSparseMoeBlock=Block),
     )
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", "0")
     target = torch.nn.Sequential(Block("layers.0.mlp.gate"), Block("layers.1.mlp.gate"))
     draft = torch.nn.Sequential(Block("mtp.layers.0.mlp.gate"))
     return SimpleNamespace(
@@ -593,6 +592,7 @@ def test_router_fp32_switch_sets_every_gate(state, router_model):
     torch, runner = router_model.torch, router_model.runner
     switch = dev_ab.SWITCHES["qwen4_router_fp32"]
     assert switch.graph_bound and not switch.output_identical
+    assert switch.env == "hf_overrides.text_config.moe_router_dtype"
     assert switch.unavailable(runner) is None and switch.current(runner) is False
     # What the block's constructor does when the switch is set at boot.
     reference = router_model.Gate("reference")
@@ -602,29 +602,26 @@ def test_router_fp32_switch_sets_every_gate(state, router_model):
     switch.apply(runner, False)  # the boot arm first, as the per-arm capture
     switch.apply(runner, True)
     assert switch.current(runner) is True
-    assert dev_ab.os.environ["VLLM_QWEN4_ROUTER_FP32"] == "1"
     for gate in router_model.gates:
         assert _gate_fields(gate) == _gate_fields(reference)
     switch.apply(runner, False)
     assert switch.current(runner) is False
     assert [_gate_fields(gate) for gate in router_model.gates] == boot
-    assert dev_ab.os.environ["VLLM_QWEN4_ROUTER_FP32"] == "0"
     # set_out_dtype refuses a second set, so the boot fields came back first.
     switch.apply(runner, True)
     assert switch.current(runner) is True
 
 
-def test_router_fp32_switch_refuses_at_boot(monkeypatch, router_model):
+def test_router_fp32_switch_refuses_at_boot(router_model):
     torch, runner = router_model.torch, router_model.runner
     switch = dev_ab.SWITCHES["qwen4_router_fp32"]
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", "1")
-    assert "VLLM_QWEN4_ROUTER_FP32=0" in switch.unavailable(runner)
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", "0")
     other = SimpleNamespace(model=torch.nn.Sequential(torch.nn.Linear(2, 2)))
     assert "no Qwen4Exp MoE router gates" in switch.unavailable(other)
+    # A boot with moe_router_dtype="float32" already set the FP32 logits.
     draft_gate = router_model.gates[-1]
     draft_gate.out_dtype = torch.float32
     assert "already has out_dtype" in switch.unavailable(runner)
+    assert "moe_router_dtype" in switch.unavailable(runner)
     draft_gate.out_dtype = None
     draft_gate._rocm_bf16x3_weight_eligible = True
     assert "ROCm BF16x3" in switch.unavailable(runner)

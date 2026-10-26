@@ -332,9 +332,10 @@ _ROUTER_GATE_ATTRS = (
 def _router_gates(runner) -> list:
     """The router gate of every Qwen4Exp MoE block, target and draft model.
 
-    With VLLM_QWEN4_ROUTER_FP32 set, the block calls ``set_out_dtype`` at
-    construction; ``GateLinear.forward`` reads the output dtype and the tier
-    flags on every call, so the two arms differ only in those fields.
+    With the text config field ``moe_router_dtype="float32"``, the block calls
+    ``set_out_dtype`` at construction; ``GateLinear.forward`` reads the output
+    dtype and the tier flags on every call, so the two arms differ only in
+    those fields.
     """
     module = sys.modules.get(_QWEN4_MODEL_MODULE)
     if module is None:
@@ -351,17 +352,16 @@ def _router_gates(runner) -> list:
 
 
 def _router_unavailable(runner) -> str | None:
-    if _env_flag("VLLM_QWEN4_ROUTER_FP32"):
-        return (
-            "boot with VLLM_QWEN4_ROUTER_FP32=0; its on arm sets the FP32 "
-            "router logits"
-        )
     gates = _router_gates(runner)
     if not gates:
         return "the served model has no Qwen4Exp MoE router gates"
     for gate in gates:
         if gate.out_dtype is not None:
-            return f"router gate {gate.prefix} already has out_dtype {gate.out_dtype}"
+            return (
+                f"router gate {gate.prefix} already has out_dtype "
+                f"{gate.out_dtype}; boot without moe_router_dtype in "
+                "--hf-overrides, the on arm sets the FP32 router logits"
+            )
         if gate._rocm_bf16x3_weight_eligible:
             return (
                 f"router gate {gate.prefix} would need the ROCm BF16x3 weight "
@@ -386,7 +386,6 @@ def _router_apply(runner, on: bool) -> None:
             for gate in _router_gates(runner)
         ],
     )
-    _set_env("VLLM_QWEN4_ROUTER_FP32", on)
     for gate, boot in gates:
         for attr, value in boot.items():
             setattr(gate, attr, value)
@@ -1078,7 +1077,8 @@ SWITCHES: dict[str, Switch] = {
             _target_argmax_apply,
         ),
         Switch(
-            "qwen4_router_fp32", "VLLM_QWEN4_ROUTER_FP32", True, False,
+            "qwen4_router_fp32", "hf_overrides.text_config.moe_router_dtype",
+            True, False,
             _router_unavailable, _router_current, _router_apply,
         ),
     )

@@ -188,7 +188,7 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             self.experts.moe_config.skip_final_all_reduce = False
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
-        apply_router_precision(self.gate)
+        apply_router_precision(vllm_config, self.gate)
 
 
 class Qwen4ExpDecoderLayer(nn.Module):

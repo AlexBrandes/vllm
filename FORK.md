@@ -888,9 +888,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_PP_PACKED_HOP` | `bool` | `False` | `'0'` |
 | `VLLM_PP_SPLIT_DRAFT_EVENT` | `bool` | `False` | `'0'` |
 | `VLLM_PP_SPREAD_DECODES` | `bool` | `False` | `'0'` |
-| `VLLM_QWEN4_MTP_PER_STREAM_NORM` | `bool` | `False` | `'0'` |
 | `VLLM_QWEN4_QSA_TOPK_CANONICAL` | `bool` | `False` | `'0'` |
-| `VLLM_QWEN4_ROUTER_FP32` | `bool` | `False` | `'0'` |
 | `VLLM_QWEN_QSA_TOPK_SORTED` | `bool` | `True` | `'1'` |
 | `VLLM_ROUND_ONCE_ALLREDUCE_GROUPED` | `bool` | `False` | `'0'` |
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
@@ -912,7 +910,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **151 variables** | | | |
+| **149 variables** | | | |
 
 ## 4. Unreferenced fork code
 
