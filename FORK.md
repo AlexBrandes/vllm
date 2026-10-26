@@ -768,9 +768,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_MARLIN_BUILD` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_CUDA` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_DECODE_V2` | `bool` | `False` | `'0'` |
-| `VLLM_AMPERE_MARLIN_PREFILL_NARROW` | `bool` | `False` | `'0'` |
-| `VLLM_AMPERE_MARLIN_PREFILL_WIDE` | `bool` | `False` | `'0'` |
-| `VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_CUDAGRAPH_ESTIMATE_SPLIT` | `int` | `0` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `str` | `''` | `None` |
@@ -883,6 +880,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
 | `VLLM_SM80_KDA_PREFILL` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_MARLIN_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
@@ -893,7 +891,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **147 variables** | | | |
+| **145 variables** | | | |
 
 ## 4. Unreferenced fork code
 

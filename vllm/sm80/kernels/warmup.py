@@ -107,9 +107,8 @@ def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
     # The split-block Marlin MoE prefill (vllm/sm80/kernels/marlin_moe/
     # prefill.py). Same reason: its block-list buffers are
     # allocate-once per (device, E) and its Triton kernels compile on first
-    # launch. Only with VLLM_AMPERE_MARLIN_PREFILL_WIDE or
-    # VLLM_AMPERE_MARLIN_PREFILL_NARROW.
-    if envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE or envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW:
+    # launch. Only with VLLM_SM80_MARLIN_PREFILL.
+    if envs.VLLM_SM80_MARLIN_PREFILL:
         from vllm.sm80.kernels.marlin_moe.prefill import (
             warmup_from_worker as warmup_pp_marlin_prefill,
         )

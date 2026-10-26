@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-block Marlin W4A16 MoE prefill (VLLM_AMPERE_MARLIN_PREFILL_WIDE).
+"""Split-block Marlin W4A16 MoE prefill at whole experts (VLLM_SM80_MARLIN_PREFILL).
 
 CPU (CUDA_VISIBLE_DEVICES=""): the cover table, the block-list layout contract
 on a pure-Python model of the split alignment, the gate and its fall-throughs,
@@ -12,7 +12,9 @@ incumbent; the split path against an fp64 reference relative to the
 incumbent's own error (mean <= 1.10x, max <= 1.25x) on M in {1282, 2304, 2312}
 and on small M where lists are empty; every routed row written exactly once;
 bitwise run-to-run; CUDA-graph replay equal to eager with no allocation
-growth; the gate-closed fall-throughs on the device.  Captured prefill
+growth; the gate-closed fall-throughs on the device.  These run the split
+lists on the released kernels (the compiled tiles are
+test_ampere_marlin_prefill_tiles.py).  Captured prefill
 records are used when VLLM_PP_MARLIN_CAPTURE_DIR points at a capture
 (``moe_pre/*.pt`` plus the ``once/`` weights they name).
 """
@@ -30,7 +32,9 @@ from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
 
 E, TOPK, K, N, G = 288, 8, 4096, 2048, 128
-FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
+FLAG = "VLLM_SM80_MARLIN_PREFILL"
+# The compiled tile tables; _apply runs without them unless asked.
+TILES = pmp.TILE_TABLES
 
 
 def _min_tokens(monkeypatch, rows):
@@ -207,7 +211,7 @@ def test_flag_defaults(monkeypatch):
 
     monkeypatch.delenv(FLAG, raising=False)
     use_rows(monkeypatch)
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE is False
+    assert envs.VLLM_SM80_MARLIN_PREFILL is False
     assert pmp.min_rows(N) == 384
     _min_tokens(monkeypatch, 700)
     assert pmp.min_rows(N) == 700
@@ -422,11 +426,14 @@ def _inputs(M, seed, dev="cuda"):
     return x, tw.to(dev), ti.to(dev)
 
 
-def _apply(layer, wd, x, tw, ti, monkeypatch, flag, min_tokens=384):
+def _apply(layer, wd, x, tw, ti, monkeypatch, flag, min_tokens=384, tiles=False):
+    """One MarlinExperts.apply; the split lists on the compiled tiles only
+    with ``tiles`` (else as at a width without a tile table)."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     monkeypatch.setenv(FLAG, flag)
     _min_tokens(monkeypatch, min_tokens)
+    monkeypatch.setattr(pmp, "TILE_TABLES", TILES if tiles else {})
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
     M = x.size(0)
     out = torch.full((M, K), float("nan"), dtype=torch.bfloat16, device=x.device)

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compiled Marlin MoE prefill tiles for PP whole experts
-(VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED, off by default; the serving
-defaults turn it on at PP4): the split-list GEMMs of the N=2048 Marlin prefill
-(VLLM_AMPERE_MARLIN_PREFILL_WIDE) through the optional library's
+(VLLM_SM80_MARLIN_PREFILL, off by default): the split-list GEMMs of the
+N=2048 Marlin prefill through the optional library's
 prefill_tile_gemm, with the optimistic fast dequant and its per-GEMM redo
 areas. The TP4 (N=512) lists have no tile table and run on the released
 kernels.
 
-CPU: the switch and its retired name; ``compiled_tiles`` reasons (switch off,
+CPU: the switch and the retired names of the separate tiles switch;
+``compiled_tiles`` reasons (switch off,
 no table for the width, library/op missing, not a CUDA device, no scratch
 during a capture); the per-GEMM tile table reaches the op exactly ((64,512,1)
 on the 64/48/32-row lists of both GEMMs, Marlin's own choice on the 16-row
@@ -28,7 +28,8 @@ GEMM gets its redo row; against an fp64 reference within 1.10x mean / 1.25x
 max of the released split path's and the unsplit incumbent's error, with
 in-range scales and with scales above 2^-5 (the redo pass lists tiles);
 bitwise run to run; with the op missing the result is bitwise the released
-split path (switch 0); in-range scales give bitwise the regular kernels'
+split path (the lists without a tile table); in-range scales give bitwise
+the regular kernels'
 output; graph replay equals eager (the replay zeroes stale counts) with no
 allocation growth; with every SM but one held by another kernel, as a
 collective on another stream can hold them, the compiled tiles finish on the
@@ -48,10 +49,11 @@ import torch
 from tests.kernels import test_ampere_pp_marlin_prefill as pp
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
 
-SWITCH = "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED"
-RETIRED_SWITCH = "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED"
+SWITCH = "VLLM_SM80_MARLIN_PREFILL"
+# The names of the former separate tiles switch.
+RETIRED_SWITCHES = ("VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED",
+                    "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED")
 FLAG = pp.FLAG
-TP4_FLAG = "VLLM_AMPERE_MARLIN_PREFILL_NARROW"
 E, TOPK, K, N = pp.E, pp.TOPK, pp.K, pp.N
 gpu = pp.gpu
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,12 +61,12 @@ LIB = ROOT / "csrc" / "libtorch_stable" / "moe" / "ampere_marlin"
 WIDE = {64: (64, 512, 1), 48: (64, 512, 1), 32: (64, 512, 1)}
 TILES_BANNER = f"Marlin MoE prefill compiled tiles active ({SWITCH}, N=2048)"
 FAST_BANNER = f"Marlin MoE prefill fast dequant active ({SWITCH}, N=2048)"
-assert N == 2048 and FLAG == "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
+assert N == 2048 and FLAG == SWITCH
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for name in (SWITCH, RETIRED_SWITCH, FLAG, TP4_FLAG, pp.MIN_TOKENS):
+    for name in (SWITCH, *RETIRED_SWITCHES):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -73,33 +75,34 @@ def _clean(monkeypatch):
 def test_switch_defaults_off_and_turns_on(monkeypatch):
     import vllm.envs as envs
 
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is False
+    assert envs.VLLM_SM80_MARLIN_PREFILL is False
     monkeypatch.setenv(SWITCH, "0")
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is False
+    assert envs.VLLM_SM80_MARLIN_PREFILL is False
     monkeypatch.setenv(SWITCH, "1")
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is True
+    assert envs.VLLM_SM80_MARLIN_PREFILL is True
     from vllm.sm80 import envs as fork_envs  # typed declarations
 
     src = open(fork_envs.__file__).read()
     assert f"    {SWITCH}: bool = False\n" in src
 
 
-def test_retired_name_is_ignored(monkeypatch):
-    """The earlier name of the switch only warns; it never turns the tiles
-    on or off, and the TP4 switch has no successor."""
+def test_retired_names_are_ignored(monkeypatch):
+    """The names of the former tiles switch only warn; they never turn the
+    tiles or the split path on or off, and the TP4 tiles switch has no
+    successor."""
     import vllm.envs as envs
     from vllm.sm80 import envs as fork_envs
 
-    monkeypatch.setenv(RETIRED_SWITCH, "1")
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is False
-    monkeypatch.setenv(RETIRED_SWITCH, "0")
+    for name in RETIRED_SWITCHES:
+        monkeypatch.setenv(name, "1")
+        assert name not in envs.environment_variables
+        assert fork_envs.RETIRED_ENV_VARS[name].startswith(f"merged into {SWITCH}")
+    assert envs.VLLM_SM80_MARLIN_PREFILL is False
     monkeypatch.setenv(SWITCH, "1")
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED is True
-    assert fork_envs.RETIRED_ENV_VARS[RETIRED_SWITCH] == f"renamed to {SWITCH}"
+    assert envs.VLLM_SM80_MARLIN_PREFILL is True
     assert fork_envs.RETIRED_ENV_VARS[
         "VLLM_GLM5_TP4_MARLIN_PREFILL_COMPILED"
     ].startswith("removed;")
-    assert "VLLM_AMPERE_MARLIN_PREFILL_NARROW_COMPILED" not in envs.environment_variables
 
 
 def test_tile_tables():
@@ -384,7 +387,7 @@ def _open_gate(monkeypatch, capturing=False):
     """Open the gate on CPU (meta tensors; the device check is the only
     closed condition here) and record run()'s ``compiled`` and the banners."""
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(pp.MIN_TOKENS, "384")
+    pp._min_tokens(monkeypatch, 384)
     monkeypatch.setattr(pmp, "gate_reason", lambda *a, **k: None)
     monkeypatch.setattr(pmp, "_buffers", lambda *a, **k: {"t_max": 1 << 20})
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing",
@@ -442,18 +445,18 @@ def test_missing_op_keeps_the_released_kernels_and_says_why(monkeypatch):
                and "released Marlin kernels" in b for b in banners)
 
 
-def test_kill_switch_runs_the_split_list_path_without_the_op(monkeypatch):
-    """=0: no library lookup, no tile banner, run() gets compiled=None (the
-    split lists on the released kernels)."""
+def test_kill_switch_leaves_the_call_to_fused_marlin_moe(monkeypatch):
+    """=0: the split path declines before any gate, library lookup or
+    banner; the caller runs fused_marlin_moe."""
     from vllm.sm80.kernels.marlin_moe import extension
 
-    monkeypatch.setenv(SWITCH, "0")
     ran, banners = _open_gate(monkeypatch)
+    monkeypatch.setenv(SWITCH, "0")
     monkeypatch.setattr(extension, "prefill_tile_op",
                         lambda: pytest.fail("library consulted"))
-    assert pmp.maybe_apply(pp._layer(n=2048), **_maybe_args(2304)) is True
-    assert ran == [None]
-    assert len(banners) == 1 and banners[0].startswith("PP Marlin MoE prefill active")
+    assert pmp.maybe_apply(pp._layer(n=2048), **_maybe_args(2304)) is False
+    assert ran == []
+    assert banners == []
 
 
 def test_tp4_call_never_reaches_the_op(monkeypatch):
@@ -461,10 +464,7 @@ def test_tp4_call_never_reaches_the_op(monkeypatch):
     kernels: no table, no library lookup, no tile banner."""
     from vllm.sm80.kernels.marlin_moe import extension
 
-    monkeypatch.setenv(SWITCH, "1")
     ran, banners = _open_gate(monkeypatch)
-    monkeypatch.delenv(FLAG)
-    monkeypatch.setenv(TP4_FLAG, "1")
     monkeypatch.setattr(extension, "prefill_tile_op",
                         lambda: pytest.fail("library consulted"))
     assert pmp.maybe_apply(pp._layer(n=512), **_maybe_args(1728, n=512)) is True
@@ -479,7 +479,6 @@ def test_warmup_from_worker_passes_the_width(monkeypatch, tp):
     has no tile table: compiled_tiles returns nothing without asking for the
     op or allocating scratch or a redo area."""
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "1")
     monkeypatch.setattr(pmp, "_is_sm80", lambda d: True)
     calls = []
     monkeypatch.setattr(pmp, "warmup", lambda *a: calls.append(a))
@@ -641,17 +640,15 @@ def test_compiled_accuracy_vs_fp64(pp_weights, monkeypatch, M, min_tokens, big):
     calls = _spy(monkeypatch)
     layer = pp._gpu_layer(wd)
     x, tw, ti = pp._inputs(M, 100 + M)
-    monkeypatch.setenv(SWITCH, "1")
-    on = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", min_tokens)
+    on = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", min_tokens, tiles=True)
     assert calls and all(calls), "every list GEMM ran with a redo row"
     counts = pmp._TILE_REDO[str(x.device)][:, 0].tolist()
     if big and M >= 384:
         assert sum(counts) > 0, "out-of-range scales listed tiles"
     if not big:
         assert sum(counts) == 0, counts
-    again = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", min_tokens)
+    again = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", min_tokens, tiles=True)
     assert torch.equal(on, again), "bitwise run to run"
-    monkeypatch.setenv(SWITCH, "0")
     released = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", min_tokens)
     rows = pp._sample_rows(M)
     ref = pp.reference_fp64(x, wd, tw, ti, rows)
@@ -668,11 +665,9 @@ def test_missing_op_is_bitwise_the_released_split_path(pp_weights, monkeypatch, 
     wd = pp_weights[0]
     layer = pp._gpu_layer(wd)
     x, tw, ti = pp._inputs(M, 7 + M)
-    monkeypatch.setenv(SWITCH, "0")
     released = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1")
-    monkeypatch.setenv(SWITCH, "1")
     monkeypatch.setattr(extension, "prefill_tile_op", lambda: (None, "absent"))
-    fallback = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1")
+    fallback = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", tiles=True)
     assert torch.equal(fallback, released)
 
 
@@ -686,11 +681,10 @@ def test_fast_dequant_is_bitwise_the_regular_kernels(pp_weights, monkeypatch, M)
     _spy(monkeypatch)
     layer = pp._gpu_layer(wd)
     x, tw, ti = pp._inputs(M, 40 + M)
-    monkeypatch.setenv(SWITCH, "1")
-    fast = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1")
+    fast = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", tiles=True)
     assert sum(pmp._TILE_REDO[str(x.device)][:, 0].tolist()) == 0
     monkeypatch.setattr(pmp, "_tile_redo", lambda *a, **k: None)
-    regular = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1")
+    regular = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", tiles=True)
     assert torch.equal(fast, regular)
 
 
@@ -705,13 +699,12 @@ def test_compiled_graph_replay_equals_eager(pp_weights, monkeypatch):
     layer = pp._gpu_layer(wd)
     x, tw, ti = pp._inputs(M, 3)
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(pp.MIN_TOKENS, "384")
-    monkeypatch.setenv(SWITCH, "1")
+    pp._min_tokens(monkeypatch, 384)
     monkeypatch.setattr(pmp, "_TILE_REDO", {})
     pmp.warmup(x.device, E, 3460, TOPK, N)
     assert str(x.device) in pmp._TILE_SCRATCH
     redo = pmp._TILE_REDO[str(x.device)]
-    eager = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1")
+    eager = pp._apply(layer, wd, x, tw, ti, monkeypatch, "1", tiles=True)
     assert sum(redo[:, 0].tolist()) > 0
     out = torch.empty_like(x)
     ws13 = torch.empty(M * TOPK, K, dtype=torch.bfloat16, device=x.device)

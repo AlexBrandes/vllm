@@ -70,9 +70,7 @@ if TYPE_CHECKING:
     VLLM_PP_SPLIT_DRAFT_EVENT: bool = False
     VLLM_PP_DRAFT_TAIL_STAGE: int = -1
     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE: bool = False
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED: bool = False
-    VLLM_AMPERE_MARLIN_PREFILL_NARROW: bool = False
+    VLLM_SM80_MARLIN_PREFILL: bool = False
     VLLM_AMPERE_MARLIN_DECODE_CUDA: bool = False
     VLLM_AMPERE_MARLIN_DECODE_V2: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
@@ -622,39 +620,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_PP_FOLD_DRAFT_FC": lambda: bool(
         int(os.getenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"))
     ),
-    # Whole-expert Marlin W4A16 MoE at prefill (pipeline parallel, TP=1: all
-    # 288 experts, N=2048, on one sm_80 card): align the routed rows into one
-    # block list per size 64/48/32/16 (cheapest cover per expert) instead of
-    # padding every expert to one block size, and run each Marlin GEMM once
-    # per list (vllm/sm80/kernels/marlin_moe/prefill.py). Same compiled
-    # Marlin kernels; the split cover changes stream-K boundaries and reduction
-    # order, so output is not bitwise equal to fused_marlin_moe. Taken only
-    # for M >= the moe_prefill/marlin_min_rows row of the sm80 tuning table on
-    # exactly that configuration; everything else keeps fused_marlin_moe (TP4,
-    # N=512, has its own switch, VLLM_AMPERE_MARLIN_PREFILL_NARROW).
-    # Off by default.
-    "VLLM_AMPERE_MARLIN_PREFILL_WIDE": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE", "0"))
-    ),
-    # With VLLM_AMPERE_MARLIN_PREFILL_WIDE: run the split-list Marlin GEMMs of
-    # the whole-expert (N=2048) prefill through the optional library's
-    # prefill_tile_gemm with the tile table of
-    # vllm/sm80/kernels/marlin_moe/prefill.py ((64,512) tiles for the
-    # 64/48/32-row lists in both GEMMs) and the optimistic fast dequant (tiles
-    # with a scale above 2^-5 recomputed by the regular kernel). Without the
-    # library or its op, the released kernels run. The TP4 (N=512) lists
-    # always run on the released kernels. Off by default (the released split
-    # path); serving defaults turn it on where validated.
-    "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED", "0"))
-    ),
-    # The same split-block Marlin MoE prefill under tensor parallel 4 (each
-    # card holds all 288 experts sharded to N=512): taken only for M >=
-    # the moe_prefill/marlin_min_rows row of the sm80 tuning table at N=512 and
-    # otherwise the conditions of VLLM_AMPERE_MARLIN_PREFILL_WIDE. Its own
-    # switch so the two layouts are judged separately. Off by default.
-    "VLLM_AMPERE_MARLIN_PREFILL_NARROW": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "0"))
+    # Split-block Marlin W4A16 MoE prefill on sm_80 for 288 routed experts
+    # (vllm/sm80/kernels/marlin_moe/prefill.py): align the routed rows into
+    # one block list per size 64/48/32/16 (cheapest cover per expert) instead
+    # of padding every expert to one block size, and run each Marlin GEMM once
+    # per list. The expert width per card picks the shape: whole experts
+    # (N=2048, pipeline parallel with TP=1), with the list GEMMs on the
+    # optional library's prefill_tile_gemm tiles ((64,512) on the 64/48/32-row
+    # lists of both GEMMs, the optimistic fast dequant with tiles above a 2^-5
+    # scale recomputed by the regular kernel; without the library or its op the
+    # released kernels); or tensor-parallel-4 shards (N=512) on the released
+    # kernels. Taken for M >= the moe_prefill/marlin_min_rows row of the sm80
+    # tuning table at that N. The split cover changes stream-K boundaries and
+    # reduction order, so output is not bitwise equal to fused_marlin_moe.
+    # Everything else keeps fused_marlin_moe. Off by default.
+    "VLLM_SM80_MARLIN_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_MARLIN_PREFILL", "0"))
     ),
     # Optional prebuilt sm_80 Marlin decode kernels. Enabling the flag
     # requires vllm._ampere_marlin_C; startup fails if it is missing or
@@ -1374,18 +1355,14 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_INDEXER_DECODE_RAW_K": "renamed to VLLM_INDEXER_DECODE_RAW_K",
     "VLLM_GLM5_MARLIN_DECODE_CUDA": "renamed to VLLM_AMPERE_MARLIN_DECODE_CUDA",
     "VLLM_GLM5_PP_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
-    "VLLM_GLM5_PP_MARLIN_PREFILL": "renamed to VLLM_AMPERE_MARLIN_PREFILL_WIDE",
-    "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": (
-        "renamed to VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED"
-    ),
+    "VLLM_GLM5_PP_MARLIN_PREFILL": "merged into VLLM_SM80_MARLIN_PREFILL",
+    "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": "merged into VLLM_SM80_MARLIN_PREFILL",
     "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": (
         "renamed to VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE"
     ),
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": "renamed to VLLM_TOOL_CHOICE_NONE_MASK",
     "VLLM_GLM5_TP4_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
-    "VLLM_GLM5_TP4_MARLIN_PREFILL": (
-        "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
-    ),
+    "VLLM_GLM5_TP4_MARLIN_PREFILL": "merged into VLLM_SM80_MARLIN_PREFILL",
     # Merged: one switch per operation across models.
     "VLLM_GLM5_TOPK_TIEFIX": (
         "merged into VLLM_SM80_TOPK_CANONICAL_TIES (all sparse indexers)"
@@ -1408,6 +1385,18 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_AMPERE_KDA_PREFILL_NARROW": (
         "merged into VLLM_SM80_KDA_PREFILL (64 or 16 heads per card, picked "
         "by the layer's head count)"
+    ),
+    "VLLM_AMPERE_MARLIN_PREFILL_WIDE": (
+        "merged into VLLM_SM80_MARLIN_PREFILL (whole experts or TP4 shards, "
+        "picked by the expert width per card)"
+    ),
+    "VLLM_AMPERE_MARLIN_PREFILL_NARROW": (
+        "merged into VLLM_SM80_MARLIN_PREFILL (whole experts or TP4 shards, "
+        "picked by the expert width per card)"
+    ),
+    "VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED": (
+        "merged into VLLM_SM80_MARLIN_PREFILL (the whole-expert lists run on "
+        "the compiled tiles whenever the library has them)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (
