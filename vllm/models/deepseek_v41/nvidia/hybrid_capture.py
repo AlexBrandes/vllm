@@ -11,9 +11,9 @@ No hook is installed with VLLM_SM80_CAPTURE unset.
 import functools
 import inspect
 import itertools
-import weakref
 
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from vllm.sm80 import capture
 
@@ -46,8 +46,9 @@ def _leaves(value, prefix="out"):
 def _link(value):
     if not isinstance(value, torch.Tensor):
         return None
-    saved = _outputs.get(value.untyped_storage().data_ptr())
-    if saved is None or saved[1]() is None:
+    storage = value.untyped_storage()
+    saved = _outputs.get(storage.data_ptr())
+    if saved is None or saved[1].expired() or saved[1] != StorageWeakRef(storage):
         return None
     source = saved[0]
     if source["dtype"] != str(value.dtype):
@@ -123,7 +124,7 @@ def _defer_reader(rec, op, args):
     rec.defer(materialize)
 
 
-def _snapshot_args(op, args):
+def _snapshot_args(op, args, *, in_graph):
     """Retain pre-write state and neighboring write guards for mutating ops."""
     saved = dict(args)
     if op in ("compress_rows", "store_rows"):
@@ -135,6 +136,8 @@ def _snapshot_args(op, args):
             # Include the null block and real adjacent blocks as write guards.
             ids = torch.cat((blocks.new_zeros(1), blocks,
                              (blocks + 1).remainder(cache.shape[0])))
+            if not in_graph:
+                ids = torch.unique(ids, sorted=True)
             saved[name] = cache[ids]
             saved["snapshot_blocks"] = ids
             saved["snapshot_name"] = name
@@ -159,7 +162,7 @@ def _record(op, args, run, *, linear=None, boundary=False):
                         call_id=next(_serial), parents=parents, linear=linear, tp_boundary=boundary)
     if rec is None:
         return run()
-    saved = _snapshot_args(op, args)
+    saved = _snapshot_args(op, args, in_graph=rec.in_graph)
     if op in ("index_scores", "sparse_attention"):
         _defer_reader(rec, op, saved)
     else:
@@ -170,13 +173,13 @@ def _record(op, args, run, *, linear=None, boundary=False):
         outputs["out.ring"] = args["ring"][saved["snapshot_blocks"]]
     elif op == "store_rows":
         outputs["out"] = args["cache"][saved["snapshot_blocks"]]
-    rec.put(**outputs)
+    rec.put(preserve_layout=True, **outputs)
     rec.meta["outputs"] = list(outputs)
     for name, value in outputs.items():
         _outputs[value.untyped_storage().data_ptr()] = ({
             "call_id": rec.meta["call_id"], "output": name, "prefix": prefix, "point_phase": rec.point_phase,
             "storage_offset": value.storage_offset(), "dtype": str(value.dtype),
-        }, weakref.ref(value))
+        }, StorageWeakRef(value.untyped_storage()))
     rec.done()
     return result
 

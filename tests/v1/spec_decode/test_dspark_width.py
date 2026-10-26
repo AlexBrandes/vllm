@@ -31,6 +31,8 @@ def _config(schedule=((1, 3, 5), (4, 8, 3))):
     return SimpleNamespace(
         speculative_config=spec,
         scheduler_config=SimpleNamespace(max_num_seqs=8),
+        # Speculator.max_model_len reads the model config.
+        model_config=SimpleNamespace(max_model_len=128),
     )
 
 
@@ -39,7 +41,6 @@ def _init_cpu(self, config, device):
     self.device = device
     self.max_num_reqs = 8
     self.max_num_tokens = 128
-    self.max_model_len = 128
     self.max_width = self.width = self.num_speculative_steps = 5
     self.widths = (5,)
     self.sample_from_anchor = True

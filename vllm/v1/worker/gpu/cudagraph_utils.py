@@ -1063,6 +1063,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     ):
         return 0
 
+    from vllm.sm80.worker.cudagraph_mem import profiling_speculator_graphs
+
     gc.collect()
     torch.accelerator.empty_cache()
 
@@ -1093,8 +1095,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         all_wrappers: list[Any] = []
         original_pools: dict[int, Any] = {}
         speculator = getattr(runner, "speculator", None)
-        spec_manager_names: list[str] = []
+        spec_manager_scope = ExitStack()
         try:
+            spec_manager_scope.enter_context(
+                profiling_speculator_graphs(speculator, throwaway_pool)
+            )
             if not runner.needs_cudagraph_capture():
                 return 0
             manager.pool = throwaway_pool
@@ -1108,12 +1113,6 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             for wrapper in all_wrappers:
                 original_pools[id(wrapper)] = wrapper.graph_pool
                 wrapper.graph_pool = throwaway_pool
-            if speculator is not None:
-                spec_manager_names = [
-                    name
-                    for name, value in vars(speculator).items()
-                    if isinstance(value, CudaGraphManager)
-                ]
             manager._max_full_descs_to_capture = _FULL_GRAPH_PROFILING_SAMPLES
             mem_samples: list[int] = []
             manager._capture_mem_samples = mem_samples
@@ -1137,11 +1136,10 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             for wrapper in all_wrappers:
                 if id(wrapper) in original_pools:
                     wrapper.graph_pool = original_pools[id(wrapper)]
-            # Drop the speculator's cudagraph managers; the real
-            # initialize_kv_cache re-creates them. Their profiling graphs
-            # release the throwaway pool here rather than after the real init.
-            for name in spec_manager_names:
-                setattr(speculator, name, None)
+            # Retire direct and registry-held speculator managers before
+            # teardown flushes the throwaway pool. Real initialization
+            # re-creates them against the restored global pool.
+            spec_manager_scope.close()
             # Drop local references before teardown detaches the runner's
             # manager and flushes the allocator.
             del manager

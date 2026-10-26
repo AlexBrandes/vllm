@@ -54,7 +54,8 @@ capture cannot keep a large free segment from being released.
 The worker and model runner subclasses that call in here are in
 ``graph_mem_worker``; without the flag nothing here runs (the fork platform
 also selects that worker for the greedy target argmax, whose runner then
-keeps vLLM's estimate).
+keeps vLLM's estimate). The speculator-manager retirement scope also runs with
+the upstream estimate: all profiling graphs must release their throwaway pool.
 """
 
 from __future__ import annotations
@@ -77,6 +78,55 @@ _MiB = float(1 << 20)
 
 UPSTREAM_WORKER = "vllm.v1.worker.gpu_worker.Worker"
 WORKER = "vllm.sm80.worker.graph_mem_worker.GraphMemWorker"
+
+
+def _speculator_manager_slots(speculator: Any) -> list[tuple[dict, Any, bool]]:
+    """Direct manager attributes and manager entries in their dictionaries.
+
+    This is the ownership layout used by single- and multi-width speculators.
+    Do not walk model objects, tensors, or arbitrary nested state.
+    """
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+
+    if speculator is None:
+        return []
+    attributes = vars(speculator)
+    slots = []
+    seen = {id(attributes)}
+    for name, value in attributes.items():
+        if isinstance(value, CudaGraphManager):
+            slots.append((attributes, name, True))
+        elif isinstance(value, dict) and id(value) not in seen:
+            seen.add(id(value))
+            slots.extend(
+                (value, key, False)
+                for key, manager in value.items()
+                if isinstance(manager, CudaGraphManager)
+            )
+    return slots
+
+
+@contextmanager
+def profiling_speculator_graphs(speculator: Any, pool: Any) -> Iterator[None]:
+    """Bind every owned manager to profiling's pool, then discard its handles.
+
+    Real KV initialization rebuilds the managers. Clearing only the active
+    direct alias leaves width-indexed managers, their graphs and snapshots
+    alive and pins the shared throwaway pool. Dictionary entries are removed,
+    not replaced with None, so width selection cannot find a retired manager.
+    """
+    try:
+        for owner, key, _ in _speculator_manager_slots(speculator):
+            owner[key].pool = pool
+        yield
+    finally:
+        # Re-enumerate to include handles created lazily during capture; their
+        # constructors bind the globally swapped profiling pool.
+        for owner, key, attribute in _speculator_manager_slots(speculator):
+            if attribute:
+                owner[key] = None
+            else:
+                del owner[key]
 
 
 def enabled() -> bool:

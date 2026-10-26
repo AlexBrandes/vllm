@@ -515,3 +515,49 @@ def test_prefill_per_key_rejects_negative_limit_before_hooks(on, spec_file):
     with pytest.raises(ValueError, match="prefill_per_key must be nonnegative"):
         cap.config()
     assert cap._cfg is None and not on.exists()
+
+
+def test_linked_producer_layout_is_opt_in_and_survives_save_load(on):
+    backing = torch.arange(80, dtype=torch.float32).reshape(4, 20)
+    source = backing[:, 3:11]
+    expected = source.clone()
+    _step([1, 1, 1, 1])
+    rec = cap.begin("dense", "projection", PREFIX, 4)
+    rec.put(x=source)
+    rec.put(preserve_layout=True, out=source)
+    assert rec.tensors["x"].is_contiguous()
+    assert rec.tensors["out"].stride() == source.stride()
+    assert rec.tensors["out"].storage_offset() == 0
+    assert rec.tensors["out"].untyped_storage().nbytes() == 68 * source.element_size()
+    backing.fill_(-1)
+    rec.done()
+    (row,) = _index(on)
+    obj = torch.load(row["path"], weights_only=True, mmap=True)
+    assert row["bytes"] == (32 + 68) * source.element_size()
+    assert obj["tensors"]["out"].stride() == (20, 1)
+    assert torch.equal(obj["tensors"]["out"], expected)
+    assert torch.equal(obj["tensors"]["x"], expected)
+
+
+def test_linked_producer_host_copy_cannot_pack_holes(monkeypatch):
+    source = torch.arange(64, dtype=torch.float32).reshape(4, 16)[:, :8]
+    rec = cap.Record("hybrid", "hybrid_linear_consumer", PREFIX, 4, {})
+    rec.put(preserve_layout=True, out=source)
+    # Force the packing behavior of a non-dense device transfer without CUDA;
+    # the opt-in path must transfer its flat span, not the strided logical view.
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda value: value.clone(memory_format=torch.contiguous_format))
+    saved = rec.materialize()["out"]
+    assert saved.stride() == source.stride()
+    assert saved.untyped_storage().nbytes() == 56 * source.element_size()
+    assert torch.equal(saved, source)
+
+
+def test_linked_producer_byte_quota_counts_storage_span(on):
+    source = torch.arange(64, dtype=torch.float32).reshape(4, 16)[:, :8]
+    cap.config().max_bytes = source.numel() * source.element_size()
+    _step([1, 1, 1, 1])
+    cap.begin("dense", "projection", PREFIX, 4).put(preserve_layout=True, out=source).done()
+    (row,) = _index(on)
+    assert row["bytes"] == 56 * source.element_size()
+    assert not row["saved"] and "path" not in row
+    assert cap._bytes == [0]

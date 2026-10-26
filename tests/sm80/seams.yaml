@@ -1255,8 +1255,8 @@ seams:
 - id: graphmem-profile-cudagraph-memory
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
-  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
-  sha256: ffdd4cd7ba6c9cc949864294bdac6dc7f54f6f0e95b41fbfd53b85292eba43ef
+  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; direct and dictionary-held speculator managers share one profiling-pool/retirement scope before allocator cleanup; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
+  sha256: a67b75c2f12662a15e448363699632e5f0828cf33fce9d792805e22e7ee2223c
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: graphmem-runner-capture-model
@@ -1326,7 +1326,7 @@ seams:
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
   why: the graph-memory estimate comes from runner.capture_model(profile_only=True), so dev_ab's both-arm capture is what the KV cache is sized against
-  sha256: ffdd4cd7ba6c9cc949864294bdac6dc7f54f6f0e95b41fbfd53b85292eba43ef
+  sha256: a67b75c2f12662a15e448363699632e5f0828cf33fce9d792805e22e7ee2223c
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: dev-ab-request-state
