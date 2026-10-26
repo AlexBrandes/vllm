@@ -17,16 +17,13 @@ import vllm.envs as envs
 from vllm.sm80 import envs as fork_envs
 
 RENAMED = {
-    "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": "VLLM_MOE_MASK_PADDING_MAX_TOKENS",
     "VLLM_GLM5_FLA_PIN_AUTOTUNE": "VLLM_FLA_PIN_AUTOTUNE",
     "VLLM_GLM5_HOST_ALLREDUCE": "VLLM_HOST_ALLREDUCE",
-    "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": "VLLM_HOST_ALLREDUCE_MAX_SIZE",
     "VLLM_GLM5_MEM_ATTRIBUTION": "VLLM_MEM_ATTRIBUTION",
     "VLLM_GLM5_MOE_MASK_PADDING": "VLLM_MOE_MASK_PADDING",
     "VLLM_GLM5_SHARED_EXPERT_REORDER": "VLLM_SHARED_EXPERT_REORDER",
     "VLLM_GLM5_STATE_INDEX_CHECK": "VLLM_STATE_INDEX_CHECK",
     "VLLM_GLM5_THIN_GEMM": "VLLM_THIN_GEMM",
-    "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": "VLLM_THIN_GEMM_MAX_TOKENS",
     "VLLM_ALLOW_PCIE_P2P_CUSTOM_ALLREDUCE": "VLLM_CUSTOM_ALLREDUCE_PCIE_P2P",
     "VLLM_BUILD_AMPERE_MARLIN": "VLLM_AMPERE_MARLIN_BUILD",
     "VLLM_DSA_INDEXER_REF": "VLLM_INDEXER_DSA_REF",
@@ -90,13 +87,57 @@ REPLACED_OR_REMOVED = {
     "VLLM_DFLASH_BOUNDARY_CACHE",
 }
 
+# Size cut-offs moved to the sm80 tuning table (vllm/sm80/tuning.py), with
+# the (op, param) rows that replace them and the shape key and default each
+# reader passes.
+MOVED_TO_TABLE = {
+    "VLLM_THIN_GEMM_MAX_TOKENS": (
+        "dense_gemm/thin_max_rows", {"gemm_n": 4096, "gemm_k": 4096}, 32),
+    "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": (
+        "dense_gemm/thin_max_rows", {"gemm_n": 4096, "gemm_k": 4096}, 32),
+    "VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS": (
+        "mhc/decode_v2_max_rows", {"hidden": 4096, "hc_mult": 4}, 32),
+    "VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS": (
+        "moe_router/route_v2_max_rows",
+        {"n_experts": 288, "top_k": 8, "hidden": 4096}, 32),
+    "VLLM_MOE_MASK_PADDING_MAX_TOKENS": (
+        "moe_router/fused_route_max_rows", {"top_k": 8}, 8),
+    "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": (
+        "moe_router/fused_route_max_rows", {"top_k": 8}, 8),
+    "VLLM_GLM5_PREFILL_MIN_TOKENS": (
+        "attention_prefill/sparse_mla_min_rows", {"head_dim": 512}, 512),
+    "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS": (
+        "moe_prefill/marlin_min_rows", {"gemm_n": 2048}, 384),
+    "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": (
+        "moe_prefill/marlin_min_rows", {"gemm_n": 512}, 384),
+    "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS": (
+        "moe_routed_gemm/marlin_multi_max_rows", {"gemm_n": 2048}, 32),
+    "VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT": (
+        "attention_prefill/sparse_mla_min_ctx",
+        {"head_dim": 512, "index_width": 2176}, 4352),
+    "VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS": (
+        "topk_select/split_rows", {"top_k": 512}, 0),
+    "VLLM_EXL3_MOE_CHUNK_ROWS": (
+        "moe_routed_gemm/exl3_chunk_rows", {"hidden": 5120}, 0),
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES": (
+        "allreduce/flags_max_bytes", {"world_size": 4, "hidden": 5120}, 262144),
+    "VLLM_HOST_ALLREDUCE_MAX_SIZE": (
+        "allreduce/host_max_bytes", {"world_size": 4, "hidden": 5120}, 524288),
+    "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": (
+        "allreduce/host_max_bytes", {"world_size": 4, "hidden": 5120}, 524288),
+}
+
 
 def test_table_lists_every_retired_name():
-    assert set(fork_envs.RETIRED_ENV_VARS) == set(RENAMED) | REPLACED_OR_REMOVED
+    assert set(fork_envs.RETIRED_ENV_VARS) == (
+        set(RENAMED) | REPLACED_OR_REMOVED | set(MOVED_TO_TABLE)
+    )
     assert all(fork_envs.RETIRED_ENV_VARS.values())
 
 
-@pytest.mark.parametrize("name", sorted(set(RENAMED) | REPLACED_OR_REMOVED))
+@pytest.mark.parametrize(
+    "name", sorted(set(RENAMED) | REPLACED_OR_REMOVED | set(MOVED_TO_TABLE))
+)
 def test_retired_name_is_not_declared(name):
     assert name not in envs.environment_variables
 
@@ -105,6 +146,32 @@ def test_retired_name_is_not_declared(name):
 def test_renamed_name_points_at_its_replacement(old, new):
     assert new in envs.environment_variables
     assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"renamed to {new}")
+
+
+@pytest.mark.parametrize("old,row", sorted(MOVED_TO_TABLE.items()))
+def test_moved_name_points_at_its_table_row(old, row):
+    message = fork_envs.RETIRED_ENV_VARS[old]
+    assert message.startswith(f"moved to the sm80 tuning table, {row[0]}")
+
+
+def test_prefill_min_tokens_names_both_rows():
+    assert fork_envs.RETIRED_ENV_VARS["VLLM_GLM5_PREFILL_MIN_TOKENS"] == (
+        "moved to the sm80 tuning table, attention_prefill/sparse_mla_min_rows "
+        "and mhc/prefill_min_rows"
+    )
+
+
+@pytest.mark.parametrize("old,row", sorted(MOVED_TO_TABLE.items()))
+def test_moved_value_is_never_used(monkeypatch, old, row):
+    from tests.sm80.tuning_rows import use_rows
+    from vllm.sm80 import tuning
+
+    use_rows(monkeypatch)
+    op_param, key, default = row
+    op, param = op_param.split("/")
+    # Not a valid value: a reader of the old name would raise or change it.
+    monkeypatch.setenv(old, "not-a-valid-value")
+    assert tuning.lookup(op, param, key, default) == default
 
 
 @pytest.mark.parametrize("old,new", sorted(RENAMED.items()))

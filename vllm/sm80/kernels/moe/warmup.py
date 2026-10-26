@@ -5,8 +5,10 @@
 
 from vllm.logger import init_logger
 from vllm.sm80.kernels.moe import (
+    fused_route_max_rows,
     marlin_block_size_m,
     route_v2_masks_padding,
+    route_v2_max_rows,
     use_ampere_moe_routing,
 )
 from vllm.sm80.kernels.warmup_utils import find_module, token_sizes
@@ -50,7 +52,6 @@ def _moe_shape(worker, model) -> tuple[int, int] | None:
 
 
 def _warmup_moe(worker, model, device, capture_sizes, gate) -> None:
-    from vllm import envs
     from vllm.sm80.kernels.moe import routing
 
     shape = _moe_shape(worker, model)
@@ -60,7 +61,7 @@ def _warmup_moe(worker, model, device, capture_sizes, gate) -> None:
     hidden = int(worker.vllm_config.model_config.get_hidden_size())
     ms = [
         m
-        for m in token_sizes(capture_sizes, envs.VLLM_MOE_MASK_PADDING_MAX_TOKENS)
+        for m in token_sizes(capture_sizes, fused_route_max_rows(topk))
         if gate(m, num_experts, topk)
     ]
     if not ms:
@@ -83,7 +84,6 @@ def _warmup_moe_route(worker, model, device, capture_sizes) -> None:
     """Compile every (M, block size) variant of route.py and allocate its
     scratch (split-K partials, bitmask columns, arrival counters) before any
     graph is captured."""
-    from vllm import envs
     from vllm.sm80.kernels.moe import route
 
     shape = _moe_shape(worker, model)
@@ -93,7 +93,7 @@ def _warmup_moe_route(worker, model, device, capture_sizes) -> None:
     hidden = int(worker.vllm_config.model_config.get_hidden_size())
     if (num_experts, topk, hidden) != (288, 8, 4096):
         return
-    ms = token_sizes(capture_sizes, envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS)
+    ms = token_sizes(capture_sizes, route_v2_max_rows())
     if not ms:
         return
     for m in ms:

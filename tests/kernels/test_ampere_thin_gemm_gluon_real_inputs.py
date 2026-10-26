@@ -168,13 +168,13 @@ def test_dispatch_holds_cublas_error_on_real_inputs(monkeypatch):
     import types
 
     from tests.kernels.quantization.test_exl3_dense_splitk import _Pool
-    from vllm import envs
+    from tests.sm80.tuning_rows import use_rows
     from vllm.config import CompilationMode, CUDAGraphMode
     from vllm.sm80.kernels.thin_gemm import gluon
 
     directory = real.case_dir_or_skip()
     _, cases = real.load_manifest(directory)
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    use_rows(monkeypatch)
     monkeypatch.setattr(gluon, "_LIVE", [False])
     gluon.impl.cache_clear()
     device = torch.device("cuda", torch.cuda.current_device())

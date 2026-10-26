@@ -17,12 +17,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.sm80.tuning_rows import use_rows
+
 E, TOPK, HIDDEN = 288, 8, 4096
 TIE_DELTA = 2.0**-17
 
 
+def _route_v2_rows(monkeypatch, rows):
+    use_rows(
+        monkeypatch,
+        ("moe_router", "route_v2_max_rows",
+         {"n_experts": E, "top_k": TOPK, "hidden": HIDDEN}, rows),
+    )
+
+
 @pytest.fixture
 def on(monkeypatch):
+    use_rows(monkeypatch)
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "1")
     monkeypatch.setenv("VLLM_MOE_DECODE_ROUTE_V2", "1")
     monkeypatch.setattr("vllm.sm80.kernels._platform._SM80_CACHE", True)
@@ -54,11 +65,12 @@ def _x(m, device="cpu"):
 # --- CPU: flags, gate, handoff --------------------------------------------------
 def test_flags_default_off(monkeypatch):
     from vllm import envs
+    from vllm.sm80.kernels.moe import route_v2_max_rows
 
     monkeypatch.delenv("VLLM_MOE_DECODE_ROUTE_V2", raising=False)
-    monkeypatch.delenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", raising=False)
+    use_rows(monkeypatch)
     assert envs.VLLM_MOE_DECODE_ROUTE_V2 is False
-    assert envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS == 32
+    assert route_v2_max_rows() == 32
 
 
 def test_gate_off_by_default(monkeypatch):
@@ -86,7 +98,7 @@ def test_gate_token_range(on):
     for m in (1, 2, 4, 8, 16, 32):
         assert use_ampere_moe_route_v2(m, g, r, _x(m))
     assert not use_ampere_moe_route_v2(33, g, r, _x(33))
-    on.setenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "4")
+    _route_v2_rows(on, 4)
     assert use_ampere_moe_route_v2(4, g, r, _x(4))
     assert not use_ampere_moe_route_v2(5, g, r, _x(5))
 
@@ -202,13 +214,13 @@ def test_launch_count_by_rows(monkeypatch):
 
 
 def test_gate_bound_above_64_rows_is_rejected(monkeypatch):
-    from vllm import envs
+    from vllm.sm80.kernels.moe import route_v2_max_rows
 
-    monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "64")
-    assert envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS == 64
-    monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "65")
+    _route_v2_rows(monkeypatch, 64)
+    assert route_v2_max_rows() == 64
+    _route_v2_rows(monkeypatch, 65)
     with pytest.raises(ValueError, match="exceeds 64"):
-        envs.environment_variables["VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS"]()
+        route_v2_max_rows()
 
 
 # --- GPU: the kernel ------------------------------------------------------------

@@ -465,7 +465,6 @@ def test_tp4_call_never_reaches_the_op(monkeypatch):
     ran, banners = _open_gate(monkeypatch)
     monkeypatch.delenv(FLAG)
     monkeypatch.setenv(TP4_FLAG, "1")
-    monkeypatch.setenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
     monkeypatch.setattr(extension, "prefill_tile_op",
                         lambda: pytest.fail("library consulted"))
     assert pmp.maybe_apply(pp._layer(n=512), **_maybe_args(1728, n=512)) is True

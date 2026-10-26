@@ -27,8 +27,8 @@ ONE LAUNCH FOR 2 <= M <= 64, TWO AT M = 1, NOTHING ABOVE 64
                    upstream's CUDA kernels (single_group_topk / moe_align /
                    count_and_sort).
 
-The gate (VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS, at most 64) keeps larger
-batches on the unfused path.
+The gate (moe_router/route_v2_max_rows in the sm80 tuning table, at most 64)
+keeps larger batches on the unfused path.
 
 Whole op, 42-layer weight rotation, graph replay, routing variants (us):
     M                       1     2     4     8    16    32

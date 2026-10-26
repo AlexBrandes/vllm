@@ -48,7 +48,7 @@ The runtime flags default to `0`:
 | --- | --- |
 | `VLLM_AMPERE_MARLIN_DECODE_CUDA=1` | TP4 intermediate width 512, 1–32 tokens; PP4 width 2048, 4 or 8 tokens |
 | `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS=1` (with the above) | PP4 width 2048, also 5–7 tokens |
-| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI=1` (with the above) | PP4 width 2048, the token ranges of `VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` (`lo-hi[,lo-hi...]` within 9–64, default `9-32`) |
+| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI=1` (with the above) | PP4 width 2048, 9 tokens up to the `moe_routed_gemm/marlin_multi_max_rows` row of the sm80 tuning table (`vllm/sm80/tuning/`; at most 64, default 32) |
 
 Decode splits the first projection four ways along K into fixed-order fp32
 partials, which is faster but sums in a different order from the released
@@ -65,7 +65,7 @@ The decode schedule retains routing and padding semantics, slot-order
 summation, shared-expert handling and final reduction. Optional scratch is
 reserved per device and stream before CUDA-graph capture, including PP
 workers: 32 tokens for TP4, and for PP4 8 tokens or the largest row count of
-`VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` when that switch is on.
+`moe_routed_gemm/marlin_multi_max_rows` when that switch is on.
 Fully masked graph padding rows remain don't-care, as with released kernels.
 
 MoE prefill under TP4 uses the released Marlin kernels (with the split-block

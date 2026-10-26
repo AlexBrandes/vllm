@@ -4,7 +4,7 @@
 ``vllm/sm80/kernels/warmup_utils.py`` for why it must run before capture)."""
 
 from vllm.logger import init_logger
-from vllm.sm80.kernels.mhc import use_ampere_mhc_decode_v3
+from vllm.sm80.kernels.mhc import decode_v2_max_rows, use_ampere_mhc_decode_v3
 from vllm.sm80.kernels.warmup_utils import find_module, token_sizes
 
 logger = init_logger(__name__)
@@ -28,7 +28,6 @@ def _warmup_mhc_v3(model, device, capture_sizes, gate) -> None:
     are allocated per call, from the graph pool during capture), so compiling
     before capture is all that is needed.
     """
-    from vllm import envs
     from vllm.sm80.kernels.mhc import decode as mhc_decode
 
     layer = find_module(model, "mhc_fused_post_pre_op")
@@ -37,7 +36,7 @@ def _warmup_mhc_v3(model, device, capture_sizes, gate) -> None:
     hidden = int(layer.hidden_size)
     hc = int(layer.n)
     sinkhorn = int(layer.mhc_sinkhorn_iterations)
-    bound = envs.VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS
+    bound = decode_v2_max_rows(hc, hidden)
     ms = [m for m in token_sizes(capture_sizes, bound) if gate(m, hc, hidden)]
     if not ms:
         logger.info("sm_80 mHC decode v3 requested but its gate is closed "

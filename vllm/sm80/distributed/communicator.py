@@ -89,6 +89,22 @@ def p2p_probe_mandatory() -> Iterator[None]:
             envs.enable_envs_cache()
 
 
+def allreduce_max_bytes(param: str, world_size: int, default: int) -> int:
+    """The allreduce/``param`` row of the sm80 tuning table for a group of
+    ``world_size`` ranks, else ``default``. The key is the world size and,
+    when the communicator is built inside an engine (under the current vLLM
+    config), the model's hidden size: the width of its activation messages."""
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.sm80 import tuning
+
+    key: dict[str, int | str] = {"world_size": int(world_size)}
+    config = get_current_vllm_config_or_none()
+    model_config = None if config is None else config.model_config
+    if model_config is not None:
+        key["hidden"] = int(model_config.get_hidden_size())
+    return tuning.lookup("allreduce", param, key, default)
+
+
 class Sm80CustomAllreduce(car.CustomAllreduce):
     """Upstream's custom all-reduce plus the flags-in-data two-shot path.
 
@@ -138,7 +154,7 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
             self.device,
             self.rank,
             self.world_size,
-            envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES,
+            allreduce_max_bytes("flags_max_bytes", self.world_size, 262144),
             self.create_shared_buffer,
             self.free_shared_buffer,
         )
@@ -224,7 +240,9 @@ class Sm80CudaCommunicator(CudaCommunicator):
             self.hostshm_comm = HostShmAllreduce(
                 group=self.cpu_group,
                 device=self.device,
-                max_size=envs.VLLM_HOST_ALLREDUCE_MAX_SIZE,
+                max_size=allreduce_max_bytes(
+                    "host_max_bytes", self.world_size, 512 * 1024
+                ),
             )
             if self.hostshm_comm.disabled:
                 self.hostshm_comm = None

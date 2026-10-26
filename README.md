@@ -217,9 +217,8 @@ hold, so the reported pool is one the server can fill —
 log-probabilities on every run and every install: fixed-order MoE block
 alignment (`VLLM_MOE_DETERMINISTIC_ALIGN`), CUDA-graph padding kept out of
 the MoE (`VLLM_MOE_MASK_PADDING`), indexer top-k consistent on ties and in
-a fixed order (`VLLM_GLM5_TOPK_TIEFIX`, `VLLM_GLM5_TOPK_SORTED`,
-`VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS`), pinned linear-attention prefill
-configurations (`VLLM_FLA_PIN_AUTOTUNE`).
+a fixed order (`VLLM_GLM5_TOPK_TIEFIX`, `VLLM_GLM5_TOPK_SORTED`), pinned
+linear-attention prefill configurations (`VLLM_FLA_PIN_AUTOTUNE`).
 
 **Pipeline-parallel and scheduling.** Decodes spread over every in-flight
 micro-batch — `VLLM_PP_SPREAD_DECODES`; one packed, metadata-free hand-off

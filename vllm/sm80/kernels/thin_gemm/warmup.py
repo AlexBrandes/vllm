@@ -107,8 +107,8 @@ def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
         register_groups(worker, capture_sizes)
 
     from vllm.sm80.kernels.thin_gemm import (
-        dispatch_threshold,
         impl,
+        max_rows,
         use_ampere_thin_gemm,
     )
 
@@ -124,19 +124,21 @@ def warmup_ampere_thin_gemm(worker, capture_sizes) -> None:
 
     warmup = impl().warmup
 
-    bound = dispatch_threshold()
-    ms = _token_sizes(capture_sizes, bound)
-    if not ms:
-        return
-
-    # Only sizes <= the bound are warmed: a captured graph at M=40..64 takes the
-    # cuBLAS branch, so the kernel is never in it and needs nothing preallocated.
-    # If the bound is raised by env, this follows it automatically.
     nk = _discover_nk(worker)
     discovered = len(nk)
     nk.update(_TABLE_NK)
     backstop = len(nk) - discovered
     device = worker.device
+
+    # Only sizes <= the largest per-shape bound (dense_gemm/thin_max_rows in
+    # the sm80 tuning table) are warmed: a captured graph above it takes the
+    # cuBLAS branch, so the kernel is never in it and needs nothing
+    # preallocated. A shape with a lower bound is warmed at the extra sizes
+    # too, which costs only their compile.
+    bound = max((max_rows(n, k) for n, k in nk), default=0)
+    ms = _token_sizes(capture_sizes, bound)
+    if not ms:
+        return
 
     if envs.VLLM_THIN_GEMM_GLUON:
         # The Gluon thin GEMM decides its gate here and warms the (N, K) it

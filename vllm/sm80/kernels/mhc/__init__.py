@@ -14,14 +14,18 @@ needs ``VLLM_AMPERE_DECODE_KERNELS`` and ``VLLM_GLM5_DECODE_MHC_V2``, and with
 either unset no kernel module is imported and the call site keeps the TileLang
 path. The prefill pre-norm gates are called from
 ``vllm/model_executor/kernels/mhc/tilelang.py::_hc_prenorm_gemm_outputs``.
+Their row bounds are the ``mhc`` rows of the sm80 tuning table
+(``vllm/sm80/tuning.py``).
 """
 
 import torch
 
+from vllm.sm80 import tuning
 from vllm.sm80.kernels._platform import _is_sm80
 
 __all__ = [
     "ampere_prenorm_offsets_fit",
+    "decode_v2_max_rows",
     "use_ampere_mhc_decode_v3",
     "use_ampere_prefill_prenorm",
 ]
@@ -30,6 +34,15 @@ __all__ = [
 # to know whether it is None, and the artifact-link script calls the gate with
 # three positional arguments, so the parameter cannot be required.
 _PRESENT = object()
+
+
+def decode_v2_max_rows(hc_mult: int, hidden_size: int) -> int:
+    """Largest M of the decode kernel: the mhc/decode_v2_max_rows row of the
+    sm80 tuning table, else 32 (the measurements below)."""
+    return tuning.lookup(
+        "mhc", "decode_v2_max_rows", {"hidden": hidden_size, "hc_mult": hc_mult},
+        32,
+    )
 
 
 def use_ampere_mhc_decode_v3(
@@ -41,8 +54,8 @@ def use_ampere_mhc_decode_v3(
 ) -> bool:
     """Gate for vllm/sm80/kernels/mhc/decode.py::mhc_fused_post_pre.
 
-    When open it replaces TileLang for 1 <= M <=
-    ``VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS`` (32). Measured us/call for v2, the
+    When open it replaces TileLang for 1 <= M <= :func:`decode_v2_max_rows`
+    (32 without a table row). Measured us/call for v2, the
     kernel pair v3 refines, graph replay, one CMP 170HX, against the faster of
     the earlier v1 kernel and TileLang in the same run (best of 3):
 
@@ -62,11 +75,11 @@ def use_ampere_mhc_decode_v3(
 
     if not envs.VLLM_AMPERE_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_MHC_V2:
         return False
-    if num_tokens < 1 or num_tokens > envs.VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS:
-        return False
     if norm_weight is None:
         return False
     if hc_mult != 4 or hidden_size <= 0 or hidden_size % 1024:
+        return False
+    if num_tokens < 1 or num_tokens > decode_v2_max_rows(hc_mult, hidden_size):
         return False
     return _is_sm80()
 
@@ -75,8 +88,10 @@ def use_ampere_prefill_prenorm(num_tokens: int) -> bool:
     """Gate for vllm/sm80/kernels/mhc/prenorm.py.
 
     Resolved on the host, per call, outside any graph. At decode sizes the
-    upstream TileLang kernel is the one that was tuned, so the threshold keeps
-    every captured CUDA graph on it.
+    upstream TileLang kernel is the one that was tuned, so the threshold (the
+    mhc/prefill_min_rows row of the sm80 tuning table, else 512) keeps every
+    captured CUDA graph on it. The call site passes no shape, so the row has
+    an empty key.
 
     COVERAGE. This gates `_hc_prenorm_gemm_outputs`, which is the choke point
     for `mhc_pre_tilelang`, `mhc_pre_broadcast_tilelang` and
@@ -93,7 +108,7 @@ def use_ampere_prefill_prenorm(num_tokens: int) -> bool:
 
     if not envs.VLLM_GLM5_PREFILL_KERNELS:
         return False
-    if num_tokens < envs.VLLM_GLM5_PREFILL_MIN_TOKENS:
+    if num_tokens < tuning.lookup("mhc", "prefill_min_rows", {}, 512):
         return False
     return current_platform.is_cuda() and current_platform.is_device_capability(80)
 

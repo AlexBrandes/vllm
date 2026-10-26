@@ -25,12 +25,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
 
 E, TOPK, K, N, G = 288, 8, 4096, 2048, 128
 FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
-MIN_TOKENS = "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS"
+
+
+def _min_tokens(monkeypatch, rows):
+    """The moe_prefill/marlin_min_rows row at this module's N."""
+    use_rows(monkeypatch, ("moe_prefill", "marlin_min_rows", {"gemm_n": N}, int(rows)))
 
 
 # --------------------------------------------------------------------------
@@ -201,9 +206,12 @@ def test_flag_defaults(monkeypatch):
     import vllm.envs as envs
 
     monkeypatch.delenv(FLAG, raising=False)
-    monkeypatch.delenv(MIN_TOKENS, raising=False)
+    use_rows(monkeypatch)
     assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE is False
-    assert envs.VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS == 384
+    assert pmp.min_rows(N) == 384
+    _min_tokens(monkeypatch, 700)
+    assert pmp.min_rows(N) == 700
+    assert pmp.min_rows(N // 4 if N == 2048 else N * 4) == 384
 
 
 def test_gate_open_config_only_misses_the_device():
@@ -305,7 +313,7 @@ def test_hook_falls_through_to_fused_marlin_moe(monkeypatch, flag):
 
 def test_below_min_tokens_is_not_gated(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_tokens(monkeypatch, 384)
     monkeypatch.setattr(pmp, "gate_reason",
                         lambda *a, **k: pytest.fail("gate consulted"))
     a = _apply_args(M=383)
@@ -418,7 +426,7 @@ def _apply(layer, wd, x, tw, ti, monkeypatch, flag, min_tokens=384):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     monkeypatch.setenv(FLAG, flag)
-    monkeypatch.setenv(MIN_TOKENS, str(min_tokens))
+    _min_tokens(monkeypatch, min_tokens)
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
     M = x.size(0)
     out = torch.full((M, K), float("nan"), dtype=torch.bfloat16, device=x.device)
@@ -594,7 +602,7 @@ def test_graph_replay_equals_eager_without_allocation_growth(weights, monkeypatc
     layer = _gpu_layer(weights)
     x, tw, ti = _inputs(M, 3)
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_tokens(monkeypatch, 384)
     pmp.warmup(x.device, E, 2312, TOPK)
     eager = _apply(layer, weights, x, tw, ti, monkeypatch, "1")
     out = torch.empty_like(x)

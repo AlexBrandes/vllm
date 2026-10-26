@@ -779,7 +779,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_CUDAGRAPH_ESTIMATE_SPLIT` | `int` | `0` | `'0'` |
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `str` | `''` | `None` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS` | `bool` | `False` | `'0'` |
-| `VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES` | `int` | `262144` | `'262144'` |
 | `VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S` | `float` | `60.0` | `'60'` |
 | `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_ATTN_PIPELINE` | `bool` | `False` | `'0'` |
@@ -829,7 +828,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_EXL3_EXPERT_REPLICAS` | `str` | `''` | `''` |
 | `VLLM_EXL3_EXPERT_REPLICAS_SHA256` | `str` | `''` | `''` |
 | `VLLM_EXL3_HYBRID` | `bool` | `False` | `'0'` |
-| `VLLM_EXL3_MOE_CHUNK_ROWS` | `int` | `0` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_TC` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_PREFILL_UNCHUNKED` | `bool` | `False` | `'0'` |
 | `VLLM_EXL3_MOE_V2` | `bool` | `False` | `'0'` |
@@ -852,28 +850,19 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_GLM5_DECODE_IDX_GLUE_PARTS` | `str` | `'weights,glue,fwht,cache,moesum'` | `'weights,glue,fwht,cache,moesum'` |
 | `VLLM_GLM5_DECODE_KDA_WIDE` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_DECODE_MHC_V2` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS` | `int` | `32` | `'32'` |
-| `VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_GLM5_DECODE_MOE_ROUTING` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE` | `str` | `''` | `''` |
 | `VLLM_GLM5_DRAFTER_ROPE_FIT` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_DRAFTER_SELECTOR_SHARD` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MARLIN_DECODE_PP_MULTI` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` | `str` | `'9-32'` | `'9-32'` |
 | `VLLM_GLM5_MOE_ROUTE_V2_MASK` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS` | `int` | `384` | `'384'` |
 | `VLLM_GLM5_PREFILL_KERNELS` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_PREFILL_MIN_TOKENS` | `int` | `512` | `'512'` |
 | `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT` | `float` | `2.0` | `'2.0'` |
 | `VLLM_GLM5_TOPK_SORTED` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_TOPK_TIEFIX` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS` | `int` | `0` | `'0'` |
-| `VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS` | `int` | `384` | `'384'` |
 | `VLLM_HOST_ALLREDUCE` | `bool` | `False` | `'0'` |
-| `VLLM_HOST_ALLREDUCE_MAX_SIZE` | `int` | `512 * 1024` | `str(512 * 1024)` |
 | `VLLM_INDEXER_DECODE_RAW_K` | `bool` | `False` | `'0'` |
 | `VLLM_INDEXER_DSA_REF` | `bool` | `False` | `'0'` |
 | `VLLM_KV_MAMBA_INFLIGHT_STATES` | `bool` | `False` | `'0'` |
@@ -882,7 +871,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_MOE_DECODE_ROUTE_V2` | `bool` | `False` | `'0'` |
 | `VLLM_MOE_DETERMINISTIC_ALIGN` | `int` | `0` | `'0'` |
 | `VLLM_MOE_MASK_PADDING` | `bool` | `False` | `'0'` |
-| `VLLM_MOE_MASK_PADDING_MAX_TOKENS` | `int` | `8` | `'8'` |
 | `VLLM_PP_DRAFT_TAIL_STAGE` | `int` | `-1` | `'-1'` |
 | `VLLM_PP_HOP_NO_METADATA` | `bool` | `False` | `'0'` |
 | `VLLM_PP_PACKED_HOP` | `bool` | `False` | `'0'` |
@@ -905,12 +893,12 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_TUNING_FILE` | `str` | `''` | `''` |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_CONCAT` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
-| `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
 | **151 variables** | | | |
 

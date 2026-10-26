@@ -34,8 +34,8 @@ GATE.  Taken only for exactly the validated configuration: sm_80, bf16
 activations, uint4b8 group-128 weights without zero points, bias, global
 scales or activation quantisation, E = 288 local = global (no expert map),
 top-8, K = 4096, N = 2048, SiLU with clamp limit 10.0, router weight applied
-on the output, and M >= VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS; or the same
-with N = 512 and M >= VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS under
+on the output, and M at least the moe_prefill/marlin_min_rows row of the sm80
+tuning table at that N (384 without one); or the same with N = 512 under
 VLLM_AMPERE_MARLIN_PREFILL_NARROW.  Everything else falls through to
 ``fused_marlin_moe`` unchanged.
 
@@ -79,6 +79,7 @@ import torch
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import tuning
 
 logger = init_logger(__name__)
 
@@ -139,16 +140,23 @@ def _is_sm80(device: torch.device) -> bool:
     return ok
 
 
+def min_rows(n: int) -> int:
+    """Smallest M of the split path at expert width ``n`` per rank: the
+    moe_prefill/marlin_min_rows row of the sm80 tuning table, else 384."""
+    return tuning.lookup("moe_prefill", "marlin_min_rows", {"gemm_n": n}, 384)
+
+
 def enabled_shapes() -> dict:
     """{N: (flag, min_tokens)} for the flags that are set: N=2048 under
-    VLLM_AMPERE_MARLIN_PREFILL_WIDE, N=512 under VLLM_AMPERE_MARLIN_PREFILL_NARROW."""
+    VLLM_AMPERE_MARLIN_PREFILL_WIDE, N=512 under VLLM_AMPERE_MARLIN_PREFILL_NARROW;
+    min_tokens is :func:`min_rows` at that N."""
     out = {}
     if envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE:
         out[N_GATE] = ("VLLM_AMPERE_MARLIN_PREFILL_WIDE",
-                       envs.VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS)
+                       min_rows(N_GATE))
     if envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW:
         out[N_GATE_TP4] = ("VLLM_AMPERE_MARLIN_PREFILL_NARROW",
-                           envs.VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS)
+                           min_rows(N_GATE_TP4))
     return out
 
 

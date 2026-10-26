@@ -16,11 +16,13 @@ import os
 import re
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import vllm.envs as envs
+from tests.sm80.tuning_rows import use_rows
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.sm80.distributed import communicator as comm
 from vllm.sm80.distributed import custom_all_reduce_flags as flags
@@ -33,17 +35,44 @@ CPU_ENV = dict(os.environ, CUDA_VISIBLE_DEVICES="")
 
 # ---------------------------------------------------------------- env and gate
 def test_env_defaults(monkeypatch):
-    for name in (
-        "VLLM_CUSTOM_ALLREDUCE_FLAGS",
-        "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", raising=False)
     assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS is False
-    assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES == 262144
     monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", "1")
-    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", "65536")
     assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS is True
-    assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES == 65536
+
+
+def _current_config(monkeypatch, hidden):
+    import vllm.config
+
+    config = None
+    if hidden is not None:
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(get_hidden_size=lambda: hidden)
+        )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+
+
+def test_max_bytes_default_without_a_row(monkeypatch):
+    use_rows(monkeypatch)
+    _current_config(monkeypatch, 4096)
+    assert comm.allreduce_max_bytes("flags_max_bytes", 4, 262144) == 262144
+
+
+@pytest.mark.parametrize(
+    "hidden,world_size,want",
+    [(4096, 4, 262144), (5120, 4, 524288), (5120, 2, 65536), (None, 4, 65536)],
+)
+def test_max_bytes_keyed_by_world_size_and_hidden(
+    monkeypatch, hidden, world_size, want
+):
+    use_rows(
+        monkeypatch,
+        ("allreduce", "flags_max_bytes", {"world_size": 4, "hidden": 5120}, 524288),
+        ("allreduce", "flags_max_bytes", {}, 65536),
+        ("allreduce", "flags_max_bytes", {"world_size": 4, "hidden": 4096}, 262144),
+    )
+    _current_config(monkeypatch, hidden)
+    assert comm.allreduce_max_bytes("flags_max_bytes", world_size, 1) == want
 
 
 def test_build_dir_follows_vllm_cache_root(monkeypatch, tmp_path):
@@ -298,7 +327,10 @@ def _init_ca(monkeypatch, world_size=4, capability=(8, 0), p2p=True, load_ok=Tru
 def test_init_on_banner(monkeypatch, log_capture, world_size):
     # distinct sizes per case: info_once would drop a repeated banner
     max_bytes = 65536 * world_size
-    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", str(max_bytes))
+    use_rows(
+        monkeypatch,
+        ("allreduce", "flags_max_bytes", {"world_size": world_size}, max_bytes),
+    )
     ca, made = _init_ca(monkeypatch, world_size=world_size)
     ca._init_flags(same_node=True)
     assert ca._flags is made[0] and made[0].max_bytes == max_bytes
