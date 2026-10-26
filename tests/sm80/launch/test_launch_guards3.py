@@ -481,13 +481,15 @@ ARG_UTILS = '''\
 import argparse
 
 
-def add_cli_args(parser):
-    parser.add_argument("--max-model-len", type=int)
-    parser.add_argument("--max-num-seqs", type=int)
-    parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
-    parser.add_argument("--enable-lora", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--enable-log-requests", action="store_true")
-    parser.add_argument("--compilation-config", type=str)
+class AsyncEngineArgs:
+    @staticmethod
+    def add_cli_args(parser):
+        parser.add_argument("--max-model-len", type=int)
+        parser.add_argument("--max-num-seqs", type=int)
+        parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
+        parser.add_argument("--enable-lora", action=argparse.BooleanOptionalAction)
+        parser.add_argument("--enable-log-requests", action="store_true")
+        parser.add_argument("--compilation-config", type=str)
 '''
 
 
@@ -621,6 +623,8 @@ FRONTEND_ARGS = '''\
 from dataclasses import dataclass
 from typing import ClassVar
 
+from vllm.engine.arg_utils import AsyncEngineArgs
+
 
 @dataclass
 class BaseFrontendArgs:
@@ -651,6 +655,7 @@ class UnusedArgs(BaseFrontendArgs):
 def make_arg_parser(parser):
     parser.add_argument("--headless", action="store_true")
     parser = FrontendArgs.add_cli_args(parser)
+    parser = AsyncEngineArgs.add_cli_args(parser)
     return parser
 '''
 

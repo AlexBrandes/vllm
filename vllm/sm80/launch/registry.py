@@ -8,10 +8,14 @@ tree, ``<tree>/vllm/sm80/envs.py``. Never imports ``vllm`` (its package
 import pulls in torch) and never uses the launcher's own commit's tables:
 the names, retired-name texts and code defaults always come from the tree
 that will run. The long option spellings come the same way from the files
-that declare the server's arguments (``ARG_SOURCES``), by the two ways the
-engine registers them: every literal ``--name`` passed to ``add_argument``
-(with the aliases of a call that names several), and the options a
-frontend class generates from its dataclass fields (see
+that declare the serve command's arguments, found from the tree's own
+imports (``arg_sources``): ``vllm/entrypoints/cli/serve.py``, the module it
+imports ``make_arg_parser`` from, and the module of each class whose
+``add_cli_args`` that function calls. A link that cannot be followed
+exactly is a refusal naming it, never a shorter list. Each file is read by
+the two ways the engine registers options: every literal ``--name`` passed
+to ``add_argument`` (with the aliases of a call that names several), and
+the options a frontend class generates from its dataclass fields (see
 ``_generated_options``). The negative ``--no-X`` forms of boolean options
 are not listed; a ``no-`` spelling the tree does not declare is read as
 the flag it negates.
@@ -27,7 +31,8 @@ from canon import sha256_file
 from errors import Refusal
 
 CAPABILITIES = ("sm80", "plain-upstream")
-ARG_SOURCES = ("vllm/engine/arg_utils.py", "vllm/entrypoints/launchers/cli_args.py")
+SERVE_COMMAND = "vllm/entrypoints/cli/serve.py"
+PARSER_FACTORY = "make_arg_parser"
 
 
 @dataclass
@@ -163,13 +168,78 @@ class ArgOptions:
     aliases: dict[str, str] = field(default_factory=dict)
 
 
+def _from_imports(module: ast.Module) -> dict[str, tuple[str, int, str]]:
+    """Local name -> (module, level, imported name) of every top-level
+    ``from X import name [as local]``."""
+    return {a.asname or a.name: (node.module or "", node.level, a.name)
+            for node in module.body if isinstance(node, ast.ImportFrom) for a in node.names}
+
+
+def _module_file(tree: str, origin: tuple[str, int, str], where: str) -> str:
+    """The tree-relative file of the module a name is imported from."""
+    module, level, name = origin
+    if level:
+        raise Refusal(f"{where}: {name} is imported relatively (from {'.' * level}{module}); "
+                      "the launcher follows absolute imports only")
+    base = module.replace(".", "/")
+    for rel in (base + ".py", base + "/__init__.py"):
+        if os.path.isfile(os.path.join(tree, rel)):
+            return rel
+    raise Refusal(f"{where}: {name} comes from {module}, which this engine tree lacks (no {base}.py)")
+
+
+def arg_sources(tree: str) -> dict[str, ast.Module]:
+    """The files that declare the serve command's options, tree-relative
+    path -> module: the serve command, the module it imports the parser
+    factory from, and the module of every class whose add_cli_args the
+    factory calls (a class of that module, or one it imports by name and
+    the named module defines). A missing file or a link the launcher cannot
+    follow (no import, a relative import, the parser handed to any other
+    call) refuses, naming what is missing."""
+    serve_path = os.path.join(tree, SERVE_COMMAND)
+    if not os.path.isfile(serve_path):
+        raise Refusal(f"engine tree {tree} has no {SERVE_COMMAND}; the server's argument files cannot be found")
+    serve = _parse(serve_path)
+    origins = {o for o in _from_imports(serve).values() if o[2] == PARSER_FACTORY}
+    if len(origins) != 1:
+        raise Refusal(f"{SERVE_COMMAND}: {'more than one' if origins else 'no'} "
+                      f"'from ... import {PARSER_FACTORY}'; the server's argument parser cannot be found")
+    parser_rel = _module_file(tree, origins.pop(), SERVE_COMMAND)
+    parser = _parse(os.path.join(tree, parser_rel))
+    factory = next((f for f in parser.body if isinstance(f, ast.FunctionDef) and f.name == PARSER_FACTORY), None)
+    if factory is None:
+        raise Refusal(f"{parser_rel} defines no function {PARSER_FACTORY} ({SERVE_COMMAND} imports it from there)")
+    sources = {SERVE_COMMAND: serve, parser_rel: parser}
+    classes = {c.name for c in parser.body if isinstance(c, ast.ClassDef)}
+    imports = _from_imports(parser)
+    param = factory.args.args[0].arg if factory.args.args else None
+    for node in ast.walk(factory):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "add_cli_args" and isinstance(func.value, ast.Name):
+            cls = func.value.id
+            if cls in classes:
+                continue
+            if cls not in imports:
+                raise Refusal(f"{parser_rel}: {PARSER_FACTORY} installs {cls}, which the module neither "
+                              "defines nor imports by name")
+            rel = _module_file(tree, imports[cls], parser_rel)
+            if rel not in sources:
+                sources[rel] = _parse(os.path.join(tree, rel))
+            name = imports[cls][2]
+            if not any(isinstance(c, ast.ClassDef) and c.name == name for c in sources[rel].body):
+                raise Refusal(f"{rel} defines no class {name} ({parser_rel} installs it from there)")
+        elif param and any(isinstance(a, ast.Name) and a.id == param
+                           for a in (*node.args, *(k.value for k in node.keywords))):
+            raise Refusal(f"{parser_rel}: {PARSER_FACTORY} passes its parser to {ast.unparse(func)}, "
+                          "whose options the launcher cannot read")
+    return sources
+
+
 def read_arg_options(tree: str) -> ArgOptions:
     out = ArgOptions(options={"help"})          # argparse's own
-    for rel in ARG_SOURCES:
-        path = os.path.join(tree, rel)
-        if not os.path.isfile(path):
-            continue
-        module = _parse(path)
+    for module in arg_sources(tree).values():
         out.options |= _generated_options(module)
         for node in ast.walk(module):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)

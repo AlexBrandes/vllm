@@ -13,9 +13,11 @@ from helpers import World, write
 
 # An engine CLI without --max-num-seqs (a controlled argument of the model).
 FOREIGN_ARG_UTILS = """\
-def add_cli_args(parser):
-    parser.add_argument("--max-model-len", type=int)
-    parser.add_argument("--gpu-memory-utilization", type=float)
+class AsyncEngineArgs:
+    @staticmethod
+    def add_cli_args(parser):
+        parser.add_argument("--max-model-len", type=int)
+        parser.add_argument("--gpu-memory-utilization", type=float)
 """
 
 ABSENT = '[absent_args]\nmax-num-seqs = "The engine\'s CLI declares no such option."\n'

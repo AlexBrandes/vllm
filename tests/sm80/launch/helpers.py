@@ -67,11 +67,34 @@ def sm80_envs_py(fork: dict[str, str], retired: dict[str, str]) -> str:
 # The engine options the synthetic model protects, declared as the tree's
 # argument file declares them (the launcher reads option names from it).
 ARG_UTILS = """\
-def add_cli_args(parser):
-    parser.add_argument("--max-model-len", type=int)
-    parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
-    parser.add_argument("--max-num-seqs", type=int)
+class AsyncEngineArgs:
+    @staticmethod
+    def add_cli_args(parser):
+        parser.add_argument("--max-model-len", type=int)
+        parser.add_argument("--gpu-memory-utilization", "--device-memory-utilization", type=float)
+        parser.add_argument("--max-num-seqs", type=int)
 """
+
+# The serve command and its parser module (the launcher finds the argument
+# files from the serve command's imports), laid out with the parser in
+# OLD_PARSER; serve_py(NEW_PARSER) is the later layout.
+OLD_PARSER = "vllm/entrypoints/launchers/cli_args.py"
+NEW_PARSER = "vllm/entrypoints/common/cli_args.py"
+SERVE = "vllm/entrypoints/cli/serve.py"
+PARSER = """\
+from vllm.engine.arg_utils import AsyncEngineArgs
+
+
+def make_arg_parser(parser):
+    parser = AsyncEngineArgs.add_cli_args(parser)
+    return parser
+"""
+
+
+def serve_py(parser_file: str = OLD_PARSER) -> str:
+    module = parser_file.removesuffix(".py").replace("/", ".")
+    return (f"from {module} import (\n    make_arg_parser,\n)\n\n\n"
+            "def subparser_init(serve_parser):\n    return make_arg_parser(serve_parser)\n")
 
 
 def make_tree(root: str, *, sm80: bool = True, fork: dict | None = None,
@@ -86,6 +109,8 @@ def make_tree(root: str, *, sm80: bool = True, fork: dict | None = None,
                            retired if retired is not None else RETIRED))
     write(os.path.join(root, "csrc", "kernel.cu"), "// kernel\n")
     write(os.path.join(root, "vllm", "engine", "arg_utils.py"), ARG_UTILS)
+    write(os.path.join(root, SERVE), serve_py())
+    write(os.path.join(root, OLD_PARSER), PARSER)
     write(os.path.join(root, ".gitignore"), "*.so\nbuild/\n")
     for rel, text in (extra_files or {}).items():
         write(os.path.join(root, rel), text)
