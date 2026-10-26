@@ -163,7 +163,7 @@ def _topk_gate():
 
 def _topk_unavailable(runner) -> str | None:
     if _topk_gate() is None:
-        return "no sparse indexer using the shared top-k gate is loaded"
+        return "the GLM or Qwen sparse indexer (shared top-k gate) is not loaded"
     return None
 
 
