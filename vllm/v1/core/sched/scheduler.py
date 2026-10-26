@@ -387,11 +387,6 @@ class Scheduler(SchedulerInterface):
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle_block_drop,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
-            use_dflash_boundary=(
-                speculative_config is not None
-                and speculative_config.use_dflash()
-                and envs.VLLM_DFLASH_BOUNDARY_CACHE
-            ),
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -416,23 +411,6 @@ class Scheduler(SchedulerInterface):
             for manager in self.kv_cache_manager.coordinator.single_type_managers
             if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
-        coordinator = self.kv_cache_manager.coordinator
-        self.mamba_eagle_block_drop = self.use_eagle_block_drop
-        if coordinator.dflash_boundary_group_ids:
-            # Mamba checkpoints follow the participating groups' replay boundary.
-            self.mamba_eagle_block_drop = bool(coordinator.eagle_group_ids)
-            logger.info_once(
-                "DFlash boundary cache lookup active "
-                "(VLLM_DFLASH_BOUNDARY_CACHE): context blocks matched "
-                "without draft lookahead; local prompt tails stay unpadded; "
-                "target replay safety preserved"
-            )
-        elif envs.VLLM_DFLASH_BOUNDARY_CACHE:
-            logger.info_once(
-                "DFlash boundary cache lookup inactive "
-                "(VLLM_DFLASH_BOUNDARY_CACHE): needs prefix caching "
-                "with explicitly marked DFlash sliding-window groups"
-            )
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -677,9 +655,6 @@ class Scheduler(SchedulerInterface):
             getattr(self, "mamba_state_block_size", None)
             or self.cache_config.block_size
         )
-        drop_eagle_block = getattr(
-            self, "mamba_eagle_block_drop", self.use_eagle_block_drop
-        )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -689,7 +664,7 @@ class Scheduler(SchedulerInterface):
         last_cache_position = get_mamba_prefill_checkpoint_position(
             request.num_tokens,
             block_size,
-            drop_eagle_block,
+            self.use_eagle_block_drop,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
         )
 
@@ -697,7 +672,7 @@ class Scheduler(SchedulerInterface):
         checkpoint_position = get_mamba_prefill_checkpoint_position(
             prefill_end,
             ckpt_block_size,
-            drop_eagle_block=drop_eagle_block,
+            drop_eagle_block=self.use_eagle_block_drop,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
         )
         use_internal_checkpoint = (
@@ -740,7 +715,7 @@ class Scheduler(SchedulerInterface):
             get_mamba_prefill_checkpoint_position(
                 request.num_prompt_tokens,
                 self.hash_block_size,
-                drop_eagle_block,
+                self.use_eagle_block_drop,
                 num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
             )
             if self.mamba_partial_cache_hit and not use_internal_checkpoint

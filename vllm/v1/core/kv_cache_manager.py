@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import itertools
 from collections.abc import Sequence
@@ -148,7 +147,6 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
-        use_dflash_boundary: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -173,7 +171,6 @@ class KVCacheManager:
             max_in_flight_tokens=max_in_flight_tokens,
             use_eagle=self.use_eagle,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
-            use_dflash_boundary=use_dflash_boundary,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,

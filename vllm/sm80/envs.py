@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     VLLM_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_TOOL_CHOICE_NONE_MASK: bool = False
-    VLLM_DFLASH_BOUNDARY_CACHE: bool = False
     VLLM_DSPARK_PER_K_WIDTH: bool = False
     VLLM_DSPARK_CONFIDENCE_DUMP: str = ""
     VLLM_DSPARK_ADAPTIVE_DEPTH: str = ""
@@ -549,9 +548,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # requests are adjusted as upstream adjusts them; the GLM launcher sets 1.
     "VLLM_TOOL_CHOICE_NONE_MASK": lambda: bool(
         int(os.getenv("VLLM_TOOL_CHOICE_NONE_MASK", "0"))
-    ),
-    "VLLM_DFLASH_BOUNDARY_CACHE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_BOUNDARY_CACHE", "0"))
     ),
     # DSpark drafts the scheduled K rather than drafting the maximum and
     # truncating. Each positive width has persistent anchors and CUDA graphs.
@@ -1503,7 +1499,6 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_DECODE_KERNELS": "renamed to VLLM_AMPERE_DECODE_KERNELS",
     "VLLM_GLM5_DECODE_MOE_ROUTE_V2": "renamed to VLLM_MOE_DECODE_ROUTE_V2",
     "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": "renamed to VLLM_MOE_DETERMINISTIC_ALIGN",
-    "VLLM_GLM5_DFLASH_BOUNDARY_CACHE": "renamed to VLLM_DFLASH_BOUNDARY_CACHE",
     "VLLM_GLM5_INDEXER_DECODE_RAW_K": "renamed to VLLM_INDEXER_DECODE_RAW_K",
     "VLLM_GLM5_MARLIN_DECODE_CUDA": "renamed to VLLM_AMPERE_MARLIN_DECODE_CUDA",
     "VLLM_GLM5_PP_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_WIDE",
@@ -1641,6 +1636,14 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_ENGRAM_NATIVE_READ": (
         "removed; the sm_80 Engram rows are always fetched by one native host "
         "function (csrc/exl3/engram_fetch.cpp)"
+    ),
+    "VLLM_GLM5_DFLASH_BOUNDARY_CACHE": (
+        "removed; DFlash and DSpark never drop the last prefix-cache block "
+        "(upstream vLLM #54163)"
+    ),
+    "VLLM_DFLASH_BOUNDARY_CACHE": (
+        "removed; DFlash and DSpark never drop the last prefix-cache block "
+        "(upstream vLLM #54163)"
     ),
 }
 _warned_retired_env_vars: set[str] = set()
