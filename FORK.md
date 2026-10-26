@@ -763,8 +763,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_AMPERE_DECODE_IDX_GLUE` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_DECODE_KERNELS` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_FOLD` | `bool` | `False` | `'0'` |
-| `VLLM_AMPERE_KDA_PREFILL_NARROW` | `bool` | `False` | `'0'` |
-| `VLLM_AMPERE_KDA_PREFILL_WIDE` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_RECOVER_OFF` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_KDA_SMALL_STACK` | `bool` | `False` | `'0'` |
 | `VLLM_AMPERE_MARLIN_BUILD` | `bool` | `False` | `'0'` |
@@ -884,6 +882,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS` | `int` | `65` | `'65'` |
 | `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
 | `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
+| `VLLM_SM80_KDA_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_CANONICAL_TIES` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_TOPK_SORTED` | `bool` | `False` | `'0'` |
@@ -894,7 +893,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **148 variables** | | | |
+| **147 variables** | | | |
 
 ## 4. Unreferenced fork code
 

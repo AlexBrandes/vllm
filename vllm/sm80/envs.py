@@ -27,9 +27,8 @@ if TYPE_CHECKING:
     VLLM_INDEXER_DECODE_RAW_K: bool = False
     VLLM_INDEXER_DSA_REF: bool = False
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
-    VLLM_AMPERE_KDA_PREFILL_WIDE: bool = False
+    VLLM_SM80_KDA_PREFILL: bool = False
     VLLM_STATE_INDEX_CHECK: bool = False
-    VLLM_AMPERE_KDA_PREFILL_NARROW: bool = False
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
@@ -276,15 +275,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_GLM5_SMLA_PREFILL_PRED_LOAD", "0"))
     ),
     # sm_80 KDA chunked prefill (vllm/models/glm5next/nvidia/ops/kda_prefill.py)
-    # in place of the upstream chunk_kda_with_fused_gate, when all 64 heads live on one
-    # card (pipeline parallel, TP=1): six launches instead of nine, fixed
-    # launch configurations, fp32-exact intermediates where the recurrence
-    # needs them. Taken only on sm_80 with the Triton prefill backend, head
-    # dim 128, bf16 activations, fp32 state, the safe gate at -5, and chunks
-    # of up to 2312 tokens and 16 sequences; everything else keeps the
+    # in place of the upstream chunk_kda_with_fused_gate: six launches instead
+    # of nine, fixed launch configurations, fp32-exact intermediates where the
+    # recurrence needs them. The layer's head count picks the shape: 64 heads
+    # per card (pipeline parallel, TP=1) with chunks of up to 2312 tokens, or
+    # 16 heads per card (tensor parallel 4) with chunks of up to 3460 tokens
+    # (the TP token budget). Taken only on sm_80 with the Triton prefill
+    # backend, head dim 128, bf16 activations, fp32 state, the safe gate at
+    # -5 and at most 16 sequences per chunk; everything else keeps the
     # upstream path. Off by default.
-    "VLLM_AMPERE_KDA_PREFILL_WIDE": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_KDA_PREFILL_WIDE", "0"))
+    "VLLM_SM80_KDA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM80_KDA_PREFILL", "0"))
     ),
     # Debug: range-check every KDA/Mamba state index (GDN metadata, align-mode
     # pre-/post-copy block columns and block ids) on the host before the
@@ -292,13 +293,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Synchronizes every step. Off by default.
     "VLLM_STATE_INDEX_CHECK": lambda: bool(
         int(os.getenv("VLLM_STATE_INDEX_CHECK", "0"))
-    ),
-    # The same sm_80 KDA chunked prefill with tensor parallel 4 (16 heads per
-    # card), for prefill chunks of up to 3460 tokens (the TP token budget) and
-    # 16 sequences; the other conditions as VLLM_AMPERE_KDA_PREFILL_WIDE. Its own
-    # switch so the two layouts are judged separately. Off by default.
-    "VLLM_AMPERE_KDA_PREFILL_NARROW": lambda: bool(
-        int(os.getenv("VLLM_AMPERE_KDA_PREFILL_NARROW", "0"))
     ),
     # Opt in to the sm_80 decode kernels (mHC and MoE routing in
     # vllm/sm80/kernels/, the KDA decode step in vllm/models/glm5next/nvidia/ops/;
@@ -1379,7 +1373,7 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_DETERMINISTIC_MOE_ALIGN": "renamed to VLLM_MOE_DETERMINISTIC_ALIGN",
     "VLLM_GLM5_INDEXER_DECODE_RAW_K": "renamed to VLLM_INDEXER_DECODE_RAW_K",
     "VLLM_GLM5_MARLIN_DECODE_CUDA": "renamed to VLLM_AMPERE_MARLIN_DECODE_CUDA",
-    "VLLM_GLM5_PP_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_WIDE",
+    "VLLM_GLM5_PP_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
     "VLLM_GLM5_PP_MARLIN_PREFILL": "renamed to VLLM_AMPERE_MARLIN_PREFILL_WIDE",
     "VLLM_GLM5_PP_MARLIN_PREFILL_COMPILED": (
         "renamed to VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED"
@@ -1388,7 +1382,7 @@ RETIRED_ENV_VARS: dict[str, str] = {
         "renamed to VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE"
     ),
     "VLLM_GLM5_TOOL_CHOICE_NONE_MASK": "renamed to VLLM_TOOL_CHOICE_NONE_MASK",
-    "VLLM_GLM5_TP4_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_NARROW",
+    "VLLM_GLM5_TP4_KDA_PREFILL": "merged into VLLM_SM80_KDA_PREFILL",
     "VLLM_GLM5_TP4_MARLIN_PREFILL": (
         "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
     ),
@@ -1405,6 +1399,15 @@ RETIRED_ENV_VARS: dict[str, str] = {
     ),
     "VLLM_QWEN_QSA_TOPK_SORTED": (
         "merged into VLLM_SM80_TOPK_SORTED (all sparse indexers; default off)"
+    ),
+    # The shape picks the kernel.
+    "VLLM_AMPERE_KDA_PREFILL_WIDE": (
+        "merged into VLLM_SM80_KDA_PREFILL (64 or 16 heads per card, picked "
+        "by the layer's head count)"
+    ),
+    "VLLM_AMPERE_KDA_PREFILL_NARROW": (
+        "merged into VLLM_SM80_KDA_PREFILL (64 or 16 heads per card, picked "
+        "by the layer's head count)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (

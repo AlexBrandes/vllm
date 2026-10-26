@@ -63,12 +63,10 @@ def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
     # (vllm/models/glm5next/nvidia/ops/kda_prefill.py): compile its kernels
     # before the first prefill. Prefill runs eagerly, so this is about
     # first-request latency, not capture.
-    # Only with VLLM_AMPERE_KDA_PREFILL_WIDE=1 or VLLM_AMPERE_KDA_PREFILL_NARROW=1, and
-    # a no-op unless a KDA layer took the path.
+    # Only with VLLM_SM80_KDA_PREFILL=1, and a no-op unless a KDA layer took
+    # the path.
     kda_prefill = sys.modules.get("vllm.models.glm5next.nvidia.ops.kda_prefill")
-    if kda_prefill is not None and (
-        envs.VLLM_AMPERE_KDA_PREFILL_WIDE or envs.VLLM_AMPERE_KDA_PREFILL_NARROW
-    ):
+    if kda_prefill is not None and envs.VLLM_SM80_KDA_PREFILL:
         kda_prefill.warmup_from_worker(worker)
     # The sm_80 thin-M BF16 GEMM (vllm/sm80/kernels/thin_gemm/). This MUST run before
     # capture_model(): thin_gemm keeps its FP32 split-K partials and arrival

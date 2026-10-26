@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E501
-"""sm_80 KDA chunked prefill with 16 heads per card (VLLM_AMPERE_KDA_PREFILL_NARROW).
+"""sm_80 KDA chunked prefill with 16 heads per card (VLLM_SM80_KDA_PREFILL).
 
-The kernels are the ones of VLLM_AMPERE_KDA_PREFILL_WIDE (64 heads); this file
-checks the tensor-parallel-4 gate and runs the same GPU checks at 16 heads
+The kernels are the 64-head ones, under the same switch; this file checks
+the tensor-parallel-4 gate and runs the same GPU checks at 16 heads
 and the TP4 chunk sizes (up to 3460 tokens). The GPU helpers (production
 input layout, fp64 reference, accuracy rule) are those of
 ``test_ampere_pp_kda_prefill.py``, loaded as a separate module with the head
 count set to 16.
 
-CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the flag is declared and off
-by default; the 16-head layer gate and the 3460-token call gate open only
-under this flag, and the 64-head gates are unchanged; the warm-up hook
+CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the switch is declared and
+off by default and opens both head counts; the 16-head layer gate and the
+3460-token call gate, and the 64-head gates unchanged; the warm-up hook
 compiles at the layer's head count.
 
 GPU tests (skip without an sm_80 device): gate closed == upstream bitwise;
@@ -35,8 +35,7 @@ import torch
 
 from vllm.models.glm5next.nvidia.ops import kda_prefill as kp
 
-FLAG = "VLLM_AMPERE_KDA_PREFILL_NARROW"
-PP_FLAG = "VLLM_AMPERE_KDA_PREFILL_WIDE"
+FLAG = "VLLM_SM80_KDA_PREFILL"
 H, D = kp.TP4_HEADS, kp.HEAD_DIM
 BF16, F32 = torch.bfloat16, torch.float32
 
@@ -72,13 +71,19 @@ def test_flag_declared_default_off(monkeypatch):
     assert f"    {FLAG}: bool = False\n" in src
 
 
-@pytest.mark.parametrize("pp,tp4,want", [
-    ("0", "0", ()), ("1", "0", (64,)), ("0", "1", (16,)), ("1", "1", (64, 16)),
+@pytest.mark.parametrize("value,want", [
+    ("0", ()), ("1", (64, 16)),
 ])
-def test_enabled_heads(monkeypatch, pp, tp4, want):
-    monkeypatch.setenv(PP_FLAG, pp)
-    monkeypatch.setenv(FLAG, tp4)
+def test_enabled_heads(monkeypatch, value, want):
+    monkeypatch.setenv(FLAG, value)
     assert kp.enabled_heads() == want
+
+
+def test_banners_name_the_switch_and_head_count():
+    assert kp.BANNER.startswith("GLM5 PP KDA prefill: sm_80 fused chunk path live (64 heads)")
+    assert kp.TP4_BANNER.startswith("GLM5 TP4 KDA prefill: sm_80 fused chunk path live (16 heads)")
+    for banner in (kp.BANNER, kp.TP4_BANNER):
+        assert banner.endswith(f"; {FLAG}=1")
 
 
 # ------------------------------------------------------------------ CPU: gates
@@ -181,7 +186,6 @@ def test_use_for_layer(monkeypatch):
 
 def test_warmup_hook_noop_without_flags(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    monkeypatch.delenv(PP_FLAG, raising=False)
 
     class Worker:
         def get_model(self):
@@ -191,7 +195,6 @@ def test_warmup_hook_noop_without_flags(monkeypatch):
 
 
 def test_warmup_hook_uses_layer_heads(monkeypatch):
-    monkeypatch.delenv(PP_FLAG, raising=False)
     monkeypatch.setenv(FLAG, "1")
 
     class Layer(torch.nn.Module):
@@ -219,10 +222,7 @@ def test_call_site_passes_head_count():
     # The layer part of the gate is resolved by the fork KDA layer.
     src = open(layer_mod.__file__).read()
     assert "allowed_heads=enabled_heads()," in src
-    assert (
-        "_envs.VLLM_AMPERE_KDA_PREFILL_WIDE or _envs.VLLM_AMPERE_KDA_PREFILL_NARROW"
-        in src
-    )
+    assert "if _envs.VLLM_SM80_KDA_PREFILL:" in src
 
 
 # ------------------------------------------------------------------ GPU

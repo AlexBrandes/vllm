@@ -9,8 +9,7 @@ every KDA layer the GLM decoder builds is this subclass. It adds:
 
 - the decode attributes the fused sm_80 KDA decode step and the KDA chunked
   prefill read in the layer's forward (``VLLM_AMPERE_DECODE_KERNELS``,
-  ``VLLM_GLM5_DECODE_KDA_WIDE``, ``VLLM_AMPERE_KDA_PREFILL_WIDE`` /
-  ``_NARROW``), and the deferred ``g_b_proj`` fill;
+  ``VLLM_GLM5_DECODE_KDA_WIDE``, ``VLLM_SM80_KDA_PREFILL``), and the deferred ``g_b_proj`` fill;
 - RecoverSSM (``vllm/sm80/kernels/kda/recover.py``): the per-layer record
   buffer, no draft-position state pages in the KV spec, and the builder's
   commit metadata;
@@ -173,10 +172,10 @@ class Glm5NextLinearAttention(glm_kda.Glm5NextLinearAttention):
             if kda_recover_enabled(vllm_config):
                 self._init_kda_recover(config, vllm_config, prefix)
 
-        # VLLM_AMPERE_KDA_PREFILL_WIDE (64 heads) / VLLM_AMPERE_KDA_PREFILL_NARROW (16
-        # heads): the layer part of the gate, resolved once.
+        # VLLM_SM80_KDA_PREFILL (64 or 16 heads): the layer part of the gate,
+        # resolved once.
         self._pp_kda_prefill = False
-        if _envs.VLLM_AMPERE_KDA_PREFILL_WIDE or _envs.VLLM_AMPERE_KDA_PREFILL_NARROW:
+        if _envs.VLLM_SM80_KDA_PREFILL:
             from vllm.models.glm5next.nvidia.ops.kda_prefill import (
                 enabled_heads,
                 use_for_layer,
