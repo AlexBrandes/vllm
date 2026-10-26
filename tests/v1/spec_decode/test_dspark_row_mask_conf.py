@@ -312,15 +312,15 @@ def test_a_step_that_drafts_nothing_resets_its_slots(make, monkeypatch):
     assert _propose(drafter, [6, 2], 3) == "drafts"
     assert _propose(drafter, [6, 2], None) == "drafts"
     assert torch.equal(conf, stale)
-    # Under data parallelism a zero-draft step still drafts.
-    drafter.dp_size = 2
-    assert _propose(drafter, [6, 2], 0) == "drafts"
-    assert torch.equal(conf, stale)
-    drafter.dp_size = 1
-    assert _propose(drafter, [6, 2], 0) == "drafts"
+    # A zero-draft step resets its slots, under data parallelism too: propose
+    # skips the draft step on every rank (the batch sync agrees on it).
     want = stale.clone()
     want[[6, 2]] = 1.0
-    assert torch.equal(conf, want)
+    for dp_size in (2, 1):
+        drafter.dp_size = dp_size
+        conf.copy_(stale)
+        assert _propose(drafter, [6, 2], 0) == "drafts"
+        assert torch.equal(conf, want)
     # The width passed positionally.
     t = torch.ones(1, dtype=torch.int32)
     batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([4]))
