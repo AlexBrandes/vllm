@@ -38,8 +38,8 @@ file per server start)::
 
 ``verified`` and ``accepted`` come from ``num_sampled - 1 + num_rejected`` and
 ``num_sampled - 1``. Rows that verified nothing are skipped: prefill chunks,
-and a step after a zero-draft step, which runs no draft step
-(``draft_context_only``) and so leaves no confidences of its batch. Warm-up
+and a step after a zero-draft step, which runs no draft step (the zero-draft
+branch of ``DFlashSpeculator.propose``) and so leaves no confidences of its batch. Warm-up
 requests (ids ``_warmup*``, ``_v2_mixed_warmup*``) are skipped. A row is
 written once its copy event completes, so in steady state the host never
 waits on the device; leftover rows are written at interpreter exit.
@@ -320,10 +320,8 @@ class ConfidenceDumpMixin:
             )
         result = super().propose(input_batch, *args, **kwargs)
         if real:
-            if arguments.get("num_speculative_tokens") == 0 and (
-                getattr(self, "dp_size", 1) <= 1
-            ):
-                # draft_context_only (zero_draft.py): no draft step ran.
+            if arguments.get("num_speculative_tokens") == 0:
+                # Zero drafts: propose stored only the context K/V.
                 dump.drafted_nothing()
             else:
                 width = int(getattr(self, "width", self.max_width))

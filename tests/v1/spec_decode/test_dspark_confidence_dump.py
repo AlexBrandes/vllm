@@ -182,7 +182,7 @@ def test_a_zero_draft_step_leaves_nothing_to_pair(make, monkeypatch, tmp_path):
     drafter = make()
     drafter.load_draft_model(None, set())
     _propose_positional(drafter, ["a", "b"], [1, 1], [0, 0])
-    # Zero drafts: the draft step does not run (draft_context_only), so the
+    # Zero drafts: the draft step does not run (DFlashSpeculator.propose), so the
     # buffer still holds the previous batch's rows, in its order.
     monkeypatch.setattr(
         upstream.DSparkSpeculator, "propose", lambda self, *a, **k: None, raising=False

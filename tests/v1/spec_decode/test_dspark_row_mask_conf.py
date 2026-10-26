@@ -25,7 +25,6 @@ from vllm.sm80.envs import FORK_ENV_VARS
 from vllm.sm80.spec_decode import dspark_row_mask as state_module
 from vllm.sm80.spec_decode import dspark_row_mask_conf as conf_module
 from vllm.sm80.spec_decode import dspark_width as width_module
-from vllm.sm80.spec_decode.zero_draft import draft_context_only
 from vllm.v1.worker.gpu.spec_decode.dspark import speculator as upstream
 
 pytestmark = pytest.mark.cpu_test
@@ -337,9 +336,11 @@ def test_a_step_that_drafts_nothing_resets_its_slots(make, monkeypatch):
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("num_speculative_tokens", [0, 3, None])
 def test_drafts_nothing_matches_the_zero_draft_return(dp_size, num_speculative_tokens):
-    spec = SimpleNamespace(dp_size=dp_size, _precompute_context_kv=lambda s, e: None)
+    # DFlashSpeculator.propose returns before the draft step exactly when the
+    # step schedules zero drafts, on every data-parallel rank.
+    spec = SimpleNamespace(dp_size=dp_size)
     assert conf_module.drafts_nothing(spec, num_speculative_tokens) == (
-        draft_context_only(spec, num_speculative_tokens, 4)
+        num_speculative_tokens == 0
     )
 
 

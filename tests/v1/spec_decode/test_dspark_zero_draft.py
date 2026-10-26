@@ -382,10 +382,11 @@ def test_drafting_steps_run_the_draft_block(monkeypatch):
     assert s.num_query_per_req == NUM_SPEC
 
 
-def test_data_parallel_keeps_the_full_step(monkeypatch):
+def test_data_parallel_skips_the_draft_block_too(monkeypatch):
+    # The data-parallel batch sync makes every rank agree on a zero-draft step.
     calls: list = []
     s = _dspark(monkeypatch, calls)
     s.dp_size = 2
-    with pytest.raises(_Stop):
-        _propose(s, num_reqs=6, num_speculative_tokens=0)
-    assert calls == ["prepare", "draft_block"]
+    out = _propose(s, num_reqs=6, num_speculative_tokens=0)
+    assert calls == ["prepare", ("context_kv", 0, 6)]
+    assert out.shape == (6, NUM_SPEC)

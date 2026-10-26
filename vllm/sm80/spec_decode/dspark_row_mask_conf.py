@@ -22,7 +22,7 @@ With ``VLLM_DSPARK_ADAPTIVE_DEPTH`` set, ``create_dspark_speculator`` mixes
   columns are positions 1 .. width and the columns past the drafted width
   are 0 (a draft that does not exist is never accepted);
 * on a ``propose`` call that drafts nothing (a zero-draft step stores only the
-  context K/V, ``zero_draft.py``), resets the batch's slots to 1.0, so no
+  context K/V, ``DFlashSpeculator.propose``), resets the batch's slots to 1.0, so no
   later verify step reads an older step's confidences.
 
 The publish is one small kernel recorded inside the captured draft step. It
@@ -144,9 +144,10 @@ def publish_confidences(
 
 
 def drafts_nothing(speculator, num_speculative_tokens: int | None) -> bool:
-    """True when ``propose`` returns before the draft step
-    (``zero_draft.draft_context_only``)."""
-    return num_speculative_tokens == 0 and speculator.dp_size <= 1
+    """True when ``propose`` returns before the draft step: a step that
+    schedules zero drafts stores only the context K/V (data-parallel ranks
+    agree on it in the batch sync)."""
+    return num_speculative_tokens == 0
 
 
 def verify_drafts_by_batch(vllm_config, max_num_reqs: int) -> list[int]:

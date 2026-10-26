@@ -23,7 +23,7 @@ def draft_widths(vllm_config: VllmConfig) -> tuple[int, ...]:
     adaptive = spec.adaptive_k_config
     if adaptive is not None and adaptive.draft_by_load:
         widths.update(adaptive.allowed)
-    # Zero means context-KV only, not a query block (draft_context_only).
+    # Zero means context-KV only, not a query block (DFlashSpeculator.propose).
     return tuple(sorted(w for w in widths if w > 0))
 
 
