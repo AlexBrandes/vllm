@@ -63,6 +63,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.sm80 import hot_swap
 from vllm.triton_utils import tl, triton
 
 BLOCK = 4096  # columns per chunk; one slot per chunk
@@ -599,11 +600,25 @@ def shard_argmax_sampling(
     """Decorates ``DSparkSpeculator._sample_sequential``: with
     ``VLLM_SM80_SHARD_ARGMAX`` the greedy drafts come from
     :func:`sample_sequential`; the switch refuses a speculator it cannot
-    serve (:func:`refusal`). The mark on the wrapper lets :func:`drafting`
+    serve (:func:`refusal`). With the hot pair ``shard_argmax``
+    (``vllm.sm80.hot_swap``) both samplers are one pair site writing the
+    same ``draft_tokens``. The mark on the wrapper lets :func:`drafting`
     find this sampler."""
 
     @functools.wraps(sample)
     def wrapper(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        if hot_swap.listed("shard_argmax"):
+
+            def gathered() -> torch.Tensor:
+                sample(self, num_reqs, head_hidden)
+                return self.draft_tokens
+
+            def per_rank(out: torch.Tensor | None) -> torch.Tensor:
+                sample_sequential(self, num_reqs, head_hidden)
+                return self.draft_tokens
+
+            hot_swap.pair("shard_argmax", gathered, per_rank)
+            return None
         if not _enabled(self):
             return sample(self, num_reqs, head_hidden)
         sample_sequential(self, num_reqs, head_hidden)

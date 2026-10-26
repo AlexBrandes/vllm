@@ -16,6 +16,7 @@ import sys
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 
 logger = init_logger(__name__)
 
@@ -92,7 +93,7 @@ def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
 
     warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
     _log_prefill_switches()
-    if envs.VLLM_SM80_SPARSE_MLA_PREFILL:
+    if envs.VLLM_SM80_SPARSE_MLA_PREFILL or hot_swap.listed("sparse_mla_prefill"):
         # The 64-head sparse-MLA prefill kernel (sparse_prefill_mla_pp.py).
         # Prefill runs eagerly, but compiling here keeps the Gluon JIT off the
         # first request. No-op unless this rank runs 64 heads on sm_80.

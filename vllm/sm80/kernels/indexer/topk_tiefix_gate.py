@@ -27,7 +27,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
-from vllm.sm80 import tuning
+from vllm.sm80 import hot_swap, tuning
 
 logger = init_logger(__name__)
 
@@ -109,10 +109,12 @@ def tiefix_topk_(
     row_starts: torch.Tensor | None = None,
     relative: bool = False,
     sort: bool = False,
+    split_rows: int | None = None,
 ) -> torch.Tensor:
     """Resolve boundary ties of an exact top-k to the lowest indices, in
     place; with ``sort`` also sort each row (VLLM_SM80_TOPK_SORTED) in the
-    same launch (two launches in all on the split path, ``use_split``). See
+    same launch (two launches in all on the split path, ``use_split``, up to
+    ``split_rows`` rows; None: :func:`tiefix_split_rows`). See
     ``topk_tiefix.py``; imported lazily so that with the flag unset nothing
     new is loaded."""
     from vllm.sm80.kernels.indexer.topk_tiefix import (
@@ -120,10 +122,12 @@ def tiefix_topk_(
         use_split,
     )
 
+    if split_rows is None:
+        split_rows = tiefix_split_rows(int(topk_indices.shape[1]))
     split = sort and use_split(
         topk_indices.shape[0],
         logits.shape[1],
-        tiefix_split_rows(int(topk_indices.shape[1])),
+        split_rows,
     )
     return topk_tiefix_(
         logits,
@@ -134,6 +138,44 @@ def tiefix_topk_(
         sort=sort,
         split=split,
     )
+
+
+# The hot pairs of this site (vllm.sm80.hot_swap): a server lists at most one.
+_HOT_PAIRS = ("topk_canonical_ties", "topk_sorted")
+
+
+def _hot_pair() -> str | None:
+    for name in _HOT_PAIRS:
+        if hot_swap.listed(name):
+            return name
+    return None
+
+
+def _canonical(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    row_ends: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    relative: bool,
+    ties: bool,
+    sort: bool,
+    split_rows: int | None = None,
+) -> torch.Tensor:
+    if ties:
+        tiefix_topk_(
+            logits,
+            topk_indices,
+            row_ends=row_ends,
+            row_starts=row_starts,
+            relative=relative,
+            sort=sort,
+            split_rows=split_rows,
+        )
+    elif sort:
+        from vllm.sm80.kernels.indexer.topk_tiefix import sort_topk_rows_
+
+        sort_topk_rows_(topk_indices)
+    return topk_indices
 
 
 def canonical_topk_(
@@ -149,20 +191,33 @@ def canonical_topk_(
     sorting each row in the same launch when VLLM_SM80_TOPK_SORTED is on too;
     with the sort alone, sort each row and keep the set. Both unset: nothing
     runs. ``row_ends``/``row_starts``/``relative`` describe each row's window
-    as the top-k kernel saw it (see ``topk_tiefix_``)."""
-    if use_tiefix_topk():
-        tiefix_topk_(
-            logits,
-            topk_indices,
-            row_ends=row_ends,
-            row_starts=row_starts,
-            relative=relative,
-            sort=use_sorted_topk(),
-        )
-    elif use_sorted_topk():
-        from vllm.sm80.kernels.indexer.topk_tiefix import sort_topk_rows_
+    as the top-k kernel saw it (see ``topk_tiefix_``).
 
-        sort_topk_rows_(topk_indices)
+    With a hot pair of ``_HOT_PAIRS`` listed, this is its pair site: the
+    incumbent runs the switches as booted, the candidate with the pair's
+    switch on, both in place on ``topk_indices``. With both switches on, the
+    candidate's split row bound is the topk_select/split_rows row, as served."""
+    ties, sort = use_tiefix_topk(), use_sorted_topk()
+    hot = _hot_pair()
+    if hot is None:
+        _canonical(logits, topk_indices, row_ends, row_starts, relative, ties, sort)
+        return
+    cand = (True, sort) if hot == "topk_canonical_ties" else (ties, True)
+    split_rows = (
+        max(0, tuning.lookup(
+            "topk_select", "split_rows", {"top_k": int(topk_indices.shape[1])}, 0
+        ))
+        if all(cand) else 0
+    )
+    hot_swap.pair(
+        hot,
+        lambda: _canonical(
+            logits, topk_indices, row_ends, row_starts, relative, ties, sort
+        ),
+        lambda out: _canonical(
+            logits, topk_indices, row_ends, row_starts, relative, *cand, split_rows
+        ),
+    )
 
 
 def canonical_decode_topk_(
@@ -175,7 +230,7 @@ def canonical_decode_topk_(
     ``SparseIndexerTopk`` (``get_indexer_topk``) just wrote into
     ``topk_indices``, over the same per-row ends as its kernels
     (``SparseIndexerTopk._row_ends`` of the same arguments)."""
-    if use_tiefix_topk() or use_sorted_topk():
+    if use_tiefix_topk() or use_sorted_topk() or _hot_pair() is not None:
         canonical_topk_(
             logits,
             topk_indices,

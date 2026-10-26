@@ -199,7 +199,10 @@ def test_allowlist():
 def test_extension_methods_are_free_on_the_worker():
     gpu_worker = pytest.importorskip("vllm.v1.worker.gpu_worker")
     names = [n for n in dir(dev_ab.DevABWorkerExtension) if not n.startswith("__")]
-    assert names == ["begin_ab_batch", "end_ab_batch", "get_ab_arm", "set_ab_arm"]
+    assert names == [
+        "begin_ab_batch", "end_ab_batch", "get_ab_arm", "get_hot_arms",
+        "set_ab_arm", "set_hot_arms",
+    ]
     for name in names:
         assert not hasattr(gpu_worker.Worker, name)
 
