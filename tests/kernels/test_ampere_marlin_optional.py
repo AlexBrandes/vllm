@@ -110,10 +110,14 @@ def test_incompatible_build_is_rejected_before_dispatch(monkeypatch, key, bad):
     (0, 512, False), (1, 512, True), (32, 512, True),
     (33, 512, False), (64, 512, False), (4, 2048, True),
     (8, 2048, True), (0, 2048, False), (1, 2048, False),
-    (3, 2048, False), (5, 2048, False), (7, 2048, False),
-    (9, 2048, False), (16, 2048, False), (32, 2048, False),
+    (3, 2048, False), (5, 2048, True), (7, 2048, True),
+    (9, 2048, True), (16, 2048, True), (32, 2048, True),
+    (33, 2048, False),
 ])
-def test_decode_regime_boundaries(tokens, width, expected):
+def test_decode_regime_boundaries(monkeypatch, tokens, width, expected):
+    """Whole experts: 4..8 rows and the multi-request rows up to the
+    marlin_multi_max_rows row (32 without one)."""
+    use_rows(monkeypatch)
     assert decode.compiled_regime(tokens, width) is expected
 
 

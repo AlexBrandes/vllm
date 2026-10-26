@@ -203,6 +203,9 @@ def _launch_kwargs(monkeypatch, T, heads, width=WIDTH):
     rec = _Recorder()
     monkeypatch.setattr(spm, "_sparse_mla_kernel", rec)
     monkeypatch.setattr(spm, "num_sms", lambda *_a: 70)
+    # The Triton kernel's launch at every head count (64 heads otherwise go
+    # to the Gluon kernel of sparse_prefill_mla_pp first).
+    monkeypatch.setattr(spm, "PP_HEADS", 0)
     q = torch.zeros(T, heads, DIM, dtype=torch.bfloat16)
     kv = torch.zeros(4096, 1, DIM, dtype=torch.bfloat16)
     idx = torch.zeros(T, 1, width, dtype=torch.int32)
@@ -239,6 +242,8 @@ def test_kernel_source_predicates_only_the_nope_gather():
 
 # --------------------------------------------------------------------- GPU
 def _run(q, kv, idx, flag, monkeypatch, out=None):
+    # The Triton kernel at every head count (see _launch_kwargs).
+    monkeypatch.setattr(spm, "PP_HEADS", 0)
     if flag:
         monkeypatch.setenv(FLAG, "1")
     else:

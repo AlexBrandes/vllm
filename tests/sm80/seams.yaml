@@ -238,7 +238,7 @@ seams:
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention._forward_core
   why: reads the fork layer's _kda_recover, _kda_recover_records, _kda_step_tile, _kda_wide, _pp_kda_prefill and _fill_deferred_g2, and the metadata's spec_max_query_len
-  sha256: 1a483f608bff9a44a93fc19b2cd21247b16fb33c27212a39ecc348bff11fdda4
+  sha256: cf017014837f8bf0921c4ced96248272a5ea5105a26cfc5fec0dd941b2edbdaf
   signature: '(self, qkv_proj_states: torch.Tensor, g1: torch.Tensor | None, beta: torch.Tensor, core_attn_out: torch.Tensor, g2: torch.Tensor | None = None, f_a: torch.Tensor | None = None, g_a: torch.Tensor | None = None) -> bool'
 
 - id: glm-mamba-get-attn-backend
