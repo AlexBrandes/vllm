@@ -112,14 +112,13 @@ exceptions:
     this file, so that it no longer differs from upstream.
 
 - file: vllm/v1/core/sched/scheduler.py
-  hunks: [856437ee3c56, 2a416d3832a2, 22f90a26368e, 8ceddf09f07e, 7759e06de501, 2ba978c6ce4e]
+  hunks: [856437ee3c56, a8d54cb7d7ef, 22f90a26368e, 8ceddf09f07e, 7759e06de501, 2ba978c6ce4e]
   reason: >-
     Upstream bug fix taken ahead of upstream (vllm-project/vllm#54076, first
     part): the align-mode prefill split stops on the Mamba group's own block
     size instead of cache_config.block_size, which a smaller drafter group
     pulls below it (GLM-5.3-Flash at PP4). The split is a private scheduler
-    method with no extension point. At zero context the replaced line merges
-    with the fork's adjacent drop_eagle_block hunk into one hunk.
+    method with no extension point.
     The additional budget hunks prevent a long hybrid prompt from waiting for
     decodes to finish when their recurring token and draft-slot charges leave
     less than one state block. Both admission and running-chunk paths pass
@@ -205,18 +204,6 @@ exceptions:
     (ba753e35fcca) Remove when upstream exposes per-output failed-token metadata through the runner output constructor without adding another per-step lookup.
     (75b463763419) Remove when upstream exposes a pre-forward runner hook with the step's input batch (or when the row mask moves into upstream adaptive verification); retain the row-mask kernel and live-row identity tests.
     (645d5ea70245) Remove when upstream exposes a pre-rejection hook over invalid drafts, or the cap moves into upstream adaptive verification; retain the greedy truncation and num_rejected tests.
-
-- file: vllm/tokenizers/deepseek_v41_encoding.py
-  hunks: [0b665958e7ac, 5331783e1d57]
-  reason: >-
-    Upstream's own fix (#62199, after the base): find_last_user_index skips a
-    user message that holds only tool results, as the 1017 reference encoder
-    does. The function is called inside upstream's encoder; carrying upstream's
-    exact lines makes the hunks vanish when the base includes that commit.
-  owner: DeepSeek V4.1 prompt encoding
-  removal: >-
-    Drops out at the first base that contains upstream ddefe40e16 (#62199);
-    delete this entry and the modification notice then.
 
 - file: vllm/envs.py
   hunks: [61396cef5c73]
