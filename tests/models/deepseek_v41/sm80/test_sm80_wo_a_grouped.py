@@ -182,7 +182,27 @@ def _ptxas():
     return os.path.join(os.path.dirname(triton.__file__), "backends/nvidia/bin/ptxas")
 
 
-@pytest.mark.parametrize("config", wg.CONFIGS, ids=lambda c: f"rows{c[0]}")
+# A known Triton 3.8 regression: the second layout pass rematerialises the
+# weight decode into one dot's operand layout at MT=3 and MT=4.
+_DECODED_TWICE = pytest.mark.xfail(
+    strict=True,
+    reason="release-blocker:dsv41-flash: Triton 3.8 decodes the weights twice "
+    "per K step at 33-64 rows (layout rematerialisation); blocks the next "
+    "dsv41-flash release",
+)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            c,
+            id=f"rows{c[0]}",
+            marks=_DECODED_TWICE if c[0] in (48, 64) else (),
+        )
+        for c in wg.CONFIGS
+    ],
+)
 def test_kernel_compiles_for_sm80(tmp_path, config):
     import triton
     from triton.backends.compiler import GPUTarget
