@@ -1154,13 +1154,6 @@ seams:
   sha256: 2550895d3b06f2c947b9dd88e76aa37edd546480f2ccf824ab695bbcf08f42f9
   signature: '(self, request_id: str) -> tuple[list[int], ...]'
 
-- id: kv-planning-project-groups-to-worker
-  kind: function
-  target: vllm.v1.core.kv_cache_planning:_project_kv_cache_groups_to_worker
-  why: kv_planning.merge_eagle_group_flags restores is_eagle_group in the scheduler config because this projection clears it on a worker that owns none of a group's layers and keeps every worker's group list index-aligned
-  sha256: 6750fb8e9748f841018fcfc711a4a505781d0677737b2abdb7030862ea3c5e93
-  signature: '(global_kv_cache_groups: list[vllm.v1.kv_cache_interface.KVCacheGroupSpec], worker_spec: dict[str, vllm.v1.kv_cache_interface.KVCacheSpec]) -> list[vllm.v1.kv_cache_interface.KVCacheGroupSpec]'
-
 - id: kv-planning-bytes-per-block
   kind: function
   target: vllm.v1.core.kv_cache_planning:_get_kv_cache_bytes_per_block

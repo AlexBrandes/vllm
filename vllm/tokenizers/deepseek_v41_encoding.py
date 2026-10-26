@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified by Morrowmake for CMP 170HX support; see repository history.
 # ruff: noqa
 
 """Text encoding adapted from the DeepSeek V4.1 reference encoder.

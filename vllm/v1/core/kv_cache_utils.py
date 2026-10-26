@@ -23,10 +23,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
-from vllm.sm80.kv_planning import (
-    max_concurrency_for_kv_cache_config,
-    merge_eagle_group_flags,
-)
+from vllm.sm80.kv_planning import max_concurrency_for_kv_cache_config
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -1098,9 +1095,6 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
-    # Groups only some pipeline stages own (a drafter's) keep the
-    # is_eagle_group flag of the stage that owns them.
-    merge_eagle_group_flags(cfg, kv_cache_configs)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,

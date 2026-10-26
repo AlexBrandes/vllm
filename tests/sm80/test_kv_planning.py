@@ -460,33 +460,6 @@ def test_other_models_are_left_alone():
     assert not any(group.is_eagle_group for group in groups)
 
 
-# --------------------------------------------------------------------------
-# Scheduler config
-# --------------------------------------------------------------------------
-
-
-def test_scheduler_config_merges_eagle_flags_across_workers():
-    spec = new_kv_cache_spec()
-
-    def cfg(flags):
-        return KVCacheConfig(
-            num_blocks=10,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    [f"l{i}"] if f is not None else [], spec, is_eagle_group=bool(f)
-                )
-                for i, f in enumerate(flags)
-            ],
-        )
-
-    configs = [cfg([False, None]), cfg([False, None]), cfg([False, True])]
-    sched = generate_scheduler_kv_cache_config(configs)
-    assert [g.is_eagle_group for g in sched.kv_cache_groups] == [False, True]
-    # The workers' own configs are untouched.
-    assert not configs[0].kv_cache_groups[1].is_eagle_group
-
-
 @pytest.mark.parametrize("enabled", [False, True])
 def test_kv_plan_log(monkeypatch, caplog, enabled):
     """VLLM_KV_PLAN_LOG logs the plan the concurrency comes from, one entry

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache planning rules of the CMP 170HX (sm_80) fork.
 
-Upstream files call in from three places:
+Upstream files call in from two places:
 
 - ``kv_cache_planning._get_packed_kv_cache_groups`` passes its groups through
   :func:`fit_packed_kv_cache_groups`, which refits the groups of an MLA +
@@ -14,9 +14,6 @@ Upstream files call in from three places:
   :func:`max_concurrency_for_kv_cache_config`, which charges a spec's
   speculative scratch (``KVCacheSpec.speculative_scratch_bytes``) once per
   running request instead of once per resident request.
-- ``kv_cache_utils.generate_scheduler_kv_cache_config`` calls
-  :func:`merge_eagle_group_flags`, which keeps the ``is_eagle_group``
-  annotation of groups only some pipeline stages own.
 """
 
 import math
@@ -589,22 +586,3 @@ def pool_concurrency_limit(
         return all_running
     usable_blocks = num_blocks - max_num_seqs * scratch_blocks_per_request
     return usable_blocks / resident_blocks_per_request
-
-
-def merge_eagle_group_flags(
-    scheduler_kv_cache_config: KVCacheConfig,
-    kv_cache_configs: list[KVCacheConfig],
-) -> None:
-    """Set each scheduler group's is_eagle_group from every worker's config.
-
-    Under pipeline parallelism a worker's projection clears is_eagle_group on
-    groups it owns no layers of, and a drafter's groups live on the last stage
-    only. The scheduler config is copied from one worker, so take the flag
-    from whichever worker owns the group, or the scheduler loses the
-    annotation and the coordinator falls back to treating every group as an
-    eagle group.
-    """
-    for group_id, group in enumerate(scheduler_kv_cache_config.kv_cache_groups):
-        group.is_eagle_group = any(
-            other.kv_cache_groups[group_id].is_eagle_group for other in kv_cache_configs
-        )
