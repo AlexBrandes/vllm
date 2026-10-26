@@ -186,9 +186,8 @@ def test_allowlist():
         "dsv41_attn_pipeline",
         "dsv41_select_one_launch",
         "dsv41_moe_prefill_tc",
-        "qsa_topk_canonical",
+        "topk_canonical_ties",
         "marlin_decode_v2",
-        "glm5_topk_tiefix",
         "custom_allreduce_flags",
         "kda_prefill",
         "local_argmax_reduction",
@@ -392,37 +391,81 @@ def test_profiling_extrapolates_each_arms_full_graphs(monkeypatch, state, fake_s
     assert total == 110 + extra
 
 
-def test_qsa_switch_imports_its_module(monkeypatch):
+def test_topk_switch_imports_the_qsa_module(monkeypatch):
     import types
 
-    module = types.ModuleType(dev_ab._QSA_MODULE)
-    module._QSA_TOPK_CANONICAL = True
+    gate = types.ModuleType(dev_ab._TOPK_GATE)
     monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QSA_MODULE, raising=False)
+    monkeypatch.delitem(dev_ab.sys.modules, dev_ab._TOPK_GATE, raising=False)
     imported = []
 
     def fake_import(name):
+        # The QSA ops module imports the shared gate.
         imported.append(name)
-        dev_ab.sys.modules[name] = module
-        return module
+        dev_ab.sys.modules[name] = types.ModuleType(name)
+        dev_ab.sys.modules[dev_ab._TOPK_GATE] = gate
+        return dev_ab.sys.modules[name]
 
     monkeypatch.setattr(dev_ab.importlib, "import_module", fake_import)
     monkeypatch.setitem(
         dev_ab.sys.modules, dev_ab._QSA_MODEL_MODULE, types.ModuleType("m")
     )
-    switch = dev_ab.SWITCHES["qsa_topk_canonical"]
-    assert switch.unavailable(None) is None
-    assert switch.current(None) is True
-    assert imported == [dev_ab._QSA_MODULE]
-    monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QSA_MODULE)
+    monkeypatch.setenv(dev_ab._TOPK_ENV, "1")
+    switch = dev_ab.SWITCHES["topk_canonical_ties"]
+    try:
+        assert switch.unavailable(None) is None
+        assert switch.current(None) is True
+        assert imported == [dev_ab._QSA_MODULE]
+    finally:
+        dev_ab.sys.modules.pop(dev_ab._QSA_MODULE, None)
+        dev_ab.sys.modules.pop(dev_ab._TOPK_GATE, None)
 
 
-def test_qsa_switch_refuses_a_model_without_the_indexer(monkeypatch):
-    # Another model (no QSA indexer built): refuse rather than A/B two equal arms.
+def test_topk_switch_refuses_a_model_without_an_indexer(monkeypatch):
+    # Another model (no GLM or QSA indexer built): refuse rather than A/B two
+    # equal arms.
     monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QSA_MODEL_MODULE, raising=False)
+    monkeypatch.delitem(dev_ab.sys.modules, dev_ab._TOPK_GATE, raising=False)
     imported = []
     monkeypatch.setattr(dev_ab.importlib, "import_module", imported.append)
-    why = dev_ab.SWITCHES["qsa_topk_canonical"].unavailable(None)
+    why = dev_ab.SWITCHES["topk_canonical_ties"].unavailable(None)
     assert "not loaded" in why and imported == []
+
+
+def test_topk_switch_apply_rereads_the_gate(monkeypatch):
+    """An arm sets the switch, drops the gate's cached reads and warms the
+    kernels (use_tiefix_topk) before the arm's capture; the sort switch is
+    left as booted."""
+    import os
+    import types
+
+    calls = []
+
+    class Cached:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self):
+            calls.append(self.name)
+
+        def cache_clear(self):
+            calls.append(f"clear {self.name}")
+
+    gate = types.ModuleType(dev_ab._TOPK_GATE)
+    for name in ("use_sorted_topk", "use_tiefix_topk", "tiefix_split_rows"):
+        setattr(gate, name, Cached(name))
+    monkeypatch.setitem(dev_ab.sys.modules, dev_ab._TOPK_GATE, gate)
+    monkeypatch.setenv(dev_ab._TOPK_ENV, "0")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
+    dev_ab.SWITCHES["topk_canonical_ties"].apply(None, True)
+    assert os.environ[dev_ab._TOPK_ENV] == "1"
+    assert os.environ["VLLM_SM80_TOPK_SORTED"] == "1"
+    assert calls == [
+        "clear use_sorted_topk",
+        "clear use_tiefix_topk",
+        "clear tiefix_split_rows",
+        "use_tiefix_topk",
+    ]
 
 
 def test_swa_meta_batch_switch(monkeypatch):

@@ -17,7 +17,7 @@ columns.
 
 ``persistent_topk`` alone may return a different set for identical scores;
 the count of distinct native outputs is printed, not asserted (it depends on
-timing). With VLLM_QWEN4_QSA_TOPK_CANONICAL the set must be identical on
+timing). With VLLM_SM80_TOPK_CANONICAL_TIES the set must be identical on
 every call and equal to the (score descending, block index ascending) choice.
 Without ties the tie fix must leave the native output byte for byte.
 Needs a CUDA device and the compiled _C ops; skipped otherwise.
@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
-from vllm.sm80.kernels.indexer import qsa_topk_gate
+from vllm.sm80.kernels.indexer import topk_tiefix_gate as gate
 
 COMPRESS_RATIO = 4
 BLOCK_TOPK = 512
@@ -60,6 +60,26 @@ pytestmark = [
         reason="needs a CUDA device and torch.ops._C.persistent_topk",
     ),
 ]
+
+
+def _clear_gate() -> None:
+    for f in (gate.use_tiefix_topk, gate.use_sorted_topk, gate.tiefix_split_rows):
+        f.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_gate():
+    """The gate caches its reads; drop them around each test (after the
+    environment is restored)."""
+    _clear_gate()
+    yield
+    _clear_gate()
+
+
+def _switches(monkeypatch, *, canonical: bool, sort: bool) -> None:
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1" if canonical else "0")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1" if sort else "0")
+    _clear_gate()
 
 
 def _tied_logits(visible: torch.Tensor, width: int, seed: int) -> torch.Tensor:
@@ -160,8 +180,7 @@ def _check_canonical_every_call(monkeypatch, logits, visible, sort, label) -> No
         assert (native >= 0).all() and (native < visible[:, None]).all()
         native_variants.add(native.cpu().numpy().tobytes())
 
-    monkeypatch.setattr(qsa_indexer_ops, "_QSA_TOPK_SORTED", sort)
-    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", True)
+    _switches(monkeypatch, canonical=True, sort=sort)
     first = None
     for _ in range(REPEATS):
         got = _qsa_topk(logits, visible, workspace)
@@ -174,7 +193,7 @@ def _check_canonical_every_call(monkeypatch, logits, visible, sort, label) -> No
         elif sort:
             assert torch.equal(got, first)
     canonical_ms = _time_ms(_qsa_topk, logits, visible, workspace)
-    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", False)
+    _switches(monkeypatch, canonical=False, sort=sort)
     stock_ms = _time_ms(_qsa_topk, logits, visible, workspace)
     print(
         f"QSA_TIE {label} sort={int(sort)} k={BLOCK_TOPK} width={logits.shape[1]} "
@@ -213,11 +232,8 @@ def test_long_decode_without_ties_is_a_no_op(monkeypatch, branch):
     native = _native(logits, visible, _workspace())
     assert torch.equal(_row_sets_sorted(native), _reference(logits, visible))
 
-    monkeypatch.setattr(qsa_topk_gate, "_QSA_TOPK_CANONICAL", True)
     for sort in (False, True):
+        _switches(monkeypatch, canonical=True, sort=sort)
         got = native.clone()
-        ran = qsa_topk_gate.canonical_qsa_topk_(
-            logits, got, row_ends=visible, sort=sort
-        )
-        assert ran
+        gate.canonical_topk_(logits, got, row_ends=visible)
         assert torch.equal(got, _row_sets_sorted(native) if sort else native)

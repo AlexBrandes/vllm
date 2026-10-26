@@ -160,7 +160,8 @@ The EXL3 kernels written for this card — MoE kernels for decode and prefill, a
 split-K dense kernel with tensor-core blocks for small decode launches, a
 tensor-core dense kernel for prefill and a native n-gram table read — are
 switched by `VLLM_EXL3_*`; the model's sparse-attention top-k tie order by
-`VLLM_QWEN4_QSA_TOPK_CANONICAL`. The recipe's
+`VLLM_SM80_TOPK_CANONICAL_TIES` and its traversal order by
+`VLLM_SM80_TOPK_SORTED`. The recipe's
 [engine switches](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe#engine-switches)
 table lists the set it turns on.
 
@@ -217,8 +218,8 @@ hold, so the reported pool is one the server can fill —
 log-probabilities on every run and every install: fixed-order MoE block
 alignment (`VLLM_MOE_DETERMINISTIC_ALIGN`), CUDA-graph padding kept out of
 the MoE (`VLLM_MOE_MASK_PADDING`), indexer top-k consistent on ties and in
-a fixed order (`VLLM_GLM5_TOPK_TIEFIX`, `VLLM_GLM5_TOPK_SORTED`), pinned
-linear-attention prefill configurations (`VLLM_FLA_PIN_AUTOTUNE`).
+a fixed order (`VLLM_SM80_TOPK_CANONICAL_TIES`, `VLLM_SM80_TOPK_SORTED`),
+pinned linear-attention prefill configurations (`VLLM_FLA_PIN_AUTOTUNE`).
 
 **Pipeline-parallel and scheduling.** Decodes spread over every in-flight
 micro-batch — `VLLM_PP_SPREAD_DECODES`; one packed, metadata-free hand-off
