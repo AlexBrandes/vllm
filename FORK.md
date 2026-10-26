@@ -165,6 +165,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
 | `vllm/sm80/fla/pinned_autotune.py` | 384 |
 | `vllm/sm80/guard.py` | 68 |
+| `vllm/sm80/jit_extension.py` | 55 |
 | `vllm/sm80/kv_planning.py` | 588 |
 | `vllm/sm80/launch/__init__.py` | 7 |
 | `vllm/sm80/launch/canon.py` | 107 |
@@ -197,7 +198,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/plugin.py` | 330 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
-| `vllm/sm80/spec_decode/aux_fc_fold.py` | 173 |
+| `vllm/sm80/spec_decode/aux_fc_fold.py` | 184 |
 | `vllm/sm80/spec_decode/dflash2_model.py` | 425 |
 | `vllm/sm80/spec_decode/dspark_confidence.py` | 369 |
 | `vllm/sm80/spec_decode/dspark_depth_hint.py` | 175 |
@@ -218,7 +219,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 231 |
-| **75 files** | **22,170** |
+| **76 files** | **22,236** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -537,7 +538,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/launch/test_launch_validated.py` | 483 |
 | `tests/sm80/round_once_allreduce_bits.py` | 207 |
 | `tests/sm80/round_once_unchecked.py` | 46 |
-| `tests/sm80/seams.yaml` | 1,596 |
+| `tests/sm80/seams.yaml` | 1,610 |
 | `tests/sm80/test_ce_ring_all_reduce.py` | 289 |
 | `tests/sm80/test_dev_ab.py` | 649 |
 | `tests/sm80/test_dev_ab_atomic.py` | 137 |
@@ -547,12 +548,14 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_exl3_platform_verification.py` | 65 |
 | `tests/sm80/test_exl3_plugin.py` | 110 |
 | `tests/sm80/test_fork_map.py` | 55 |
+| `tests/sm80/test_glm_pp4_draft_fc_staging.py` | 86 |
 | `tests/sm80/test_glm_pp4_kv_plan.py` | 89 |
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_gpu_lock_guard.py` | 74 |
 | `tests/sm80/test_import_cuda_init.py` | 140 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
+| `tests/sm80/test_jit_extension_std.py` | 87 |
 | `tests/sm80/test_kv_planning.py` | 494 |
 | `tests/sm80/test_modification_notices.py` | 80 |
 | `tests/sm80/test_moe_layers.py` | 297 |
@@ -609,7 +612,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_pp_split_draft_event.py` | 127 |
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 564 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **284 files** | **120,685** |
+| **286 files** | **120,872** |
 
 #### `tools/`
 
@@ -927,12 +930,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 223 |
-| Fork-added product lines | 76,600 |
+| Fork-added product files | 224 |
+| Fork-added product lines | 76,666 |
 | Patched upstream files | 100 |
 | Patched upstream lines | +4,539 / -787 |
 | Patched upstream product files | 73 |
 | Patched upstream product lines | +3,056 / -237 |
-| Product lines added (new files and patches) | 79,656 |
+| Product lines added (new files and patches) | 79,722 |
 | Fork environment variables (flags) | 150 |
 | Unreferenced fork definitions | 7 (59 lines) |

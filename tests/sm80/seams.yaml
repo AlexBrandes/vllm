@@ -1007,6 +1007,20 @@ seams:
   sha256: 640f1064db2022126aa6056c463c07bf24faef91dd3bf94cc58d9a4faaee70a4
   signature: '(self, block_size: int) -> None'
 
+- id: drafter-fc-fold-graph-forward
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator._prepare_graph_forward
+  why: the FULL draft graph passes _aux_staging[:num_context] to the drafter's combine_hidden_states; with the drafter fc fold, mark_drafter_aux_fc_folded reallocates _aux_staging as the fp32 [rows, hidden_size] fc output the folded combine takes
+  sha256: f3eee9dc9b0f031fab7488da77517ef0d84b6e70d8ff82129d1d2e4fee7c696e
+  signature: '(self, num_reqs: int, attn_metadata: dict[str, typing.Any] | None) -> None'
+
+- id: drafter-fc-fold-store-hidden-states
+  kind: method
+  target: vllm.v1.worker.gpu.spec_decode.dflash.speculator:DFlashSpeculator._store_hidden_states
+  why: concatenates the aux hidden states into _aux_staging for the FULL graph's rows and combines the rest eagerly; with the drafter fc fold the aux list is the single fp32 fc output, so the reallocated staging buffer matches that width and dtype
+  sha256: e92b662a604051cecce55e9843c527cc2f6b0604609b74918b4f2be129312e33
+  signature: '(self, num_tokens: int, last_hidden_states: torch.Tensor, aux_hidden_states: list[torch.Tensor] | None, num_graph_tokens: int = 0) -> None'
+
 - id: drafter-load-following-widths
   kind: function
   target: vllm.v1.worker.gpu.spec_decode.dflash2.speculator:load_following_draft_widths
