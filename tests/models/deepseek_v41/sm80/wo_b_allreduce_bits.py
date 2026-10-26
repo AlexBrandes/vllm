@@ -14,13 +14,12 @@ the wo_b output shape ``[rows, 5120]``, this compares
 * ``fp32``: ``all_reduce(partial.float()).bfloat16()`` (today's path);
 * ``exact``: the FP64 sum of the four gathered partials rounded to BF16;
 
-* ``switched``: ``wo_b_all_reduce(partial, switch, pieces_switch)``, the
-  layer's own call with ``switch`` = VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE
-  (on: BF16 where the custom all-reduce takes the message whole) and
-  ``pieces_switch`` = VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE (on: BF16
-  through the custom all-reduce in pieces where the message is too large for
-  it whole) as the process environment sets them; the JSON records both and
-  the path each message took (``bf16``, ``bf16_pieces`` or ``fp32``);
+* ``switched``: ``wo_b_all_reduce(partial, switch)``, the layer's own call
+  with ``switch`` = VLLM_SM80_ALLREDUCE_ROUND_ONCE as the process environment
+  sets it (on: BF16 where the host-staged or custom all-reduce takes the
+  message whole, else through the custom all-reduce in pieces where the
+  message is too large for it whole); the JSON records the switch and the
+  path each message took (``bf16``, ``bf16_pieces`` or ``fp32``);
 
 reports which backend each message takes, bitwise equality, mismatch counts
 and the largest BF16-ulp distance (also of ``switched`` and ``fp32`` against
@@ -36,10 +35,10 @@ each, under the served all-reduce switches (test_wo_b_allreduce_bits_gpu.py
 runs it and judges its JSON). It loads the plugins and puts ``ninja`` on PATH
 as the engine has them, and exits 2 without
 measuring when the communicator is not the served one (with
-VLLM_CUSTOM_ALLREDUCE_FLAGS=1: the flags-in-data kernel must be up)::
+VLLM_SM80_ALLREDUCE=1: the flags-in-data kernel must be up)::
 
-    VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 VLLM_CUSTOM_ALLREDUCE_FLAGS=1 \\
-    VLLM_CUSTOM_ALLREDUCE_ALGO=2stage VLLM_HOST_ALLREDUCE=1 NCCL_P2P_LEVEL=SYS \\
+    VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 VLLM_SM80_ALLREDUCE=1 \\
+    VLLM_CUSTOM_ALLREDUCE_ALGO=2stage NCCL_P2P_LEVEL=SYS \\
     torchrun --standalone --nproc-per-node 4 \\
         tests/models/deepseek_v41/sm80/wo_b_allreduce_bits.py --out result.json
 """
@@ -54,7 +53,7 @@ import torch.distributed as dist
 
 from vllm.sm80.distributed.step_errors import copy_error_flags
 
-from tests.sm80.test_round_once_all_reduce import exact_sum, reference_round
+from tests.models.deepseek_v41.sm80.exact_round import exact_sum, reference_round
 
 # 819 rows of 5120 BF16 are the largest message below the 8 MiB custom
 # all-reduce buffer, 820 the smallest above it.
@@ -142,13 +141,13 @@ def _refuse_unless_served(comm) -> str | None:
 
     if needs_fork_communicator() and not isinstance(comm, Sm80CudaCommunicator):
         return f"the TP communicator is {type(comm).__name__}, not the fork's"
-    if envs.VLLM_CUSTOM_ALLREDUCE_FLAGS:
+    if envs.VLLM_SM80_ALLREDUCE:
         ca = getattr(comm, "ca_comm", None)
         if ca is None or ca.disabled:
-            return "VLLM_CUSTOM_ALLREDUCE_FLAGS=1 but the custom all-reduce is off"
+            return "VLLM_SM80_ALLREDUCE=1 but the custom all-reduce is off"
         if getattr(ca, "_flags", None) is None:
             return (
-                "VLLM_CUSTOM_ALLREDUCE_FLAGS=1 but the flags-in-data kernel is "
+                "VLLM_SM80_ALLREDUCE=1 but the flags-in-data kernel is "
                 "not up (see the 'flags-in-data' log line above for why)"
             )
     return None
@@ -193,8 +192,7 @@ def main() -> None:
     _engine_like_setup()
     import vllm.envs as envs
 
-    switch = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE)
-    pieces_switch = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE)
+    switch = bool(envs.VLLM_SM80_ALLREDUCE_ROUND_ONCE)
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -238,7 +236,7 @@ def main() -> None:
             partial[0, 1] = -midpoint
             bf16 = tensor_model_parallel_all_reduce(partial.clone())
             fp32 = tensor_model_parallel_all_reduce(partial.float()).to(torch.bfloat16)
-            switched = wo_b_all_reduce(partial.clone(), switch, pieces_switch)
+            switched = wo_b_all_reduce(partial.clone(), switch)
             errors = copy_error_flags(dev)
             gathered = [torch.empty_like(partial) for _ in range(world)]
             dist.all_gather(gathered, partial)
@@ -247,9 +245,11 @@ def main() -> None:
             all_bits = [torch.empty_like(switched_bits) for _ in range(world)]
             dist.all_gather(all_bits, switched_bits)
             ranks_agree = all(torch.equal(b, all_bits[0]) for b in all_bits[1:])
-            if switch and custom_all_reduce_takes(partial):
+            host = getattr(get_tp_group().device_communicator, "hostshm_comm", None)
+            host_takes = host is not None and host.should_host_ar(partial)
+            if switch and (host_takes or custom_all_reduce_takes(partial)):
                 path = "bf16"
-            elif pieces_switch and custom_all_reduce_pieces(partial) is not None:
+            elif switch and custom_all_reduce_pieces(partial) is not None:
                 path = "bf16_pieces"
             else:
                 path = "fp32"
@@ -287,7 +287,7 @@ def main() -> None:
                     args.iters,
                 )
                 case["us_switched"] = _time(
-                    lambda: wo_b_all_reduce(partial, True, True), args.iters
+                    lambda: wo_b_all_reduce(partial, True), args.iters
                 )
             results.append(case)
 
@@ -345,7 +345,6 @@ def main() -> None:
                 {
                     "verdict": verdict,
                     "switch": switch,
-                    "pieces_switch": pieces_switch,
                     "equal": equal,
                     "switched_equal": switched_ok,
                     "switched_no_less_accurate": no_less_accurate,

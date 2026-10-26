@@ -20,9 +20,8 @@ if TYPE_CHECKING:
     VLLM_AMPERE_MARLIN_BUILD: bool = False
     VLLM_CUSTOM_ALLREDUCE_PCIE_P2P: bool = False
     VLLM_CUSTOM_ALLREDUCE_ALGO: str = ""
-    VLLM_CUSTOM_ALLREDUCE_FLAGS: bool = False
+    VLLM_SM80_ALLREDUCE: bool = False
     VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES: int = 262144
-    VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S: float = 60.0
     VLLM_GLM5_PREFILL_KERNELS: bool = False
     VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE: bool = False
     VLLM_GLM5_PREFILL_MIN_TOKENS: int = 512
@@ -90,8 +89,6 @@ if TYPE_CHECKING:
     VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI: bool = False
     VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS: str = "9-32"
-    VLLM_HOST_ALLREDUCE: bool = False
-    VLLM_ROUND_ONCE_ALLREDUCE_GROUPED: bool = False
     VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_EXL3_DENSE_SPLITK: bool = False
     VLLM_EXL3_DENSE_MMA: bool = False
@@ -102,11 +99,9 @@ if TYPE_CHECKING:
     VLLM_EXL3_HYBRID: bool = False
     VLLM_QWEN_QSA_TOPK_SORTED: bool = True
     VLLM_QWEN4_QSA_TOPK_CANONICAL: bool = False
-    VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE: bool = False
-    VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE: bool = False
     VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE: bool = False
-    VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE: bool = False
-    VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE: bool = False
+    VLLM_SM80_ALLREDUCE_ROUND_ONCE: bool = False
+    VLLM_SM80_PREFILL_REDUCE_OVERLAP: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
     VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
@@ -239,23 +234,30 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # whitespace stripping, raising on anything else the way the kernel
     # throws at its first all-reduce.
     "VLLM_CUSTOM_ALLREDUCE_ALGO": lambda: _custom_allreduce_algo(),
-    # Flags-in-data two-shot all-reduce for bf16 messages up to
-    # VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES at TP2 or TP4 over PCIe peer-to-peer
-    # (vllm/sm80/distributed/custom_all_reduce_flags.py). Bitwise identical to
-    # cross_device_reduce_2stage at TP4 (the kernel it replaces only under
-    # VLLM_CUSTOM_ALLREDUCE_ALGO=2stage; the default one-stage kernel sums in a
-    # different order) and to upstream's one-stage or two-stage kernel at TP2.
-    # Off unless set.
-    "VLLM_CUSTOM_ALLREDUCE_FLAGS": lambda: bool(
-        int(os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", "0"))
+    # The fork's tensor-parallel all-reduce transports, each message sent on
+    # the one its world size, bytes, dtype and the CUDA graph state select
+    # (the order is listed in vllm/sm80/distributed/communicator.py):
+    # - the host-staged all-reduce (host_shm_all_reduce.py), TP groups only;
+    #   it stands aside where VLLM_CUSTOM_ALLREDUCE_PCIE_P2P is set and peer
+    #   access works;
+    # - inside the PCIe peer-to-peer custom all-reduce, the flags-in-data
+    #   two-shot kernel (custom_all_reduce_flags.py) for BF16 messages up to
+    #   allreduce/flags_max_bytes of the sm80 tuning table at TP2 or TP4,
+    #   bitwise identical to cross_device_reduce_2stage at TP4 and to
+    #   upstream's kernels at TP2;
+    # - for the sums a model layer owns (DeepSeek-V4.1's wo_b and MoE outputs),
+    #   on eager steps, the copy-engine ring (ce_ring_all_reduce.py) for
+    #   messages the two paths above do not take (device memory per rank: one
+    #   scratch slot per ring step for a max_num_batched_tokens x hidden FP32
+    #   message); round-once sums take its owner sum (FP32 in rank order).
+    # VLLM_CUSTOM_ALLREDUCE_PCIE_P2P stays the hardware gate of every
+    # peer-to-peer path. Default OFF: unset, every group gets upstream's
+    # communicator and dispatch.
+    "VLLM_SM80_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_SM80_ALLREDUCE", "0"))
     ),
     "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES": lambda: int(
         os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", "262144")
-    ),
-    # Longest a flags-in-data all-reduce waits for a peer before it records
-    # the overrun and traps (the process then exits with the record logged).
-    "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S": lambda: float(
-        os.getenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "60")
     ),
     # Opt in to the sm_80 prefill kernels (the mHC pre-norm GEMM in
     # vllm/sm80/kernels/mhc/ and the sparse-MLA prefill in
@@ -772,29 +774,6 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS": lambda: os.getenv(
         "VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS", "9-32"
     ).strip(),
-    # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
-    # (the CMP 170HX case). Off by default. When on it stands aside only if
-    # VLLM_CUSTOM_ALLREDUCE_PCIE_P2P is also set *and* peer access is
-    # really there, so the two fast paths are mutually exclusive by the
-    # operator's choice rather than by what the driver happens to report. See
-    # vllm/sm80/distributed/host_shm_all_reduce.py.
-    "VLLM_HOST_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_HOST_ALLREDUCE", "0"))
-    ),
-    # Round-once all-reduce of large messages for the model call sites that ask
-    # for one (DeepSeek-V4.1: VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE and
-    # VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE) over grouped NCCL send/recv:
-    # a reduce-scatter in the message dtype, each rank's chunk summed in FP64
-    # in rank order and rounded once (the exact sum correctly rounded while the
-    # partials' magnitudes lie within about 2^40 of each other), then an
-    # all-gather. The same bytes as NCCL's ring, which instead rounds every hop
-    # (TP4: about a third of BF16 elements differ from the correct rounding).
-    # Off: those call sites use the custom all-reduce in pieces (slower at
-    # prefill sizes). Eager steps only. Default OFF. Any TP size; see
-    # vllm/sm80/distributed/round_once_all_reduce.py.
-    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED": lambda: bool(
-        int(os.getenv("VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "0"))
-    ),
     # Largest message the host path serves; anything above goes to NCCL. 512 KiB
     # is where the measured curve stops paying: at 8-256 KiB the host path is
     # 1.06-2.04x NCCL, while prefill-sized messages (>= 2 MiB) already run near
@@ -908,80 +887,57 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN4_QSA_TOPK_CANONICAL": lambda: bool(
         int(os.getenv("VLLM_QWEN4_QSA_TOPK_CANONICAL", "0"))
     ),
-    # DeepSeek-V4.1 on sm_80: all-reduce the wo_b partials in BF16 when the
-    # custom all-reduce takes that message (its own should_custom_ar, and the
-    # host-staged path not taking it first). That kernel accumulates in FP32
-    # in a fixed order and rounds once, which gives the bits of today's FP32
-    # all-reduce at half the bytes; every other message keeps the FP32 sum
-    # rounded once. Default OFF: unset, every wo_b partial is all-reduced in
-    # FP32. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
-    "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE", "0"))
-    ),
-    # DeepSeek-V4.1 on sm_80: all-reduce a wo_b partial that is too large for
-    # the custom all-reduce to take whole (prefill and mixed steps; above 819
-    # rows of 5120 at the 8 MiB buffer) in BF16, rounded once: over grouped
-    # NCCL send/recv with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED, else through that
-    # same custom all-reduce in pieces below its buffer when it takes them.
-    # Each element is summed in FP32 in a fixed order and rounded to BF16
-    # once, as on the FP32 path and in the reference's RowParallelLinear
-    # (y.float(), all_reduce, type_as). The FP32 sum of four BF16 partials is
-    # exact when their magnitudes lie within a factor 2^14 of each other, so
-    # such elements get the FP32 path's bits in any order; others can differ
-    # in the last BF16 bit where the inexact FP32 sum rounds differently in
-    # another order, as the FP32 path's own ring order already can. Half the
-    # bytes of the FP32 message. Eager steps only: never during CUDA graph
-    # capture or its warm-up. Default OFF: unset, such partials are
-    # all-reduced in FP32. Read in
-    # vllm/models/deepseek_v41/nvidia/sm80_attention.py.
-    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE", "0"))
-    ),
     # DeepSeek-V4.1 on sm_80: all-reduce the MoE output partial (routed experts
     # plus the shared-expert shard, BF16) that is too large for the custom
-    # all-reduce to take whole (prefill and mixed steps) rounded once, as
-    # VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE does for wo_b (grouped NCCL
-    # with VLLM_ROUND_ONCE_ALLREDUCE_GROUPED, else the custom all-reduce in
-    # pieces), instead of NCCL's BF16 ring. Precision: NCCL's ring stores every
-    # hop's sum in BF16, so a TP4 element is rounded three times (CPU emulation:
-    # about a third of the elements differ from one rounding of the FP32 sum);
-    # round-once paths round each element once (grouped: the correctly rounded
-    # sum; pieces: the FP32 sum in a fixed order), as the custom all-reduce
-    # already does for the decode-sized messages it takes whole and as the
-    # reference all-reduces its MoE output in FP32. Speed: grouped moves the
-    # ring's bytes; the custom all-reduce pieces move them more slowly.
-    # The layer does the reduction the runner would do (skip_final_all_reduce);
-    # every other message takes the communicator's usual path. Eager steps
-    # only. Default OFF: unset, the runner all-reduces the MoE output as today.
-    # Read in vllm/models/deepseek_v41/nvidia/sm80_moe.py.
+    # all-reduce to take whole (prefill and mixed steps) rounded once, on the
+    # copy-engine ring's owner sum (VLLM_SM80_ALLREDUCE) or else the custom
+    # all-reduce in pieces, instead of NCCL's BF16 ring. Precision: NCCL's ring
+    # stores every hop's sum in BF16, so a TP4 element is rounded three times
+    # (CPU emulation: about a third of the elements differ from one rounding of
+    # the FP32 sum); round-once paths sum each element in FP32 in a fixed order
+    # and round once, as the custom all-reduce already does for the
+    # decode-sized messages it takes whole and as the reference all-reduces its
+    # MoE output in FP32. The layer does the reduction the runner would do
+    # (skip_final_all_reduce); every other message takes the communicator's
+    # usual path. Eager steps only. Default OFF: unset, the runner all-reduces
+    # the MoE output as today. Read in
+    # vllm/models/deepseek_v41/nvidia/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE", "0"))
     ),
-    # DeepSeek-V4.1 on sm_80: in eager steps of at least 1024 rows, run each
-    # target decoder layer's wo_b, FFN and both TP all-reduces in two row
-    # slices, the all-reduces on a side stream, so one slice's all-reduce runs
-    # beside the other slice's compute (sm80_split_reduce.py). Each slice's
-    # message takes the path the whole message would; steps whose slices the
+    # Sum the BF16 partials of the TP ranks that a layer all-reduces itself
+    # (DeepSeek-V4.1's attention wo_b) with one rounding per element: each
+    # element accumulated in FP32 in a fixed order and rounded once to BF16,
+    # as the switch-off FP32 all-reduce does, at half its bytes. The message
+    # stays BF16 wherever its transport rounds once: the host-staged or custom
+    # all-reduce when it takes the message whole (decode), else on eager steps
+    # the copy-engine ring's owner sum (VLLM_SM80_ALLREDUCE) or the custom
+    # all-reduce in pieces below its buffer (prefill). Any other message is
+    # all-reduced in FP32 and rounded once (CUDA graph capture of a message
+    # too large for the custom all-reduce, a backend dispatched before the
+    # custom all-reduce). The FP32 sum of four BF16 partials is exact when
+    # their magnitudes lie within a factor 2^14 of each other, so such
+    # elements get the FP32 path's bits in any order; others can differ in
+    # the last BF16 bit where a transport sums in another order than the FP32
+    # path's (the ring's owner sum, the pieces). The function
+    # (sm80_attention.round_once_all_reduce) takes any consumer's partial.
+    # Default OFF: unset, wo_b partials are all-reduced in FP32 and rounded
+    # once. Read in vllm/models/deepseek_v41/nvidia/sm80_attention.py.
+    "VLLM_SM80_ALLREDUCE_ROUND_ONCE": lambda: bool(
+        int(os.getenv("VLLM_SM80_ALLREDUCE_ROUND_ONCE", "0"))
+    ),
+    # In eager steps of at least 1024 rows, run each target decoder layer's
+    # wo_b, FFN and both TP all-reduces in two row slices, the all-reduces on
+    # a side stream, so one slice's all-reduce runs beside the other slice's
+    # compute (DeepSeek-V4.1: sm80_split_reduce.py). Each slice's message
+    # takes the path the whole message would; steps whose slices the
     # host-staged or custom all-reduce would take run whole. Not bit-equal to
     # the unsplit step (NCCL's ring and the two-stage custom all-reduce both
     # sum an element in an order set by its place in the message); judged by
-    # the V2 prefill dNLL check. Default OFF:
-    # unset, every layer runs whole. Read in
-    # vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
-    "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE", "0"))
-    ),
-    # DeepSeek-V4.1 on sm_80: TP all-reduces of the FP32 wo_b partial and of the
-    # MoE output that the host-staged and custom all-reduce do not take (eager
-    # prefill-sized messages) run on a copy-engine ring instead of NCCL
-    # (vllm/sm80/distributed/ce_ring_all_reduce.py): copy-engine copies into
-    # the next rank's IPC scratch, one-block flag kernels and one add per
-    # reduce-scatter step. Device memory per rank: one scratch slot per ring
-    # step for a max_num_batched_tokens x hidden FP32 message (63 MiB at TP4,
-    # 2048 x 5120). The sum order is the ring's, not NCCL's. Default OFF.
+    # the V2 prefill dNLL check. Default OFF: unset, every layer runs whole.
     # Read in vllm/models/deepseek_v41/nvidia/sm80_model.py and sm80_moe.py.
-    "VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE", "0"))
+    "VLLM_SM80_PREFILL_REDUCE_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_SM80_PREFILL_REDUCE_OVERLAP", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
     # post + pre at every sublayer boundary and the pre-only entries) through
@@ -1448,7 +1404,6 @@ RETIRED_ENV_VARS: dict[str, str] = {
         "padding mask cutoff whether or not VLLM_AMPERE_DECODE_KERNELS is on"
     ),
     "VLLM_GLM5_FLA_PIN_AUTOTUNE": "renamed to VLLM_FLA_PIN_AUTOTUNE",
-    "VLLM_GLM5_HOST_ALLREDUCE": "renamed to VLLM_HOST_ALLREDUCE",
     "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": "renamed to VLLM_HOST_ALLREDUCE_MAX_SIZE",
     "VLLM_GLM5_MEM_ATTRIBUTION": "renamed to VLLM_MEM_ATTRIBUTION",
     "VLLM_GLM5_MOE_MASK_PADDING": (
@@ -1484,6 +1439,30 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_TP4_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_NARROW",
     "VLLM_GLM5_TP4_MARLIN_PREFILL": (
         "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
+    ),
+    "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": (
+        "renamed to VLLM_SM80_PREFILL_REDUCE_OVERLAP"
+    ),
+    # Merged: one switch per operation across models.
+    "VLLM_GLM5_HOST_ALLREDUCE": (
+        "merged into VLLM_SM80_ALLREDUCE, which picks the transport per message"
+    ),
+    "VLLM_HOST_ALLREDUCE": (
+        "merged into VLLM_SM80_ALLREDUCE, which picks the transport per message"
+    ),
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS": (
+        "merged into VLLM_SM80_ALLREDUCE, which picks the transport per message"
+    ),
+    "VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE": (
+        "merged into VLLM_SM80_ALLREDUCE, which picks the transport per message"
+    ),
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": (
+        "merged into VLLM_SM80_ALLREDUCE_ROUND_ONCE (wo_b partials summed with "
+        "one rounding, in BF16 where the transport rounds once)"
+    ),
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": (
+        "merged into VLLM_SM80_ALLREDUCE_ROUND_ONCE (wo_b partials summed with "
+        "one rounding, in BF16 where the transport rounds once)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (
@@ -1521,12 +1500,21 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR": (
         "replaced by $VLLM_CACHE_ROOT/custom_all_reduce_flags"
     ),
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S": (
+        "replaced by the constant WAIT_S (60 s) in "
+        "vllm/sm80/distributed/custom_all_reduce_flags.py"
+    ),
     "VLLM_GLM5_AUX_HIDDEN_TENSOR": (
         "replaced by the model config field aux_hidden_state_tensor; for the "
         "branch tensor pass --hf-overrides "
         '{"text_config": {"aux_hidden_state_tensor": "branch"}}'
     ),
     # Removed with the code they selected.
+    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED": (
+        "removed with the grouped NCCL round-once all-reduce: the copy-engine "
+        "ring's owner sum (VLLM_SM80_ALLREDUCE) takes every message it could "
+        "take"
+    ),
     "VLLM_GLM5_DECODE_MHC": (
         "removed with the v1 sm_80 mHC decode kernel; the v3 kernel, opted in "
         "with VLLM_GLM5_DECODE_MHC_V2, covers the same shapes"

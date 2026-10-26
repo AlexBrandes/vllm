@@ -83,8 +83,8 @@ def test_layer_all_reduce_moves_the_final_all_reduce_into_the_layer(
 ) -> None:
     """The adopted MoE's forward is its reduce of its forward_partial: the
     round-once all-reduce with VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE,
-    else the runner's own all-reduce (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE
-    alone)."""
+    else the runner's own all-reduce (VLLM_SM80_PREFILL_REDUCE_OVERLAP or
+    VLLM_SM80_ALLREDUCE alone)."""
     ffn = _bare_moe()
     sm80_moe._adopt_layer_all_reduce(ffn, round_once=round_once)
     assert type(ffn) is sm80_moe.Sm80DeepseekV41MoE
@@ -135,72 +135,6 @@ def test_moe_round_once_allreduce_default_off(monkeypatch) -> None:
     import vllm.envs as envs
 
     name = "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE"
-    monkeypatch.delenv(name, raising=False)
-    assert getattr(envs, name) is False
-    monkeypatch.setenv(name, "1")
-    assert getattr(envs, name) is True
-
-
-def _grouped(monkeypatch, takes=True):
-    """VLLM_ROUND_ONCE_ALLREDUCE_GROUPED on, with the grouped transport faked:
-    it records the message and returns the FP32 sum of four equal partials."""
-    monkeypatch.setenv("VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "1")
-    calls = []
-
-    def grouped(t, pynccl):
-        calls.append((t.dtype, tuple(t.shape), pynccl))
-        return (t.float() * 4).to(t.dtype)
-
-    monkeypatch.setattr(sm80, "grouped_round_once_takes", lambda t, comm: takes)
-    monkeypatch.setattr(sm80, "nccl_round_once_all_reduce", grouped)
-    return calls
-
-
-@pytest.mark.parametrize(
-    "case,rows,grouped",
-    [
-        ("too_large", 40, True),
-        ("whole_fits", 7, False),
-        ("host_takes", 40, False),
-        ("grouped_declines", 40, False),
-    ],
-)
-def test_grouped_round_once_for_large_messages(monkeypatch, case, rows, grouped):
-    """With VLLM_ROUND_ONCE_ALLREDUCE_GROUPED a message the fast paths do not
-    take whole goes to the grouped NCCL round-once all-reduce (never the custom
-    all-reduce pieces); any other message keeps its path (MoE: the runner's
-    all-reduce; wo_b: the FP32 all-reduce)."""
-    ca = _PieceCustomAllreduce(_MAX)
-    seen = _comm(monkeypatch, ca, host_takes=case == "host_takes")
-    comm = sm80.get_tp_group().device_communicator
-    comm.pynccl_comm = "pynccl"
-    calls = _grouped(monkeypatch, takes=case != "grouped_declines")
-    out = torch.randn(rows, 64, generator=torch.Generator().manual_seed(5)).to(BF16)
-    got = sm80_moe.moe_all_reduce(out)
-    assert not ca.pieces
-    if grouped:
-        assert calls == [(BF16, (rows, 64), "pynccl")] and not seen
-        assert torch.equal(got, (out.float() * 4).to(BF16))
-    else:
-        assert not calls and seen == [BF16]
-
-    fp32 = []
-
-    def all_reduce(t):
-        fp32.append(t.dtype)
-        return t * 4
-
-    monkeypatch.setattr(sm80, "tensor_model_parallel_all_reduce", all_reduce)
-    calls.clear()
-    got = sm80.wo_b_all_reduce(out, False, True)
-    assert torch.equal(got, (out.float() * 4).to(BF16))
-    assert (calls != []) == grouped and (fp32 == []) == grouped
-
-
-def test_round_once_allreduce_grouped_default_off(monkeypatch) -> None:
-    import vllm.envs as envs
-
-    name = "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED"
     monkeypatch.delenv(name, raising=False)
     assert getattr(envs, name) is False
     monkeypatch.setenv(name, "1")

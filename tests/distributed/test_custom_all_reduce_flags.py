@@ -34,15 +34,15 @@ CPU_ENV = dict(os.environ, CUDA_VISIBLE_DEVICES="")
 # ---------------------------------------------------------------- env and gate
 def test_env_defaults(monkeypatch):
     for name in (
-        "VLLM_CUSTOM_ALLREDUCE_FLAGS",
+        "VLLM_SM80_ALLREDUCE",
         "VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
-    assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS is False
+    assert envs.VLLM_SM80_ALLREDUCE is False
     assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES == 262144
-    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS", "1")
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE", "1")
     monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES", "65536")
-    assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS is True
+    assert envs.VLLM_SM80_ALLREDUCE is True
     assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_MAX_BYTES == 65536
 
 
@@ -333,9 +333,43 @@ def test_init_not_called_when_off():
     src = inspect.getsource(comm.Sm80CudaCommunicator.__init__)
     # the class swap and the setup are reached only under the flag
     assert re.search(
-        r"if envs\.VLLM_CUSTOM_ALLREDUCE_FLAGS and ca_comm is not None", src
+        r"if envs\.VLLM_SM80_ALLREDUCE and ca_comm is not None", src
     )
     assert "ca_comm.__class__ = Sm80CustomAllreduce" in src
+
+
+def _bare_communicator(**attrs):
+    c = object.__new__(comm.Sm80CudaCommunicator)
+    for name in ("fi_pcie_ipc_ar_comm", "fi_ar_comm", "pynccl_comm", "qr_comm",
+                 "aiter_ar_comm", "hostshm_comm", "ca_comm", "symm_mem_comm"):
+        setattr(c, name, None)
+    c.use_aiter_allreduce = False
+    c._defer_backend_log = False
+    c.world_size = 4
+    for name, value in attrs.items():
+        setattr(c, name, value)
+    return c
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_backend_line_names_the_transport_switch(monkeypatch, log_capture, on):
+    """The backend-selection line says when VLLM_SM80_ALLREDUCE picks the
+    transport per message (one line per group: distinct names per case)."""
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE", "1" if on else "0")
+    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_PCIE_P2P", raising=False)
+    name = f"tp:transport-note-{on}"
+    _bare_communicator(unique_name=name)._log_all_reduce_backend_selection()
+    lines = [m for m in log_capture.messages if name in m]
+    assert len(lines) == 1, log_capture.messages
+    assert ("VLLM_SM80_ALLREDUCE=1: the fork's all-reduce transports" in lines[0]) is on
+
+
+def test_switch_selects_the_fork_communicator(monkeypatch):
+    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_PCIE_P2P", raising=False)
+    monkeypatch.delenv("VLLM_SM80_ALLREDUCE", raising=False)
+    assert comm.needs_fork_communicator() is False
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE", "1")
+    assert comm.needs_fork_communicator() is True
 
 
 # ------------------------------------------------------------ kernel source
@@ -489,16 +523,12 @@ def test_jit_build(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------ wait overrun
-def test_wait_limit_env(monkeypatch):
-    monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", raising=False)
-    assert envs.VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S == 60.0
+def test_wait_limit_constant(monkeypatch):
+    assert flags.WAIT_S == 60.0
     assert flags.wait_limit_ns() == 60 * 10**9
-    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "2.5")
+    # read at call time, so a test can shorten it
+    monkeypatch.setattr(flags, "WAIT_S", 2.5)
     assert flags.wait_limit_ns() == 2_500_000_000
-    for bad in ("0", "-1"):
-        monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", bad)
-        with pytest.raises(ValueError):
-            flags.wait_limit_ns()
 
 
 def test_kernel_source_never_falls_through():
@@ -524,7 +554,7 @@ def test_describe():
     msg = flags.describe(REC)
     for part in ("timed out on rank 2", "61.0 s", "limit 60.0 s", "call 41",
                  "stage 0", "1536 packs", "reduce-scatter wait for rank 3",
-                 "block 5, thread 17", "trapped", "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S"):
+                 "block 5, thread 17", "trapped", "custom_all_reduce_flags.WAIT_S"):
         assert part in msg, (part, msg)
     assert "all-gather" in flags.describe(REC[:5] + [2] + REC[6:])
 
@@ -717,6 +747,7 @@ def test_model_late_rank_beyond_limit_traps():
 OVERRUN_CHILD = r"""
 import sys, torch
 from vllm.sm80.distributed import custom_all_reduce_flags as f
+f.WAIT_S = 2.0
 m = f.load_module()
 rec = f.ErrorRecord(m)
 size_bytes = 8192
@@ -743,7 +774,7 @@ def test_gpu_overrun_kills_process_with_message(tmp_path):
 
     script = tmp_path / "child.py"
     script.write_text(OVERRUN_CHILD)
-    env = dict(os.environ, VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S="2")
+    env = dict(os.environ)
     t0 = time.time()
     r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
                        env=env, timeout=600)
@@ -800,7 +831,7 @@ def test_gpu_two_ranks_bitwise_vs_custom_allreduce(monkeypatch, algo):
         monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_ALGO", algo)
     else:
         monkeypatch.delenv("VLLM_CUSTOM_ALLREDUCE_ALGO", raising=False)
-    monkeypatch.setenv("VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S", "20")
+    monkeypatch.setattr(flags, "WAIT_S", 20.0)
     devs = [torch.device("cuda", r) for r in range(2)]
     # a device-to-device copy makes torch enable peer access, one direction each
     for a, b in ((0, 1), (1, 0)):

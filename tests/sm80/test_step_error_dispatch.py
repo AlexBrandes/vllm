@@ -20,7 +20,7 @@ class CheckedOutput(AsyncModelRunnerOutput):
     def get_output(self):
         self.reads += 1
         if self.fail:
-            raise ValueError("round-once requires a finite exponent span")
+            raise ValueError("copy-engine ring all-reduce: a peer flag did not arrive")
         return "valid output"
 
 
@@ -44,7 +44,7 @@ def test_non_output_rank_consumes_existing_async_output(fail):
     assert output.reads == 0, "the RPC thread must not wait for the output copy"
     queued = worker.async_output_queue.get_nowait()
     if fail:
-        with pytest.raises(ValueError, match="finite exponent span"):
+        with pytest.raises(ValueError, match="a peer flag did not arrive"):
             worker.enqueue_output(queued)
     else:
         worker.enqueue_output(queued)
@@ -65,4 +65,5 @@ def test_reply_rank_keeps_the_normal_failure_response():
     worker._execute_worker_rpc(("sample_tokens", (), {}, 0))
     worker.enqueue_output(worker.async_output_queue.get_nowait())
     assert output.reads == 1
-    assert replies == [(WorkerProc.ResponseStatus.FAILURE, "round-once requires a finite exponent span")]
+    assert replies == [(WorkerProc.ResponseStatus.FAILURE,
+                        "copy-engine ring all-reduce: a peer flag did not arrive")]

@@ -96,8 +96,7 @@ def test_fork_platform_offers_triton_mla_sparse_last(monkeypatch, major, expecte
     "switch",
     [
         None,
-        "VLLM_HOST_ALLREDUCE",
-        "VLLM_CUSTOM_ALLREDUCE_FLAGS",
+        "VLLM_SM80_ALLREDUCE",
         "VLLM_CUSTOM_ALLREDUCE_PCIE_P2P",
     ],
 )
@@ -110,8 +109,7 @@ def test_communicator_class_follows_the_switches(monkeypatch, switch):
     from vllm.utils.import_utils import resolve_obj_by_qualname
 
     for name in (
-        "VLLM_HOST_ALLREDUCE",
-        "VLLM_CUSTOM_ALLREDUCE_FLAGS",
+        "VLLM_SM80_ALLREDUCE",
         "VLLM_CUSTOM_ALLREDUCE_PCIE_P2P",
     ):
         monkeypatch.delenv(name, raising=False)

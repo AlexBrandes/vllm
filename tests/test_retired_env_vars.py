@@ -19,7 +19,6 @@ from vllm.sm80 import envs as fork_envs
 RENAMED = {
     "VLLM_GLM5_DECODE_MOE_MAX_TOKENS": "VLLM_MOE_MASK_PADDING_MAX_TOKENS",
     "VLLM_GLM5_FLA_PIN_AUTOTUNE": "VLLM_FLA_PIN_AUTOTUNE",
-    "VLLM_GLM5_HOST_ALLREDUCE": "VLLM_HOST_ALLREDUCE",
     "VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE": "VLLM_HOST_ALLREDUCE_MAX_SIZE",
     "VLLM_GLM5_MEM_ATTRIBUTION": "VLLM_MEM_ATTRIBUTION",
     "VLLM_GLM5_MOE_MASK_PADDING": "VLLM_MOE_MASK_PADDING",
@@ -45,6 +44,18 @@ RENAMED = {
     "VLLM_GLM5_TP4_MARLIN_PREFILL": "VLLM_AMPERE_MARLIN_PREFILL_NARROW",
     "VLLM_DEEPSEEK_V41_DSPARK_SHARD_ARGMAX": "VLLM_DSPARK_SHARD_ARGMAX",
     "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": "VLLM_SM80_TARGET_SHARD_ARGMAX",
+    "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE": "VLLM_SM80_PREFILL_REDUCE_OVERLAP",
+}
+
+MERGED = {
+    "VLLM_GLM5_HOST_ALLREDUCE": "VLLM_SM80_ALLREDUCE",
+    "VLLM_HOST_ALLREDUCE": "VLLM_SM80_ALLREDUCE",
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS": "VLLM_SM80_ALLREDUCE",
+    "VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE": "VLLM_SM80_ALLREDUCE",
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": "VLLM_SM80_ALLREDUCE_ROUND_ONCE",
+    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": (
+        "VLLM_SM80_ALLREDUCE_ROUND_ONCE"
+    ),
 }
 
 REPLACED_OR_REMOVED = {
@@ -60,6 +71,7 @@ REPLACED_OR_REMOVED = {
     "VLLM_GLM5_LOCAL_LOGITS",
     "VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR",
     "VLLM_CUSTOM_ALLREDUCE_FLAGS_BUILD_DIR",
+    "VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S",
     "VLLM_GLM5_AUX_HIDDEN_TENSOR",
     "VLLM_GLM5_DECODE_MHC",
     "VLLM_GLM5_DECODE_MHC_MAX_TOKENS",
@@ -93,15 +105,18 @@ REPLACED_OR_REMOVED = {
     "VLLM_EXL3_EXPERT_REPLICAS",
     "VLLM_EXL3_EXPERT_REPLICAS_SHA256",
     "VLLM_DEEPSEEK_V41_WO_A_STRIDED",
+    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED",
 }
 
 
 def test_table_lists_every_retired_name():
-    assert set(fork_envs.RETIRED_ENV_VARS) == set(RENAMED) | REPLACED_OR_REMOVED
+    assert set(fork_envs.RETIRED_ENV_VARS) == (
+        set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED
+    )
     assert all(fork_envs.RETIRED_ENV_VARS.values())
 
 
-@pytest.mark.parametrize("name", sorted(set(RENAMED) | REPLACED_OR_REMOVED))
+@pytest.mark.parametrize("name", sorted(set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED))
 def test_retired_name_is_not_declared(name):
     assert name not in envs.environment_variables
 
@@ -112,7 +127,15 @@ def test_renamed_name_points_at_its_replacement(old, new):
     assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"renamed to {new}")
 
 
-@pytest.mark.parametrize("old,new", sorted(RENAMED.items()))
+@pytest.mark.parametrize("old,new", sorted(MERGED.items()))
+def test_merged_name_points_at_its_replacement(old, new):
+    assert new in envs.environment_variables
+    assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"merged into {new}")
+
+
+@pytest.mark.parametrize(
+    "old,new", sorted(RENAMED.items()) + sorted(MERGED.items())
+)
 def test_retired_value_is_never_used(monkeypatch, old, new):
     monkeypatch.delenv(old, raising=False)
     monkeypatch.delenv(new, raising=False)

@@ -202,11 +202,13 @@ for the attention indexer and its FP8 stores, and sm_80 key-pool compression
 GEMMs tuned per shape, up to 32 rows — `VLLM_THIN_GEMM`. MoE shared
 experts that overlap the routed experts — `VLLM_SHARED_EXPERT_REORDER`.
 
-**All-reduce over PCIe.** For cards without GPU peer access, small all-reduces
-take one round trip through shared host memory — `VLLM_HOST_ALLREDUCE`.
-Where peer access is granted, a PCIe custom all-reduce runs in device memory
-instead — `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`, kernel chosen by
-`VLLM_CUSTOM_ALLREDUCE_ALGO`; it falls back to the host path on its own.
+**All-reduce over PCIe.** One switch, `VLLM_SM80_ALLREDUCE`, picks the
+transport per message: for cards without GPU peer access, small all-reduces
+take one round trip through shared host memory; where peer access is granted
+(`VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`, kernel chosen by
+`VLLM_CUSTOM_ALLREDUCE_ALGO`), a PCIe custom all-reduce with a flags-in-data
+kernel runs in device memory instead and falls back to the host path on its
+own; prefill-sized sums a layer owns run on a copy-engine ring.
 
 **KV accounting.** The KV reserve covers what prefill chunks in flight really
 hold, so the reported pool is one the server can fill —

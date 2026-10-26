@@ -227,7 +227,7 @@ def _custom_allreduce():
 def _flags_unavailable(runner) -> str | None:
     if getattr(_custom_allreduce(), "_flags", None) is None:
         return (
-            "boot with VLLM_CUSTOM_ALLREDUCE_FLAGS=1 and the flags-in-data path "
+            "boot with VLLM_SM80_ALLREDUCE=1 and the flags-in-data path "
             "on; its off arm runs the existing kernel"
         )
     return None
@@ -1033,7 +1033,7 @@ SWITCHES: dict[str, Switch] = {
             lambda runner: _env_flag("VLLM_GLM5_TOPK_TIEFIX"), _tiefix_apply,
         ),
         Switch(
-            "custom_allreduce_flags", "VLLM_CUSTOM_ALLREDUCE_FLAGS", True, False,
+            "custom_allreduce_flags", "VLLM_SM80_ALLREDUCE", True, False,
             _flags_unavailable, _flags_current, _flags_apply,
         ),
         Switch(

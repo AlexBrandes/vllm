@@ -3,21 +3,40 @@
 """The fork's CUDA device communicator.
 
 ``vllm.sm80.platform`` returns :class:`Sm80CudaCommunicator` from
-``get_device_communicator_cls`` only while one of the fork's all-reduce
-switches is set (:func:`needs_fork_communicator`); otherwise every group
-gets upstream's ``CudaCommunicator``. On top of upstream it adds:
+``get_device_communicator_cls`` only while ``VLLM_SM80_ALLREDUCE`` or
+``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`` is set (:func:`needs_fork_communicator`);
+otherwise every group gets upstream's ``CudaCommunicator``. On top of
+upstream it adds:
 
-- the host-staged all-reduce (``VLLM_HOST_ALLREDUCE``,
+- the host-staged all-reduce (``VLLM_SM80_ALLREDUCE``,
   ``host_shm_all_reduce.py``), TP groups only, tried before every upstream
   backend in ``all_reduce``;
-- the flags-in-data two-shot path (``VLLM_CUSTOM_ALLREDUCE_FLAGS``,
+- the flags-in-data two-shot path (``VLLM_SM80_ALLREDUCE``,
   ``custom_all_reduce_flags.py``) inside the custom all-reduce: ``ca_comm``
   becomes a :class:`Sm80CustomAllreduce`, whose ``custom_all_reduce`` tries
   the flags kernel first, at the same point upstream's own kernel is chosen;
 - with ``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`` the bytes-moving
   ``gpu_p2p_access_check`` probe stays mandatory: ``VLLM_SKIP_P2P_CHECK`` is
   read as 0 while upstream builds the custom all-reduce;
-- the HOSTSHM entry and the PCIe note in the backend-selection log line.
+- the HOSTSHM entry and the PCIe and transport notes in the
+  backend-selection log line.
+
+With ``VLLM_SM80_ALLREDUCE`` each message of a TP all-reduce takes the first
+of these transports that takes it (world size, bytes, dtype, CUDA graph
+capture):
+
+1. the host-staged all-reduce: BF16/FP32 up to its size limit, TP2/TP4 on one
+   node; built only where it does not stand aside for working PCIe peer
+   access under ``VLLM_CUSTOM_ALLREDUCE_PCIE_P2P``;
+2. the custom all-reduce (PCIe peer access): the flags-in-data kernel for
+   BF16 up to its size limit at TP2/TP4, else upstream's kernel up to its
+   buffer size;
+3. upstream's remaining backends (NCCL).
+
+Layer-owned sums of eager prefill-sized messages (DeepSeek-V4.1's wo_b and
+MoE outputs) go, ahead of 3., to the copy-engine ring
+(``ce_ring_all_reduce.py``; round-once sums take its owner sum); the model's
+own all-reduce helpers make that choice.
 
 Limitation: ``vllm.distributed.stateless_coordinator`` asserts that the
 platform's communicator class is upstream's ``CudaCommunicator``. Stateless
@@ -50,11 +69,7 @@ COMMUNICATOR_QUALNAME = "vllm.sm80.distributed.communicator.Sm80CudaCommunicator
 
 def needs_fork_communicator() -> bool:
     """Whether a fork all-reduce switch is set that this communicator serves."""
-    return bool(
-        envs.VLLM_HOST_ALLREDUCE
-        or envs.VLLM_CUSTOM_ALLREDUCE_FLAGS
-        or envs.VLLM_CUSTOM_ALLREDUCE_PCIE_P2P
-    )
+    return bool(envs.VLLM_SM80_ALLREDUCE or envs.VLLM_CUSTOM_ALLREDUCE_PCIE_P2P)
 
 
 @contextmanager
@@ -128,7 +143,7 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
         if reason is not None:
             logger.info_once(
                 "Custom all-reduce flags-in-data path requested "
-                "(VLLM_CUSTOM_ALLREDUCE_FLAGS=1) but off: %s",
+                "(VLLM_SM80_ALLREDUCE=1) but off: %s",
                 reason,
                 scope="global",
             )
@@ -144,9 +159,9 @@ class Sm80CustomAllreduce(car.CustomAllreduce):
         )
         logger.info_once(
             "Custom all-reduce flags-in-data two-shot kernel on for bf16 "
-            "messages up to %d bytes (VLLM_CUSTOM_ALLREDUCE_FLAGS=1); larger "
+            "messages up to %d bytes (VLLM_SM80_ALLREDUCE=1); larger "
             "messages and other dtypes keep the existing kernel; a peer wait over "
-            "%.0f s (VLLM_CUSTOM_ALLREDUCE_FLAGS_WAIT_S) traps and ends the process",
+            "%.0f s (custom_all_reduce_flags.WAIT_S) traps and ends the process",
             self._flags.max_bytes,
             self._flags.limit_ns / 1e9,
             scope="global",
@@ -205,7 +220,7 @@ class Sm80CudaCommunicator(CudaCommunicator):
         self._defer_backend_log = False
 
         ca_comm = self.ca_comm
-        if envs.VLLM_CUSTOM_ALLREDUCE_FLAGS and ca_comm is not None and (
+        if envs.VLLM_SM80_ALLREDUCE and ca_comm is not None and (
             not ca_comm.disabled
         ):
             ca_comm.__class__ = Sm80CustomAllreduce
@@ -216,7 +231,7 @@ class Sm80CudaCommunicator(CudaCommunicator):
         # GPU peer access works; otherwise it serves even where peers are
         # advertised, since ca_comm refuses PCIe above two GPUs without that flag.
         if (
-            envs.VLLM_HOST_ALLREDUCE
+            envs.VLLM_SM80_ALLREDUCE
             and unique_name.split(":")[0] == "tp"
             and self.world_size > 1
             and current_platform.is_cuda()
@@ -254,9 +269,9 @@ class Sm80CudaCommunicator(CudaCommunicator):
             ahead.append("AITER_CUSTOM")
         if ahead:
             raise RuntimeError(
-                "VLLM_HOST_ALLREDUCE=1 is tried before every other all-reduce "
-                f"backend, but {ahead} would have to come first; turn those off "
-                "or unset VLLM_HOST_ALLREDUCE."
+                "The host-staged all-reduce (VLLM_SM80_ALLREDUCE=1) is tried before "
+                f"every other all-reduce backend, but {ahead} would have to come "
+                "first; turn those off or unset VLLM_SM80_ALLREDUCE."
             )
 
     def _log_all_reduce_backend_selection(self) -> None:
@@ -327,13 +342,21 @@ class Sm80CudaCommunicator(CudaCommunicator):
                 " as fully connected for the custom all-reduce, and the"
                 " host-staged path stands aside wherever peer access is present."
             )
+        transport_note = ""
+        if envs.VLLM_SM80_ALLREDUCE:
+            transport_note = (
+                " VLLM_SM80_ALLREDUCE=1: the fork's all-reduce transports take"
+                " each message by world size, bytes, dtype and CUDA graph"
+                " capture."
+            )
         logger.info_once(
             "Using %s all-reduce backends (in dispatch order) for group "
-            "'%s' out of potential backends: %s.%s",
+            "'%s' out of potential backends: %s.%s%s",
             "[" + ", ".join(f"'{b}'" for b in enabled_ar_backends) + "]",
             self.unique_name or "<unnamed>",
             "[" + ", ".join(f"'{b}'" for b in all_potential_ar_backends) + "]",
             pcie_p2p_note,
+            transport_note,
             scope="global",
         )
 
