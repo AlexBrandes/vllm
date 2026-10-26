@@ -110,8 +110,8 @@ page says which layout each serves):
   its TP4 verify (the commit fold's included) with at most 16 rows per warp,
   less stack and more KV cache, bitwise the same
   (not yet validated, off unless set) — `VLLM_AMPERE_KDA_SMALL_STACK`;
-  the KDA step for PP4 decode batches beyond one short request (where it
-  measures faster) — `VLLM_GLM5_DECODE_KDA_WIDE`; second
+  under PP4 the KDA step also takes the decode batches beyond one short
+  request where it measures faster; second
   generation `VLLM_MOE_DECODE_ROUTE_V2`, `VLLM_GLM5_DECODE_MHC_V2`,
   `VLLM_AMPERE_DECODE_IDX_GLUE`; under TP4, the KDA state commit after
   sampling folded into the next decode step, same state bit for bit
@@ -120,10 +120,11 @@ page says which layout each serves):
   position instead of one per request (the reference without state
   recovery, as wherever that path's limits are not met) —
   `VLLM_AMPERE_KDA_RECOVER_OFF`.
-- Prefill kernels (mHC projection, sparse attention) — `VLLM_GLM5_PREFILL_KERNELS`,
-  `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`; at TP4 shapes `VLLM_AMPERE_KDA_PREFILL_NARROW`,
-  `VLLM_AMPERE_MARLIN_PREFILL_NARROW`; at PP4 shapes `VLLM_AMPERE_KDA_PREFILL_WIDE`,
-  `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE`, `VLLM_AMPERE_MARLIN_PREFILL_WIDE`.
+- Prefill kernels, one switch per operation, each picking its kernel by the
+  layout's head count or expert width: mHC projection — `VLLM_SM80_MHC_PREFILL`;
+  sparse attention — `VLLM_SM80_SPARSE_MLA_PREFILL`, `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`;
+  KDA chunked prefill — `VLLM_SM80_KDA_PREFILL`; split-block Marlin MoE
+  prefill — `VLLM_SM80_MARLIN_PREFILL`.
 - Batch-sharded logits and sampling (TP4) — `--enable-batch-sharded-sampling`.
 - Drafter: selector tables split across cards — `VLLM_GLM5_DRAFTER_SELECTOR_SHARD`;
   position table sized to the context — `VLLM_GLM5_DRAFTER_ROPE_FIT`; folded
@@ -235,11 +236,9 @@ both layouts: `VLLM_AMPERE_MARLIN_DECODE_CUDA` (eligible decode batches). Reques
 it without a compatible library fails at startup rather than falling back
 silently. The decode kernels split the first projection along K: faster, and
 the fp32 summation order differs from the released Marlin kernels. Under PP4
-the split-block prefill (`VLLM_AMPERE_MARLIN_PREFILL_WIDE`) also runs on the
-library's (64,512) tiles with a one-HFMA2 dequant —
-`VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (engine default off, on in the PP4
-serving defaults), the released kernels without the library; TP4 prefill uses
-the released kernels.
+the split-block prefill (`VLLM_SM80_MARLIN_PREFILL`) also runs on the
+library's (64,512) tiles with a one-HFMA2 dequant, the released kernels
+without the library; TP4 prefill uses the released kernels.
 
 **Correctness fixes (always on).** 64-bit KV row offsets in the
 sparse-attention kernels and a vocabulary clamp in the sampler kernels.
