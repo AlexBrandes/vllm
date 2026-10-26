@@ -420,7 +420,7 @@ def test_decode_scratch_waits_for_kv_sizing(monkeypatch, width, M):
 def test_kernel_warmup_opens_scratch_before_warmup():
     import inspect
 
-    from vllm.model_executor.warmup import kernel_warmup
+    from vllm.sm80.kernels import warmup as sm80_warmup
 
-    src = inspect.getsource(kernel_warmup.kernel_warmup)
+    src = inspect.getsource(sm80_warmup.warmup_from_worker)
     assert 0 < src.index("open_late_scratch()") < src.index("warmup_from_worker(worker)")
