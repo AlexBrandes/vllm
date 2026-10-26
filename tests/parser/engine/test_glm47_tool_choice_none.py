@@ -11,6 +11,7 @@ import torch
 from tests.parser.engine.conftest import make_mock_tokenizer
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.inputs.engine import tokens_input
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.parser.engine.parser_engine import ParserEngine
@@ -122,17 +123,22 @@ class MaskOnlyParser(PlainParser):
 def _preprocess(api, parser_cls, monkeypatch, reuse=False):
     request = _request(api, tool_choice="none")
     monkeypatch.setattr(type(request), "build_tok_params", lambda *a: MagicMock())
-    monkeypatch.setattr(type(request), "build_chat_params", lambda *a: ChatParams())
+    monkeypatch.setattr(
+        type(request), "build_chat_params", lambda *a, **kw: ChatParams()
+    )
     tokenizer = _parser().model_tokenizer
     renderer = object.__new__(OnlineRenderer)
     renderer.trust_request_mm_kwargs = False
+    renderer.reasoning_effort_map = {}
     renderer.model_config = SimpleNamespace(
-        multimodal_config=None, enable_prompt_embeds=False
+        multimodal_config=None, enable_prompt_embeds=False, is_encoder_decoder=False
     )
     renderer.renderer = MagicMock()
     renderer.renderer.tokenizer = tokenizer
     renderer.renderer.get_tokenizer.return_value = tokenizer
-    renderer.renderer.render_chat_async = AsyncMock(return_value=([[]], [{}]))
+    renderer.renderer.render_chat_async = AsyncMock(
+        return_value=([[]], [tokens_input([1])])
+    )
     tools = [{"type": "function", "function": {"name": "lookup"}}]
     if reuse:
         request.kv_transfer_params = {"prompt_token_ids": [1, 2, 3]}
@@ -214,12 +220,17 @@ def test_managed_parser_and_startup_banner(api, configuration, enabled, monkeypa
     assert banner.call_args.args[1] == ("enabled" if enabled == "1" else "disabled")
     renderer.model_config.multimodal_config = None
     renderer.model_config.enable_prompt_embeds = False
+    renderer.model_config.is_encoder_decoder = False
     renderer.renderer.tokenizer = tokenizer
     renderer.renderer.get_tokenizer.return_value = tokenizer
-    renderer.renderer.render_chat_async = AsyncMock(return_value=([[]], [{}]))
+    renderer.renderer.render_chat_async = AsyncMock(
+        return_value=([[]], [tokens_input([1])])
+    )
     request = _request(api, tool_choice="none", bad_words=["existing"])
     monkeypatch.setattr(type(request), "build_tok_params", lambda *a: MagicMock())
-    monkeypatch.setattr(type(request), "build_chat_params", lambda *a: ChatParams())
+    monkeypatch.setattr(
+        type(request), "build_chat_params", lambda *a, **kw: ChatParams()
+    )
     for _ in range(2):
         asyncio.run(
             renderer.preprocess_chat(
