@@ -155,6 +155,8 @@ class _StubRunner:
         self.shared_experts = shared
         self._log = log
         self.gate = None
+        # FusedMoERouter's default: monolithic kernels take the logits as is.
+        self.router = SimpleNamespace(prepare_monolithic_logits=lambda logits: logits)
         self.routed_experts = SimpleNamespace(
             quant_method=SimpleNamespace(is_monolithic=True),
             _ensure_moe_quant_config_init=lambda: None,
