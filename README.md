@@ -125,7 +125,7 @@ page says which layout each serves):
   `VLLM_AMPERE_MARLIN_PREFILL_NARROW`; at PP4 shapes `VLLM_AMPERE_KDA_PREFILL_WIDE`,
   `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE`, `VLLM_AMPERE_MARLIN_PREFILL_WIDE`.
 - Batch-sharded logits and sampling (TP4) — `--enable-batch-sharded-sampling`.
-- Drafter: selector tables split across cards — `VLLM_GLM5_DRAFTER_SELECTOR_SHARD`;
+- Drafter: selector tables split across cards — `VLLM_DFLASH2_SELECTOR_SHARD`;
   position table sized to the context — `VLLM_GLM5_DRAFTER_ROPE_FIT`; folded
   input projection under PP4 — `VLLM_GLM5_PP_FOLD_DRAFT_FC`.
 - Always on: a rejected draft can no longer overwrite the tail of the

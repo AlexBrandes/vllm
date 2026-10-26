@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_ADAPTIVE_DEPTH: str = ""
     VLLM_DSPARK_DEPTH_HINT: str = ""
     VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
-    VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
+    VLLM_DFLASH2_SELECTOR_SHARD: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_CUDAGRAPH_ESTIMATE_SPLIT: int = 0
     VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB: int = 0
@@ -578,8 +578,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # vocab rows across the tensor-parallel ranks instead of replicating them.
     # Each rank looks up the rows it owns, zero elsewhere, and one all-reduce
     # of the two gathered row sets rebuilds them exactly (x + 0 = x).
-    "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": lambda: bool(
-        int(os.getenv("VLLM_GLM5_DRAFTER_SELECTOR_SHARD", "0"))
+    "VLLM_DFLASH2_SELECTOR_SHARD": lambda: bool(
+        int(os.getenv("VLLM_DFLASH2_SELECTOR_SHARD", "0"))
     ),
     # Log where device memory goes at start-up: resident bytes per module
     # group after loading, the peak of each profile_run stage, the KV sizing
@@ -1484,6 +1484,10 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_TP4_KDA_PREFILL": "renamed to VLLM_AMPERE_KDA_PREFILL_NARROW",
     "VLLM_GLM5_TP4_MARLIN_PREFILL": (
         "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
+    ),
+    "VLLM_GLM5_DRAFTER_SELECTOR_SHARD": (
+        "renamed to VLLM_DFLASH2_SELECTOR_SHARD (read by the shared DFlash2 "
+        "drafter code)"
     ),
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (

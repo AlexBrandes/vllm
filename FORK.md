@@ -801,6 +801,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE` | `bool` | `False` | `'0'` |
 | `VLLM_DEV_AB_SWITCH` | `str` | `''` | `''` |
+| `VLLM_DFLASH2_SELECTOR_SHARD` | `bool` | `False` | `'0'` |
 | `VLLM_DFLASH_BOUNDARY_CACHE` | `bool` | `False` | `'0'` |
 | `VLLM_DSPARK_ADAPTIVE_DEPTH` | `str` | `''` | `''` |
 | `VLLM_DSPARK_CONFIDENCE_DUMP` | `str` | `''` | `''` |
@@ -847,7 +848,6 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_GLM5_DECODE_MOE_ROUTING` | `bool` | `True` | `'1'` |
 | `VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE` | `str` | `''` | `''` |
 | `VLLM_GLM5_DRAFTER_ROPE_FIT` | `bool` | `False` | `'0'` |
-| `VLLM_GLM5_DRAFTER_SELECTOR_SHARD` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MARLIN_DECODE_PP_MID_ROWS` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MARLIN_DECODE_PP_MULTI` | `bool` | `False` | `'0'` |
 | `VLLM_GLM5_MARLIN_DECODE_PP_MULTI_ROWS` | `str` | `'9-32'` | `'9-32'` |
