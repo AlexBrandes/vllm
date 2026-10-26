@@ -205,6 +205,30 @@ def test_dispatch_two_ranks_qwen_rows(monkeypatch):
         assert bool(ca._flags.calls) is flagged and len(ops_calls) == (not flagged)
 
 
+def test_dispatch_four_ranks_deepseek_rows(monkeypatch):
+    """DeepSeek-V4.1 TP4 messages (5120-wide bf16 rows: 32 rows at eight
+    requests, 40 in the largest decode graph, 128 in the prefill replay tail)
+    take the flags path whenever the allreduce/flags_max_bytes limit of the
+    sm80 tuning table covers them: 256 KiB (the default) keeps 26 rows and
+    more on upstream's kernel, 512 KiB (the served DeepSeek value) takes up
+    to 51 rows, and 1.25 MiB takes the 128-row prefill tail."""
+    for max_bytes, rows, flagged in (
+        (262144, 25, True),
+        (262144, 26, False),
+        (262144, 32, False),
+        (524288, 51, True),
+        (524288, 52, False),
+        (1310720, 32, True),
+        (1310720, 40, True),
+        (1310720, 128, True),
+        (1310720, 129, False),
+    ):
+        ca, ops_calls = _fake_ca(monkeypatch, with_flags=True)
+        ca._flags = FakeFlags(max_bytes)
+        ca.custom_all_reduce(torch.zeros(rows, 5120, dtype=torch.bfloat16))
+        assert bool(ca._flags.calls) is flagged and len(ops_calls) == (not flagged)
+
+
 def test_dispatch_respects_should_custom_ar(monkeypatch):
     ca, ops_calls = _fake_ca(monkeypatch, with_flags=True)
     ca.fully_connected = False  # incumbent refuses: the flags path must too
@@ -444,7 +468,11 @@ int main() {
   std::mt19937 rng(7);
   std::normal_distribution<float> nd(0.f, 1.f);
   long checked = 0, control = 0;
-  for (int size = 1; size <= 20000; size += (size < 2048 ? 1 : 97)) {
+  // Four ranks: every size up to 2048 packs, then strides up to 2 MiB, and the
+  // 5120-wide bf16 messages (640 packs per row) of 24 to 40 decode rows and of
+  // the 128-row prefill tail, which exceed the default flags limit and run on
+  // the incumbent unless the tuning table's allreduce/flags_max_bytes is raised.
+  auto check4 = [&](int size) {
     int sum = 0, L = part_len<4>(3, size);
     for (int q = 0; q < 4; q++) { sum += part_len<4>(q, size); if (part_len<4>(q, size) > L) fails++; }
     if (sum != size) fails++;
@@ -461,7 +489,10 @@ int main() {
       if (bits(sum4_owner_order(x, 0)) != bits(incumbent(x, idx, size))) control++;
       checked++;
     }
-  }
+  };
+  for (int size = 1; size <= 131072; size += (size < 2048 ? 1 : (size < 20000 ? 97 : 1021)))
+    check4(size);
+  for (int rows : {24, 28, 32, 40, 51, 128}) check4(rows * 640);
   // Two ranks, finite and special values (signed zeros, infinities, subnormals,
   // the largest finite value); NaN results are the GPU test's.
   const uint16_t specials[] = {0x0000, 0x8000, 0x7F80, 0xFF80, 0x0001, 0x8001, 0x7F7F, 0xFF7F};
