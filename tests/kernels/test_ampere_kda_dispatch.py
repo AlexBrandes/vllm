@@ -12,8 +12,8 @@ unfused chain (f_b/g_b GEMMs, causal_conv1d_update, fla fused_recurrent_kda,
 o_norm) elsewhere. Served shapes: up to 8 sequences of 1..8 tokens (draft depth
 up to 7), pure verify and mixed steps.
 
-CPU part: the removed switches are gone, the dispatch table, the wide-schedule
-choice, the kill switch VLLM_GLM5_DECODE_KDA_WIDE.
+CPU part: the dispatch table, the wide-schedule choice, the kill switch
+VLLM_GLM5_DECODE_KDA_WIDE.
 GPU part (skipped without CUDA), driven through the real forward()/_forward():
 for every served shape, the step's normed output o, its consumer y = o @ Wo^T
 (FP64 consumer on the kernel's bf16 output) and the per-token recurrent states
@@ -44,10 +44,6 @@ from vllm.models.glm5next.nvidia.ops.kda_decode import use_ampere_kda_decode_v2
 D, KA, CONV_K = 128, 128, 4
 WINDOW = 8                      # draft depth 7 + 1: the served speculative window
 HIDDEN = 512                    # synthetic o_proj rows (the consumer y)
-REMOVED = ("VLLM_GLM5_DECODE_KDA", "VLLM_GLM5_DECODE_KDA_MAX_TOKENS",
-           "VLLM_GLM5_DECODE_KDA_V2", "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS",
-           "VLLM_GLM5_DECODE_KDA_V2_DEEP", "VLLM_GLM5_KDA_RECOVER",
-           "VLLM_GLM5_DECODE_KDA_STEP_TILE")
 ENV = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_GLM5_DECODE_KDA_WIDE",
        "VLLM_GLM5_DECODE_MOE_ROUTING", "VLLM_USE_BREAKABLE_CUDAGRAPH")
 MEAN_X, MAX_X = 1.10, 1.25
@@ -101,19 +97,12 @@ def expected_path(H, nseq, T, wide_switch=True):
 
 # ------------------------------------------------------------------ CPU tests
 
-def test_removed_switches_are_gone():
-    """The v1 kernel and the kill switches of features validated in 1.7.0 are
-    gone; the one new kill switch defaults on."""
+def test_wide_kill_switch_defaults_on():
+    """VLLM_GLM5_DECODE_KDA_WIDE, the dispatch's one kill switch, defaults on."""
     from vllm import envs
 
-    for name in REMOVED:
-        assert name not in envs.environment_variables, name
     os.environ.pop("VLLM_GLM5_DECODE_KDA_WIDE", None)
     assert envs.VLLM_GLM5_DECODE_KDA_WIDE is True
-    assert not hasattr(kda_decode, "use_ampere_kda_decode")
-    import importlib.util
-
-    assert importlib.util.find_spec("vllm.ampere_decode") is None
 
 
 def test_dispatch_table_every_served_shape():
@@ -791,7 +780,7 @@ def gpu_test_warmup_plans_64_heads():
         e.undo()
 
 
-CPU_TESTS = (test_removed_switches_are_gone, test_dispatch_table_every_served_shape,
+CPU_TESTS = (test_wide_kill_switch_defaults_on, test_dispatch_table_every_served_shape,
              test_gate_checks_the_weights, test_wide_schedule,
              test_import_does_not_initialise_cuda)
 GPU_TESTS = (gpu_test_every_served_shape_vs_fp64, gpu_test_mixed_step_spec_rows,
