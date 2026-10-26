@@ -443,13 +443,16 @@ def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
         4096 rows, between the two.
 
     Both rows are keyed by ``head_dim`` (dim_qk) and the second also by
-    ``index_width`` (index_topk).
+    ``index_width`` (index_topk). With the hot pair ``sparse_mla_prefill``
+    (``vllm.sm80.hot_swap``) the switch's value is the pair's arm at each
+    call past both rows, which no captured graph may read.
     """
     from vllm import envs
     from vllm.platforms import current_platform
-    from vllm.sm80 import tuning
+    from vllm.sm80 import hot_swap, tuning
 
-    if not envs.VLLM_SM80_SPARSE_MLA_PREFILL:
+    on = envs.VLLM_SM80_SPARSE_MLA_PREFILL
+    if not on and not hot_swap.listed("sparse_mla_prefill"):
         return False
     if num_tokens < tuning.lookup(
         "attention_prefill", "sparse_mla_min_rows", {"head_dim": head_dim}, 512
@@ -461,6 +464,8 @@ def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
         {"head_dim": head_dim, "index_width": index_topk},
         2 * index_topk,
     ):
+        return False
+    if not on and not hot_swap.eager_on("sparse_mla_prefill"):
         return False
     return current_platform.is_cuda() and current_platform.is_device_capability(80)
 

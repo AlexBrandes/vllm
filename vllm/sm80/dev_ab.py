@@ -58,6 +58,12 @@ RPCs and ordered admission require both development gates. They record actual
 row order, verification/draft K, input tensors and target/draft descriptors,
 not merely the graphs captured at boot. Pin mismatches never count as identity.
 These synchronizing controls are for correctness, not timing.
+
+Several switches in one server, without a graph set per arm, are
+:mod:`vllm.sm80.hot_swap` (``VLLM_HOT_SWAP``): its pairs share the boot's
+allocations and graph shapes, and this extension carries its
+``set_hot_arms`` and ``get_hot_arms``. A switch whose arms capture different
+graphs, and the ordered batches above, stay here.
 """
 
 import functools
@@ -71,6 +77,7 @@ from typing import Any, NoReturn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 
 logger = init_logger(__name__)
 
@@ -1042,37 +1049,40 @@ SWITCHES: dict[str, Switch] = {
 # ---------------------------------------------------------------------------
 
 def configure(vllm_config) -> None:
-    """Inject :class:`DevABWorkerExtension` when VLLM_DEV_AB_SWITCH is set."""
+    """Inject :class:`DevABWorkerExtension` when VLLM_DEV_AB_SWITCH or
+    VLLM_HOT_SWAP (:mod:`vllm.sm80.hot_swap`) is set."""
     name = envs.VLLM_DEV_AB_SWITCH
-    if not name:
+    hot = hot_swap.configure(vllm_config)
+    if not name and not hot:
         return
-    if envs.VLLM_SM80_CAPTURE:
-        raise ValueError(
-            "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE"
-        )
-    if name not in SWITCHES:
-        raise ValueError(
-            f"VLLM_DEV_AB_SWITCH={name!r} is not one of: "
-            + ", ".join(sorted(SWITCHES))
-        )
+    what = f"VLLM_HOT_SWAP={envs.VLLM_HOT_SWAP}" if hot else f"VLLM_DEV_AB_SWITCH={name}"
+    if not hot:
+        if envs.VLLM_SM80_CAPTURE:
+            raise ValueError(
+                "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE"
+            )
+        if name not in SWITCHES:
+            raise ValueError(
+                f"VLLM_DEV_AB_SWITCH={name!r} is not one of: "
+                + ", ".join(sorted(SWITCHES))
+            )
     parallel_config = vllm_config.parallel_config
     if parallel_config.worker_extension_cls not in ("", EXTENSION_QUALNAME):
         raise ValueError(
-            "VLLM_DEV_AB_SWITCH needs worker_extension_cls for its own setter; "
+            f"{what} needs worker_extension_cls for its own setter; "
             f"{parallel_config.worker_extension_cls!r} is already set"
         )
     parallel_config.worker_extension_cls = EXTENSION_QUALNAME
-    if envs.VLLM_SERVER_DEV_MODE:
+    if envs.VLLM_SERVER_DEV_MODE and not hot:
         from vllm.sm80.dev_ab_batch import configure as configure_ordered_batches
         configure_ordered_batches(vllm_config)
     if not envs.VLLM_SERVER_DEV_MODE:
         logger.warning_once(
-            "VLLM_DEV_AB_SWITCH=%s without VLLM_SERVER_DEV_MODE=1: "
-            "POST /collective_rpc is off, so the arm cannot be changed.", name
+            "%s without VLLM_SERVER_DEV_MODE=1: "
+            "POST /collective_rpc is off, so the arm cannot be changed.", what
         )
     logger.warning_once(
-        "VLLM_DEV_AB_SWITCH=%s: development server, both arms captured; "
-        "not for serving.", name
+        "%s: development server, both arms captured; not for serving.", what
     )
 
 
@@ -1389,6 +1399,8 @@ def with_ab_capture(capture):
     """Keep the ordinary capture body intact behind a default-neutral wrapper."""
     @functools.wraps(capture)
     def wrapped(runner, *, profile_only=False):
+        if hot_swap.active():
+            return hot_swap.capture(runner, capture, profile_only)
         per_arm = capture_model_per_arm(runner, profile_only)
         if per_arm is not None:
             return per_arm
@@ -1626,7 +1638,7 @@ def _set_arm(worker, arm: str, generation: int, replay: bool = True) -> dict[str
 
 class DevABWorkerExtension:
     """Worker methods for ``POST /collective_rpc``; injected only with
-    VLLM_DEV_AB_SWITCH set."""
+    VLLM_DEV_AB_SWITCH or VLLM_HOT_SWAP set."""
 
     def set_ab_arm(self, arm: str, generation: int, replay: bool = True) -> dict[str, Any]:
         """Switch while drained; replay=False supplies a same-arm eager control."""
@@ -1636,6 +1648,15 @@ class DevABWorkerExtension:
         """This worker's switch state."""
         _resolve(self.model_runner)
         return _report(self, True, "")
+
+    def set_hot_arms(self, on: list[str], generation: int) -> dict[str, Any]:
+        """Run the candidates of the VLLM_HOT_SWAP pairs in ``on``, the
+        incumbents of the rest; drained, on every rank or on none."""
+        return hot_swap.set_arms(self, on, generation)
+
+    def get_hot_arms(self) -> dict[str, Any]:
+        """This worker's hot pairs and the candidates running."""
+        return hot_swap.get_arms(self)
 
 
     def begin_ab_batch(self, manifest: dict, reference: str, establish: bool) -> dict:

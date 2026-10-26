@@ -1205,12 +1205,19 @@ _BY_HEADS = {
 }
 
 
+def supported_heads() -> tuple[int, ...]:
+    """Every local head count the path supports (the hot pair
+    ``kda_prefill`` of ``vllm.sm80.hot_swap`` resolves its layer gates with
+    these, the switch being off)."""
+    return tuple(_BY_HEADS)
+
+
 def enabled_heads() -> tuple[int, ...]:
     """The local head counts the path may take: every one it supports when
     VLLM_SM80_KDA_PREFILL is set, none otherwise."""
     from vllm import envs
 
-    return tuple(_BY_HEADS) if envs.VLLM_SM80_KDA_PREFILL else ()
+    return supported_heads() if envs.VLLM_SM80_KDA_PREFILL else ()
 
 
 def layer_closed_reason(

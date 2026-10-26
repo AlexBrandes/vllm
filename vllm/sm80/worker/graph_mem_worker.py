@@ -15,7 +15,9 @@ on:
   are the per-rank argmax rows; ``load_model`` ends in
   ``target_argmax.load``, which refuses a target, head or drafter the switch
   cannot serve and takes a ``sample_draft`` drafter's greedy drafts per
-  rank; and the dummy sampler run at boot warms the slot kernels.
+  rank; and the dummy sampler run at boot warms the slot kernels. The hot
+  pair ``shard_argmax`` (``vllm.sm80.hot_swap``) needs the same runner and
+  turns the target half on and off between steps (``set_enabled``).
 
 A feature that is off leaves its methods as upstream's; everything else is
 upstream's. Other runners (V1, the encoder-only runner) are built unchanged:
@@ -29,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 from vllm.sm80.worker import cudagraph_mem, target_argmax
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -81,7 +84,7 @@ class GraphMemWorker(Worker):
     def _make_model_runner(self) -> GPUModelRunner:
         if self.use_v2_model_runner and not self.vllm_config.is_mm_encoder_only:
             return runner_cls()(self.vllm_config, self.device)  # type: ignore[return-value]
-        if getattr(envs, target_argmax.SWITCH):
+        if getattr(envs, target_argmax.SWITCH) or hot_swap.listed("shard_argmax"):
             raise ValueError(
                 f"{target_argmax.SWITCH}: the greedy target argmax needs the V2 "
                 "model runner of a generative model"

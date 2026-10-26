@@ -71,6 +71,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 
 logger = init_logger(__name__)
 
@@ -139,11 +140,11 @@ def tracing() -> bool:
 
 def select_worker(parallel_config: Any) -> None:
     """With this flag or the greedy target argmax
-    (``VLLM_SM80_SHARD_ARGMAX``), run the fork worker in place
-    of upstream's GPU worker (called by the fork platform's
-    ``check_and_update_config``). The argmax refuses another worker; the
-    estimate split only warns."""
-    argmax = bool(envs.VLLM_SM80_SHARD_ARGMAX)
+    (``VLLM_SM80_SHARD_ARGMAX``, or its hot pair ``shard_argmax``), run the
+    fork worker in place of upstream's GPU worker (called by the fork
+    platform's ``check_and_update_config``). The argmax refuses another
+    worker; the estimate split only warns."""
+    argmax = bool(envs.VLLM_SM80_SHARD_ARGMAX) or hot_swap.listed("shard_argmax")
     if not (enabled() or argmax):
         return
     if parallel_config.worker_cls == UPSTREAM_WORKER:

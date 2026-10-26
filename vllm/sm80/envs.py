@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_SM80_REPLAY_DIR: str = ""
     VLLM_SM80_REPLAY_LIMIT: int | None = None
     VLLM_DEV_AB_SWITCH: str = ""
+    VLLM_HOT_SWAP: str = ""
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -1172,6 +1173,12 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # between requests. Costs graph memory and boot time; not for serving.
     # Unset by default.
     "VLLM_DEV_AB_SWITCH": lambda: os.getenv("VLLM_DEV_AB_SWITCH", ""),
+    # Development server only: comma-separated pairs of
+    # vllm.sm80.hot_swap.HOT_PAIRS, each a switch booted off. Every CUDA
+    # graph holds each pair's graph sites in both variants side by side, and
+    # POST /collective_rpc set_hot_arms (VLLM_SERVER_DEV_MODE=1) selects the
+    # candidates between requests. Not for serving. Unset by default.
+    "VLLM_HOT_SWAP": lambda: os.getenv("VLLM_HOT_SWAP", ""),
 }
 
 

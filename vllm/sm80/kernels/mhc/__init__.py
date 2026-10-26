@@ -102,13 +102,21 @@ def use_ampere_prefill_prenorm(num_tokens: int) -> bool:
     `_HC_PRENORM_GEMM_TILELANG_KERNEL` inline and are deliberately left on the
     upstream kernel: this deployment does not take them. If that ever changes,
     extend the hook there too rather than assuming it is already covered.
+
+    With the hot pair ``mhc_prefill`` (``vllm.sm80.hot_swap``) the switch's
+    value is the pair's arm at each call above the threshold, which no
+    captured graph may read.
     """
     from vllm import envs
     from vllm.platforms import current_platform
+    from vllm.sm80 import hot_swap
 
-    if not envs.VLLM_SM80_MHC_PREFILL:
+    on = envs.VLLM_SM80_MHC_PREFILL
+    if not on and not hot_swap.listed("mhc_prefill"):
         return False
     if num_tokens < tuning.lookup("mhc", "prefill_min_rows", {}, 512):
+        return False
+    if not on and not hot_swap.eager_on("mhc_prefill"):
         return False
     return current_platform.is_cuda() and current_platform.is_device_capability(80)
 

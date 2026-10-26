@@ -363,10 +363,12 @@ def warmup(device="cuda:0"):
 
 def warmup_from_worker(worker) -> bool:
     """Called before CUDA-graph capture. Compiles the kernel when the flag is
-    on and this rank runs 64 heads on sm_80; returns whether it did."""
+    on (or its hot pair ``sparse_mla_prefill`` is listed) and this rank runs
+    64 heads on sm_80; returns whether it did."""
     from vllm import envs
+    from vllm.sm80 import hot_swap
 
-    if not envs.VLLM_SM80_SPARSE_MLA_PREFILL:
+    if not (envs.VLLM_SM80_SPARSE_MLA_PREFILL or hot_swap.listed("sparse_mla_prefill")):
         return False
     device = worker.device
     if torch.cuda.get_device_capability(device) != (8, 0):

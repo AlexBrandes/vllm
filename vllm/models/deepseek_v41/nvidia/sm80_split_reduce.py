@@ -64,12 +64,19 @@ logger = init_logger(__name__)
 SLICE_ALIGN = 512
 
 
+def splits(layer) -> bool:
+    """Whether the decoder layer issues both of its sums itself (TP ``wo_b``
+    and the adopted MoE's :meth:`~Sm80DeepseekV41MoE.reduce`), so its eager
+    steps may split. The hot pair ``prefill_reduce_overlap``
+    (``vllm.sm80.hot_swap``) sets ``_split_reduce`` on these layers."""
+    return isinstance(layer.ffn, Sm80DeepseekV41MoE) and layer.attn.reduces_wo_b()
+
+
 def adopt_split_reduce(layers: Iterable) -> None:
-    """Let the target decoder layers whose sums the layer issues itself (TP
-    ``wo_b`` and the adopted MoE's :meth:`~Sm80DeepseekV41MoE.reduce`) split."""
+    """Let the target decoder layers that :func:`splits` names split."""
     count = 0
     for layer in layers:
-        if isinstance(layer.ffn, Sm80DeepseekV41MoE) and layer.attn.reduces_wo_b():
+        if splits(layer):
             layer._split_reduce = True
             count += 1
     logger.info_once(
