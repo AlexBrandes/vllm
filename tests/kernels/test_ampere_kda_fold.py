@@ -10,7 +10,7 @@ commit / gather / pre-copy / postprocess path (kda_fold_world.py, the Gluon
 verify modelled) with byte identity of everything a consumer reads, on
 random schedules at block size 16 and at the 1,152-token boundary, in align
 and in "none" mode, and on schedules replayed from captured commits
-(KDA_FOLD_REPLAY_DIR, optional); the same sequences with deliberately broken
+(VLLM_SM80_REPLAY_DIR/kda, optional); the same sequences with deliberately broken
 folds must fail; request lifecycle: streaming-input re-adds (the owed commit
 is written first), a preempted request resumed in a later step and one
 preempted and resumed in the same step (never written); the host cost of a
@@ -22,6 +22,8 @@ under CUDA-graph capture.
 
     python tests/kernels/test_ampere_kda_fold.py           # CPU part
     CUDA_VISIBLE_DEVICES=<gpu> python tests/kernels/test_ampere_kda_fold.py
+    python tests/kernels/test_ampere_kda_fold.py test_gather   # named cases
+    (under pytest, select cases with -k)
 """
 
 import contextlib
@@ -39,6 +41,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from tests.kernels import kda_fold_world as W  # noqa: E402
+from tests.kernels import replay_inputs as replay  # noqa: E402
 
 
 def _interpret(name, timeout=3600):
@@ -206,20 +209,19 @@ def _scenarios():
     # prefill_runs_as_decode), right after a request that owed a commit
     yield ("slot reuse B16", dict(block_size=16),
            W.random_schedule(5, 40, 16, p_skip=0.0, p_mixed=0.0, max_len=12))
-    d = os.environ.get("KDA_FOLD_REPLAY_DIR")
-    if d:
-        rows = _captured_commits(d, int(os.environ.get("KDA_FOLD_REPLAY_STEPS", "120")))
+    files = replay.files("kda", "*-cm-*.pt")
+    if files:
+        rows = _captured_commits(files[: replay.limit(120) or None])
         yield f"replay {len(rows)} captured steps", dict(block_size=1152), \
             W.replay_schedule(rows, 1152, len(rows))
 
 
-def _captured_commits(d, steps):
+def _captured_commits(paths):
     """[(qlen, num_sampled, nc mod 1152)] per captured commit ('cm' payloads,
     in capture order)."""
-    names = sorted(n for n in os.listdir(d) if "-cm-" in n and n.endswith(".pt"))
     out = []
-    for n in names[:steps]:
-        p = torch.load(os.path.join(d, n), map_location="cpu", weights_only=False)
+    for path in paths:
+        p = torch.load(path, map_location="cpu", weights_only=False)
         t = p["tensors"]
         q = (t["query_start_loc"][1:] - t["query_start_loc"][:-1]).tolist()
         ns = t["num_sampled"].tolist()
@@ -1013,9 +1015,9 @@ def _main():
     tests = list(CPU_TESTS)
     if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "" and torch.cuda.is_available():
         tests += list(GPU_TESTS)
-    only = os.environ.get("KDA_FOLD_ONLY")
+    only = sys.argv[1:]
     if only:
-        tests = [t for t in tests if t.__name__ in only.split(",")]
+        tests = [t for t in tests if t.__name__ in only]
     failed = 0
     for t in tests:
         try:

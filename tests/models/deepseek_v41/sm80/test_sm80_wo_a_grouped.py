@@ -440,7 +440,7 @@ def test_off_arm_without_the_marlin_layers_refuses(monkeypatch):
         layer.quant_method.apply_grouped(layer, torch.zeros(1, 2, 256, dtype=BF16))
 
 
-def test_adoption_refusals(monkeypatch):
+def test_adoption_refusals(monkeypatch, tmp_path):
     layer, *_ = _mxfp8_layer(monkeypatch, 2, 64, 256)
     with pytest.raises(ValueError, match="64 outputs per group"):
         wg.WoAGroupedGemmMethod.adopt(layer, 2)
@@ -457,11 +457,12 @@ def test_adoption_refusals(monkeypatch):
     with pytest.raises(ValueError, match="not an MXFP8"):
         wg.WoAGroupedGemmMethod.adopt(plain, 2)
     layer, *_ = _mxfp8_layer(monkeypatch, 2, 128, 256)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "capture")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "dense,hybrid")
+    spec = tmp_path / "capture.toml"
+    spec.write_text('dir = "capture"\nfamilies = ["dense", "hybrid"]\n')
+    monkeypatch.setenv("VLLM_SM80_CAPTURE", str(spec))
     with pytest.raises(ValueError, match="hybrid capture"):
         wg.WoAGroupedGemmMethod.adopt(layer, 2)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "dense,attn")
+    spec.write_text('dir = "capture"\nfamilies = ["dense", "attn"]\n')
     wg.WoAGroupedGemmMethod.adopt(layer, 2)
 
 

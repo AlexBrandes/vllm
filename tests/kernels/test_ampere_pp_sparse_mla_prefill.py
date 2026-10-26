@@ -14,19 +14,18 @@ fallbacks bitwise equal to the flag-off path; on-path accuracy against an
 fp64 recomputation, relative to the Triton kernel with the predicated gather
 and to the fp32 reference that rounds P to bf16 before P.V; awkward shapes;
 determinism; CUDA-graph replay equal to eager with no allocation growth; real
-captured prefill records when ``SMLA_PRE_CAPTURE_DIR`` points at them.
+captured prefill records when ``VLLM_SM80_REPLAY_DIR`` holds them in ``smla_pre/``.
 
     CUDA_VISIBLE_DEVICES="" pytest -q tests/kernels/test_ampere_pp_sparse_mla_prefill.py
     pytest -q tests/kernels/test_ampere_pp_sparse_mla_prefill.py
 """
 
-import glob
-import os
 import sys
 
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
 from vllm.sm80.kernels.attention import sparse_prefill_mla as spm
 
 FLAG = "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE"
@@ -567,12 +566,11 @@ def test_graph_replay_equals_eager_no_growth(monkeypatch, T, prior):
 
 
 def _capture_files():
-    d = os.environ.get("SMLA_PRE_CAPTURE_DIR", "")
-    return sorted(glob.glob(os.path.join(d, "p*_b*_*.pt"))) if d else []
+    return replay.files("smla_pre", "p*_b*_*.pt")
 
 
 @needs_sm80
-@pytest.mark.skipif(not _capture_files(), reason="SMLA_PRE_CAPTURE_DIR has no records")
+@pytest.mark.skipif(not _capture_files(), reason="no smla_pre records in VLLM_SM80_REPLAY_DIR")
 def test_real_records(monkeypatch):
     """Each captured record replayed at its original row positions inside a
     full-size chunk (other rows -1). Summed mean error and worst max error
@@ -604,5 +602,5 @@ def test_real_records(monkeypatch):
             tot[k][1] = max(tot[k][1], x)
         n += 1
     if n == 0:
-        pytest.skip("no 64-head records in SMLA_PRE_CAPTURE_DIR")
+        pytest.skip("no 64-head smla_pre records in VLLM_SM80_REPLAY_DIR")
     _assert_within({k: tuple(v) for k, v in tot.items()})

@@ -74,9 +74,9 @@ import triton
 import triton.language as tl
 from torch import nn
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
+from vllm.sm80 import capture
 from vllm.sm80.layers.grouped_linear import GroupedLinearMethod
 
 logger = init_logger(__name__)
@@ -297,7 +297,7 @@ class WoAGroupedGemmMethod(GroupedLinearMethod):
         reason = unsupported(layer, groups)
         if reason is not None:
             raise ValueError(f"VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: {reason}")
-        if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+        if capture.captures("hybrid"):
             # The hybrid capture records the grouped wo_a through
             # GroupedLinearMethod.apply_grouped, which this method replaces:
             # its wo_a cases would vanish.

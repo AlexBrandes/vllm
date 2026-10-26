@@ -154,16 +154,9 @@ if TYPE_CHECKING:
     VLLM_EXL3_EXPERT_REPLICAS: str = ""
     VLLM_EXL3_EXPERT_REPLICAS_SHA256: str = ""
     VLLM_EXL3_MOE_CHUNK_ROWS: int = 0
-    VLLM_SM80_CAPTURE_DIR: str = ""
-    VLLM_SM80_CAPTURE_FAMILIES: str = "dense,moe,attn"
-    VLLM_SM80_CAPTURE_MATCH: str = ""
-    VLLM_SM80_CAPTURE_ROWS: str = ""
-    VLLM_SM80_CAPTURE_PER_KEY: int = 2
-    VLLM_SM80_CAPTURE_PREFILL_MATCH: str = ""
-    VLLM_SM80_CAPTURE_PREFILL_CALLS: str = "1"
-    VLLM_SM80_CAPTURE_PREFILL_PER_KEY: int = 0
-    VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS: int = 65
-    VLLM_SM80_CAPTURE_MAX_MB: int = 4096
+    VLLM_SM80_CAPTURE: str = ""
+    VLLM_SM80_REPLAY_DIR: str = ""
+    VLLM_SM80_REPLAY_LIMIT: int | None = None
     VLLM_QWEN4_ROUTER_FP32: bool = False
     VLLM_QWEN4_MTP_PER_STREAM_NORM: bool = False
     VLLM_DEV_AB_SWITCH: str = ""
@@ -191,6 +184,15 @@ def _glm5_route_v2_max_tokens() -> int:
             "most rows the sm_80 fused MoE router handles"
         )
     return value
+
+
+def _replay_limit() -> int | None:
+    """VLLM_SM80_REPLAY_LIMIT; None when unset (each replay test then reads
+    its own number of records)."""
+    raw = os.getenv("VLLM_SM80_REPLAY_LIMIT", "")
+    if not raw:
+        return None
+    return int(raw)
 
 
 def _custom_allreduce_algo() -> str:
@@ -1401,46 +1403,20 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_MOE_CHUNK_ROWS": lambda: int(
         os.getenv("VLLM_EXL3_MOE_CHUNK_ROWS", "0")
     ),
-    # Diagnostic: a directory to which selected served kernel calls (inputs
-    # and outputs) are saved (vllm/sm80/capture.py). Saving waits for the
-    # stream: diagnostic boots only. Default empty: nothing is captured and
-    # nothing is patched.
-    "VLLM_SM80_CAPTURE_DIR": lambda: os.getenv("VLLM_SM80_CAPTURE_DIR", ""),
-    # Comma-separated capture families: dense, moe, attn, mhc.
-    "VLLM_SM80_CAPTURE_FAMILIES": lambda: os.getenv(
-        "VLLM_SM80_CAPTURE_FAMILIES", "dense,moe,attn"
-    ),
-    # Regex searched in a call's prefix (checkpoint prefix for dense
-    # matrices, module prefix otherwise): the calls captured outside prefill
-    # steps. Default empty: every prefix.
-    "VLLM_SM80_CAPTURE_MATCH": lambda: os.getenv("VLLM_SM80_CAPTURE_MATCH", ""),
-    # Comma-separated row counts of the CUDA graphs whose calls are captured.
-    "VLLM_SM80_CAPTURE_ROWS": lambda: os.getenv("VLLM_SM80_CAPTURE_ROWS", ""),
-    # Files per (family, prefix, rows, phase, graph owner).
-    "VLLM_SM80_CAPTURE_PER_KEY": lambda: int(
-        os.getenv("VLLM_SM80_CAPTURE_PER_KEY", "2")
-    ),
-    # Regex of the prefixes captured in prefill steps (default: the MATCH one).
-    "VLLM_SM80_CAPTURE_PREFILL_MATCH": lambda: os.getenv(
-        "VLLM_SM80_CAPTURE_PREFILL_MATCH", ""
-    ),
-    # Comma-separated ordinals, per family and prefix from 1, of the prefill
-    # step calls (of at least _PREFILL_MIN_ROWS rows) that are saved.
-    "VLLM_SM80_CAPTURE_PREFILL_CALLS": lambda: os.getenv(
-        "VLLM_SM80_CAPTURE_PREFILL_CALLS", "1"
-    ),
-    # Positive: first N eligible prefill attempts per semantic key, including
-    # point and short/long context. Quota refusals count. Zero keeps ordinals.
-    "VLLM_SM80_CAPTURE_PREFILL_PER_KEY": lambda: int(
-        os.getenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "0")
-    ),
-    "VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS": lambda: int(
-        os.getenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "65")
-    ),
-    # Most MiB of tensors one process saves; later calls are only indexed.
-    "VLLM_SM80_CAPTURE_MAX_MB": lambda: int(
-        os.getenv("VLLM_SM80_CAPTURE_MAX_MB", "4096")
-    ),
+    # Diagnostic: the path of a capture spec, a TOML file naming the
+    # directory to which selected served kernel calls (inputs and outputs)
+    # are saved and which calls (vllm/sm80/capture.py: its keys and their
+    # defaults). Saving waits for the stream: diagnostic boots only. Default
+    # empty: nothing is captured and nothing is patched.
+    "VLLM_SM80_CAPTURE": lambda: os.getenv("VLLM_SM80_CAPTURE", ""),
+    # Tests only: a directory of captured kernel inputs with one subdirectory
+    # per capture family (kda, kda_pre, smla_pre, idx_glue, moe_pre with its
+    # once weights), which the replay tests read
+    # (tests/kernels/replay_inputs.py). Default empty: those tests skip.
+    "VLLM_SM80_REPLAY_DIR": lambda: os.getenv("VLLM_SM80_REPLAY_DIR", ""),
+    # Tests only: the most records a replay test reads from its family; 0
+    # reads every record. Default unset: each test's own number.
+    "VLLM_SM80_REPLAY_LIMIT": _replay_limit,
     # Preserve BF16 router operands but accumulate and return logits in FP32.
     "VLLM_QWEN4_ROUTER_FP32": lambda: bool(
         int(os.getenv("VLLM_QWEN4_ROUTER_FP32", "0"))
@@ -1514,6 +1490,62 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_GLM5_TP4_MARLIN_PREFILL": (
         "renamed to VLLM_AMPERE_MARLIN_PREFILL_NARROW"
     ),
+    # Merged: one switch per operation across models.
+    "VLLM_SM80_CAPTURE_DIR": (
+        "merged into VLLM_SM80_CAPTURE, the path of a capture spec whose dir "
+        "key names the directory"
+    ),
+    "VLLM_SM80_CAPTURE_FAMILIES": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's families list)"
+    ),
+    "VLLM_SM80_CAPTURE_MATCH": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's match)"
+    ),
+    "VLLM_SM80_CAPTURE_ROWS": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's rows list)"
+    ),
+    "VLLM_SM80_CAPTURE_PER_KEY": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's per_key)"
+    ),
+    "VLLM_SM80_CAPTURE_PREFILL_MATCH": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's prefill_match)"
+    ),
+    "VLLM_SM80_CAPTURE_PREFILL_CALLS": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's prefill_calls list)"
+    ),
+    "VLLM_SM80_CAPTURE_PREFILL_PER_KEY": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's prefill_per_key)"
+    ),
+    "VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's prefill_min_rows)"
+    ),
+    "VLLM_SM80_CAPTURE_MAX_MB": (
+        "merged into VLLM_SM80_CAPTURE (the capture spec's max_mb)"
+    ),
+    "KDA_FOLD_REPLAY_DIR": (
+        "merged into VLLM_SM80_REPLAY_DIR (its kda subdirectory)"
+    ),
+    "KDA_FOLD_REPLAY_STEPS": "merged into VLLM_SM80_REPLAY_LIMIT",
+    "KDA_PRE_CAPTURE_DIR": (
+        "merged into VLLM_SM80_REPLAY_DIR (its kda_pre subdirectory)"
+    ),
+    "KDA_PRE_CAPTURE_MAX": "merged into VLLM_SM80_REPLAY_LIMIT",
+    "SMLA_PRE_CAPTURE_DIR": (
+        "merged into VLLM_SM80_REPLAY_DIR (its smla_pre subdirectory)"
+    ),
+    "VLLM_GLM5_IDX_GLUE_CAPTURE": (
+        "merged into VLLM_SM80_REPLAY_DIR (its idx_glue subdirectory)"
+    ),
+    "VLLM_PP_MARLIN_CAPTURE_DIR": (
+        "merged into VLLM_SM80_REPLAY_DIR (its moe_pre and once "
+        "subdirectories)"
+    ),
+    "VLLM_PP_MARLIN_CAPTURE_LIMIT": "merged into VLLM_SM80_REPLAY_LIMIT",
+    "VLLM_TP4_MARLIN_CAPTURE_DIR": (
+        "merged into VLLM_SM80_REPLAY_DIR (its moe_pre and once "
+        "subdirectories)"
+    ),
+    "VLLM_TP4_MARLIN_CAPTURE_LIMIT": "merged into VLLM_SM80_REPLAY_LIMIT",
     # Replaced by a vLLM option or a standard location.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": (
         "replaced by --speculative-config adaptive_k (by_load)"
@@ -1644,6 +1676,11 @@ RETIRED_ENV_VARS: dict[str, str] = {
     "VLLM_DFLASH_BOUNDARY_CACHE": (
         "removed; DFlash and DSpark never drop the last prefix-cache block "
         "(upstream vLLM #54163)"
+    ),
+    "KDA_FOLD_ONLY": (
+        "removed; select the KDA fold test cases with pytest -k, or name them "
+        "on the command line when running tests/kernels/test_ampere_kda_fold.py "
+        "as a script"
     ),
 }
 _warned_retired_env_vars: set[str] = set()

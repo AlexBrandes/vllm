@@ -894,16 +894,9 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_QWEN_QSA_TOPK_SORTED` | `bool` | `True` | `'1'` |
 | `VLLM_ROUND_ONCE_ALLREDUCE_GROUPED` | `bool` | `False` | `'0'` |
 | `VLLM_SHARED_EXPERT_REORDER` | `bool` | `False` | `'0'` |
-| `VLLM_SM80_CAPTURE_DIR` | `str` | `''` | `''` |
-| `VLLM_SM80_CAPTURE_FAMILIES` | `str` | `'dense,moe,attn'` | `'dense,moe,attn'` |
-| `VLLM_SM80_CAPTURE_MATCH` | `str` | `''` | `''` |
-| `VLLM_SM80_CAPTURE_MAX_MB` | `int` | `4096` | `'4096'` |
-| `VLLM_SM80_CAPTURE_PER_KEY` | `int` | `2` | `'2'` |
-| `VLLM_SM80_CAPTURE_PREFILL_CALLS` | `str` | `'1'` | `'1'` |
-| `VLLM_SM80_CAPTURE_PREFILL_MATCH` | `str` | `''` | `''` |
-| `VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS` | `int` | `65` | `'65'` |
-| `VLLM_SM80_CAPTURE_PREFILL_PER_KEY` | `int` | `0` | `'0'` |
-| `VLLM_SM80_CAPTURE_ROWS` | `str` | `''` | `''` |
+| `VLLM_SM80_CAPTURE` | `str` | `''` | `''` |
+| `VLLM_SM80_REPLAY_DIR` | `str` | `''` | `''` |
+| `VLLM_SM80_REPLAY_LIMIT` | `int \| None` | `None` | - |
 | `VLLM_SM80_TARGET_SHARD_ARGMAX` | `bool` | `False` | `'0'` |
 | `VLLM_STATE_INDEX_CHECK` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM` | `bool` | `False` | `'0'` |
@@ -912,7 +905,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_THIN_GEMM_MAX_TOKENS` | `int` | `32` | `'32'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **151 variables** | | | |
+| **144 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -942,5 +935,5 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Patched upstream product files | 83 |
 | Patched upstream product lines | +3,717 / -256 |
 | Product lines added (new files and patches) | 77,084 |
-| Fork environment variables (flags) | 151 |
+| Fork environment variables (flags) | 144 |
 | Unreferenced fork definitions | 7 (59 lines) |

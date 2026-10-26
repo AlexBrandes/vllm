@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The EXL3 capture points of the kernel call capture (vllm/sm80/capture.py,
-VLLM_SM80_CAPTURE_DIR; inert when it is unset).
+VLLM_SM80_CAPTURE; inert when it is unset).
 
 - ``dense`` (point ``exl3_linear``): every call of ops._linear on a
   registered matrix: tensors ``x`` (the input as the operator received it)

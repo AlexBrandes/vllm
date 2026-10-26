@@ -430,7 +430,8 @@ def test_combined_features_keep_default_off(monkeypatch, name):
 
 
 @pytest.mark.parametrize("name", ["VLLM_DEV_AB_SWITCH", "VLLM_EXL3_EXPERT_PLACEMENT",
-                                  "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", "VLLM_SM80_CAPTURE_DIR"])
+                                  "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", "VLLM_SM80_CAPTURE",
+                                  "VLLM_SM80_REPLAY_DIR"])
 def test_combined_optional_paths_keep_empty_default(monkeypatch, name):
     from vllm.sm80.envs import FORK_ENV_VARS
 

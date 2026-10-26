@@ -1541,9 +1541,10 @@ def _spread(records: list[dict], calls: int) -> list[dict]:
 def expert_tp_cases(captures, checkpoint, size: int = 4, calls: int = 4) -> dict:
     """served_cases/1 cases of the routed experts split across ``size``
     tensor-parallel ranks, derived from captures of whole experts
-    (expert-parallel) at ``captures``: each the VLLM_SM80_CAPTURE_DIR of a
-    boot of ``size`` ranks, r<rank>/index.jsonl and the files it names, of
-    the ``checkpoint`` they served. Every rank of the split routes the same
+    (expert-parallel) at ``captures``: each the capture directory (the
+    ``dir`` of a VLLM_SM80_CAPTURE spec) of a boot of ``size`` ranks,
+    r<rank>/index.jsonl and the files it names, of the ``checkpoint`` they
+    served. Every rank of the split routes the same
     rows, so rank 0's file of a call stands for every rank (each rank's file
     of that name must hold the same x, topk_ids and topk_weights); the
     driver derives each rank's arguments (tp_call). Per operator (decode,

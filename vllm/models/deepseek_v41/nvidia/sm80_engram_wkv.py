@@ -31,9 +31,9 @@ from itertools import islice
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearMethodBase
+from vllm.sm80 import capture
 
 
 def prefill_min_rows(vllm_config) -> int:
@@ -177,7 +177,7 @@ def adopt_replicated_wkv(model) -> None:
             f"replicated wkv: steps of {min_rows}+ rows (above every decode "
             f"step and capture) exceed max_num_batched_tokens {batched}"
         )
-    if envs.VLLM_SM80_CAPTURE_DIR and "hybrid" in envs.VLLM_SM80_CAPTURE_FAMILIES.split(","):
+    if capture.captures("hybrid"):
         # Each shard copy carries this rank's capture facts: the capture would
         # record the four shard GEMMs as this rank's.
         raise ValueError(

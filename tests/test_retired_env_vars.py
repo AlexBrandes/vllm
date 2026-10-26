@@ -47,6 +47,29 @@ RENAMED = {
     "VLLM_DEEPSEEK_V41_TARGET_SHARD_ARGMAX": "VLLM_SM80_TARGET_SHARD_ARGMAX",
 }
 
+MERGED = {
+    "VLLM_SM80_CAPTURE_DIR": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_FAMILIES": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_MATCH": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_ROWS": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_PER_KEY": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_PREFILL_MATCH": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_PREFILL_CALLS": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_PREFILL_PER_KEY": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS": "VLLM_SM80_CAPTURE",
+    "VLLM_SM80_CAPTURE_MAX_MB": "VLLM_SM80_CAPTURE",
+    "KDA_FOLD_REPLAY_DIR": "VLLM_SM80_REPLAY_DIR",
+    "KDA_FOLD_REPLAY_STEPS": "VLLM_SM80_REPLAY_LIMIT",
+    "KDA_PRE_CAPTURE_DIR": "VLLM_SM80_REPLAY_DIR",
+    "KDA_PRE_CAPTURE_MAX": "VLLM_SM80_REPLAY_LIMIT",
+    "SMLA_PRE_CAPTURE_DIR": "VLLM_SM80_REPLAY_DIR",
+    "VLLM_GLM5_IDX_GLUE_CAPTURE": "VLLM_SM80_REPLAY_DIR",
+    "VLLM_PP_MARLIN_CAPTURE_DIR": "VLLM_SM80_REPLAY_DIR",
+    "VLLM_PP_MARLIN_CAPTURE_LIMIT": "VLLM_SM80_REPLAY_LIMIT",
+    "VLLM_TP4_MARLIN_CAPTURE_DIR": "VLLM_SM80_REPLAY_DIR",
+    "VLLM_TP4_MARLIN_CAPTURE_LIMIT": "VLLM_SM80_REPLAY_LIMIT",
+}
+
 REPLACED_OR_REMOVED = {
     "VLLM_GLM5_DFLASH_ADAPTIVE_K",
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS",
@@ -88,15 +111,16 @@ REPLACED_OR_REMOVED = {
     "VLLM_ENGRAM_NATIVE_READ",
     "VLLM_GLM5_DFLASH_BOUNDARY_CACHE",
     "VLLM_DFLASH_BOUNDARY_CACHE",
+    "KDA_FOLD_ONLY",
 }
 
 
 def test_table_lists_every_retired_name():
-    assert set(fork_envs.RETIRED_ENV_VARS) == set(RENAMED) | REPLACED_OR_REMOVED
+    assert set(fork_envs.RETIRED_ENV_VARS) == set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED
     assert all(fork_envs.RETIRED_ENV_VARS.values())
 
 
-@pytest.mark.parametrize("name", sorted(set(RENAMED) | REPLACED_OR_REMOVED))
+@pytest.mark.parametrize("name", sorted(set(RENAMED) | set(MERGED) | REPLACED_OR_REMOVED))
 def test_retired_name_is_not_declared(name):
     assert name not in envs.environment_variables
 
@@ -107,7 +131,13 @@ def test_renamed_name_points_at_its_replacement(old, new):
     assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"renamed to {new}")
 
 
-@pytest.mark.parametrize("old,new", sorted(RENAMED.items()))
+@pytest.mark.parametrize("old,new", sorted(MERGED.items()))
+def test_merged_name_points_at_its_replacement(old, new):
+    assert new in envs.environment_variables
+    assert fork_envs.RETIRED_ENV_VARS[old].startswith(f"merged into {new}")
+
+
+@pytest.mark.parametrize("old,new", sorted({**RENAMED, **MERGED}.items()))
 def test_retired_value_is_never_used(monkeypatch, old, new):
     monkeypatch.delenv(old, raising=False)
     monkeypatch.delenv(new, raising=False)
