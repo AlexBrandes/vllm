@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     VLLM_GLM5_SMLA_PREFILL_PRED_LOAD: bool = False
     VLLM_SM80_KDA_PREFILL: bool = False
     VLLM_STATE_INDEX_CHECK: bool = False
+    VLLM_SM80_EXECUTION_TRACE: bool = False
+    VLLM_SM80_SERIAL_TRACE_EXPORT: bool = False
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
@@ -292,6 +294,22 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # Synchronizes every step. Off by default.
     "VLLM_STATE_INDEX_CHECK": lambda: bool(
         int(os.getenv("VLLM_STATE_INDEX_CHECK", "0"))
+    ),
+    # Diagnostic: every torch profiler trace also gets torch's execution trace
+    # (op inputs and outputs by tensor and storage id) beside it as
+    # <stem>.et.json[.gz] (vllm/sm80/worker/execution_trace.py). Ops replayed
+    # inside CUDA graphs are not in it. Off by default.
+    "VLLM_SM80_EXECUTION_TRACE": lambda: bool(
+        int(os.getenv("VLLM_SM80_EXECUTION_TRACE", "0"))
+    ),
+    # Inside the stop_profile request, the workers of an engine stop their
+    # torch profiler sessions one after another (pipeline stage, then
+    # tensor-parallel rank), each releasing its trace's host memory before the
+    # next starts, so the host holds one rank's trace at a time; a session
+    # stopped by its iteration limit inside a model step is not ordered
+    # (vllm/sm80/worker/trace_export.py). Off by default.
+    "VLLM_SM80_SERIAL_TRACE_EXPORT": lambda: bool(
+        int(os.getenv("VLLM_SM80_SERIAL_TRACE_EXPORT", "0"))
     ),
     # Opt in to the sm_80 decode kernels (mHC and MoE routing in
     # vllm/sm80/kernels/, the KDA decode step in vllm/models/glm5next/nvidia/ops/;

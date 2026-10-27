@@ -1608,3 +1608,38 @@ seams:
   why: invalid_drafts (one bool per logits row) turns a draft into -1 for verification only; a -1 draft is rejected and the token at its row is the target's (greedy argmax, or a plain target sample), and num_rejected counts it; dspark_row_mask_reject.py ORs the masked rows into it
   sha256: 421fd2df7bb2e1c990eee3b650a23bc3f4c5cc03da5ae954f2f02897fa5ce551
   signature: '(self, logits: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, draft_logits: torch.Tensor | None = None, invalid_drafts: torch.Tensor | None = None) -> vllm.v1.worker.gpu.sample.output.SamplerOutput'
+
+- id: profiler-torch-start
+  kind: method
+  target: vllm.profiler.wrapper:TorchProfilerWrapper._start
+  why: builds a new torch.profiler.profile from self._profiler_kwargs (read at call time, on_trace_ready included) and starts it; execution_trace.py swaps in kwargs with an execution_trace_observer and a wrapping on_trace_ready around this call, and trace_export.py relies on it to recreate the profiler it dropped
+  sha256: c103d8e3f0014f75c7ef87b4d36a75b589ee692e7758b4ca60c0c0a957d20a54
+  signature: (self) -> None
+
+- id: profiler-torch-stop
+  kind: method
+  target: vllm.profiler.wrapper:TorchProfilerWrapper._stop
+  why: stops self.profiler, which writes the trace through on_trace_ready into _torch_profiler_trace_dir, and reads no profiler state afterwards; execution_trace.py finalises its observer after it and trace_export.py orders it across ranks, then drops self.profiler
+  sha256: 352b9e653ba905801bde06e77ad4b13796f8deb7e21c9bd89f80e3b3363d92a1
+  signature: (self) -> None
+
+- id: profiler-worker-step
+  kind: method
+  target: vllm.profiler.wrapper:TorchProfilerWrapper.step
+  why: the max-iterations stop runs through self.stop() inside step(); trace_export.py marks stops made inside step() as unordered
+  sha256: 9cd9c53d21702ac9eb634abd4e9d20fac6453de784f259fa5cb0e46b0ef346b5
+  signature: (self) -> None
+
+- id: profiler-worker-shutdown
+  kind: method
+  target: vllm.profiler.wrapper:TorchProfilerWrapper.shutdown
+  why: a running session is stopped through self.stop() inside shutdown(); trace_export.py marks stops made inside shutdown() as unordered
+  sha256: fc2945c8ee205409d9ff0c67bca6d82f91e81aec2423f67e419236f67b7dc63a
+  signature: (self) -> None
+
+- id: profiler-is-uri-path
+  kind: function
+  target: vllm.config.profiler:_is_uri_path
+  why: true for a remote trace directory (gs:// and the like); trace_export.py orders exports and moves temporary files only for a local directory
+  sha256: 3e56aa69835f93d1cb1d3f08e590fcc9928e74a9d9f81935c1f1cc35727dbe5f
+  signature: '(path: str) -> bool'

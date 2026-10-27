@@ -189,6 +189,24 @@ def register() -> None:
     install_depth_hint()
     # After the hint: the host width runs on the width the hint chose.
     install_host_width()
+    register_execution_trace()
+    register_serial_trace_export()
+
+
+def register_execution_trace() -> None:
+    """Execution traces beside the torch profiler's, with
+    VLLM_SM80_EXECUTION_TRACE (vllm/sm80/worker/execution_trace.py)."""
+    from vllm.sm80.worker import execution_trace
+
+    execution_trace.install()
+
+
+def register_serial_trace_export() -> None:
+    """Rank-ordered torch profiler trace export, with
+    VLLM_SM80_SERIAL_TRACE_EXPORT (vllm/sm80/worker/trace_export.py)."""
+    from vllm.sm80.worker import trace_export
+
+    trace_export.install()
 
 
 def is_registered() -> bool:
