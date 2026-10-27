@@ -64,7 +64,9 @@ class HashCache:
     """sha256 of files keyed by (device, inode, size, mtime_ns).
 
     The cache only avoids re-reading unchanged files; a changed stat always
-    re-hashes. ``path`` None keeps the cache in memory only.
+    re-hashes. ``path`` None keeps the cache in memory only. A save keeps
+    only the entries whose path still exists, so trees that are gone do not
+    grow the file every launch reads.
     """
 
     SCHEMA = "launch-hash-cache/1"
@@ -101,6 +103,7 @@ class HashCache:
     def save(self) -> None:
         if not self.path or not self.dirty:
             return
+        self.entries = {p: e for p, e in self.entries.items() if os.path.exists(p)}
         try:
             atomic_write(self.path, canonical({"schema": self.SCHEMA, "entries": self.entries}))
         except OSError:
