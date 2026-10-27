@@ -106,7 +106,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/idx_glue_gate.py` | 75 |
 | `vllm/sm80/kernels/indexer/__init__.py` | 9 |
 | `vllm/sm80/kernels/indexer/topk_tiefix.py` | 571 |
-| `vllm/sm80/kernels/indexer/topk_tiefix_gate.py` | 238 |
+| `vllm/sm80/kernels/indexer/topk_tiefix_gate.py` | 259 |
 | `vllm/sm80/kernels/kda/__init__.py` | 17 |
 | `vllm/sm80/kernels/kda/commit_plan.py` | 225 |
 | `vllm/sm80/kernels/kda/recover.py` | 1,053 |
@@ -134,7 +134,7 @@ Kernels shared by several models on sm_80, one directory per family.
 | `vllm/sm80/kernels/thin_gemm/warmup.py` | 154 |
 | `vllm/sm80/kernels/warmup.py` | 132 |
 | `vllm/sm80/kernels/warmup_utils.py` | 37 |
-| **52 files** | **18,463** |
+| **52 files** | **18,484** |
 
 ### `vllm/sm80/`
 
@@ -211,7 +211,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/spec_decode/warmup.py` | 184 |
 | `vllm/sm80/table_segment.py` | 707 |
 | `vllm/sm80/tuning.py` | 278 |
-| `vllm/sm80/tuning/nvidia-cmp-170hx.toml` | 330 |
+| `vllm/sm80/tuning/nvidia-cmp-170hx.toml` | 331 |
 | `vllm/sm80/worker/__init__.py` | 2 |
 | `vllm/sm80/worker/cudagraph_mem.py` | 528 |
 | `vllm/sm80/worker/graph_mem_worker.py` | 96 |
@@ -220,7 +220,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 278 |
-| **78 files** | **24,517** |
+| **78 files** | **24,518** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -400,11 +400,11 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/kernels/test_deterministic_moe_align.py` | 411 |
 | `tests/kernels/test_fla_autotune_pin.py` | 629 |
 | `tests/kernels/test_replay_inputs.py` | 56 |
-| `tests/kernels/test_sorted_topk.py` | 256 |
+| `tests/kernels/test_sorted_topk.py` | 262 |
 | `tests/kernels/test_sparse_kv_row_offsets.py` | 173 |
 | `tests/kernels/test_topk_reference.py` | 114 |
 | `tests/kernels/test_topk_tiefix.py` | 458 |
-| `tests/kernels/test_topk_tiefix_split.py` | 316 |
+| `tests/kernels/test_topk_tiefix_split.py` | 320 |
 | `tests/kernels/thin_gemm_real_cases.py` | 148 |
 | `tests/kernels/topk_reference.py` | 59 |
 | `tests/model_executor/layers/test_exl3_layers.py` | 615 |
@@ -552,7 +552,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_glm_pp4_mamba_split.py` | 263 |
 | `tests/sm80/test_glm_registrations.py` | 309 |
 | `tests/sm80/test_gpu_lock_guard.py` | 74 |
-| `tests/sm80/test_hot_swap.py` | 700 |
+| `tests/sm80/test_hot_swap.py` | 701 |
 | `tests/sm80/test_hot_swap_gpu.py` | 124 |
 | `tests/sm80/test_import_cuda_init.py` | 159 |
 | `tests/sm80/test_indexer_deep_gemm_gates.py` | 57 |
@@ -574,7 +574,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_step_error_dispatch.py` | 72 |
 | `tests/sm80/test_table_segment.py` | 283 |
 | `tests/sm80/test_triton_mla_sparse_block_stride.py` | 151 |
-| `tests/sm80/test_tuning.py` | 277 |
+| `tests/sm80/test_tuning.py` | 288 |
 | `tests/sm80/tuning_rows.py` | 39 |
 | `tests/sm80/update_seams.py` | 173 |
 | `tests/test_retired_env_vars.py` | 319 |
@@ -616,7 +616,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_sm80_cudagraph_mem.py` | 571 |
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **289 files** | **122,922** |
+| **289 files** | **122,944** |
 
 #### `tools/`
 
@@ -660,7 +660,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/models/glm5next/common/kda.py` | modified | 270 | 14 | 19 |
 | `vllm/models/glm5next/nvidia/ops/kpool_compress.py` | modified | 48 | 14 | 23 |
 | `vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py` | modified | 8 | 6 | 8 |
-| `vllm/models/glm5next/nvidia/sparse_indexer.py` | modified | 122 | 16 | 18 |
+| `vllm/models/glm5next/nvidia/sparse_indexer.py` | modified | 123 | 16 | 18 |
 | `vllm/models/kimi_k3/nvidia/kda_metadata.py` | modified | 3 | 0 | 2 |
 | `vllm/models/kimi_k3/nvidia/ops/recoverssm.py` | modified | 3 | 1 | 3 |
 | `vllm/models/qwen4_exp/common/ngram_embedding.py` | modified | 4 | 0 | 2 |
@@ -709,7 +709,7 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 | `vllm/v1/worker/gpu/warmup.py` | modified | 3 | 0 | 3 |
 | `vllm/v1/worker/gpu_model_runner.py` | modified | 7 | 0 | 3 |
 | `vllm/v1/worker/gpu_worker.py` | modified | 85 | 4 | 10 |
-| **73 files** | | **2,917** | **249** | **424** |
+| **73 files** | | **2,918** | **249** | **424** |
 
 ### Tests, docs and .github
 
@@ -748,9 +748,9 @@ Every upstream-owned path that differs from the base. Hunks are counted at zero 
 
 | Group | Files | + | - | Hunks |
 |---|---:|---:|---:|---:|
-| Product code | 73 | 2,917 | 249 | 424 |
+| Product code | 73 | 2,918 | 249 | 424 |
 | Tests, docs and .github | 27 | 1,481 | 550 | 88 |
-| All | 100 | 4,398 | 799 | 512 |
+| All | 100 | 4,399 | 799 | 512 |
 
 ## 3. Fork environment variables
 
@@ -892,11 +892,11 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 | Measure | Value |
 |---|---:|
 | Fork-added product files | 225 |
-| Fork-added product lines | 78,755 |
+| Fork-added product lines | 78,777 |
 | Patched upstream files | 100 |
-| Patched upstream lines | +4,398 / -799 |
+| Patched upstream lines | +4,399 / -799 |
 | Patched upstream product files | 73 |
-| Patched upstream product lines | +2,917 / -249 |
-| Product lines added (new files and patches) | 81,672 |
+| Patched upstream product lines | +2,918 / -249 |
+| Product lines added (new files and patches) | 81,695 |
 | Fork environment variables (flags) | 109 |
 | Unreferenced fork definitions | 6 (51 lines) |
