@@ -43,9 +43,13 @@ first, at most ``rows``), ``first`` (counter value of the first of them),
 and ``meta`` (JSON: rank, device, tags, layer, scopes, columns as [tag, path,
 edge]). A request already present at start is not served.
 
-Hooks: a global forward pre-hook finds the roots (only while some configured
-root class has not been seen; it is removed once every one has), then each
-root, its layers and their scopes get forward hooks of their own.
+Hooks: a global forward pre-hook finds the roots, then each root, its layers
+and their scopes get forward hooks of their own. The finder is removed once
+every configured root class has been seen, or else when a root it found starts
+its next forward: the first step (the profile run) calls every root the rank
+holds, so a rank without one (a pipeline stage without the drafter, a run
+without one) keeps no per-module hook past it, and a root first called after
+that is never timed.
 """
 
 from __future__ import annotations
@@ -200,13 +204,21 @@ class LightTimer:
 
     def find_roots(self, module: nn.Module, args: Any) -> None:
         tag = self.by_class.get(type(module).__name__)
-        if tag is None or id(module) in self.attached:
+        if tag is None:
+            return
+        if id(module) in self.attached:
+            # A root's next forward: every root of this rank has run by now.
+            self.stop_finding()
             return
         self.attach(module, tag)
         # The root's own hooks miss this call's entry but not its exit.
         self.enter_root(tag)
         self.missing.discard(type(module).__name__)
-        if not self.missing and self.handle is not None:
+        if not self.missing:
+            self.stop_finding()
+
+    def stop_finding(self) -> None:
+        if self.handle is not None:
             self.handle.remove()
             self.handle = None
 

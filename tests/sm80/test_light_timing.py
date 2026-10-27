@@ -165,6 +165,21 @@ def test_roots_keep_their_own_tags_and_the_finder_goes(timing):
     assert {k[0] for k in timer.columns} == {"draft"}
 
 
+def test_finder_goes_at_the_next_forward_when_a_root_is_missing(timing):
+    """A rank that holds the target only: the finder is gone once the target
+    starts its second forward, and a root first called after that is not
+    timed."""
+    timer, calls, state = timing
+    target = Wrapper()
+    target(torch.zeros(1))
+    assert timer.handle is not None
+    target(torch.zeros(1))
+    assert timer.handle is None
+    calls.clear()
+    ToyDraft(layers=1)(torch.zeros(1))
+    assert calls == []
+
+
 def test_drafter_layers_of_another_class_are_stamped(timing):
     """A layer list times a drafter whose layers are not the target's class;
     a scope its layers lack is skipped."""
