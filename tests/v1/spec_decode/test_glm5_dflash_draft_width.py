@@ -159,6 +159,8 @@ def _drafter(max_width, widths, width, num_reqs, pad, split, seed=0):
     s.candidate_sampler = sm.CandidateSampler(MAX_REQS, k, TOP_K, s.device)
     s.draft_tokens = torch.zeros(MAX_REQS, k, dtype=torch.int64)
     s.draft_logits = None
+    s.draft_logits_num_shards = 1
+    s.draft_logits_shard_idx = 0
     s.use_fp64_gumbel = False
     s.enable_adaptive_verification = False
     s.split_tail = False

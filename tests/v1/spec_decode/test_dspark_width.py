@@ -53,6 +53,8 @@ def _init_cpu(self, config, device):
     self._sample_cols = {5: self.sample_col}
     self.draft_token_confidence_probs = torch.full((8, 5), -1.0)
     self.draft_logits = None
+    self.draft_logits_num_shards = 1
+    self.draft_logits_shard_idx = 0
     self._cg_managers = {}
     self.query_cudagraph_manager = None
     self._draft_topk = None

@@ -736,6 +736,8 @@ def _speculator(num_reqs, pad, split, seed=0):
     s.candidate_sampler = sm.CandidateSampler(max_reqs, k, top_k, s.device)
     s.draft_tokens = torch.zeros(max_reqs, k, dtype=torch.int64)
     s.draft_logits = None
+    s.draft_logits_num_shards = 1
+    s.draft_logits_shard_idx = 0
     s.use_fp64_gumbel = False
     s.enable_adaptive_verification = False
     s.split_tail = False
