@@ -2,12 +2,23 @@
 
 The fork is based on [vLLM](https://github.com/vllm-project/vllm) and retains
 its Apache-2.0 licence, source notices and upstream contributor history.
-Morrowmake maintains the CMP 170HX changes; inherited and adapted code is not
-claimed as independently authored. These credits supplement, rather than
+AlexBrandes maintains this downstream fork. Its newer engine is derived from
+Morrowmake's CMP 170HX fork; inherited and adapted code is not claimed as
+independently authored. These credits supplement, rather than
 replace, the original per-file and bundled licence notices. They do not imply
 endorsement by the people or projects named here.
 
 ## Code and reference implementations
+
+- **Morrowmake:** [vllm-cmp170hx](https://github.com/Morrowmake/vllm-cmp170hx)
+  is the base of this engine line, including its SM80 kernels, EXL3 integration,
+  plugin architecture, and serving improvements. The original notices are retained.
+- **turboderp / ExLlamaV3:** EXL3 codec/reference work; the adapted implementation's
+  MIT grant and modification notices are in [the EXL3 license directory](../plugins/sm80/licenses/exl3).
+- **polyuij42-del and nguyenthimy2022kg-alt:** community PP and SSD-backed PLE
+  work behind our earlier W4A16 production branch. Its
+  [recipe NOTICE](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/c0db9613d146eda17338b84f2440ead5505f53c5/NOTICE)
+  identifies the sources and licenses.
 
 - **wtdcode/vllm-backport and lazymio:** the shared-expert aux-stream reorder in
   `vllm/model_executor/layers/fused_moe/runner/{moe_runner,shared_experts}.py`
@@ -42,6 +53,13 @@ endorsement by the people or projects named here.
 
 The following are idea credits, not assertions that those projects' code was
 copied or that their licences apply to our independent implementations.
+
+- **[CMPUnlocker, the original amoghmunikote repository](https://github.com/amoghmunikote/cmpunlocker):**
+  driver-unlock work enabling practical compute use of CMP cards. The driver is
+  a separate project; its code is not copied into this engine.
+- **[PixelML / club-170hx](https://github.com/PixelML/club-170hx):**
+  hardware qualification, deployment guidance, community benchmark work, and
+  ideas for multi-card serving under CMP PCIe constraints.
 
 - [MiaAI-Lab's GLM recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/6278ecb01034cea9ef6de0f851d09fccafe3e835):
   kpool slot-mapping correctness, Mamba in-flight reservation, tool-call masking
