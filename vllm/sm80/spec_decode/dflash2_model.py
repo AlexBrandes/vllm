@@ -20,7 +20,7 @@ upstream's):
   given the fork class (:meth:`DFlashGroupedConv.adopt`), so their modules and
   parameters are exactly the upstream ones. LiLiCorr builds the same decoder
   layers (``lilicorr_model.py``);
-- ``VLLM_GLM5_DRAFTER_SELECTOR_SHARD`` with TP > 1: the candidate selector
+- ``VLLM_DFLASH2_SELECTOR_SHARD`` with TP > 1: the candidate selector
   keeps a contiguous vocab shard of its two codebooks per tensor-parallel rank
   and rebuilds the looked-up rows with one all-reduce (exact: each row has one
   non-zero contributor). The PP draft tail builds its selector the same way
@@ -316,7 +316,7 @@ class CandidateSelector(qwen3_dflash2.CandidateSelector):
         )
         elem = torch.tensor([], dtype=params_dtype).element_size()
         logger.info_once(
-            "VLLM_GLM5_DRAFTER_SELECTOR_SHARD: selector codebooks %d -> %d "
+            "VLLM_DFLASH2_SELECTOR_SHARD: selector codebooks %d -> %d "
             "rows per rank (%.1f -> %.1f MiB for both).",
             vocab_size,
             rows,
@@ -375,9 +375,9 @@ class CandidateSelector(qwen3_dflash2.CandidateSelector):
 
 def build_candidate_selector(**kwargs) -> qwen3_dflash2.CandidateSelector:
     """The DFlash2 candidate selector: the vocab-sharded one with
-    ``VLLM_GLM5_DRAFTER_SELECTOR_SHARD`` and TP > 1, else upstream's."""
+    ``VLLM_DFLASH2_SELECTOR_SHARD`` and TP > 1, else upstream's."""
     tp_size = get_tensor_model_parallel_world_size()
-    if envs.VLLM_GLM5_DRAFTER_SELECTOR_SHARD and tp_size > 1:
+    if envs.VLLM_DFLASH2_SELECTOR_SHARD and tp_size > 1:
         return CandidateSelector(**kwargs)
     return qwen3_dflash2.CandidateSelector(**kwargs)
 

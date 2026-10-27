@@ -35,6 +35,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sm80 import capture
+from vllm.sm80 import tuning
 from vllm.sm80.kernels.exl3.hybrid import (
     EXL3,
     UNQUANTIZED,
@@ -44,8 +45,6 @@ from vllm.sm80.kernels.exl3.hybrid import (
 )
 from vllm.sm80.kernels.exl3.layout import Exl3Layout, exl3_layout
 from vllm.sm80.kernels.exl3.override import apply_override
-from vllm.sm80.kernels.exl3.placement import apply_placement
-from vllm.sm80.kernels.exl3 import replicas as expert_replicas
 from vllm.sm80.kernels.exl3.utils import (
     Exl3Manifest,
     PackedMatrix,
@@ -847,12 +846,6 @@ def tensor_parallel_expert_split(moe, prefix: str) -> tuple[int, slice]:
     reason = expert_tp_closed_reason(parallel)
     if reason is not None:
         raise ValueError(reason)
-    for name in ("VLLM_EXL3_EXPERT_REPLICAS", "VLLM_EXL3_EXPERT_PLACEMENT"):
-        if getattr(envs, name):
-            raise ValueError(
-                f"{name} plans whole experts per rank: it needs "
-                "--enable-expert-parallel, not tensor-parallel routed experts"
-            )
     intermediate = moe.intermediate_size
     size, rank = parallel.tp_size, parallel.tp_rank
     layer_index = extract_layer_index(prefix)
@@ -884,22 +877,10 @@ def tensor_parallel_expert_split(moe, prefix: str) -> tuple[int, slice]:
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
-    # VLLM_EXL3_EXPERT_REPLICAS: this layer's replicas (create_weights) and
-    # the resident bytes their copies add; None and 0 when off.
-    replicas = None
-    replica_bytes = 0
     # Routed experts at MoE tensor parallel size > 1: (whole intermediate,
     # this rank's columns of every expert) from tensor_parallel_expert_split;
     # None with whole experts per rank.
     expert_split = None
-
-    @property
-    def home_experts(self) -> int:
-        """Local slots of the experts whose home is this rank (the operator
-        gates check these); replica copies follow them."""
-        if self.replicas is None:
-            return self.local_experts
-        return self.local_experts - len(self.replicas.copies)
 
     def __init__(self, config, prefix, moe):
         super().__init__(moe)
@@ -953,12 +934,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if params_dtype != torch.bfloat16 or layer.apply_router_weight_on_input:
             raise ValueError("EXL3 MoE requires BF16 and routing weights after down")
         assert self.config.manifest is not None
-        apply_placement(layer, self.config, self.prefix)
-        # VLLM_EXL3_EXPERT_REPLICAS: copies of this layer's replicated experts
-        # whose home is another rank, in slots after the home slots.
-        self.replicas = expert_replicas.plan_layer(layer, self.config, self.prefix)
-        if self.replicas is not None:
-            num_experts += len(self.replicas.copies)
         if self.expert_split is None:
             intermediate, columns = intermediate_size_per_partition, None
         else:
@@ -979,8 +954,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         local_matrices = []
         for expert in range(layer.global_num_experts):
             local = layer._map_global_expert_id_to_local_expert_id(expert)
-            if local < 0 and self.replicas is not None:
-                local = self.replicas.local[expert]
             for role in ("gate_proj", "up_proj", "down_proj"):
                 prefix = self.config.layout.expert_matrix(
                     self.config, self.prefix, expert, role
@@ -1024,15 +997,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if any(len(expert) != 3 for expert in weights):
             raise ValueError("EXL3 expert assignment is incomplete or duplicated")
         layer.exl3_experts = nn.ModuleList(nn.ModuleList(w) for w in weights)
-        if self.replicas is not None:
-            added = sum(
-                p.nbytes
-                for expert in weights[self.home_experts :]
-                for weight in expert
-                for p in (weight.trellis, weight.suh, weight.svh)
-            )
-            self.replica_bytes = added
-            expert_replicas.log_layer(self.prefix, self.replicas, added)
 
     def get_fused_moe_quant_config(self, layer):
         return FusedMoEQuantConfig.make()
@@ -1085,18 +1049,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         else:
             layer.register_buffer("exl3_expert_map", layer.expert_map)
-        # The operator gates check the home slots; replica slots repeat
-        # matrices of the same layer.
-        gate_metadata = metadata[: self.home_experts]
-        replica_map = None
-        if self.replicas is not None:
-            if any(meta not in gate_metadata for meta in metadata[self.home_experts :]):
-                raise ValueError("EXL3 expert replicas differ from the layer's experts")
-            if layer.exl3_expert_map.dtype not in (torch.int32, torch.int64):
-                raise ValueError("EXL3 expert replicas need an integer expert map")
-            replica_map = expert_replicas.ReplicaMap(
-                self.replicas, device, layer.exl3_expert_map.dtype
-            )
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         prepare = maybe_make_prepare_finalize(
             moe=self.moe,
@@ -1106,7 +1058,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         max_rows = dispatched_rows(prepare, self.moe)
         # Its workspace holds one moe_out launch, which may be a row chunk.
-        moe_out_rows = moe_out_launch_rows(max_rows)
+        moe_out_rows = moe_out_launch_rows(max_rows, self.hidden_size)
         workspace = exl3_ops.moe_workspace_size(
             moe_out_rows,
             self.hidden_size,
@@ -1117,14 +1069,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         moe_v2_rows = moe_v2_bits_x2 = 0
         if envs.VLLM_EXL3_MOE_V2:
             moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
-                layer, gate_metadata, max_rows, workspace
+                layer, metadata, max_rows, workspace
             )
         # VLLM_EXL3_MOE_V2_DRAFT: the DSpark drafter's layers, with kernels of
         # their own (ops.MOE_V2_DRAFT_CONFIGS), never folded.
         moe_v2_draft = False
         if not moe_v2_rows and envs.VLLM_EXL3_MOE_V2_DRAFT:
             moe_v2_rows, moe_v2_bits_x2, workspace = self._moe_v2(
-                layer, gate_metadata, max_rows, workspace, draft=True
+                layer, metadata, max_rows, workspace, draft=True
             )
             moe_v2_draft = bool(moe_v2_rows)
         # VLLM_EXL3_MOE_V2_RING: the target layers' moe_out_v2 calls of the covered
@@ -1137,18 +1089,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         prefill_decode_len = 0
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace = self._moe_prefill(
-                layer, gate_metadata, max_rows, workspace
+                layer, metadata, max_rows, workspace
             )
         prefill_v2_bits_x2 = prefill_v2_decode_len = 0
         if self.prefill_v2:
             prefill_v2_bits_x2, prefill_v2_decode_len, workspace = (
-                self._moe_prefill_v2(layer, gate_metadata, max_rows, workspace)
+                self._moe_prefill_v2(layer, metadata, max_rows, workspace)
             )
         if moe_out_rows < max_rows:
             logger.info_once(
                 "EXL3 moe_out runs MoE calls of more than %d rows in chunks of "
-                "at most %d (VLLM_EXL3_MOE_CHUNK_ROWS); its workspace holds %d "
-                "rows instead of %d.",
+                "at most %d (moe_routed_gemm/exl3_chunk_rows); its workspace "
+                "holds %d rows instead of %d.",
                 moe_out_rows,
                 moe_out_rows,
                 moe_out_rows,
@@ -1173,7 +1125,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             prefill_v2_bits_x2=prefill_v2_bits_x2,
             prefill_v2_decode_len=prefill_v2_decode_len,
             swiglu_limit=self.swiglu_limit,
-            replica_map=replica_map,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
@@ -1193,7 +1144,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
-            self.home_experts,
+            self.local_experts,
             layer.global_num_experts,
             metadata,
             draft=draft,
@@ -1346,7 +1297,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
-            self.home_experts,
+            self.local_experts,
             layer.global_num_experts,
             metadata,
         )
@@ -1424,7 +1375,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.hidden_size,
             self.intermediate_size,
             layer.top_k,
-            self.home_experts,
+            self.local_experts,
             layer.global_num_experts,
             metadata,
         )
@@ -1502,10 +1453,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
 
 class Exl3Experts(mk.FusedMoEExpertsModular):
-    # VLLM_EXL3_EXPERT_REPLICAS: calls of 1..replicas.MAX_ROWS rows take the
-    # per-call expert map that picks one owner rank per replicated expert
-    # (replicas.py); None: the static expert map always.
-    replica_map = None
     # VLLM_EXL3_MOE_V2_FOLD: the moe_out_v2 calls take moe_out_v2_fold.
     moe_v2_fold = False
     # VLLM_EXL3_MOE_V2_DRAFT: the moe_out_v2 calls are the DSpark drafter's
@@ -1532,7 +1479,6 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         prefill_v2_bits_x2=0,
         prefill_v2_decode_len=0,
         swiglu_limit=0.0,
-        replica_map=None,
     ):
         super().__init__(moe, quant)
         self.intermediate_size = intermediate_size
@@ -1540,7 +1486,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.workspace_elements = workspace
         self.max_rows = max_rows
         # moe_out takes at most this many rows per launch (its workspace size;
-        # VLLM_EXL3_MOE_CHUNK_ROWS); larger calls run in chunks.
+        # moe_routed_gemm/exl3_chunk_rows); larger calls run in chunks.
         self.moe_out_rows = max_rows if moe_out_rows is None else moe_out_rows
         # Calls of 1..moe_v2_rows rows take moe_out_v2 (VLLM_EXL3_MOE_V2) with
         # the layer's routed-matrix bits_x2.
@@ -1561,7 +1507,6 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.prefill_v2_decode_len = prefill_v2_decode_len
         # SwiGLU clamp the native operators apply (0: none).
         self.swiglu_limit = swiglu_limit
-        self.replica_map = replica_map
 
     @staticmethod
     def activation_format():
@@ -1673,8 +1618,6 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             operator = self._prefill_operator(rows, operator)
         if self.prefill_v2_bits_x2:
             operator = self._prefill_v2_operator(rows, operator)
-        if self.replica_map is not None and 0 < rows <= expert_replicas.MAX_ROWS:
-            expert_map = self.replica_map(topk_ids)
         # Row-indexed arguments; moe_out takes at most moe_out_rows of them per
         # launch. It computes every row from its own input and routes alone, so
         # row chunks give the bits of the whole call.
@@ -1812,14 +1755,17 @@ def _unaligned_trellis_reason(pointers) -> str | None:
     return None
 
 
-def moe_out_launch_rows(max_rows: int) -> int:
+def moe_out_launch_rows(max_rows: int, hidden: int) -> int:
     """Most rows one moe_out launch takes for calls of up to ``max_rows``
-    rows: VLLM_EXL3_MOE_CHUNK_ROWS when it is set and smaller (larger calls
-    then run in row chunks), else ``max_rows``."""
-    chunk_rows = envs.VLLM_EXL3_MOE_CHUNK_ROWS
+    rows: the moe_routed_gemm/exl3_chunk_rows row of the sm80 tuning table at
+    this hidden size when it is nonzero and smaller (larger calls then run in
+    row chunks), else ``max_rows``. Without a row, 0: whole calls."""
+    chunk_rows = tuning.lookup(
+        "moe_routed_gemm", "exl3_chunk_rows", {"hidden": int(hidden)}, 0
+    )
     if chunk_rows < 0:
         raise ValueError(
-            f"VLLM_EXL3_MOE_CHUNK_ROWS must be 0 or positive, not {chunk_rows}"
+            f"moe_routed_gemm/exl3_chunk_rows must be 0 or positive, not {chunk_rows}"
         )
     return min(max_rows, chunk_rows) if chunk_rows else max_rows
 

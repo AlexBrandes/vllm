@@ -6,7 +6,7 @@
   NaN without changing the committed state or conv window.
 - Graph padding x compiled Marlin decode: live rows keep the incumbent's
   accuracy, ignore stale scratch, and repeat bitwise.
-- Flags-in-data all-reduce (VLLM_CUSTOM_ALLREDUCE_FLAGS) x KDA recover x the
+- Flags-in-data all-reduce (VLLM_SM80_ALLREDUCE) x KDA recover x the
   state-index check (VLLM_STATE_INDEX_CHECK): the flags path rotates its
   stages per call and assumes every rank issues the same collectives in the
   same order; the recover commit and the debug check add host and device work
@@ -91,7 +91,7 @@ def test_recover_and_state_index_check_issue_no_collective(no_collectives, monke
 
     # KDA recover has no switch of its own: the recover metadata below is what
     # it builds.
-    for flag in ("VLLM_CUSTOM_ALLREDUCE_FLAGS", sic.FLAG):
+    for flag in ("VLLM_SM80_ALLREDUCE", sic.FLAG):
         monkeypatch.setenv(flag, "1")
         assert envs.environment_variables[flag]() is True
     sic.check_kda_metadata("l", _recover_md([[5] + [0] * 7, [9] + [3] * 7],

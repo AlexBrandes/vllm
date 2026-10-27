@@ -18,6 +18,9 @@ can reach.
   scratch in KV capacity, and the scheduler's eagle-group flags.
 - ``failed_inputs``: fails only the requests whose model inputs a worker
   could not produce (an EXL3 PLE row that storage failed to read).
+- ``table_segment``: a holder process that keeps checkpoint files (the
+  DeepSeek V4.1 Engram tables) in sealed memory across server restarts,
+  and the client a server maps them with (``VLLM_ENGRAM_SEGMENT``).
 - ``parser_recovery``: provisional tool-call candidates for the streaming
   parser engine, held until validated; ``deepseek_v41_recovery`` recovers
   the damaged DeepSeek V4.1 tool calls with it (vllm/parser/deepseek_v41.py

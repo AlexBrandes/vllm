@@ -891,7 +891,8 @@ def mhc_fused_post_pre_tilelang(
     if use_ampere_mhc_decode_v3(
         num_tokens, hc_mult, hidden_size, norm_weight=norm_weight
     ):
-        # The sm_80 decode kernel for 1 <= M <= VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS:
+        # The sm_80 decode kernel for 1 <= M <= the mhc/decode_v2_max_rows row
+        # of the sm80 tuning table:
         # same signature, same four outputs, same dtypes, and the asserts above
         # have already run. `n_splits` / `tile_n` are part of the shared MHC
         # operator API; v3 picks its split from the runtime shape. With the gate

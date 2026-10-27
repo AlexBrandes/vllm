@@ -54,7 +54,7 @@ def test_glm_model_info_matches_upstream(architecture):
 
     fork_cls = _load(plugin.MODEL_OVERRIDES[architecture])
     upstream_cls = getattr(upstream, architecture)
-    assert fork_cls.__bases__[0] is upstream_cls
+    assert fork_cls.__bases__[-1] is upstream_cls
     assert fork_cls.__name__ == upstream_cls.__name__ == architecture
     info = _ModelInfo.from_model_cls(fork_cls)
     assert info == _ModelInfo.from_model_cls(upstream_cls)

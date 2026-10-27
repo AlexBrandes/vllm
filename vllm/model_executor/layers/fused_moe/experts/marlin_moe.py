@@ -774,10 +774,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     apply_router_weight_on_input,
                 ):
                     return
-            if (
-                envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE
-                or envs.VLLM_AMPERE_MARLIN_PREFILL_NARROW
-            ):
+            if envs.VLLM_SM80_MARLIN_PREFILL:
                 from vllm.sm80.kernels.marlin_moe.prefill import maybe_apply
 
                 if maybe_apply(

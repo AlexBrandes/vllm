@@ -12,8 +12,8 @@ unfused chain (f_b/g_b GEMMs, causal_conv1d_update, fla fused_recurrent_kda,
 o_norm) elsewhere. Served shapes: up to 8 sequences of 1..8 tokens (draft depth
 up to 7), pure verify and mixed steps.
 
-CPU part: the removed switches are gone, the dispatch table, the wide-schedule
-choice, the kill switch VLLM_GLM5_DECODE_KDA_WIDE.
+CPU part: the dispatch table (64 heads take every measured shape under
+VLLM_AMPERE_DECODE_KERNELS), the wide-schedule choice.
 GPU part (skipped without CUDA), driven through the real forward()/_forward():
 for every served shape, the step's normed output o, its consumer y = o @ Wo^T
 (FP64 consumer on the kernel's bf16 output) and the per-token recurrent states
@@ -22,8 +22,8 @@ it is no worse than the unfused chain on the same inputs (mean <= 1.10x,
 max <= 1.25x its error, for o and y), so are its per-token states, and its
 conv state is bitwise the unfused chain's. Also: mixed-step spec rows,
 CUDA-graph replay bitwise eager, a breakable (PIECEWISE) graph captured on one
-kind of step and replayed on another applying o_norm by the replayed step, the
-kill switch restoring the earlier split, and the warmup plans.
+kind of step and replayed on another applying o_norm by the replayed step, and
+the warmup plans.
 
     CUDA_VISIBLE_DEVICES=<gpu> python tests/kernels/test_ampere_kda_dispatch.py
 """
@@ -44,12 +44,8 @@ from vllm.models.glm5next.nvidia.ops.kda_decode import use_ampere_kda_decode_v2
 D, KA, CONV_K = 128, 128, 4
 WINDOW = 8                      # draft depth 7 + 1: the served speculative window
 HIDDEN = 512                    # synthetic o_proj rows (the consumer y)
-REMOVED = ("VLLM_GLM5_DECODE_KDA", "VLLM_GLM5_DECODE_KDA_MAX_TOKENS",
-           "VLLM_GLM5_DECODE_KDA_V2", "VLLM_GLM5_DECODE_KDA_V2_WIDE_MAX_SEQS",
-           "VLLM_GLM5_DECODE_KDA_V2_DEEP", "VLLM_GLM5_KDA_RECOVER",
-           "VLLM_GLM5_DECODE_KDA_STEP_TILE")
-ENV = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_GLM5_DECODE_KDA_WIDE",
-       "VLLM_GLM5_DECODE_MOE_ROUTING", "VLLM_USE_BREAKABLE_CUDAGRAPH")
+ENV = ("VLLM_AMPERE_DECODE_KERNELS", "VLLM_GLM5_DECODE_MOE_ROUTING",
+       "VLLM_USE_BREAKABLE_CUDAGRAPH")
 MEAN_X, MAX_X = 1.10, 1.25
 REF_DEVICE = "cpu"              # where the FP64 model runs ("cuda" for large runs)
 
@@ -80,7 +76,7 @@ def _w(H, dtype=torch.bfloat16, device="cpu"):
     return torch.zeros((H * D, KA), dtype=dtype, device=device)
 
 
-def expected_path(H, nseq, T, wide_switch=True):
+def expected_path(H, nseq, T):
     """The 1.8 dispatch of a pure verify step: 'v2' (per-draft-slot step,
     _select schedule), 'v2w' (wide schedule) or 'unfused'. RecoverSSM layers
     (16 heads under tensor parallel) verify every step with v2 RECOVER."""
@@ -91,8 +87,6 @@ def expected_path(H, nseq, T, wide_switch=True):
     if H == 16:
         return "unfused" if (T >= 6 and nseq > 4) else "v2"
     if H == 64:
-        if not wide_switch:
-            return "v2" if (nseq == 1 and T <= 5) else "unfused"
         if (nseq, T) not in kda_decode._KDA_V2_WIDE_SHAPES:
             return "unfused"
         return "v2w" if wide_schedule(nseq, T, H) else "v2"
@@ -101,44 +95,28 @@ def expected_path(H, nseq, T, wide_switch=True):
 
 # ------------------------------------------------------------------ CPU tests
 
-def test_removed_switches_are_gone():
-    """The v1 kernel and the kill switches of features validated in 1.7.0 are
-    gone; the one new kill switch defaults on."""
-    from vllm import envs
-
-    for name in REMOVED:
-        assert name not in envs.environment_variables, name
-    os.environ.pop("VLLM_GLM5_DECODE_KDA_WIDE", None)
-    assert envs.VLLM_GLM5_DECODE_KDA_WIDE is True
-    assert not hasattr(kda_decode, "use_ampere_kda_decode")
-    import importlib.util
-
-    assert importlib.util.find_spec("vllm.ampere_decode") is None
-
-
 def test_dispatch_table_every_served_shape():
     e = _Env()
     try:
-        for wide in (1, 0):
-            e.set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=wide)
-            for H in (16, 64):
-                w = _w(H)
-                for nseq in range(1, 10):
-                    for T in range(1, 10):
-                        want = expected_path(H, nseq, T, bool(wide)) != "unfused"
-                        got = use_ampere_kda_decode_v2(nseq, nseq * T, H, D, w, w)
-                        assert got == want, (wide, H, nseq, T, got)
-        e.set(VLLM_GLM5_DECODE_KDA_WIDE=1)
+        e.set(VLLM_AMPERE_DECODE_KERNELS=1)
+        for H in (16, 64):
+            w = _w(H)
+            for nseq in range(1, 10):
+                for T in range(1, 10):
+                    want = expected_path(H, nseq, T) != "unfused"
+                    got = use_ampere_kda_decode_v2(nseq, nseq * T, H, D, w, w)
+                    assert got == want, (H, nseq, T, got)
         # ragged token counts, zero sequences, other head counts and widths
         assert not use_ampere_kda_decode_v2(2, 7, 16, D)
         assert not use_ampere_kda_decode_v2(0, 4, 16, D)
         assert not use_ampere_kda_decode_v2(1, 4, 32, D)
         assert not use_ampere_kda_decode_v2(1, 4, 16, 64)
-        # the kill switch has no effect at 16 heads
-        e.set(VLLM_GLM5_DECODE_KDA_WIDE=0)
-        assert use_ampere_kda_decode_v2(8, 40, 16, D)
+        # the retired 64-head switch changes nothing
+        os.environ["VLLM_GLM5_DECODE_KDA_WIDE"] = "0"
+        assert use_ampere_kda_decode_v2(8, 32, 64, D)
+        del os.environ["VLLM_GLM5_DECODE_KDA_WIDE"]
         # the master switch, the device
-        e.set(VLLM_AMPERE_DECODE_KERNELS=0, VLLM_GLM5_DECODE_KDA_WIDE=1)
+        e.set(VLLM_AMPERE_DECODE_KERNELS=0)
         assert not use_ampere_kda_decode_v2(1, 4, 16, D)
         assert not use_ampere_kda_decode_v2(1, 4, 64, D)
         e.set(VLLM_AMPERE_DECODE_KERNELS=1, sm80=False)
@@ -249,7 +227,7 @@ def _fused(L):
     return L.o_norm.calls == 0
 
 
-def build_layer(H, w, *, kernels, nslot, wide=True, recover=False, window=WINDOW,
+def build_layer(H, w, *, kernels, nslot, recover=False, window=WINDOW,
                 dev="cuda"):
     """A Glm5NextLinearAttention carrying only what forward()/_forward() read,
     with the decode attributes __init__ derives from the switches."""
@@ -285,8 +263,8 @@ def build_layer(H, w, *, kernels, nslot, wide=True, recover=False, window=WINDOW
     L.A_log = w["a_log"].to(dev).float().reshape(1, 1, H, 1).contiguous()
     L.dt_bias = w["dt_bias"].to(dev).float().reshape(-1).contiguous()
     L._kda_v2 = bool(kernels)
-    L._kda_wide = bool(kernels and H == 64 and wide)
-    L._kda_step_tile = bool(kernels and (H != 64 or wide))
+    L._kda_wide = bool(kernels and H == 64)
+    L._kda_step_tile = bool(kernels)
     L._kda_recover = bool(kernels and recover)
     L._kda_recover_records = None
     if L._kda_recover:
@@ -560,7 +538,7 @@ def gpu_test_every_served_shape_vs_fp64():
     used where RecoverSSM is off) and 64 heads, 1..8 sequences of 1..8 tokens."""
     from vllm.models.glm5next.nvidia.ops.kda_decode import wide_schedule
 
-    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=1)
+    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1)
     report, failed = [], []
     try:
         for H, recover in ((16, True), (16, False), (64, False)):
@@ -595,7 +573,7 @@ def gpu_test_mixed_step_spec_rows():
     whole step is the unfused chain. The plain rows and the conv state are
     bitwise the unfused chain's."""
 
-    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=1)
+    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1)
     failed = []
     try:
         for H, recover in ((16, True), (64, False)):
@@ -617,7 +595,7 @@ def gpu_test_graph_replay_is_eager():
     import vllm.models.glm5next.common.kda as kmod
     from vllm.models.glm5next.nvidia.ops.kda_decode import wide_schedule
 
-    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=1)
+    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1)
     try:
         H = 64
         w = synthetic_weights(H, seed=1064)
@@ -657,32 +635,6 @@ def gpu_test_graph_replay_is_eager():
         e.undo()
 
 
-def gpu_test_kill_switch_restores_the_earlier_split():
-    """VLLM_GLM5_DECODE_KDA_WIDE=0 at 64 heads: one sequence of up to 5 tokens
-    on v2 with the full window (bitwise the step tile), everything else bitwise
-    the unfused chain."""
-    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=0)
-    try:
-        H = 64
-        w = synthetic_weights(H, seed=1064)
-        _warm(H, ((1, WINDOW, False),))
-        for nseq, T, fused in ((1, 4, True), (1, 6, False), (2, 4, False)):
-            x, slots, acc, conv0, rec0, meta, _ = _setup(H, nseq, T, 700 + nseq * 10 + T)
-            off = build_layer(H, w, kernels=True, nslot=conv0.shape[0], wide=False)
-            ref = build_layer(H, w, kernels=False, nslot=conv0.shape[0])
-            ra = run_layer(off, x, meta, conv0, rec0)
-            assert _fused(off) == fused, (nseq, T)
-            if fused:
-                _warm(H, ((1, T, False),))
-                on = build_layer(H, w, kernels=True, nslot=conv0.shape[0], wide=True)
-                rb = run_layer(on, x, meta, conv0, rec0)
-            else:
-                rb = run_layer(ref, x, meta, conv0, rec0)
-            assert all(torch.equal(a, b) for a, b in zip(ra[:3], rb[:3])), (nseq, T)
-    finally:
-        e.undo()
-
-
 def gpu_test_piecewise_replay_norms_by_replay_path():
     """A breakable (PIECEWISE) graph replays forward() for any step of its
     token count, so whether o_norm runs must follow the replayed step, not the
@@ -699,8 +651,7 @@ def gpu_test_piecewise_replay_norms_by_replay_path():
         eager_break_during_capture,
     )
 
-    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=1,
-                   VLLM_USE_BREAKABLE_CUDAGRAPH=1)
+    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_USE_BREAKABLE_CUDAGRAPH=1)
     saved = kmod.get_forward_context
     try:
         nseq, T = 8, 4
@@ -779,7 +730,7 @@ def gpu_test_warmup_plans_64_heads():
         scheduler_config=types.SimpleNamespace(max_num_seqs=8)))
     saved = kda_decode.find_module
     kda_decode.find_module = lambda model, attr: layer
-    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1, VLLM_GLM5_DECODE_KDA_WIDE=1)
+    e = _Env().set(VLLM_AMPERE_DECODE_KERNELS=1)
     try:
         kda_decode._WARMED.clear()
         _warmup_kda_v2(worker, torch.nn.Module(), "cuda", [1, 2, 4, 8, 16, 32, 64])
@@ -791,11 +742,11 @@ def gpu_test_warmup_plans_64_heads():
         e.undo()
 
 
-CPU_TESTS = (test_removed_switches_are_gone, test_dispatch_table_every_served_shape,
+CPU_TESTS = (test_dispatch_table_every_served_shape,
              test_gate_checks_the_weights, test_wide_schedule,
              test_import_does_not_initialise_cuda)
 GPU_TESTS = (gpu_test_every_served_shape_vs_fp64, gpu_test_mixed_step_spec_rows,
-             gpu_test_graph_replay_is_eager, gpu_test_kill_switch_restores_the_earlier_split,
+             gpu_test_graph_replay_is_eager,
              gpu_test_piecewise_replay_norms_by_replay_path,
              gpu_test_warmup_plans_64_heads)
 
@@ -805,8 +756,6 @@ if pytest is not None:
     test_gpu_every_served_shape_vs_fp64 = _needs_gpu(gpu_test_every_served_shape_vs_fp64)
     test_gpu_mixed_step_spec_rows = _needs_gpu(gpu_test_mixed_step_spec_rows)
     test_gpu_graph_replay_is_eager = _needs_gpu(gpu_test_graph_replay_is_eager)
-    test_gpu_kill_switch_restores_the_earlier_split = _needs_gpu(
-        gpu_test_kill_switch_restores_the_earlier_split)
     test_gpu_piecewise_replay_norms_by_replay_path = _needs_gpu(
         gpu_test_piecewise_replay_norms_by_replay_path)
     test_gpu_warmup_plans_64_heads = _needs_gpu(gpu_test_warmup_plans_64_heads)

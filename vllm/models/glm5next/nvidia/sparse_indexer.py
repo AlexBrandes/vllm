@@ -33,10 +33,8 @@ from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.models.glm5next.nvidia.ops.idx_glue_gates import use_glue_pos, use_glue_tail
 from vllm.platforms import current_platform
 from vllm.sm80.kernels.indexer.topk_tiefix_gate import (
-    tiefix_decode_topk_,
-    tiefix_topk_,
-    use_sorted_topk,
-    use_tiefix_topk,
+    canonical_decode_topk_,
+    canonical_topk_,
 )
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -443,16 +441,16 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
-                if use_tiefix_topk():
-                    # Boundary ties go to the lowest indices whatever the chunk shape.
-                    tiefix_topk_(
-                        logits,
-                        topk_dst,
-                        row_starts=row_starts,
-                        row_ends=row_ends,
-                        relative=True,
-                        sort=use_sorted_topk(),
-                    )
+                # The top-k determinism switches: boundary ties to the lowest
+                # indices whatever the chunk shape, rows in ascending order.
+                canonical_topk_(
+                    logits,
+                    topk_dst,
+                    indexer="kpool",
+                    row_starts=row_starts,
+                    row_ends=row_ends,
+                    relative=True,
+                )
             # Local pool ids -> request-relative global pool ids.
             _merge_dcp_topk_global(
                 logits,
@@ -738,8 +736,8 @@ def sparse_attn_indexer_kpool(
             select_k,
             attn_metadata_narrowed.max_seq_len,
         )
-        # Boundary ties go to the lowest indices, as after the prefill top-k.
-        tiefix_decode_topk_(logits, topk_dst, seq_lens, next_n)
+        # As after the prefill top-k.
+        canonical_decode_topk_(logits, topk_dst, seq_lens, next_n, indexer="kpool")
         _merge_dcp_topk_global(
             logits,
             topk_dst,

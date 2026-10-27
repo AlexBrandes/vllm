@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-block Marlin W4A16 MoE prefill (VLLM_AMPERE_MARLIN_PREFILL_WIDE).
+"""Split-block Marlin W4A16 MoE prefill at whole experts (VLLM_SM80_MARLIN_PREFILL).
 
 CPU (CUDA_VISIBLE_DEVICES=""): the cover table, the block-list layout contract
 on a pure-Python model of the split alignment, the gate and its fall-throughs,
@@ -12,12 +12,13 @@ incumbent; the split path against an fp64 reference relative to the
 incumbent's own error (mean <= 1.10x, max <= 1.25x) on M in {1282, 2304, 2312}
 and on small M where lists are empty; every routed row written exactly once;
 bitwise run-to-run; CUDA-graph replay equal to eager with no allocation
-growth; the gate-closed fall-throughs on the device.  Captured prefill
-records are used when VLLM_PP_MARLIN_CAPTURE_DIR points at a capture
+growth; the gate-closed fall-throughs on the device.  These run the split
+lists on the released kernels (the compiled tiles are
+test_ampere_marlin_prefill_tiles.py).  Captured prefill
+records are used when VLLM_SM80_REPLAY_DIR holds a capture
 (``moe_pre/*.pt`` plus the ``once/`` weights they name).
 """
 
-import glob
 import os
 import random
 from types import SimpleNamespace
@@ -25,12 +26,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import split_align as sa
 from vllm.sm80.kernels.marlin_moe import prefill as pmp
 
 E, TOPK, K, N, G = 288, 8, 4096, 2048, 128
-FLAG = "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
-MIN_TOKENS = "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS"
+FLAG = "VLLM_SM80_MARLIN_PREFILL"
+# The compiled tile tables; _apply runs without them unless asked.
+TILES = pmp.TILE_TABLES
+
+
+def _min_tokens(monkeypatch, rows):
+    """The moe_prefill/marlin_min_rows row at this module's N."""
+    use_rows(monkeypatch, ("moe_prefill", "marlin_min_rows", {"gemm_n": N}, int(rows)))
 
 
 # --------------------------------------------------------------------------
@@ -201,9 +210,12 @@ def test_flag_defaults(monkeypatch):
     import vllm.envs as envs
 
     monkeypatch.delenv(FLAG, raising=False)
-    monkeypatch.delenv(MIN_TOKENS, raising=False)
-    assert envs.VLLM_AMPERE_MARLIN_PREFILL_WIDE is False
-    assert envs.VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS == 384
+    use_rows(monkeypatch)
+    assert envs.VLLM_SM80_MARLIN_PREFILL is False
+    assert pmp.min_rows(N) == 384
+    _min_tokens(monkeypatch, 700)
+    assert pmp.min_rows(N) == 700
+    assert pmp.min_rows(N // 4 if N == 2048 else N * 4) == 384
 
 
 def test_gate_open_config_only_misses_the_device():
@@ -308,7 +320,7 @@ def test_hook_falls_through_to_fused_marlin_moe(monkeypatch, flag):
 
 def test_below_min_tokens_is_not_gated(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_tokens(monkeypatch, 384)
     monkeypatch.setattr(pmp, "gate_reason",
                         lambda *a, **k: pytest.fail("gate consulted"))
     a = _apply_args(M=383)
@@ -417,11 +429,14 @@ def _inputs(M, seed, dev="cuda"):
     return x, tw.to(dev), ti.to(dev)
 
 
-def _apply(layer, wd, x, tw, ti, monkeypatch, flag, min_tokens=384):
+def _apply(layer, wd, x, tw, ti, monkeypatch, flag, min_tokens=384, tiles=False):
+    """One MarlinExperts.apply; the split lists on the compiled tiles only
+    with ``tiles`` (else as at a width without a tile table)."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     monkeypatch.setenv(FLAG, flag)
-    monkeypatch.setenv(MIN_TOKENS, str(min_tokens))
+    _min_tokens(monkeypatch, min_tokens)
+    monkeypatch.setattr(pmp, "TILE_TABLES", TILES if tiles else {})
     monkeypatch.setenv("VLLM_MOE_DETERMINISTIC_ALIGN", "1")
     M = x.size(0)
     out = torch.full((M, K), float("nan"), dtype=torch.bfloat16, device=x.device)
@@ -597,7 +612,7 @@ def test_graph_replay_equals_eager_without_allocation_growth(weights, monkeypatc
     layer = _gpu_layer(weights)
     x, tw, ti = _inputs(M, 3)
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(MIN_TOKENS, "384")
+    _min_tokens(monkeypatch, 384)
     pmp.warmup(x.device, E, 2312, TOPK)
     eager = _apply(layer, weights, x, tw, ti, monkeypatch, "1")
     out = torch.empty_like(x)
@@ -652,11 +667,8 @@ def test_gate_on_device(weights):
 
 
 def _capture_records():
-    root = os.environ.get("VLLM_PP_MARLIN_CAPTURE_DIR")
-    if not root:
-        return []
-    files = sorted(glob.glob(os.path.join(root, "moe_pre", "*.pt")))
-    limit = int(os.environ.get("VLLM_PP_MARLIN_CAPTURE_LIMIT", "4"))
+    files = replay.files("moe_pre")
+    limit = replay.limit(4)
     # one per stage first, largest M first, so a small limit spans the stages
     files.sort(key=lambda f: (-int(f.split("_b")[1].split("_")[0]), f))
     picked, stages = [], set()
@@ -666,15 +678,15 @@ def _capture_records():
             picked.append(f)
             stages.add(st)
     picked += [f for f in files if f not in picked]
-    return picked[:limit]
+    return picked[: limit or None]
 
 
 @gpu
 @pytest.mark.skipif(not _capture_records(),
-                    reason="VLLM_PP_MARLIN_CAPTURE_DIR not set")
+                    reason="no moe_pre records in VLLM_SM80_REPLAY_DIR")
 @pytest.mark.parametrize("path", _capture_records())
 def test_captured_prefill_records(monkeypatch, path):
-    root = os.environ["VLLM_PP_MARLIN_CAPTURE_DIR"]
+    root = replay.root()
     rec = torch.load(path, map_location="cpu", weights_only=False)
     wrec = torch.load(os.path.join(root, rec["weights"]), map_location="cpu",
                       weights_only=False)

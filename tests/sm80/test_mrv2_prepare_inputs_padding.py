@@ -95,7 +95,11 @@ def test_prepare_inputs_preserves_base_padding_and_routes(
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
     monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", str(int(generic_skip)))
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "8")
+    from tests.sm80.tuning_rows import use_rows
+
+    use_rows(
+        monkeypatch, ("moe_router", "fused_route_max_rows", {"top_k": 8}, 8)
+    )
     g = torch.Generator().manual_seed(seed)
     lengths = torch.randint(1, 9, (1 + seed % 4,), generator=g).tolist()
     ntok = sum(lengths)

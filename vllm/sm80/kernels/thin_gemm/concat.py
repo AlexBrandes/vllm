@@ -44,7 +44,7 @@ from vllm.logger import init_logger
 from vllm.sm80.kernels import thin_gemm as _tg
 from vllm.sm80.kernels.thin_gemm import (
     _device_supported,
-    dispatch_threshold,
+    max_rows,
     thin_gemm_supported,
 )
 
@@ -226,18 +226,23 @@ def register_groups(worker, capture_sizes) -> None:
     mode = worker.vllm_config.compilation_config.mode
     if mode != CompilationMode.NONE:
         return _set_but_off(f"compilation mode {mode.name}, needs NONE")
-    ms = _token_sizes(capture_sizes, dispatch_threshold())
-    if not ms:
-        return _set_but_off("no token size within VLLM_THIN_GEMM_MAX_TOKENS")
     found = _find_groups(_candidate_models(worker))
     if not found:
         return _set_but_off("no MLA layer with an indexer on the thin GEMM")
+    sizes = [
+        _token_sizes(
+            capture_sizes, max(max_rows(w.shape[0], w.shape[1]) for w in ws)
+        )
+        for _name, _prefix, ws in found
+    ]
+    if not any(sizes):
+        return _set_but_off("no token size within dense_gemm/thin_max_rows")
 
     groups = []
-    for name, prefix, ws in found:
+    for (name, prefix, ws), group_sizes in zip(found, sizes):
         K = ws[0].shape[1]
         group_ms = []
-        for M in ms:
+        for M in group_sizes:
             x = torch.empty((M, K), dtype=torch.bfloat16, device="meta")
             if all(thin_gemm_supported(x, w, None) for w in ws):
                 group_ms.append(M)

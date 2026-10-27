@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""VLLM_EXL3_MOE_CHUNK_ROWS: moe_out runs calls of more than N rows in row
-chunks of at most N, with a workspace sized for N rows.
+"""moe_routed_gemm/exl3_chunk_rows (the sm80 tuning table): moe_out runs calls
+of more than N rows in row chunks of at most N, with a workspace sized for N
+rows.
 
-CPU: the switch default and its check, the launch-row rule
+CPU: the row's default and its check, the launch-row rule
 (quant.moe_out_launch_rows), and Exl3Experts.apply's chunks: consecutive row
 views of the same tensors covering every row once, each at most N rows, the
 same workspace and the other arguments unchanged; calls of at most N rows,
@@ -27,24 +28,30 @@ from tests.kernels.quantization.test_exl3_moe_v2 import (
     _bitwise,
     needs_sm80,
 )
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.exl3 import ops as exl3_ops
 from vllm.sm80.kernels.exl3 import quant
 
 HIDDEN, TOPK = 64, 6
 
 
-def test_switch_defaults_off_and_sets_the_launch_rows(monkeypatch):
-    from vllm import envs
+def _chunk_rows(monkeypatch, hidden, rows):
+    use_rows(
+        monkeypatch, ("moe_routed_gemm", "exl3_chunk_rows", {"hidden": hidden}, rows)
+    )
 
-    monkeypatch.delenv("VLLM_EXL3_MOE_CHUNK_ROWS", raising=False)
-    assert envs.VLLM_EXL3_MOE_CHUNK_ROWS == 0
-    assert quant.moe_out_launch_rows(2048) == 2048
-    monkeypatch.setenv("VLLM_EXL3_MOE_CHUNK_ROWS", "512")
-    assert quant.moe_out_launch_rows(2048) == 512
-    assert quant.moe_out_launch_rows(300) == 300
-    monkeypatch.setenv("VLLM_EXL3_MOE_CHUNK_ROWS", "-1")
+
+def test_row_defaults_off_and_sets_the_launch_rows(monkeypatch):
+    use_rows(monkeypatch)
+    assert quant.moe_out_launch_rows(2048, 5120) == 2048
+    _chunk_rows(monkeypatch, 5120, 512)
+    assert quant.moe_out_launch_rows(2048, 5120) == 512
+    assert quant.moe_out_launch_rows(300, 5120) == 300
+    # Keyed by the hidden size: another model's layers keep whole calls.
+    assert quant.moe_out_launch_rows(2048, 2560) == 2048
+    _chunk_rows(monkeypatch, 5120, -1)
     with pytest.raises(ValueError, match="0 or positive"):
-        quant.moe_out_launch_rows(2048)
+        quant.moe_out_launch_rows(2048, 5120)
 
 
 def _experts(moe_out_rows, max_rows=2048, moe_v2_rows=0, prefill_decode_len=0):

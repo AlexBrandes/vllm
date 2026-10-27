@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kernel call capture (vllm/sm80/capture.py, VLLM_SM80_CAPTURE_DIR), CPU
-only: off by default; eager prefill calls use ordinals or opt-in semantic keys;
+"""Kernel call capture (vllm/sm80/capture.py, VLLM_SM80_CAPTURE), CPU
+only: off by default; the capture spec's keys, defaults and refusals, and the
+banner; eager prefill calls use ordinals or opt-in semantic keys;
 decode calls by prefix up to the per-key count; records made while a CUDA
 graph is captured are bound to that graph and written after its replays,
 with the replaying manager as owner; dummy steps record nothing."""
 
+import importlib
 import json
 from collections import namedtuple
 from types import SimpleNamespace
@@ -17,28 +19,111 @@ from vllm.sm80 import capture as cap
 from vllm.sm80.kernels.exl3 import capture_points
 
 PREFIX = "layers.3.attn.wq_a"
+# The spec the ``on`` fixture writes (dir relative to the spec's directory).
+SPEC = dict(
+    dir="capture", match=r"layers\.3\.", families=["dense", "moe", "attn", "mhc"],
+    rows=[6], per_key=1, prefill_calls=[2], prefill_per_key=0, prefill_min_rows=65,
+)
 
 
-def test_off_by_default(monkeypatch):
-    monkeypatch.delenv("VLLM_SM80_CAPTURE_DIR", raising=False)
-    import importlib
-
-    assert importlib.reload(cap).active is False
+def _toml(settings: dict) -> str:
+    # JSON strings, integers and arrays of them are TOML values.
+    return "".join(f"{key} = {json.dumps(value)}\n" for key, value in settings.items())
 
 
 @pytest.fixture
-def on(monkeypatch, tmp_path):
+def spec_file(monkeypatch, tmp_path):
+    """Write the capture spec SPEC with ``overrides`` (None drops a key) and
+    point VLLM_SM80_CAPTURE at it."""
+    path = tmp_path / "capture.toml"
+
+    def write(**overrides):
+        settings = {k: v for k, v in dict(SPEC, **overrides).items() if v is not None}
+        path.write_text(_toml(settings))
+        monkeypatch.setenv("VLLM_SM80_CAPTURE", str(path))
+        return path
+
+    return write
+
+
+def test_off_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("VLLM_SM80_CAPTURE", raising=False)
+    # A retired name never turns the capture on.
     monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", str(tmp_path))
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_MATCH", r"layers\.3\.")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", "dense,moe,attn,mhc")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_ROWS", "6")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PER_KEY", "1")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "2")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "0")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "65")
+    assert importlib.reload(cap).active is False
+    assert cap.captures("hybrid") is False
+
+
+def test_spec_defaults(spec_file, tmp_path):
+    path = spec_file(**{k: None for k in SPEC if k != "dir"})
+    assert path.read_text() == 'dir = "capture"\n'
+    assert cap.spec() == cap.Spec(
+        path=str(path), dir=str(tmp_path / "capture"),
+        families=frozenset({"dense", "moe", "attn"}), match="", rows=frozenset(),
+        per_key=2, prefill_match="", prefill_calls=frozenset({1}),
+        prefill_per_key=0, prefill_min_rows=65, max_mb=4096,
+    )
+
+
+def test_spec_values(spec_file, tmp_path):
+    spec_file(dir=str(tmp_path / "elsewhere"), prefill_match="^mtp\\.", max_mb=12)
+    got = cap.spec()
+    assert got.dir == str(tmp_path / "elsewhere")  # absolute: as written
+    assert (got.families, got.match, got.rows, got.per_key) == (
+        frozenset({"dense", "moe", "attn", "mhc"}), r"layers\.3\.", frozenset({6}), 1)
+    assert (got.prefill_match, got.prefill_calls, got.prefill_min_rows, got.max_mb) == (
+        r"^mtp\.", frozenset({2}), 65, 12)
+
+
+@pytest.mark.parametrize("overrides,error", [
+    (dict(dir=None), "dir is required"),
+    (dict(dir=""), "dir is required"),
+    (dict(matches="x"), r"unknown keys \['matches'\]"),
+    (dict(per_key="2"), "per_key must be int"),
+    (dict(per_key=True), "per_key must be int"),
+    (dict(rows=[1, "2"]), "rows must be a list of int"),
+    (dict(rows="1,2"), "rows must be a list of int"),
+    (dict(families="dense,moe"), "families must be a list of str"),
+    (dict(families=["dense", "gemm"]), r"unknown families \['gemm'\]"),
+    (dict(prefill_per_key=-1), "prefill_per_key must be nonnegative"),
+])
+def test_spec_refusals_name_the_file(spec_file, overrides, error):
+    path = spec_file(**overrides)
+    with pytest.raises(ValueError, match=error) as exc:
+        cap.spec()
+    assert str(exc.value).startswith(f"VLLM_SM80_CAPTURE {path}: ")
+
+
+def test_captures_reads_the_spec(monkeypatch, spec_file):
+    monkeypatch.delenv("VLLM_SM80_CAPTURE", raising=False)
+    assert cap.captures("hybrid") is False
+    spec_file(families=["attn", "hybrid"])
+    assert cap.captures("hybrid") and cap.captures("attn")
+    spec_file(families=["attn"])
+    assert not cap.captures("hybrid")
+
+
+def test_banner_names_the_spec_and_directory(on, monkeypatch):
+    lines = []
+    monkeypatch.setattr(cap.logger, "info", lambda msg, *args: lines.append(msg % args))
+    cfg = cap.config()
+    assert cap.config() is cfg  # read once
+    (line,) = lines
+    assert line.startswith(
+        f"Kernel call capture active (VLLM_SM80_CAPTURE={cap.spec().path}): "
+        f"writing {on}, families attn,dense,mhc,moe, graph rows [6], 1 per key, "
+        "prefill calls [2], 0 prefill attempts per semantic key"
+    )
+    assert "at most 4096 MiB" in line
+    assert on.is_dir()
+
+
+@pytest.fixture
+def on(monkeypatch, tmp_path, spec_file):
+    spec_file()
     monkeypatch.setattr(cap, "active", True)
     monkeypatch.setattr(cap, "_cfg", None)
-    monkeypatch.setattr(cap, "_install", lambda: None)
+    monkeypatch.setattr(cap, "_install", lambda families: None)
     monkeypatch.setattr(cap, "_capturing", lambda: False)
     for name, value in (("_pending", []), ("_counts", {}), ("_prefill_calls", {}),
                         ("_bytes", [0]), ("_weights", {}), ("_seen", {})):
@@ -46,7 +131,7 @@ def on(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cap, "_step", {"real": False, "step": 0, "phase": None, "query_lens": []}
     )
-    return tmp_path / "r0"
+    return tmp_path / "capture" / "r0"
 
 
 def _index(root):
@@ -161,7 +246,7 @@ def test_drafter_graph_in_prefill_step_is_draft_and_bounded(on, monkeypatch):
             self.graphs = {}
 
     manager = DrafterManager()
-    desc = Desc(6, 2, 3, None, "FULL")  # rows in VLLM_SM80_CAPTURE_ROWS
+    desc = Desc(6, 2, 3, None, "FULL")  # rows in the spec's rows
     _graph_record(manager, desc, monkeypatch, prefix="model.layers.3.attn")
     _step([2048])
     for _ in range(3):
@@ -289,13 +374,9 @@ def test_glm_qwen_plain_linear_capture_keeps_host_materialization(on, prefix):
     assert all(torch.equal(plain.materialize()[k], v) for k, v in expected.items())
 
 
-@pytest.mark.parametrize("setting", [None, "0"])
-def test_prefill_default_retains_sparse_ordinals(on, monkeypatch, setting):
-    if setting is None:
-        monkeypatch.delenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY")
-    else:
-        monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", setting)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "1,3")
+@pytest.mark.parametrize("setting", [None, 0])
+def test_prefill_default_retains_sparse_ordinals(on, spec_file, setting):
+    spec_file(prefill_per_key=setting, prefill_calls=[1, 3])
     _step([2048])
     for ordinal in range(1, 5):
         rec = cap.begin("dense", "exl3_linear", PREFIX, 80)
@@ -311,11 +392,9 @@ def test_prefill_default_retains_sparse_ordinals(on, monkeypatch, setting):
 
 @pytest.mark.parametrize("family", cap.FAMILIES)
 @pytest.mark.parametrize("limit", [1, 2])
-def test_prefill_per_key_covers_reached_rows_context_points(on, monkeypatch, family, limit):
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_FAMILIES", family)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", str(limit))
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_CALLS", "9999")
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_MIN_ROWS", "1")
+def test_prefill_per_key_covers_reached_rows_context_points(on, spec_file, family, limit):
+    spec_file(families=[family], prefill_per_key=limit, prefill_calls=[9999],
+              prefill_min_rows=1)
     ordinals, calls, expected = {}, {}, []
     for context in (0, cap.LONG_CONTEXT):
         _step([2048], context=[context])
@@ -354,8 +433,8 @@ def test_prefill_per_key_covers_reached_rows_context_points(on, monkeypatch, fam
     ]
 
 
-def test_prefill_per_key_preserves_filters_and_actual_phase(on, monkeypatch):
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "1")
+def test_prefill_per_key_preserves_filters_and_actual_phase(on, spec_file):
+    spec_file(prefill_per_key=1)
     _step([80], dummy=True)
     assert cap.begin("dense", "projection", PREFIX, 80) is None
     assert cap._prefill_calls == cap._seen == {}
@@ -375,8 +454,8 @@ def test_prefill_per_key_preserves_filters_and_actual_phase(on, monkeypatch):
     assert cap._prefill_calls == {("dense", PREFIX): 2}
 
 
-def test_prefill_per_key_distinguishes_exact_prefixes(on, monkeypatch):
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "1")
+def test_prefill_per_key_distinguishes_exact_prefixes(on, spec_file):
+    spec_file(prefill_per_key=1)
     _step([80])
     prefixes = [PREFIX + ".a/b", PREFIX + ".a_b"]
     for number, prefix in enumerate(prefixes):
@@ -390,8 +469,8 @@ def test_prefill_per_key_distinguishes_exact_prefixes(on, monkeypatch):
         assert torch.equal(payload["tensors"]["x"], torch.full((80, 1), number))
 
 
-def test_prefill_per_key_write_bound_is_per_owner(on, monkeypatch):
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "2")
+def test_prefill_per_key_write_bound_is_per_owner(on, spec_file):
+    spec_file(prefill_per_key=2)
     _step([80])
     records = [cap.begin("attn", "attention", PREFIX, 80) for _ in range(3)]
     for rec in records:
@@ -406,8 +485,8 @@ def test_prefill_per_key_write_bound_is_per_owner(on, monkeypatch):
     assert set(cap._counts.values()) == {2}
 
 
-def test_prefill_per_key_quota_refusals_are_bounded_and_counted(on, monkeypatch):
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "2")
+def test_prefill_per_key_quota_refusals_are_bounded_and_counted(on, spec_file):
+    spec_file(prefill_per_key=2)
     cfg = cap.config()
     x = torch.ones(80, 1)
     size = x.numel() * x.element_size()
@@ -431,8 +510,54 @@ def test_prefill_per_key_quota_refusals_are_bounded_and_counted(on, monkeypatch)
     ]
 
 
-def test_prefill_per_key_rejects_negative_limit_before_hooks(on, monkeypatch):
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_PREFILL_PER_KEY", "-1")
-    with pytest.raises(ValueError, match="PREFILL_PER_KEY must be nonnegative"):
+def test_prefill_per_key_rejects_negative_limit_before_hooks(on, spec_file):
+    spec_file(prefill_per_key=-1)
+    with pytest.raises(ValueError, match="prefill_per_key must be nonnegative"):
         cap.config()
     assert cap._cfg is None and not on.exists()
+
+
+def test_linked_producer_layout_is_opt_in_and_survives_save_load(on):
+    backing = torch.arange(80, dtype=torch.float32).reshape(4, 20)
+    source = backing[:, 3:11]
+    expected = source.clone()
+    _step([1, 1, 1, 1])
+    rec = cap.begin("dense", "projection", PREFIX, 4)
+    rec.put(x=source)
+    rec.put(preserve_layout=True, out=source)
+    assert rec.tensors["x"].is_contiguous()
+    assert rec.tensors["out"].stride() == source.stride()
+    assert rec.tensors["out"].storage_offset() == 0
+    assert rec.tensors["out"].untyped_storage().nbytes() == 68 * source.element_size()
+    backing.fill_(-1)
+    rec.done()
+    (row,) = _index(on)
+    obj = torch.load(row["path"], weights_only=True, mmap=True)
+    assert row["bytes"] == (32 + 68) * source.element_size()
+    assert obj["tensors"]["out"].stride() == (20, 1)
+    assert torch.equal(obj["tensors"]["out"], expected)
+    assert torch.equal(obj["tensors"]["x"], expected)
+
+
+def test_linked_producer_host_copy_cannot_pack_holes(monkeypatch):
+    source = torch.arange(64, dtype=torch.float32).reshape(4, 16)[:, :8]
+    rec = cap.Record("hybrid", "hybrid_linear_consumer", PREFIX, 4, {})
+    rec.put(preserve_layout=True, out=source)
+    # Force the packing behavior of a non-dense device transfer without CUDA;
+    # the opt-in path must transfer its flat span, not the strided logical view.
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda value: value.clone(memory_format=torch.contiguous_format))
+    saved = rec.materialize()["out"]
+    assert saved.stride() == source.stride()
+    assert saved.untyped_storage().nbytes() == 56 * source.element_size()
+    assert torch.equal(saved, source)
+
+
+def test_linked_producer_byte_quota_counts_storage_span(on):
+    source = torch.arange(64, dtype=torch.float32).reshape(4, 16)[:, :8]
+    cap.config().max_bytes = source.numel() * source.element_size()
+    _step([1, 1, 1, 1])
+    cap.begin("dense", "projection", PREFIX, 4).put(preserve_layout=True, out=source).done()
+    (row,) = _index(on)
+    assert row["bytes"] == 56 * source.element_size()
+    assert not row["saved"] and "path" not in row
+    assert cap._bytes == [0]

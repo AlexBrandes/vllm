@@ -6,26 +6,16 @@
 import torch
 
 import vllm.envs as envs
-from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
 )
 from vllm.platforms import current_platform
-from vllm.sm80.kernels.indexer.qsa_topk_gate import canonical_qsa_topk_
+from vllm.sm80.kernels.indexer.topk_tiefix_gate import canonical_topk_
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
-
-# Resolve before warmup/capture; never read the environment in the hot path.
-_QSA_TOPK_SORTED = bool(envs.VLLM_QWEN_QSA_TOPK_SORTED)
-init_logger(__name__).info_once(
-    "Qwen QSA selected-index traversal: %s "
-    "(VLLM_QWEN_QSA_TOPK_SORTED=%d; set 0 to retain native order)",
-    "ascending, -1 padding last" if _QSA_TOPK_SORTED else "native order",
-    int(_QSA_TOPK_SORTED),
-)
 
 
 @triton.jit
@@ -486,39 +476,6 @@ def expand_qsa_block_indices(
     )
 
 
-@triton.jit
-def _sort_qsa_selected_indices_kernel(
-    block_indices_ptr,
-    stride_row,
-    stride_column,
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-) -> None:
-    row = tl.program_id(0)
-    slots = tl.arange(0, BLOCK_K)
-    pointers = block_indices_ptr + row * stride_row + slots * stride_column
-    # Unsigned -1 sorts after every valid int32 index, without a sentinel
-    # collision at INT32_MAX. The selection stays entirely in registers.
-    indices = tl.load(pointers, mask=slots < K, other=-1).to(tl.uint32)
-    indices = tl.sort(indices, descending=False)
-    tl.store(pointers, indices.to(tl.int32), mask=slots < K)
-
-
-def _sort_qsa_selected_indices_(block_indices: torch.Tensor) -> None:
-    """Order the native-selected set in place, with -1 padding last."""
-    assert block_indices.ndim == 2 and block_indices.dtype == torch.int32
-    rows, k = block_indices.shape
-    if rows == 0 or k == 0:
-        return
-    _sort_qsa_selected_indices_kernel[(rows,)](
-        block_indices,
-        *block_indices.stride(),
-        K=k,
-        BLOCK_K=triton.next_power_of_2(k),
-        num_warps=4,
-    )
-
-
 def _topk(
     logits: torch.Tensor,
     visible_blocks: torch.Tensor,
@@ -548,13 +505,7 @@ def _topk(
         block_topk,
         logits.shape[1],
     )
-    if (
-        not canonical_qsa_topk_(
-            logits, block_indices, row_ends=visible_blocks, sort=_QSA_TOPK_SORTED
-        )
-        and _QSA_TOPK_SORTED
-    ):
-        _sort_qsa_selected_indices_(block_indices)
+    canonical_topk_(logits, block_indices, indexer="qsa", row_ends=visible_blocks)
 
 
 def qsa_select_paged_decode(

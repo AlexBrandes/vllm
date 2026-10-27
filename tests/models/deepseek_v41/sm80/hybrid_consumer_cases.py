@@ -179,6 +179,15 @@ def load_source(path, sha):
     return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
 
 
+def _producer_view(value, stored, view):
+    """Apply a runtime link to a replay's logical output in its saved layout."""
+    if value.stride() != stored.stride():
+        shaped = torch.empty_strided(value.shape, stored.stride(), dtype=value.dtype, device=value.device)
+        shaped.copy_(value)
+        value = shaped
+    return value.as_strided(view["shape"], view["stride"], value.storage_offset() + view["offset"])
+
+
 def _owned_state(op, args, outputs):
     if op not in ("store_rows", "compress_rows"):
         return
@@ -220,8 +229,7 @@ def evaluate(obj, device, checkpoint, stack=()):
             raise ValueError("actual-consumer link is not byte-identical to the recorded producer view")
         for arm, values, target in zip(arms, pvals, (device, device, "cpu")):
             value = values[view["output"]]
-            arm[name] = value.as_strided(view["shape"], view["stride"],
-                                         value.storage_offset() + view["offset"]).to(device=target, dtype=tensors[name].dtype)
+            arm[name] = _producer_view(value, stored, view).to(device=target, dtype=tensors[name].dtype)
     if meta.get("linear") is not None:
         vals = []
         for index, arm in enumerate(arms):

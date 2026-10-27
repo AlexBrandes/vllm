@@ -31,6 +31,7 @@ def _config(schedule=((1, 3, 5), (4, 8, 3))):
     return SimpleNamespace(
         speculative_config=spec,
         scheduler_config=SimpleNamespace(max_num_seqs=8),
+        # Speculator.max_model_len reads the model config.
         model_config=SimpleNamespace(max_model_len=128),
     )
 

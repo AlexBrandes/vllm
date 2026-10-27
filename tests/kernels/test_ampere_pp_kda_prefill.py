@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""sm_80 KDA chunked prefill with 64 heads per card (VLLM_AMPERE_KDA_PREFILL_WIDE).
+"""sm_80 KDA chunked prefill with 64 heads per card (VLLM_SM80_KDA_PREFILL).
 
 CPU tests (run with ``CUDA_VISIBLE_DEVICES=""``): the flag is declared and off
 by default, the layer and call gates and their fallbacks, and the warm-up
@@ -12,25 +12,24 @@ fp64 token-sequential recomputation is at most the upstream path's (mean
 <= 1.10x, max <= 1.25x per output; on o, elements that are one of the two
 bf16 neighbours of the exact value may be set aside for the max, at most
 0.1 % of them), on production-magnitude random inputs, awkward shapes and,
-when ``KDA_PRE_CAPTURE_DIR`` points at a directory of captured live prefill
-calls (``p<pp>_L<layer>_b<T>_<n>.pt``), on real inputs against the live
+when ``VLLM_SM80_REPLAY_DIR`` holds captured live prefill calls in
+``kda_pre/`` (``p<pp>_L<layer>_b<T>_<n>.pt``), on real inputs against the live
 outputs; run-to-run determinism; CUDA-graph replay bitwise equal to eager
 with no allocation growth.
 
     CUDA_VISIBLE_DEVICES="" pytest -q tests/kernels/test_ampere_pp_kda_prefill.py
-    KDA_PRE_CAPTURE_DIR=<dir> pytest -q tests/kernels/test_ampere_pp_kda_prefill.py
+    VLLM_SM80_REPLAY_DIR=<dir> pytest -q tests/kernels/test_ampere_pp_kda_prefill.py
 """
 
-import glob
 import itertools
-import os
 
 import pytest
 import torch
 
+from tests.kernels import replay_inputs as replay
 from vllm.models.glm5next.nvidia.ops import kda_prefill as kp
 
-FLAG = "VLLM_AMPERE_KDA_PREFILL_WIDE"
+FLAG = "VLLM_SM80_KDA_PREFILL"
 H, D = kp.HEADS, kp.HEAD_DIM
 P = H * D
 LB = kp.LOWER_BOUND
@@ -376,9 +375,8 @@ def test_initial_state_none_equals_zeros(warmed):
 
 
 def _capture_files():
-    d = os.environ.get("KDA_PRE_CAPTURE_DIR", "")
-    files = sorted(glob.glob(os.path.join(d, "*.pt"))) if d else []
-    cap = int(os.environ.get("KDA_PRE_CAPTURE_MAX", "0") or 0)
+    files = replay.files("kda_pre")
+    cap = replay.limit(0)
     if cap and len(files) > cap:
         step = len(files) / cap
         files = [files[int(i * step)] for i in range(cap)]
@@ -396,7 +394,7 @@ def load_record(path):
 
 
 @needs_sm80
-@pytest.mark.skipif(not _capture_files(), reason="KDA_PRE_CAPTURE_DIR not set or empty")
+@pytest.mark.skipif(not _capture_files(), reason="no kda_pre records in VLLM_SM80_REPLAY_DIR")
 def test_real_captured_inputs(warmed):
     """Per class of captured call (first / cont / multi): sum of per-call mean
     errors <= 1.10x, average per-call max <= 1.25x and worst max <= 1.25x the

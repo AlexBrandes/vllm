@@ -35,14 +35,6 @@ def _rec_tests():
 
 # ------------------------------------------------------------------ CPU tests
 
-def test_no_switch_of_its_own():
-    """The former VLLM_GLM5_DECODE_KDA_STEP_TILE switch is gone (validated in
-    1.7.0)."""
-    from vllm import envs
-
-    assert "VLLM_GLM5_DECODE_KDA_STEP_TILE" not in envs.environment_variables
-
-
 def test_tile_helper():
     from vllm.models.glm5next.nvidia.ops.kda_decode import _kda_tile
 
@@ -160,7 +152,7 @@ def gpu_test_warmup_covers_every_tile():
                 os.environ[k] = v
 
 
-CPU_TESTS = (test_no_switch_of_its_own, test_tile_helper, test_metadata_field_default)
+CPU_TESTS = (test_tile_helper, test_metadata_field_default)
 GPU_TESTS = (gpu_test_tile_is_bitwise_the_full_window, gpu_test_warmup_covers_every_tile)
 
 if pytest is not None:

@@ -67,13 +67,13 @@ collective it will not join.
 
 Enabling
 --------
-Off by default. `VLLM_HOST_ALLREDUCE=1` turns it on. It then stands
+Off by default. `VLLM_SM80_ALLREDUCE=1` turns it on. It then stands
 aside for vLLM's own `CustomAllreduce` only when the operator has asked for
 that, by also setting `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1` -- the same env
 that lets `CustomAllreduce` accept PCIe peer-to-peer above two GPUs -- and peer
 access is really present. The two fast paths are therefore mutually exclusive
 by choice, not by what the driver happens to report: installing a P2P-capable
-driver on its own does not silently turn `VLLM_HOST_ALLREDUCE=1` into
+driver on its own does not silently turn `VLLM_SM80_ALLREDUCE=1` into
 NCCL. With the flag off, not one byte of this module's state is constructed and
 the dispatch chain in `CudaCommunicator.all_reduce` is byte-identical to
 upstream.
@@ -1128,7 +1128,7 @@ class HostShmAllreduce:
                 f"{self.spin_cycles} cycle bound (per-rank error flags {flags}). "
                 "A peer rank stopped issuing collectives, or the ranks fell out "
                 "of step. Results from the affected calls are invalid. Restart "
-                "with VLLM_HOST_ALLREDUCE=0 to use NCCL only."
+                "with VLLM_SM80_ALLREDUCE=0 to use NCCL only."
             )
 
     def close(self) -> None:

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tie-consistent repair of a sparse-indexer top-k (VLLM_GLM5_TOPK_TIEFIX for
-the GLM kpool indexer, VLLM_QWEN4_QSA_TOPK_CANONICAL for the Qwen QSA indexer).
+"""Tie-consistent repair of a sparse-indexer top-k
+(VLLM_SM80_TOPK_CANONICAL_TIES) and the ascending sort of a selection
+(VLLM_SM80_TOPK_SORTED), for the GLM kpool and Qwen QSA indexers; the
+switches are read in ``topk_tiefix_gate.py``.
 
 The stock top-k kernels (persistent_topk and its FilteredTopK/sampled_topk
 branches for decode, topKPerRowJob for prefill) all return an exact top-k by
@@ -123,7 +125,7 @@ def _topk_tiefix_kernel(
             c0 += BLOCK
 
     # Optional: sort the row ascending with the -1 fill last, in registers
-    # (VLLM_GLM5_TOPK_SORTED together with the tie fix), so the order is a
+    # (VLLM_SM80_TOPK_SORTED together with the tie fix), so the order is a
     # function of the set too.
     if SORT:
         tl.debug_barrier()
@@ -158,7 +160,7 @@ def _topk_tiefix_kernel(
 # Rows whose window is no longer than k and fully selected are written as the
 # identity. The bytes equal the one-program kernel with SORT (the tie fix,
 # then each row ascending with the -1 fill last). Taken only when enabled with
-# VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS and the batch has at most that many rows.
+# the topk_select/split_rows tuning row and the batch has at most that many rows.
 
 # Split geometry: at most SPLIT_MAX_CHUNKS chunks per row, each a power of
 # two >= SPLIT_CHUNK_MIN columns; tile and warps per chunk program.
@@ -433,9 +435,9 @@ _WARM_KS = (512, 2048)
 def warm_tiefix() -> None:
     """Compile the kernel variants the indexers use (GLM: K 512 for kpool 4
     and 2048 for kpool 1, decode = absolute, prefill = relative with starts;
-    Qwen QSA: K 512, absolute for both) before any CUDA graph capture; Triton
-    otherwise compiles on first launch. A no-op without CUDA or inside a
-    capture."""
+    Qwen QSA: K 512, absolute for both), and the sort alone, before any CUDA
+    graph capture; Triton otherwise compiles on first launch. A no-op without
+    CUDA or inside a capture."""
     if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -443,6 +445,7 @@ def warm_tiefix() -> None:
         logits = torch.zeros((1, k + 1), dtype=torch.float32, device=dev)
         ends = torch.full((1,), k + 1, dtype=torch.int32, device=dev)
         starts = torch.zeros((1,), dtype=torch.int32, device=dev)
+        sort_topk_rows_(torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k))
         for relative in (False, True):
             for sort, split in ((False, False), (True, False), (True, True)):
                 ids = torch.arange(k, dtype=torch.int32, device=dev).reshape(1, k)
@@ -524,5 +527,45 @@ def topk_tiefix_(
         RELATIVE=relative,
         SORT=sort,
         num_warps=TIEFIX_NUM_WARPS,
+    )
+    return topk_indices
+
+
+# The row geometry is not specialised: one compiled variant per K, compiled
+# by warm_tiefix() before any CUDA graph capture.
+@triton.jit(do_not_specialize=["stride_row", "stride_column"])
+def _sort_topk_rows_kernel(
+    idx_ptr,
+    stride_row,
+    stride_column,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    slots = tl.arange(0, BLOCK_K)
+    pointers = idx_ptr + row * stride_row + slots * stride_column
+    # Unsigned -1 sorts after every valid int32 index, without a sentinel
+    # collision at INT32_MAX. The selection stays entirely in registers.
+    indices = tl.load(pointers, mask=slots < K, other=-1).to(tl.uint32)
+    indices = tl.sort(indices, descending=False)
+    tl.store(pointers, indices.to(tl.int32), mask=slots < K)
+
+
+def sort_topk_rows_(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Sort each row of a top-k selection ascending in place, -1 fill last,
+    leaving the set as it is (the sort without the tie fix). The bytes equal
+    ``topk_tiefix_(..., sort=True)`` on a row whose boundary is not
+    contested. One program per row, no host reads: safe inside CUDA graph
+    capture."""
+    assert topk_indices.dim() == 2 and topk_indices.dtype == torch.int32
+    rows, k = topk_indices.shape
+    if rows == 0 or k == 0:
+        return topk_indices
+    _sort_topk_rows_kernel[(rows,)](
+        topk_indices,
+        *topk_indices.stride(),
+        K=k,
+        BLOCK_K=triton.next_power_of_2(k),
+        num_warps=4,
     )
     return topk_indices

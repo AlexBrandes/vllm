@@ -110,8 +110,8 @@ page says which layout each serves):
   its TP4 verify (the commit fold's included) with at most 16 rows per warp,
   less stack and more KV cache, bitwise the same
   (not yet validated, off unless set) — `VLLM_AMPERE_KDA_SMALL_STACK`;
-  the KDA step for PP4 decode batches beyond one short request (where it
-  measures faster) — `VLLM_GLM5_DECODE_KDA_WIDE`; second
+  under PP4 the KDA step also takes the decode batches beyond one short
+  request where it measures faster; second
   generation `VLLM_MOE_DECODE_ROUTE_V2`, `VLLM_GLM5_DECODE_MHC_V2`,
   `VLLM_AMPERE_DECODE_IDX_GLUE`; under TP4, the KDA state commit after
   sampling folded into the next decode step, same state bit for bit
@@ -120,12 +120,13 @@ page says which layout each serves):
   position instead of one per request (the reference without state
   recovery, as wherever that path's limits are not met) —
   `VLLM_AMPERE_KDA_RECOVER_OFF`.
-- Prefill kernels (mHC projection, sparse attention) — `VLLM_GLM5_PREFILL_KERNELS`,
-  `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`; at TP4 shapes `VLLM_AMPERE_KDA_PREFILL_NARROW`,
-  `VLLM_AMPERE_MARLIN_PREFILL_NARROW`; at PP4 shapes `VLLM_AMPERE_KDA_PREFILL_WIDE`,
-  `VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE`, `VLLM_AMPERE_MARLIN_PREFILL_WIDE`.
+- Prefill kernels, one switch per operation, each picking its kernel by the
+  layout's head count or expert width: mHC projection — `VLLM_SM80_MHC_PREFILL`;
+  sparse attention — `VLLM_SM80_SPARSE_MLA_PREFILL`, `VLLM_GLM5_SMLA_PREFILL_PRED_LOAD`;
+  KDA chunked prefill — `VLLM_SM80_KDA_PREFILL`; split-block Marlin MoE
+  prefill — `VLLM_SM80_MARLIN_PREFILL`.
 - Batch-sharded logits and sampling (TP4) — `--enable-batch-sharded-sampling`.
-- Drafter: selector tables split across cards — `VLLM_GLM5_DRAFTER_SELECTOR_SHARD`;
+- Drafter: selector tables split across cards — `VLLM_DFLASH2_SELECTOR_SHARD`;
   position table sized to the context — `VLLM_GLM5_DRAFTER_ROPE_FIT`; folded
   input projection under PP4 — `VLLM_GLM5_PP_FOLD_DRAFT_FC`.
 - Always on: a rejected draft can no longer overwrite the tail of the
@@ -160,7 +161,8 @@ The EXL3 kernels written for this card — MoE kernels for decode and prefill, a
 split-K dense kernel with tensor-core blocks for small decode launches, a
 tensor-core dense kernel for prefill and a native n-gram table read — are
 switched by `VLLM_EXL3_*`; the model's sparse-attention top-k tie order by
-`VLLM_QWEN4_QSA_TOPK_CANONICAL`. The recipe's
+`VLLM_SM80_TOPK_CANONICAL_TIES` and its traversal order by
+`VLLM_SM80_TOPK_SORTED`. The recipe's
 [engine switches](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe#engine-switches)
 table lists the set it turns on.
 
@@ -202,11 +204,13 @@ for the attention indexer and its FP8 stores, and sm_80 key-pool compression
 GEMMs tuned per shape, up to 32 rows — `VLLM_THIN_GEMM`. MoE shared
 experts that overlap the routed experts — `VLLM_SHARED_EXPERT_REORDER`.
 
-**All-reduce over PCIe.** For cards without GPU peer access, small all-reduces
-take one round trip through shared host memory — `VLLM_HOST_ALLREDUCE`.
-Where peer access is granted, a PCIe custom all-reduce runs in device memory
-instead — `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`, kernel chosen by
-`VLLM_CUSTOM_ALLREDUCE_ALGO`; it falls back to the host path on its own.
+**All-reduce over PCIe.** One switch, `VLLM_SM80_ALLREDUCE`, picks the
+transport per message: for cards without GPU peer access, small all-reduces
+take one round trip through shared host memory; where peer access is granted
+(`VLLM_CUSTOM_ALLREDUCE_PCIE_P2P`, kernel chosen by
+`VLLM_CUSTOM_ALLREDUCE_ALGO`), a PCIe custom all-reduce with a flags-in-data
+kernel runs in device memory instead and falls back to the host path on its
+own; prefill-sized sums a layer owns run on a copy-engine ring.
 
 **KV accounting.** The KV reserve covers what prefill chunks in flight really
 hold, so the reported pool is one the server can fill —
@@ -217,9 +221,8 @@ hold, so the reported pool is one the server can fill —
 log-probabilities on every run and every install: fixed-order MoE block
 alignment (`VLLM_MOE_DETERMINISTIC_ALIGN`), CUDA-graph padding kept out of
 the MoE (`VLLM_MOE_MASK_PADDING`), indexer top-k consistent on ties and in
-a fixed order (`VLLM_GLM5_TOPK_TIEFIX`, `VLLM_GLM5_TOPK_SORTED`,
-`VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS`), pinned linear-attention prefill
-configurations (`VLLM_FLA_PIN_AUTOTUNE`).
+a fixed order (`VLLM_SM80_TOPK_CANONICAL_TIES`, `VLLM_SM80_TOPK_SORTED`),
+pinned linear-attention prefill configurations (`VLLM_FLA_PIN_AUTOTUNE`).
 
 **Pipeline-parallel and scheduling.** Decodes spread over every in-flight
 micro-batch — `VLLM_PP_SPREAD_DECODES`; one packed, metadata-free hand-off
@@ -235,11 +238,9 @@ both layouts: `VLLM_AMPERE_MARLIN_DECODE_CUDA` (eligible decode batches). Reques
 it without a compatible library fails at startup rather than falling back
 silently. The decode kernels split the first projection along K: faster, and
 the fp32 summation order differs from the released Marlin kernels. Under PP4
-the split-block prefill (`VLLM_AMPERE_MARLIN_PREFILL_WIDE`) also runs on the
-library's (64,512) tiles with a one-HFMA2 dequant —
-`VLLM_AMPERE_MARLIN_PREFILL_WIDE_COMPILED` (engine default off, on in the PP4
-serving defaults), the released kernels without the library; TP4 prefill uses
-the released kernels.
+the split-block prefill (`VLLM_SM80_MARLIN_PREFILL`) also runs on the
+library's (64,512) tiles with a one-HFMA2 dequant, the released kernels
+without the library; TP4 prefill uses the released kernels.
 
 **Correctness fixes (always on).** 64-bit KV row offsets in the
 sparse-attention kernels and a vocabulary clamp in the sampler kernels.

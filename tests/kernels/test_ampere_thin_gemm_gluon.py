@@ -72,6 +72,7 @@ import types
 import pytest
 import torch
 
+from tests.sm80.tuning_rows import use_rows
 from vllm import envs
 
 GLUON = "vllm.sm80.kernels.thin_gemm.gluon"
@@ -284,7 +285,7 @@ def _route(g, monkeypatch, live=True, capturing=True):
 
 
 def test_dispatch_sends_exactly_the_table(g, monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 64, raising=False)
+    use_rows(monkeypatch, ("dense_gemm", "thin_max_rows", {}, 64))
     fn, calls = _route(g, monkeypatch)
     for n, kk in NK:
         w = torch.empty(n, kk, dtype=BF16)
@@ -333,7 +334,7 @@ def _layout(kind, x):
 def test_dispatch_layout_gate(g, monkeypatch, caplog, kind):
     """A table call runs the kernels only in the layout they were compiled
     for; any other layout takes cuBLAS (F.linear), never a new variant."""
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    use_rows(monkeypatch)
     fn, calls = _route(g, monkeypatch)
     w = torch.randn(48, 2560).to(BF16)
     xa = _layout(kind, torch.randn(4, 2560).to(BF16))
@@ -364,7 +365,7 @@ def test_layout_gate_checks_the_weight(g):
 
 
 def test_dispatch_follows_the_shipped_bound(g, monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 8, raising=False)
+    use_rows(monkeypatch, ("dense_gemm", "thin_max_rows", {}, 8))
     fn, _ = _route(g, monkeypatch)
     w = torch.empty(512, 2560, dtype=BF16)
     assert fn(None, torch.empty(8, 2560, dtype=BF16), w) == "gluon"
@@ -763,7 +764,7 @@ def test_gpu_row_stride_8_mod_16_takes_the_triton_kernel(nk, monkeypatch):
 def test_gpu_refused_layouts_take_cublas(g, monkeypatch, kind):
     """A captured table call in a refused layout takes F.linear (the capture
     count is fixed to capturing: the layout test only runs on that path)."""
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 32, raising=False)
+    use_rows(monkeypatch)
 
     def no_kernel(x, w):
         raise AssertionError("a refused layout reached the Gluon kernels")
@@ -845,7 +846,7 @@ def test_gpu_dispatch_end_to_end(g, monkeypatch):
     Gluon kernels (replay bitwise their direct call), a call outside capture
     gives F.linear's bits and launches none of them, and a captured call
     above 32 rows takes the wrapped function."""
-    monkeypatch.setattr(envs, "VLLM_THIN_GEMM_MAX_TOKENS", 64, raising=False)
+    use_rows(monkeypatch, ("dense_gemm", "thin_max_rows", {}, 64))
     shipped_calls = []
 
     def shipped(layer, x, w, bias=None):
@@ -891,12 +892,10 @@ def test_gpu_dispatch_end_to_end(g, monkeypatch):
 # with a warmup that skipped the unlisted row counts.
 _UNLISTED_ROWS = """
 import torch
-from vllm import envs
 from vllm.sm80.kernels.thin_gemm import gluon as g
 from tests.kernels.test_ampere_thin_gemm_gluon import (
     NK, _bitwise, _compiled_variants, _inputs, _worker)
 
-envs.VLLM_THIN_GEMM_MAX_TOKENS = 32
 left = []
 fn = g.wrap_dispatch(
     lambda layer, x, w, bias=None: left.append(x.shape) or torch.nn.functional.linear(x, w, bias))

@@ -591,7 +591,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
         use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
         # The fused kernel's token tile from the step's bound (None: the full
-        # num_spec + 1 window; 64 heads with VLLM_GLM5_DECODE_KDA_WIDE=0).
+        # num_spec + 1 window, without the fused step).
         kda_tile = (
             getattr(attn_metadata_narrowed, "spec_max_query_len", None)
             if getattr(self, "_kda_step_tile", False)

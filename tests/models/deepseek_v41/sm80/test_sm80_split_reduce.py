@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU checks of VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE
+"""CPU checks of VLLM_SM80_PREFILL_REDUCE_OVERLAP
 (vllm/models/deepseek_v41/nvidia/sm80_split_reduce.py): where a step splits,
 that a split decoder layer returns the unsplit layer's tensors bit for bit
 with row-wise sums, the order its work and sums are issued in, and the
@@ -439,14 +439,32 @@ def test_adopt_marks_layers_that_issue_their_own_sums() -> None:
     ]
 
 
-def test_prefill_split_reduce_default_off(monkeypatch) -> None:
+def test_prefill_reduce_overlap_default_off(monkeypatch) -> None:
     import vllm.envs as envs
 
-    name = "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE"
+    name = "VLLM_SM80_PREFILL_REDUCE_OVERLAP"
     monkeypatch.delenv(name, raising=False)
     assert getattr(envs, name) is False
     monkeypatch.setenv(name, "1")
     assert getattr(envs, name) is True
+
+
+def test_prefill_reduce_overlap_banner(monkeypatch) -> None:
+    """Adopting the split says so once at start, naming the switch."""
+    said = []
+    monkeypatch.setattr(
+        split.logger, "info_once", lambda msg, *args, **_: said.append(msg % args)
+    )
+    layers = [
+        SimpleNamespace(
+            ffn=_bare_moe(sm80_moe.Sm80DeepseekV41MoE),
+            attn=SimpleNamespace(reduces_wo_b=lambda: True),
+        )
+    ]
+    split.adopt_split_reduce(layers)
+    assert len(said) == 1
+    assert "1 decoder layers" in said[0]
+    assert "VLLM_SM80_PREFILL_REDUCE_OVERLAP=1" in said[0]
 
 
 def test_unsplit_layer_class_default() -> None:

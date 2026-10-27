@@ -6,7 +6,7 @@ fused decode router v2 (VLLM_MOE_DECODE_ROUTE_V2).
 Route v2 computes the top-k AND the Marlin block alignment at the gate and
 hands the alignment to moe_align_block_size through a stash keyed by the
 topk_ids tensor's identity. The padding mask edits those ids in place after
-routing, for batches above VLLM_MOE_MASK_PADDING_MAX_TOKENS (8) rows. Without
+routing, for batches above moe_router/fused_route_max_rows (8) rows. Without
 dropping the stash, a padded batch of 9..32 rows would get the alignment of
 the unmasked ids and the mask would do nothing. These tests drive the real
 maybe_moe_route_v2 stash path with the router kernel replaced by a torch
@@ -21,6 +21,7 @@ import torch
 import vllm.sm80.kernels.moe as moe_gates
 import vllm.sm80.kernels.moe.route as router_module
 from tests.kernels.moe_align_reference import align, chunked_align_reference
+from tests.sm80.tuning_rows import use_rows
 from vllm.model_executor.layers.fused_moe import moe_align_block_size as mab
 from vllm.sm80.kernels.moe import align as moe_align_kernel
 from vllm.sm80.layers.moe import routed_experts as mr
@@ -52,14 +53,17 @@ def env(monkeypatch):
         lambda: SimpleNamespace(is_padding=state["is_padding"]),
     )
     monkeypatch.setattr(mr, "_MASK_PADDING", None)
-    monkeypatch.setattr(mr, "_MASK_MIN_ROWS", 0)
     monkeypatch.setattr(moe_gates, "_PENDING", None)
     monkeypatch.setattr(moe_gates, "_PENDING_ROUTING", None)
     monkeypatch.setenv("VLLM_MOE_MASK_PADDING", "1")
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "1")
-    monkeypatch.setenv("VLLM_MOE_MASK_PADDING_MAX_TOKENS", "8")
     monkeypatch.setenv("VLLM_MOE_DECODE_ROUTE_V2", "1")
-    monkeypatch.setenv("VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS", "32")
+    use_rows(
+        monkeypatch,
+        ("moe_router", "fused_route_max_rows", {"top_k": 8}, 8),
+        ("moe_router", "route_v2_max_rows",
+         {"n_experts": 288, "top_k": 8, "hidden": 4096}, 32),
+    )
     # These tests cover the re-align fallback; the in-kernel mask
     # (VLLM_GLM5_MOE_ROUTE_V2_MASK) is tested in test_moe_route_v2_mask.py.
     monkeypatch.setenv("VLLM_GLM5_MOE_ROUTE_V2_MASK", "0")

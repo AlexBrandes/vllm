@@ -63,10 +63,6 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV41SparseSWAMetadataBuilder,
 )
 from vllm.platforms import current_platform
-from vllm.sm80.distributed.round_once_all_reduce import (
-    grouped_round_once_takes,
-    nccl_round_once_all_reduce,
-)
 from vllm.platforms.interface import DeviceCapability
 from vllm.sm80 import capture
 from vllm.sm80.kernels.exl3.quant import set_output_dtype
@@ -365,10 +361,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         ):
             # A quantized dense wo_a (an FP8 one in a hybrid checkpoint) runs
             # its groups as separate GEMMs of its own method (no batched
-            # kernel on sm_80; _o_proj calls apply_grouped). Its Marlin
-            # W8A16 GEMM reads a row-strided A, so with
-            # VLLM_DEEPSEEK_V41_WO_A_STRIDED the groups' rows go in as views.
-            # With VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM the MXFP8 wo_a runs as
+            # kernel on sm_80; _o_proj calls apply_grouped). With
+            # VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM the MXFP8 wo_a runs as
             # one grouped Triton GEMM instead (both arms kept for its dev
             # A/B switch).
             ab_gemm = os.getenv("VLLM_DEV_AB_SWITCH") == "dsv41_wo_a_grouped_gemm"
@@ -380,16 +374,11 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 WoAGroupedGemmMethod.adopt(
                     self.wo_a,
                     self.n_local_groups,
-                    strided_input=envs.VLLM_DEEPSEEK_V41_WO_A_STRIDED,
                     gemm=envs.VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM,
                     keep_groups=ab_gemm,
                 )
             else:
-                GroupedLinearMethod.adopt(
-                    self.wo_a,
-                    self.n_local_groups,
-                    strided_input=envs.VLLM_DEEPSEEK_V41_WO_A_STRIDED,
-                )
+                GroupedLinearMethod.adopt(self.wo_a, self.n_local_groups)
         tp_size = self.n_heads // self.n_local_heads
         index_n_heads = getattr(config, "index_n_heads", 0)
         cand_source = self.candidate_source_layer
@@ -432,7 +421,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         self._sm80_chunk_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         # Eligibility is independent of the active arm; in-boot capture must
         # be able to select either arm on both target and drafter modules.
-        self._sm80_pipeline_max_rows = envs.VLLM_DEEPSEEK_V41_ATTN_PIPELINE_MAX_TOKENS
+        from vllm.models.deepseek_v41.nvidia.ops import sm80_attn_pipeline
+
+        self._sm80_pipeline_max_rows = sm80_attn_pipeline.MAX_ROWS
         self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
         self._sm80_is_draft_layer = (
             self.layer_id >= vllm_config.model_config.hf_text_config.num_hidden_layers
@@ -459,28 +450,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 self.sm80_cfg.index_head_dim,
                 self.sm80_cfg.index_heads_per_rank,
             )
-        self._wo_b_bf16_allreduce = bool(envs.VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE)
-        if self._wo_b_bf16_allreduce:
-            logger.info_once(
-                "DeepSeek-V4.1 sm_80: wo_b partials are all-reduced in BF16 "
-                "when the custom all-reduce takes the message, else in FP32 "
-                "rounded once (VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE=1; set 0 to "
-                "all-reduce every wo_b partial in FP32)",
-                scope="global",
-            )
-        self._wo_b_bf16_pieces = bool(
-            envs.VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE
-        )
-        if self._wo_b_bf16_pieces:
-            logger.info_once(
-                "DeepSeek-V4.1 sm_80: wo_b partials too large for the custom "
-                "all-reduce whole are all-reduced in BF16 with one rounding per "
-                "element on eager steps, over %s "
-                "(VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE=1; set 0 to "
-                "all-reduce them in FP32)",
-                round_once_transport(),
-                scope="global",
-            )
+        self._wo_b_round_once = wo_b_round_once_switch()
 
     # -- pieces -------------------------------------------------------------
 
@@ -531,7 +501,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 "attention core stays unfused: %s", reason, scope="global",
             )
             return False
-        self._sm80_fused_max_rows = envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE_MAX_TOKENS
+        self._sm80_fused_max_rows = sm80_attn_fused.MAX_ROWS
         self._sm80_max_decode_query_len = max_decode_query_len(vllm_config)
         # The speculative drafter's layers are numbered after the target's.
         n_target = vllm_config.model_config.hf_text_config.num_hidden_layers
@@ -870,10 +840,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         """``wo_a`` per group (the reference's einsum over its block-diagonal
         weight) on the already inverse-RoPE'd, FP8-qdq'd output, then
         ``wo_b``; with TP the ``wo_b`` partials are summed in fp32 and rounded
-        once, as the reference's RowParallelLinear does (in BF16 by a kernel
-        that does exactly that, with VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE and,
-        for messages too large for it whole,
-        VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE; see
+        once, as the reference's RowParallelLinear does (in BF16 on a
+        transport that does exactly that, with
+        VLLM_SM80_ALLREDUCE_ROUND_ONCE; see
         :func:`wo_b_all_reduce`)."""
         if not self.reduces_wo_b():
             return self._wo_b_proj(self._wo_a_proj(attn_out))
@@ -906,7 +875,7 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         coefficients the decoder layer deferred beside it
         (``ops/sm80_mhc_side.py``)."""
         return sm80_mhc_side.beside(
-            wo_b_all_reduce, partial, self._wo_b_bf16_allreduce, self._wo_b_bf16_pieces
+            wo_b_all_reduce, partial, self._wo_b_round_once
         )
 
 
@@ -1046,63 +1015,63 @@ def custom_all_reduce_pieces(t: torch.Tensor) -> list[torch.Tensor] | None:
     return pieces
 
 
-def round_once_transport() -> str:
-    return (
-        "grouped NCCL send/recv (VLLM_ROUND_ONCE_ALLREDUCE_GROUPED=1)"
-        if envs.VLLM_ROUND_ONCE_ALLREDUCE_GROUPED
-        else "the custom all-reduce in pieces"
-    )
-
-
 def large_round_once_all_reduce(t: torch.Tensor) -> torch.Tensor | None:
     """The round-once all-reduce of a message the TP group's fast paths do not
     take whole (the host-staged path and the custom all-reduce; prefill-sized
     messages): on the copy-engine ring's owner sum when it is built
-    (VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE; the FP32 sum in rank order rounded
-    once, no SMs held during transfer), else with
-    VLLM_ROUND_ONCE_ALLREDUCE_GROUPED over grouped NCCL
-    send/recv (the exact sum correctly rounded), else through the custom
-    all-reduce in pieces (:func:`custom_all_reduce_pieces`, the FP32 sum in a
-    fixed order rounded once). None when the chosen transport does not apply:
-    the caller keeps its own path."""
+    (VLLM_SM80_ALLREDUCE; the FP32 sum in rank order rounded once, no SMs held
+    during transfer), else through the custom all-reduce in pieces
+    (:func:`custom_all_reduce_pieces`, the FP32 sum in a fixed order rounded
+    once). None when neither applies: the caller keeps its own path."""
     ring = _ce_ring_for(t)
     if ring is not None:
         return ring.round_once(t)
-    if envs.VLLM_ROUND_ONCE_ALLREDUCE_GROUPED:
-        comm = get_tp_group().device_communicator
-        host = getattr(comm, "hostshm_comm", None)
-        ca = getattr(comm, "ca_comm", None)
-        if (host is not None and host.should_host_ar(t)) or (
-            ca is not None and not ca.disabled and ca.should_custom_ar(t)
-        ):
-            return None
-        if not grouped_round_once_takes(t, comm):
-            return None
-        return nccl_round_once_all_reduce(t, comm.pynccl_comm)
     pieces = custom_all_reduce_pieces(t)
     return None if pieces is None else all_reduce_in_pieces(t, pieces)
 
 
-def wo_b_all_reduce(
-    partial: torch.Tensor, bf16_when_custom: bool, bf16_large: bool
-) -> torch.Tensor:
-    """Sum the ``wo_b`` partials of the TP ranks, rounding once to BF16: in
-    FP32; with ``bf16_when_custom`` as BF16 when the custom all-reduce (FP32
-    accumulation in a fixed order, one rounding) takes the message; with
-    ``bf16_large`` as BF16 through :func:`large_round_once_all_reduce` when
-    the message is too large for it whole."""
-    if bf16_when_custom and custom_all_reduce_takes(partial):
-        return tensor_model_parallel_all_reduce(partial)
-    if bf16_large:
-        out = large_round_once_all_reduce(partial)
-        if out is not None:
-            return out
+def round_once_all_reduce(t: torch.Tensor) -> torch.Tensor:
+    """The TP sum of the BF16 partials ``t`` with one rounding per element
+    (VLLM_SM80_ALLREDUCE_ROUND_ONCE; written for any consumer, today the
+    ``wo_b`` partial): sent as ``t``'s dtype where the transport accumulates
+    in FP32 in a fixed order and rounds once (the custom all-reduce taking
+    ``t`` whole, else :func:`large_round_once_all_reduce`), else all-reduced
+    in FP32 and rounded once (also where the host-staged path takes ``t``:
+    the FP32 message may exceed its size limit and go elsewhere)."""
+    if custom_all_reduce_takes(t):
+        return tensor_model_parallel_all_reduce(t)
+    out = large_round_once_all_reduce(t)
+    if out is not None:
+        return out
+    return prefill_all_reduce(t.float()).to(t.dtype)
+
+
+def wo_b_round_once_switch() -> bool:
+    """VLLM_SM80_ALLREDUCE_ROUND_ONCE, announced once at start when on."""
+    on = bool(envs.VLLM_SM80_ALLREDUCE_ROUND_ONCE)
+    if on:
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: wo_b partials are summed with one rounding "
+            "per element, in BF16 where the transport rounds once, else in "
+            "FP32 (VLLM_SM80_ALLREDUCE_ROUND_ONCE=1; set 0 to all-reduce "
+            "every wo_b partial in FP32)",
+            scope="global",
+        )
+    return on
+
+
+def wo_b_all_reduce(partial: torch.Tensor, round_once: bool) -> torch.Tensor:
+    """Sum the ``wo_b`` partials of the TP ranks, rounding once to BF16: with
+    ``round_once`` (VLLM_SM80_ALLREDUCE_ROUND_ONCE) through
+    :func:`round_once_all_reduce`, else all-reduced in FP32."""
+    if round_once:
+        return round_once_all_reduce(partial)
     return prefill_all_reduce(partial.float()).to(partial.dtype)
 
 
 def prefill_all_reduce(t: torch.Tensor) -> torch.Tensor:
     """``t``'s TP all-reduce: through the copy-engine ring
-    (VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE, ``ce_ring_all_reduce.py``) when it
+    (VLLM_SM80_ALLREDUCE, ``ce_ring_all_reduce.py``) when it
     takes ``t`` and neither the host-staged nor the custom all-reduce does
     (eager prefill-sized messages); otherwise
     ``tensor_model_parallel_all_reduce``."""

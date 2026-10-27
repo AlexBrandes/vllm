@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the tie-consistent indexer top-k repair (VLLM_GLM5_TOPK_TIEFIX).
+"""Tests for the tie-consistent indexer top-k repair
+(VLLM_SM80_TOPK_CANONICAL_TIES).
 
 The fast top-k kernels return an exact top-k by score but pick among the
 entries tied with the k-th score by atomic arrival order, and the kernel that
@@ -96,8 +97,9 @@ def check_equals_canonical(tiefix, logits, k, ends, starts=None, relative=False)
 # --- flag ------------------------------------------------------------------
 
 
-def test_flag_defaults_off():
-    assert envs.VLLM_GLM5_TOPK_TIEFIX is False
+def test_flag_defaults_off(monkeypatch):
+    monkeypatch.delenv("VLLM_SM80_TOPK_CANONICAL_TIES", raising=False)
+    assert envs.VLLM_SM80_TOPK_CANONICAL_TIES is False
     use_tiefix_topk.cache_clear()
     try:
         assert use_tiefix_topk() is False
@@ -106,7 +108,7 @@ def test_flag_defaults_off():
 
 
 def test_flag_is_read_when_set(monkeypatch):
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
     use_tiefix_topk.cache_clear()
     try:
         assert use_tiefix_topk() is True
@@ -115,25 +117,31 @@ def test_flag_is_read_when_set(monkeypatch):
 
 
 def test_flag_is_part_of_the_compile_key():
-    assert "VLLM_GLM5_TOPK_TIEFIX" in envs.compile_factors()
+    assert "VLLM_SM80_TOPK_CANONICAL_TIES" in envs.compile_factors()
 
 
 def test_flag_off_does_not_touch_the_output(monkeypatch):
-    """Unset, the decode tie fix never calls the repair (byte-identical
-    path)."""
+    """Both switches unset, the decode hook never calls the repair or the
+    sort (byte-identical path)."""
     calls = []
     monkeypatch.setattr(gate, "tiefix_topk_", lambda *a, **k: calls.append(1))
-    use_tiefix_topk.cache_clear()
+    monkeypatch.delenv("VLLM_SM80_TOPK_CANONICAL_TIES", raising=False)
+    monkeypatch.delenv("VLLM_SM80_TOPK_SORTED", raising=False)
+    for f in (use_tiefix_topk, gate.use_sorted_topk):
+        f.cache_clear()
     try:
         topk = SparseIndexerTopk("torch")
         logits = tied_logits(2, 64, 4, seed=0)
         out = torch.empty(2, 8, dtype=torch.int32)
         seq = torch.tensor([[64], [40]], dtype=torch.int32)
         topk(logits, seq, 1, out, 8, 64)
-        gate.tiefix_decode_topk_(logits, out, seq, 1)
+        before = out.clone()
+        gate.canonical_decode_topk_(logits, out, seq, 1, indexer="kpool")
         assert calls == []
+        assert torch.equal(out, before)
     finally:
-        use_tiefix_topk.cache_clear()
+        for f in (use_tiefix_topk, gate.use_sorted_topk):
+            f.cache_clear()
 
 
 # --- selection -------------------------------------------------------------
@@ -229,7 +237,7 @@ def test_strided_output_slice(tiefix):
 def test_2d_seq_lens_through_the_decode_tie_fix(monkeypatch, tiefix):
     """The decode tie fix with the flag on repairs the torch backend's own
     choice."""
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
     use_tiefix_topk.cache_clear()
     try:
         topk = SparseIndexerTopk("torch")
@@ -237,7 +245,7 @@ def test_2d_seq_lens_through_the_decode_tie_fix(monkeypatch, tiefix):
         seq = torch.tensor([[900], [850], [600], [3]], dtype=torch.int32)
         out = torch.empty(4, 64, dtype=torch.int32)
         topk(logits, seq, 1, out, 64, 900)
-        gate.tiefix_decode_topk_(logits, out, seq, 1)
+        gate.canonical_decode_topk_(logits, out, seq, 1, indexer="kpool")
         ref = canonical_topk(logits, 64, row_ends=seq.reshape(-1))
         assert row_sets(out) == row_sets(ref)
     finally:
@@ -279,20 +287,24 @@ def tiefix_mod():
 def test_flag_on_warms_the_kernel_once(monkeypatch, tiefix_mod):
     calls = []
     monkeypatch.setattr(tiefix_mod, "warm_tiefix", lambda: calls.append(1))
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
     use_tiefix_topk.cache_clear()
+    gate._warm.cache_clear()
     try:
         assert use_tiefix_topk() is True
         assert use_tiefix_topk() is True
         assert calls == [1]
     finally:
         use_tiefix_topk.cache_clear()
+        gate._warm.cache_clear()
 
 
 def test_flag_off_does_not_warm(monkeypatch, tiefix_mod):
     calls = []
     monkeypatch.setattr(tiefix_mod, "warm_tiefix", lambda: calls.append(1))
+    monkeypatch.delenv("VLLM_SM80_TOPK_CANONICAL_TIES", raising=False)
     use_tiefix_topk.cache_clear()
+    gate._warm.cache_clear()
     try:
         assert use_tiefix_topk() is False
         assert calls == []
@@ -354,15 +366,17 @@ def test_decode_tie_fix_passes_sort_when_both_flags(monkeypatch):
         seen.update(kw)
         return ids
 
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
-    monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
     for f in (use_tiefix_topk, gate.use_sorted_topk):
         f.cache_clear()
     monkeypatch.setattr(gate, "tiefix_topk_", fake)
     try:
         logits = torch.zeros(4, 16)
         seq = torch.tensor([[16], [9]], dtype=torch.int32)
-        gate.tiefix_decode_topk_(logits, torch.zeros(4, 8, dtype=torch.int32), seq, 2)
+        gate.canonical_decode_topk_(
+            logits, torch.zeros(4, 8, dtype=torch.int32), seq, 2, indexer="kpool"
+        )
         assert seen.get("sort") is True
         # The per-row ends of the decode top-k kernels (next_n rows per request).
         assert torch.equal(seen["row_ends"], SparseIndexerTopk._row_ends(seq, 2, 4))

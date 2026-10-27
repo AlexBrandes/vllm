@@ -423,12 +423,13 @@ def _workspace(device, num_tokens, num_heads, num_splits, block_dv, head_blocks)
 
 
 def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
-                                   index_topk: int) -> bool:
+                                   index_topk: int, head_dim: int) -> bool:
     """Gate for vllm/sm80/kernels/attention/sparse_prefill_mla.py.
 
     Two conditions, both measured (CMP 170HX, 70 SMs, TP=4 so h_q = 16):
 
-      * num_tokens: below the threshold this is decode, where the upstream
+      * num_tokens: below the attention_prefill/sparse_mla_min_rows row of the
+        sm80 tuning table (512 without one) this is decode, where the upstream
         schedule was tuned and where the captured CUDA graphs live.
       * seq_kv vs index_topk: the tuned kernel wins by rotating each query's
         start offset so concurrent CTAs stop marching through the cache in
@@ -437,16 +438,34 @@ def _use_ampere_prefill_sparse_mla(num_tokens: int, seq_kv: int,
         larger than top-k, almost every row is selected by almost every query,
         the working set is L2-resident anyway and the rotation only adds index
         arithmetic: measured 0.93x at ctx 2304, 1.39x at ctx 8192, topk 2048.
-        The default multiple of 2.0 puts the gate at 4096 rows, between the two.
+        The smallest context taken is the attention_prefill/sparse_mla_min_ctx
+        row; without one twice index_topk, which at topk 2048 puts the gate at
+        4096 rows, between the two.
+
+    Both rows are keyed by ``head_dim`` (dim_qk) and the second also by
+    ``index_width`` (index_topk). With the hot pair ``sparse_mla_prefill``
+    (``vllm.sm80.hot_swap``) the switch's value is the pair's arm at each
+    call past both rows, which no captured graph may read.
     """
     from vllm import envs
     from vllm.platforms import current_platform
+    from vllm.sm80 import hot_swap, tuning
 
-    if not envs.VLLM_GLM5_PREFILL_KERNELS:
+    on = envs.VLLM_SM80_SPARSE_MLA_PREFILL
+    if not on and not hot_swap.listed("sparse_mla_prefill"):
         return False
-    if num_tokens < envs.VLLM_GLM5_PREFILL_MIN_TOKENS:
+    if num_tokens < tuning.lookup(
+        "attention_prefill", "sparse_mla_min_rows", {"head_dim": head_dim}, 512
+    ):
         return False
-    if seq_kv < envs.VLLM_GLM5_SPARSE_MLA_MIN_CTX_MULT * index_topk:
+    if seq_kv < tuning.lookup(
+        "attention_prefill",
+        "sparse_mla_min_ctx",
+        {"head_dim": head_dim, "index_width": index_topk},
+        2 * index_topk,
+    ):
+        return False
+    if not on and not hot_swap.eager_on("sparse_mla_prefill"):
         return False
     return current_platform.is_cuda() and current_platform.is_device_capability(80)
 
@@ -484,7 +503,7 @@ def triton_mla_sparse_fwd(
     if block_dpe is None:
         block_dpe = dim_qk - d_v
 
-    if _use_ampere_prefill_sparse_mla(num_tokens, kv.shape[0], index_topk):
+    if _use_ampere_prefill_sparse_mla(num_tokens, kv.shape[0], index_topk, dim_qk):
         from vllm.sm80.kernels.attention.sparse_prefill_mla import sparse_mla_fwd
 
         return sparse_mla_fwd(

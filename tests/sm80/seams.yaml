@@ -238,7 +238,7 @@ seams:
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention._forward_core
   why: reads the fork layer's _kda_recover, _kda_recover_records, _kda_step_tile, _kda_wide, _pp_kda_prefill and _fill_deferred_g2, and the metadata's spec_max_query_len
-  sha256: 1a483f608bff9a44a93fc19b2cd21247b16fb33c27212a39ecc348bff11fdda4
+  sha256: cf017014837f8bf0921c4ced96248272a5ea5105a26cfc5fec0dd941b2edbdaf
   signature: '(self, qkv_proj_states: torch.Tensor, g1: torch.Tensor | None, beta: torch.Tensor, core_attn_out: torch.Tensor, g2: torch.Tensor | None = None, f_a: torch.Tensor | None = None, g_a: torch.Tensor | None = None) -> bool'
 
 - id: glm-mamba-get-attn-backend
@@ -828,7 +828,7 @@ seams:
 - id: idx-topk-forward
   kind: method
   target: vllm.model_executor.layers.indexer_topk:SparseIndexerTopk.forward
-  why: the GLM decode tie fix (topk_tiefix_gate.tiefix_decode_topk_) runs right after this call in sparse_attn_indexer_kpool, before the DCP merge; it relies on forward writing the exact top-k into topk_indices in place (int32, -1 fill) with no tie or order work of its own
+  why: the GLM decode tie fix and sort (topk_tiefix_gate.canonical_decode_topk_) run right after this call in sparse_attn_indexer_kpool, before the DCP merge; they rely on forward writing the exact top-k into topk_indices in place (int32, -1 fill) with no tie or order work of its own
   sha256: 8fcff0107c3c95902dc718193a6542fdf2e28c350b735d4d769d9487bf710f30
   signature: '(self, logits: torch.Tensor, seq_lens: torch.Tensor, next_n: int, topk_indices: torch.Tensor, topk_tokens: int, max_seq_len: int) -> None'
 
@@ -1269,8 +1269,8 @@ seams:
 - id: graphmem-profile-cudagraph-memory
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
-  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
-  sha256: 1aeb08fbac35c92be0d7913ceab4fe4586cb3d093ef3fe3ef0acbd742bcedc47
+  why: the estimate split reads around the one runner.capture_model(profile_only=True) it makes, with the platform's global graph pool pointed at its throwaway pool, after the minimal KV cache is built and before the teardown; direct and dictionary-held speculator managers share one profiling-pool/retirement scope before allocator cleanup; it sets the manager's FULL sample cap and sample list before that call and resets them inside it, so with no samples the return value is capture_model's measured bytes
+  sha256: a67b75c2f12662a15e448363699632e5f0828cf33fce9d792805e22e7ee2223c
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: graphmem-runner-capture-model
@@ -1340,7 +1340,7 @@ seams:
   kind: function
   target: vllm.v1.worker.gpu.cudagraph_utils:profile_cudagraph_memory
   why: the graph-memory estimate comes from runner.capture_model(profile_only=True), so dev_ab's both-arm capture is what the KV cache is sized against
-  sha256: 1aeb08fbac35c92be0d7913ceab4fe4586cb3d093ef3fe3ef0acbd742bcedc47
+  sha256: a67b75c2f12662a15e448363699632e5f0828cf33fce9d792805e22e7ee2223c
   signature: '(runner: ''GPUModelRunner'') -> int'
 
 - id: dev-ab-request-state

@@ -10,10 +10,14 @@ on:
   ``profile_cudagraph_memory`` and ``capture_model`` are routed through
   ``cudagraph_mem``, which also has the profiling capture capture every FULL
   graph;
-- ``VLLM_SM80_TARGET_SHARD_ARGMAX`` (``target_argmax``): ``sample``
+- ``VLLM_SM80_SHARD_ARGMAX`` (``target_argmax``): ``sample``
   runs inside ``target_argmax.step``, so a greedy-only step's target logits
-  are the per-rank argmax rows, and the dummy sampler run at boot warms the
-  slot kernels (and refuses a target the switch cannot serve).
+  are the per-rank argmax rows; ``load_model`` ends in
+  ``target_argmax.load``, which refuses a target, head or drafter the switch
+  cannot serve and takes a ``sample_draft`` drafter's greedy drafts per
+  rank; and the dummy sampler run at boot warms the slot kernels. The hot
+  pair ``shard_argmax`` (``vllm.sm80.hot_swap``) needs the same runner and
+  turns the target half on and off between steps (``set_enabled``).
 
 A feature that is off leaves its methods as upstream's; everything else is
 upstream's. Other runners (V1, the encoder-only runner) are built unchanged:
@@ -27,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 from vllm.sm80.worker import cudagraph_mem, target_argmax
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -45,6 +50,10 @@ def runner_cls() -> type:
     class GraphMemModelRunner(GPUModelRunnerV2):
         # target_argmax.refusal: sample() runs in target_argmax.step.
         target_argmax_steps = True
+
+        def load_model(self, *args, **kwargs) -> None:
+            super().load_model(*args, **kwargs)
+            target_argmax.load(self)
 
         def profile_cudagraph_memory(self) -> int:
             if not cudagraph_mem.enabled():
@@ -75,7 +84,7 @@ class GraphMemWorker(Worker):
     def _make_model_runner(self) -> GPUModelRunner:
         if self.use_v2_model_runner and not self.vllm_config.is_mm_encoder_only:
             return runner_cls()(self.vllm_config, self.device)  # type: ignore[return-value]
-        if getattr(envs, target_argmax.SWITCH):
+        if getattr(envs, target_argmax.SWITCH) or hot_swap.listed("shard_argmax"):
             raise ValueError(
                 f"{target_argmax.SWITCH}: the greedy target argmax needs the V2 "
                 "model runner of a generative model"

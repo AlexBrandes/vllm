@@ -14,7 +14,7 @@ Each GPU block decodes a 16-row slab of trellis tiles once into shared memory an
 
 `VLLM_EXL3_EXPERTS_CONTIGUOUS=1` (default `0`) allocates the trellis, `suh` and `svh` of a MoE layer's local expert matrices as views into one device buffer per layer and tensor kind instead of one allocation per tensor. Each view starts at a 512-byte-aligned offset, the alignment of a caching-allocator block, so the kernels, the per-expert pointer table and the loaded bytes are the same; only the allocator stops leaving holes between the tensors. With routed-expert trellis tensors of 1 to 10 MiB the PyTorch caching allocator serves each from a 20 MiB segment, so several MiB of each segment can stay unusable (about 3.7 GiB per GPU for DeepSeek-V4.1-Flash 2.9 bpw at expert parallel size 4).
 
-`VLLM_EXL3_MOE_CHUNK_ROWS=N` (default `0`, whole calls) runs `moe_out` on calls of more than N rows in row chunks of at most N, so its workspace is sized for N rows instead of the most rows one call can dispatch (`--max-num-batched-tokens` per rank). `moe_out` computes every row from its own input and routes alone, so the output bits do not change; larger prefill calls launch once per chunk. `moe_out_v2` and `moe_out_prefill` calls are not chunked.
+The `moe_routed_gemm/exl3_chunk_rows` row of the sm80 tuning table (`vllm/sm80/tuning/`, keyed by the hidden size; without a row `0`, whole calls) set to N runs `moe_out` on calls of more than N rows in row chunks of at most N, so its workspace is sized for N rows instead of the most rows one call can dispatch (`--max-num-batched-tokens` per rank). `moe_out` computes every row from its own input and routes alone, so the output bits do not change; larger prefill calls launch once per chunk. `moe_out_v2` and `moe_out_prefill` calls are not chunked.
 
 EXL3 runs on the extension `vllm._exl3_C`, built for SM 8.0 only; selecting EXL3 on any other GPU is an error. The vLLM build does not compile it: build it ahead of time with `python csrc/exl3/build_standalone.py --out vllm` from the source tree, with the PyTorch that serves (CUDA-enabled PyTorch, a matching CUDA toolkit, a C++20 compiler and Ninja; no GPU needed). Serving never compiles this extension. Its operators are registered through the non-stable `TORCH_LIBRARY` API, so loading refuses a library whose recorded PyTorch version, CUDA major version or C++ ABI differs from the running PyTorch. A successful build, CPU helper check or Meta dispatch is not GPU numerical, graph, quality or capacity validation. Validate those paths before deployment.
 
@@ -65,9 +65,9 @@ vllm serve ./qwen-exl3-checkpoint \
 
 The MTP count is configurable; this example is not a measured optimum. Keep vision enabled. Validate eager execution before graph replay and test the native context independently of a shorter diagnostic boot. `tests/models/qwen4_exp/test_exl3_construction.py` builds the target and MTP draft at two-rank expert-parallel shapes on the CPU from the checkpoint's configuration and tensor headers when `VLLM_TEST_EXL3_QWEN_CHECKPOINT` names the checkpoint directory.
 
-`VLLM_QWEN4_ROUTER_FP32=1` selects the existing `GateLinear` BF16-by-BF16 GEMM with FP32 accumulation and FP32 router logits, without changing the stored router weights. It defaults to `0`; the model logs the selected precision at construction. This switch applies to both the target and native MTP router.
+The text config field `moe_router_dtype="float32"` selects the existing `GateLinear` BF16-by-BF16 GEMM with FP32 accumulation and FP32 router logits, without changing the stored router weights. The checkpoint does not set it, so the router returns logits in the model dtype; set it with `--hf-overrides '{"text_config": {"moe_router_dtype": "float32"}}'`. The model logs the selected precision at construction. The field applies to both the target and the native MTP router: the MTP layers read it from the target config, because dict `--hf-overrides` do not reach the draft model config.
 
-`VLLM_QWEN4_MTP_PER_STREAM_NORM=1` computes a separate RMS for each native MTP hidden stream. It preserves the checkpoint's affine weight for each channel and applies the Gemma `(1 + weight)` scaling in FP32 before returning BF16. The default `0` retains one RMS over the entire concatenated hidden stack. The draft model logs the selected normalization. These are precision/normalization comparison paths, not validated default changes.
+The text config field `mtp_hidden_norm="per_stream"` computes a separate RMS for each native MTP hidden stream. It preserves the checkpoint's affine weight for each channel and applies the Gemma `(1 + weight)` scaling in FP32 before returning BF16. The default `"flat"` (field absent) retains one RMS over the entire concatenated hidden stack; any other value is refused at construction. Set it with `--hf-overrides '{"text_config": {"mtp_hidden_norm": "per_stream"}}'`; it is read from the target config. The draft model logs the selected normalization. These are precision/normalization comparison paths, not validated default changes.
 
 ## Compressed PLE placement
 
@@ -84,58 +84,6 @@ SSD reads occur at eager Python breaks between CUDA graph segments: ID completio
 A row read that still fails after its retries fails only the requests that use the row; the engine keeps serving the rest. The reader stages the row with an FP16 NaN scale, so the decoder emits a NaN row. NaN survives the tensor-parallel sum of row shards, so every rank sees which tokens failed, whichever rank owns the row. Those tokens' PLE embeddings are zeroed before the forward continues, so NaN cannot reach other requests. The model runner reports the requests that own the tokens. The scheduler finishes them with `FINISHED_ERROR` (finish reason `error`) and drops from the prefix cache the KV blocks they computed from that step on. It also fails any running request that already reused those blocks, so no request is served from a wrong embedding. The worker logs the row and the OS error; the scheduler logs the request IDs. The reader stays usable, and later requests read the row again. Errors while reading the table or its auxiliaries during startup still fail startup. `ram` and `device` read the table only at startup.
 
 The PLE file is opened with `posix_fadvise(POSIX_FADV_RANDOM)`, so the kernel does not read ahead around requested rows. Buffered reads still hit the page cache, so warm runs mostly read RAM. Set `VLLM_EXL3_PLE_COLD=1` to call `POSIX_FADV_DONTNEED` on the table at setup (no root needed; pages that another process has mapped stay resident). Page-cache residency of the table (via `mincore`) is logged at setup, after the cold drop and at process exit. `Exl3PLEEmbedding.page_cache_residency()` returns `(resident, total)` pages for sampling between runs.
-
-## Fixed expert placement
-
-`VLLM_EXL3_EXPERT_PLACEMENT` defaults to the empty string (disabled). Set it
-to a JSON file and set `VLLM_EXL3_EXPERT_PLACEMENT_SHA256` to that file's
-SHA256 to install a fixed whole-expert permutation before loading. The schema is
-`{"version":1,"ep_size":2,"layers":{"model.layers.0.mlp.experts":[[0,2],[1,3]]}}`.
-Layer keys are **checkpoint** expert prefixes, not necessarily runtime module
-names. Each ordered rank list gives its local slots in order; every logical ID
-must occur exactly once, with the existing number of slots per rank. Unlisted
-layers keep their ordinary placement. Unknown checkpoint prefixes, missing or
-duplicate experts, wrong capacities and digest mismatches fail at startup.
-
-This is supported only with whole-expert EP, no data parallelism, dynamic EPLB,
-all-to-all dispatch or fused shared experts. It does not replicate experts or
-change the router's IDs, weights or top-k order. The loader and native kernels
-share the same expert map; no per-step map allocation or lookup is added.
-Packed tensors and each expert's arithmetic are unchanged. **Rank partials
-group different experts**, so final MoE bits need not match ordinary placement.
-Validate reduction error and downstream routing before enabling. Equal-sized
-expert permutations add no resident weight or workspace memory; heterogeneous
-experts require a separate per-rank byte ledger despite equal slot counts.
-
-## Replicated hot experts
-
-`VLLM_EXL3_EXPERT_REPLICAS` defaults to the empty string (disabled). Set it to
-a JSON file and set `VLLM_EXL3_EXPERT_REPLICAS_SHA256` to that file's SHA256.
-The schema is `{"version":1,"ep_size":4,"layers":{"layers.1.ffn.experts":[17,5,203]}}`:
-per **checkpoint** expert prefix, the replicated experts, hottest first. Every
-rank then also holds a copy of each listed expert whose home is another rank,
-in local slots after its home slots.
-
-In a MoE call of 1 to 64 rows, each listed expert the call uses gets exactly
-one owner rank, chosen by the same rule on every rank from the call's top-k
-ids. The rule first counts each rank's distinct used experts that are not
-listed. The target is the larger of the busiest count and the call's distinct
-experts divided evenly over the ranks. Listed experts are then taken in plan
-order: one stays home while its home rank is below the target; otherwise it
-goes to the rank with the fewest experts so far. A small kernel writes the
-call's expert map from that rule before the routed-expert operator runs.
-Larger calls keep ordinary placement. Router ids, weights and top-k order are
-unchanged, and so is each expert's arithmetic. **Which rank's partial sum
-carries an expert changes** whenever an expert leaves its home, so final MoE
-bits need not match ordinary placement.
-
-Replicas add resident weight memory: one whole expert per listed expert that
-is not already local, per layer. vLLM's memory profile takes them out of the
-KV cache pool, and the startup log reports the bytes per layer. Supported with
-whole-expert EP at a power-of-two EP size and the linear expert placement, and
-not with data parallelism, EPLB, all-to-all dispatch, fused shared experts or
-`VLLM_EXL3_EXPERT_PLACEMENT`. Unknown checkpoint prefixes or experts and digest
-mismatches fail at startup.
 
 ## Tensor-parallel routed experts
 
@@ -155,9 +103,8 @@ each rank routes the same rows over all experts with the identity expert map,
 and the MoE's tensor-parallel all-reduce adds the ranks' partial outputs, so
 final MoE bits need not match whole-expert EP. The startup log names each
 rank's widths. Not supported with data, context or sequence parallelism,
-EPLB, all-to-all dispatch, `VLLM_EXL3_EXPERT_REPLICAS` or
-`VLLM_EXL3_EXPERT_PLACEMENT` (both plan whole experts per rank). Whether the
-decode and prefill operators take a rank width is up to their gates
+EPLB or all-to-all dispatch. Whether the decode and prefill operators take a
+rank width is up to their gates
 (`ops.MOE_V2_CONFIGS`, `ops.MOE_PREFILL_V2_CONFIGS`); `moe_out` takes any.
 The block-aligned split rotated per layer follows the idea of the
 DeepSeek-V4.1-Flash CMP 170HX recipes of GNmac-lab and Curtis White
@@ -191,7 +138,7 @@ Attention pipeline selection reserves both implementations' scratch before
 profiling. None of these selectors changes the speculative-width policy,
 graph-size ladder, checkpoint, or loaded expert placement.
 
-Hybrid checkpoint selection, expert-placement maps and digests, true per-K
+Hybrid checkpoint selection, true per-K
 DSpark construction, reduction transports/output dtypes, early Engram gathers,
 and draft-only shard argmax require a new process. Environment changes alone
 cannot update their constructed modules, storage, graph geometry, or cached

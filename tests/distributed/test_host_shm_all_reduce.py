@@ -407,7 +407,7 @@ def test_disabled_when_p2p_available_and_handed_over(monkeypatch):
 
 def test_p2p_availability_alone_does_not_stand_aside(monkeypatch):
     """Installing a P2P-capable driver must not silently turn
-    VLLM_HOST_ALLREDUCE=1 into NCCL: above two PCIe-only GPUs upstream's
+    VLLM_SM80_ALLREDUCE=1 into NCCL: above two PCIe-only GPUs upstream's
     CustomAllreduce refuses anyway unless the operator opts in."""
     _no_gpu_init(monkeypatch)
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda a, b: True)
@@ -450,8 +450,21 @@ def test_nccl_group_is_rejected(monkeypatch):
 def test_env_default_is_off():
     import vllm.envs as envs
 
-    assert envs.VLLM_HOST_ALLREDUCE is False
-    assert envs.VLLM_HOST_ALLREDUCE_MAX_SIZE == 512 * 1024
+    assert envs.VLLM_SM80_ALLREDUCE is False
+
+
+def test_max_size_is_the_tuning_row(monkeypatch):
+    """The largest message is the allreduce/host_max_bytes row of the sm80
+    tuning table, 512 KiB without one."""
+    from tests.sm80.tuning_rows import use_rows
+    from vllm.sm80.distributed import communicator as cc
+
+    use_rows(monkeypatch)
+    assert cc.allreduce_max_bytes("host_max_bytes", 4, 512 * 1024) == 512 * 1024
+    use_rows(monkeypatch, ("allreduce", "host_max_bytes", {"world_size": 4}, 65536))
+    assert cc.allreduce_max_bytes("host_max_bytes", 4, 512 * 1024) == 65536
+    src = inspect.getsource(cc.Sm80CudaCommunicator.__init__)
+    assert '"host_max_bytes", self.world_size, 512 * 1024' in src
 
 
 def test_env_vars_are_declared():
@@ -459,24 +472,20 @@ def test_env_vars_are_declared():
     and `envs.X` would not report what the feature will do."""
     import vllm.envs as envs
 
-    assert "VLLM_HOST_ALLREDUCE" in envs.environment_variables
-    assert "VLLM_HOST_ALLREDUCE_MAX_SIZE" in envs.environment_variables
+    assert "VLLM_SM80_ALLREDUCE" in envs.environment_variables
     # The type hints live in a TYPE_CHECKING block of vllm/sm80/envs.py, so
     # assert on the source rather than on runtime __annotations__ (empty).
     from vllm.sm80 import envs as fork_envs
 
     src = inspect.getsource(fork_envs)
-    assert "VLLM_HOST_ALLREDUCE: bool = False" in src
-    assert "VLLM_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024" in src
+    assert "VLLM_SM80_ALLREDUCE: bool = False" in src
 
 
 def test_env_reads_are_live(monkeypatch):
     import vllm.envs as envs
 
-    monkeypatch.setenv("VLLM_HOST_ALLREDUCE", "1")
-    monkeypatch.setenv("VLLM_HOST_ALLREDUCE_MAX_SIZE", "65536")
-    assert envs.environment_variables["VLLM_HOST_ALLREDUCE"]() is True
-    assert envs.environment_variables["VLLM_HOST_ALLREDUCE_MAX_SIZE"]() == 65536
+    monkeypatch.setenv("VLLM_SM80_ALLREDUCE", "1")
+    assert envs.environment_variables["VLLM_SM80_ALLREDUCE"]() is True
 
 
 def test_cuda_communicator_off_path_constructs_nothing():
@@ -486,7 +495,7 @@ def test_cuda_communicator_off_path_constructs_nothing():
 
     src = inspect.getsource(cc.Sm80CudaCommunicator.__init__)
     assert "self.hostshm_comm: HostShmAllreduce | None = None" in src
-    assert "envs.VLLM_HOST_ALLREDUCE" in src
+    assert "envs.VLLM_SM80_ALLREDUCE" in src
     assert 'unique_name.split(":")[0] == "tp"' in src  # TP-only
 
     dispatch = inspect.getsource(cc.Sm80CudaCommunicator.all_reduce)

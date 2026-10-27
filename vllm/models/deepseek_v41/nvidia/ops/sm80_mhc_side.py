@@ -29,8 +29,8 @@ wrote its inputs and owns their memory): an all-reduce or a flush on another
 stream launches it inline there, and that stream waits for it. The attention
 half goes beside the all-reduce where the layer sums ``wo_b`` itself
 (``reduces_wo_b``), the FFN half where the layer all-reduces the MoE output
-(``VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE``, ``_PREFILL_SPLIT_REDUCE`` or
-``_PREFILL_CE_ALLREDUCE``); otherwise the next mHC call launches it inline.
+(``VLLM_SM80_ALLREDUCE_ROUND_ONCE``, ``VLLM_SM80_PREFILL_REDUCE_OVERLAP`` or
+``VLLM_SM80_ALLREDUCE``); otherwise the next mHC call launches it inline.
 
 Same bytes as the one-launch finish: every CTA runs the same code on the same
 inputs. Kernel A wrote the partials before the fork point; nothing else reads
@@ -114,9 +114,9 @@ def layer_scope(ops: Any) -> _Layer | None:
             "to %d rows run on a side stream beside the sublayer's all-reduce "
             "(VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM=1): the attention half where the "
             "layer all-reduces wo_b itself, the FFN half where "
-            "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE, "
-            "VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE or "
-            "VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE is set; otherwise inline at the "
+            "VLLM_SM80_ALLREDUCE_ROUND_ONCE, "
+            "VLLM_SM80_PREFILL_REDUCE_OVERLAP or "
+            "VLLM_SM80_ALLREDUCE is set; otherwise inline at the "
             "next mHC call",
             MAX_ROWS,
             scope="global",

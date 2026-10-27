@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""VLLM_GLM5_DRAFTER_SELECTOR_SHARD: vocab-sharded DFlash2 selector codebooks.
+"""VLLM_DFLASH2_SELECTOR_SHARD: vocab-sharded DFlash2 selector codebooks.
 
 The DFlash2 candidate selector holds two (vocab, rank) bf16 codebooks
 (154,880 x 256 each, 151.25 MiB per rank replicated). With the flag each
@@ -42,7 +42,7 @@ def _full_weights(seed=0):
 
 
 def _selector(monkeypatch, *, shard, tp_rank, tp_size):
-    monkeypatch.setenv("VLLM_GLM5_DRAFTER_SELECTOR_SHARD", "1" if shard else "0")
+    monkeypatch.setenv("VLLM_DFLASH2_SELECTOR_SHARD", "1" if shard else "0")
     monkeypatch.setattr(
         dflash2, "get_tensor_model_parallel_world_size", lambda: tp_size
     )

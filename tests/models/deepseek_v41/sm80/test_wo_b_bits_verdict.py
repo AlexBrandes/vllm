@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.sm80.test_round_once_all_reduce import exact_sum, reference_round
+from .exact_round import exact_sum, reference_round
 from . import wo_b_allreduce_bits as bits
 
 
@@ -25,8 +25,7 @@ def _run(monkeypatch, tmp_path, values, bad_rank=None):
     out = tmp_path / "bits.json"
     monkeypatch.setattr(sys, "argv", ["bits", "--out", str(out), "--seeds", "1"])
     for key, value in {"RANK": "0", "WORLD_SIZE": "4", "LOCAL_RANK": "0",
-                       "VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE": "1",
-                       "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE": "1"}.items():
+                       "VLLM_SM80_ALLREDUCE_ROUND_ONCE": "1"}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(bits, "ROWS", [1])
     monkeypatch.setattr(bits, "HIDDEN", 8)

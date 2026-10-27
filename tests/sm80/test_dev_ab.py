@@ -151,9 +151,9 @@ def test_configure_refuses_another_extension(monkeypatch, state):
 def test_configure_refuses_diagnostic_capture(monkeypatch, state, dev_mode):
     monkeypatch.setenv("VLLM_DEV_AB_SWITCH", "exl3_dense_splitk")
     monkeypatch.setenv("VLLM_SERVER_DEV_MODE", dev_mode)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "capture-output")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE", "capture.toml")
     config = SimpleNamespace(parallel_config=SimpleNamespace(worker_extension_cls=""))
-    with pytest.raises(ValueError, match="cannot be combined with VLLM_SM80_CAPTURE_DIR"):
+    with pytest.raises(ValueError, match="cannot be combined with VLLM_SM80_CAPTURE$"):
         dev_ab.configure(config)
     assert config.parallel_config.worker_extension_cls == ""
     assert state == dev_ab._ArmState()
@@ -161,7 +161,7 @@ def test_configure_refuses_diagnostic_capture(monkeypatch, state, dev_mode):
 
 def test_diagnostic_capture_without_ab_leaves_config_untouched(monkeypatch, state):
     monkeypatch.delenv("VLLM_DEV_AB_SWITCH", raising=False)
-    monkeypatch.setenv("VLLM_SM80_CAPTURE_DIR", "capture-output")
+    monkeypatch.setenv("VLLM_SM80_CAPTURE", "capture.toml")
     dev_ab.configure(_Trap())
     assert state == dev_ab._ArmState()
 
@@ -179,7 +179,6 @@ def test_allowlist():
         "dsv41_fused_route",
         "dsv41_draft_prologue_fused",
         "dsv41_gate_gemv",
-        "dsv41_wo_a_strided",
         "dsv41_wo_a_grouped_gemm",
         "dsv41_engram_wkv_replicated_prefill",
         "dsv41_swa_meta_batch",
@@ -187,13 +186,12 @@ def test_allowlist():
         "dsv41_attn_pipeline",
         "dsv41_select_one_launch",
         "dsv41_moe_prefill_tc",
-        "qsa_topk_canonical",
+        "topk_canonical_ties",
         "marlin_decode_v2",
-        "glm5_topk_tiefix",
         "custom_allreduce_flags",
         "kda_prefill",
         "local_argmax_reduction",
-        "dsv41_target_shard_argmax",
+        "target_shard_argmax",
         "qwen4_router_fp32",
     }
 
@@ -201,7 +199,10 @@ def test_allowlist():
 def test_extension_methods_are_free_on_the_worker():
     gpu_worker = pytest.importorskip("vllm.v1.worker.gpu_worker")
     names = [n for n in dir(dev_ab.DevABWorkerExtension) if not n.startswith("__")]
-    assert names == ["begin_ab_batch", "end_ab_batch", "get_ab_arm", "set_ab_arm"]
+    assert names == [
+        "begin_ab_batch", "end_ab_batch", "get_ab_arm", "get_hot_arms",
+        "set_ab_arm", "set_hot_arms",
+    ]
     for name in names:
         assert not hasattr(gpu_worker.Worker, name)
 
@@ -393,37 +394,81 @@ def test_profiling_extrapolates_each_arms_full_graphs(monkeypatch, state, fake_s
     assert total == 110 + extra
 
 
-def test_qsa_switch_imports_its_module(monkeypatch):
+def test_topk_switch_imports_the_qsa_module(monkeypatch):
     import types
 
-    module = types.ModuleType(dev_ab._QSA_MODULE)
-    module._QSA_TOPK_CANONICAL = True
+    gate = types.ModuleType(dev_ab._TOPK_GATE)
     monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QSA_MODULE, raising=False)
+    monkeypatch.delitem(dev_ab.sys.modules, dev_ab._TOPK_GATE, raising=False)
     imported = []
 
     def fake_import(name):
+        # The QSA ops module imports the shared gate.
         imported.append(name)
-        dev_ab.sys.modules[name] = module
-        return module
+        dev_ab.sys.modules[name] = types.ModuleType(name)
+        dev_ab.sys.modules[dev_ab._TOPK_GATE] = gate
+        return dev_ab.sys.modules[name]
 
     monkeypatch.setattr(dev_ab.importlib, "import_module", fake_import)
     monkeypatch.setitem(
         dev_ab.sys.modules, dev_ab._QSA_MODEL_MODULE, types.ModuleType("m")
     )
-    switch = dev_ab.SWITCHES["qsa_topk_canonical"]
-    assert switch.unavailable(None) is None
-    assert switch.current(None) is True
-    assert imported == [dev_ab._QSA_MODULE]
-    monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QSA_MODULE)
+    monkeypatch.setenv(dev_ab._TOPK_ENV, "1")
+    switch = dev_ab.SWITCHES["topk_canonical_ties"]
+    try:
+        assert switch.unavailable(None) is None
+        assert switch.current(None) is True
+        assert imported == [dev_ab._QSA_MODULE]
+    finally:
+        dev_ab.sys.modules.pop(dev_ab._QSA_MODULE, None)
+        dev_ab.sys.modules.pop(dev_ab._TOPK_GATE, None)
 
 
-def test_qsa_switch_refuses_a_model_without_the_indexer(monkeypatch):
-    # Another model (no QSA indexer built): refuse rather than A/B two equal arms.
+def test_topk_switch_refuses_a_model_without_an_indexer(monkeypatch):
+    # Another model (no GLM or QSA indexer built): refuse rather than A/B two
+    # equal arms.
     monkeypatch.delitem(dev_ab.sys.modules, dev_ab._QSA_MODEL_MODULE, raising=False)
+    monkeypatch.delitem(dev_ab.sys.modules, dev_ab._TOPK_GATE, raising=False)
     imported = []
     monkeypatch.setattr(dev_ab.importlib, "import_module", imported.append)
-    why = dev_ab.SWITCHES["qsa_topk_canonical"].unavailable(None)
+    why = dev_ab.SWITCHES["topk_canonical_ties"].unavailable(None)
     assert "not loaded" in why and imported == []
+
+
+def test_topk_switch_apply_rereads_the_gate(monkeypatch):
+    """An arm sets the switch, drops the gate's cached reads and warms the
+    kernels (use_tiefix_topk) before the arm's capture; the sort switch is
+    left as booted."""
+    import os
+    import types
+
+    calls = []
+
+    class Cached:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self):
+            calls.append(self.name)
+
+        def cache_clear(self):
+            calls.append(f"clear {self.name}")
+
+    gate = types.ModuleType(dev_ab._TOPK_GATE)
+    for name in ("use_sorted_topk", "use_tiefix_topk", "tiefix_split_rows"):
+        setattr(gate, name, Cached(name))
+    monkeypatch.setitem(dev_ab.sys.modules, dev_ab._TOPK_GATE, gate)
+    monkeypatch.setenv(dev_ab._TOPK_ENV, "0")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
+    dev_ab.SWITCHES["topk_canonical_ties"].apply(None, True)
+    assert os.environ[dev_ab._TOPK_ENV] == "1"
+    assert os.environ["VLLM_SM80_TOPK_SORTED"] == "1"
+    assert calls == [
+        "clear use_sorted_topk",
+        "clear use_tiefix_topk",
+        "clear tiefix_split_rows",
+        "use_tiefix_topk",
+    ]
 
 
 def test_swa_meta_batch_switch(monkeypatch):
@@ -500,9 +545,9 @@ def test_target_shard_argmax_switch(monkeypatch):
     torch = pytest.importorskip("torch")
     from vllm.sm80.worker import target_argmax
 
-    switch = dev_ab.SWITCHES["dsv41_target_shard_argmax"]
+    switch = dev_ab.SWITCHES["target_shard_argmax"]
     assert not switch.graph_bound and switch.output_identical
-    assert switch.env == "VLLM_SM80_TARGET_SHARD_ARGMAX"
+    assert switch.env == "VLLM_SM80_SHARD_ARGMAX"
     lm = SimpleNamespace(
         lm_head=SimpleNamespace(tp_rank=0, tp_size=4),
         logits_processor=SimpleNamespace(org_vocab_size=129280, logits_as_input=False),
@@ -531,7 +576,13 @@ def test_target_shard_argmax_switch(monkeypatch):
     switch.apply(runner, False)
     assert switch.current(runner) is False and len(warmed) == 1
     # Servers where the on arm cannot run: refuse at boot.
-    assert "batch-sharded" in switch.unavailable(runner_with(batch_sharder=object()))
+    assert switch.unavailable(runner_with(batch_sharder=object())) is None
+    unsplit = SimpleNamespace(
+        compute_logits_local=lambda h: h, target_argmax_logits=True,
+        language_model=SimpleNamespace(lm_head=SimpleNamespace(tp_rank=0, tp_size=1),
+                                       logits_processor=lm.logits_processor),
+    )
+    assert "TP 1" in switch.unavailable(runner_with(model=unsplit))
     upstream = runner_with(target_argmax_steps=False)
     assert "does not sample in greedy steps" in switch.unavailable(upstream)
     headless = runner_with(model=SimpleNamespace(target_argmax_logits=True))
@@ -574,7 +625,6 @@ def router_model(monkeypatch):
         dev_ab._QWEN4_MODEL_MODULE,
         SimpleNamespace(Qwen4ExpSparseMoeBlock=Block),
     )
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", "0")
     target = torch.nn.Sequential(Block("layers.0.mlp.gate"), Block("layers.1.mlp.gate"))
     draft = torch.nn.Sequential(Block("mtp.layers.0.mlp.gate"))
     return SimpleNamespace(
@@ -593,6 +643,7 @@ def test_router_fp32_switch_sets_every_gate(state, router_model):
     torch, runner = router_model.torch, router_model.runner
     switch = dev_ab.SWITCHES["qwen4_router_fp32"]
     assert switch.graph_bound and not switch.output_identical
+    assert switch.env == "hf_overrides.text_config.moe_router_dtype"
     assert switch.unavailable(runner) is None and switch.current(runner) is False
     # What the block's constructor does when the switch is set at boot.
     reference = router_model.Gate("reference")
@@ -602,13 +653,11 @@ def test_router_fp32_switch_sets_every_gate(state, router_model):
     switch.apply(runner, False)  # the boot arm first, as the per-arm capture
     switch.apply(runner, True)
     assert switch.current(runner) is True
-    assert dev_ab.os.environ["VLLM_QWEN4_ROUTER_FP32"] == "1"
     for gate in router_model.gates:
         assert _gate_fields(gate) == _gate_fields(reference)
     switch.apply(runner, False)
     assert switch.current(runner) is False
     assert [_gate_fields(gate) for gate in router_model.gates] == boot
-    assert dev_ab.os.environ["VLLM_QWEN4_ROUTER_FP32"] == "0"
     # set_out_dtype refuses a second set, so the boot fields came back first.
     switch.apply(runner, True)
     assert switch.current(runner) is True
@@ -617,14 +666,13 @@ def test_router_fp32_switch_sets_every_gate(state, router_model):
 def test_router_fp32_switch_refuses_at_boot(monkeypatch, router_model):
     torch, runner = router_model.torch, router_model.runner
     switch = dev_ab.SWITCHES["qwen4_router_fp32"]
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", "1")
-    assert "VLLM_QWEN4_ROUTER_FP32=0" in switch.unavailable(runner)
-    monkeypatch.setenv("VLLM_QWEN4_ROUTER_FP32", "0")
     other = SimpleNamespace(model=torch.nn.Sequential(torch.nn.Linear(2, 2)))
     assert "no Qwen4Exp MoE router gates" in switch.unavailable(other)
+    # A boot with moe_router_dtype="float32" already set the FP32 logits.
     draft_gate = router_model.gates[-1]
     draft_gate.out_dtype = torch.float32
     assert "already has out_dtype" in switch.unavailable(runner)
+    assert "moe_router_dtype" in switch.unavailable(runner)
     draft_gate.out_dtype = None
     draft_gate._rocm_bf16x3_weight_eligible = True
     assert "ROCm BF16x3" in switch.unavailable(runner)

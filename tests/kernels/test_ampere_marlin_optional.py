@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.marlin_moe import decode, extension, prefill
 from tests.kernels import test_ampere_pp_marlin_prefill as pp_helpers
 from tests.kernels import test_ampere_tp4_marlin_prefill as tp_helpers
@@ -18,8 +19,8 @@ DECODE = "VLLM_AMPERE_MARLIN_DECODE_CUDA"
 
 @pytest.fixture(autouse=True)
 def isolated_optional_flags(monkeypatch):
-    for name in (DECODE, "VLLM_AMPERE_MARLIN_PREFILL_WIDE",
-                 "VLLM_AMPERE_MARLIN_PREFILL_NARROW", "VLLM_AMPERE_DECODE_IDX_GLUE"):
+    for name in (DECODE, "VLLM_SM80_MARLIN_PREFILL",
+                 "VLLM_AMPERE_DECODE_IDX_GLUE"):
         monkeypatch.setenv(name, "0")
     monkeypatch.setattr(extension, "_OPS", None)
 
@@ -109,10 +110,14 @@ def test_incompatible_build_is_rejected_before_dispatch(monkeypatch, key, bad):
     (0, 512, False), (1, 512, True), (32, 512, True),
     (33, 512, False), (64, 512, False), (4, 2048, True),
     (8, 2048, True), (0, 2048, False), (1, 2048, False),
-    (3, 2048, False), (5, 2048, False), (7, 2048, False),
-    (9, 2048, False), (16, 2048, False), (32, 2048, False),
+    (3, 2048, False), (5, 2048, True), (7, 2048, True),
+    (9, 2048, True), (16, 2048, True), (32, 2048, True),
+    (33, 2048, False),
 ])
-def test_decode_regime_boundaries(tokens, width, expected):
+def test_decode_regime_boundaries(monkeypatch, tokens, width, expected):
+    """Whole experts: 4..8 rows and the multi-request rows up to the
+    marlin_multi_max_rows row (32 without one)."""
+    use_rows(monkeypatch)
     assert decode.compiled_regime(tokens, width) is expected
 
 
@@ -145,10 +150,12 @@ def test_unsupported_decode_leaves_output_untouched(monkeypatch, case, reason):
 
 
 def test_released_prefill_thresholds(monkeypatch):
-    monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_WIDE", "1")
-    monkeypatch.setenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "1000")
-    monkeypatch.setenv("VLLM_AMPERE_MARLIN_PREFILL_NARROW", "1")
-    monkeypatch.setenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "700")
+    monkeypatch.setenv("VLLM_SM80_MARLIN_PREFILL", "1")
+    use_rows(
+        monkeypatch,
+        ("moe_prefill", "marlin_min_rows", {"gemm_n": 2048}, 1000),
+        ("moe_prefill", "marlin_min_rows", {"gemm_n": 512}, 700),
+    )
     assert prefill.enabled_shapes()[2048][1] == 1000
     assert prefill.enabled_shapes()[512][1] == 700
 
@@ -159,11 +166,7 @@ def test_released_prefill_thresholds(monkeypatch):
 ])
 def test_warmup_allocations_follow_admitted_width(monkeypatch, width, python_on, budget,
                                                   expected):
-    python_flag = (
-        "VLLM_AMPERE_MARLIN_PREFILL_NARROW" if width == 512
-        else "VLLM_AMPERE_MARLIN_PREFILL_WIDE"
-    )
-    monkeypatch.setenv(python_flag, str(int(python_on)))
+    monkeypatch.setenv("VLLM_SM80_MARLIN_PREFILL", str(int(python_on)))
     assert prefill._warmup_capacity(width, budget) == expected
 
 

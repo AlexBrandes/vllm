@@ -14,9 +14,9 @@
     out      [T, 64, 512] bf16          written in place when given
     max_logits, lse  [T, 64] fp32       natural-log convention
 
-Taken from ``sparse_prefill_mla.sparse_mla_fwd`` when
-``VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE=1`` and :func:`closed` finds nothing
-against the call; every other call keeps the Triton kernel there.
+Taken from ``sparse_prefill_mla.sparse_mla_fwd`` (``VLLM_SM80_SPARSE_MLA_PREFILL=1``)
+for 64-head calls when :func:`closed` finds nothing against the call; every
+other call keeps the Triton kernel there.
 
 Gluon kernel (explicit layouts, mma.sync m16n8k16 bf16 -> fp32, cp.async), one
 CTA per query row covering all 64 heads, 8 warps:
@@ -339,11 +339,11 @@ def use(q, kv, indices, d_v, block_dpe, out):
     why = closed(q, kv, indices, d_v, block_dpe, out)
     if why:
         logger.info_once(
-            "VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE=1 but the PP sparse-MLA prefill "
+            "VLLM_SM80_SPARSE_MLA_PREFILL=1 but the PP sparse-MLA prefill "
             "kernel is off for this call: %s; using the Triton kernel", why)
         return False
     logger.info_once(
-        "PP sparse-MLA prefill kernel active (VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE=1, "
+        "PP sparse-MLA prefill kernel active (VLLM_SM80_SPARSE_MLA_PREFILL=1, "
         "%d heads, %d index slots, sm_80)", HEADS, INDEX_WIDTH)
     return True
 
@@ -363,12 +363,12 @@ def warmup(device="cuda:0"):
 
 def warmup_from_worker(worker) -> bool:
     """Called before CUDA-graph capture. Compiles the kernel when the flag is
-    on and this rank runs 64 heads on sm_80; returns whether it did."""
+    on (or its hot pair ``sparse_mla_prefill`` is listed) and this rank runs
+    64 heads on sm_80; returns whether it did."""
     from vllm import envs
+    from vllm.sm80 import hot_swap
 
-    if not (
-        envs.VLLM_AMPERE_SPARSE_MLA_PREFILL_WIDE and envs.VLLM_GLM5_PREFILL_KERNELS
-    ):
+    if not (envs.VLLM_SM80_SPARSE_MLA_PREFILL or hot_swap.listed("sparse_mla_prefill")):
         return False
     device = worker.device
     if torch.cuda.get_device_capability(device) != (8, 0):

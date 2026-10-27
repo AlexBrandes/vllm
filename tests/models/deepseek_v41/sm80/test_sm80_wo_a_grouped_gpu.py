@@ -4,9 +4,9 @@
 without).
 
 Two loaded MXFP8 wo_a layers of the same codes and 32 x 32 block scales (the
-hybrid checkpoint's): the per-group Marlin W8A16 GEMMs (GroupedLinearMethod,
-strided rows) and the grouped GEMM (WoAGroupedGemmMethod), at 2 and 4 local
-groups (TP4, TP2) of 1024 outputs and 4096 inputs.
+hybrid checkpoint's): the per-group Marlin W8A16 GEMMs (GroupedLinearMethod)
+and the grouped GEMM (WoAGroupedGemmMethod), at 2 and 4 local groups (TP4,
+TP2) of 1024 outputs and 4096 inputs.
 
 - Against the FP64 product of the decoded weights, for every row count from
   1 to 48 and 64 and for prefill row counts: every output within half a BF16
@@ -91,8 +91,8 @@ def _layer(monkeypatch, codes, blocks, adopt):
 
 
 def _marlin(groups):
-    """The per-group Marlin GEMMs (strided rows), as B2 serves them."""
-    return lambda layer: GroupedLinearMethod.adopt(layer, groups, strided_input=True)
+    """The per-group Marlin GEMMs."""
+    return lambda layer: GroupedLinearMethod.adopt(layer, groups)
 
 
 def _gemm(groups, **kwargs):
@@ -213,7 +213,7 @@ def test_dev_ab_off_arm_is_the_marlin_path(monkeypatch):
     codes, blocks = _codes(groups, 3)
     marlin = _layer(monkeypatch, codes, blocks, _marlin(groups))
     both = _layer(monkeypatch, codes, blocks,
-                  _gemm(groups, strided_input=True, gemm=False, keep_groups=True))
+                  _gemm(groups, gemm=False, keep_groups=True))
     gemm = _layer(monkeypatch, codes, blocks, _gemm(groups))
     for rows in (1, 6, 48, 300):
         x = _x(rows, groups, rows)

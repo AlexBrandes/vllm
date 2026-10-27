@@ -416,11 +416,11 @@ def test_dense_prefill_requires_boot_warmup_and_preserves_route_configuration(mo
 @pytest.mark.parametrize("name", [
     "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC",
     "VLLM_DEEPSEEK_V41_ATTN_PIPELINE", "VLLM_EXL3_HYBRID", "VLLM_DSPARK_PER_K_WIDTH",
-    "VLLM_DEEPSEEK_V41_WO_B_BF16_PREFILL_ALLREDUCE",
+    "VLLM_SM80_ALLREDUCE_ROUND_ONCE", "VLLM_SM80_ALLREDUCE",
     "VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE",
-    "VLLM_ROUND_ONCE_ALLREDUCE_GROUPED", "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER",
+    "VLLM_SM80_PREFILL_REDUCE_OVERLAP", "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER",
     "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL",
-    "VLLM_DSPARK_SHARD_ARGMAX", "VLLM_SM80_TARGET_SHARD_ARGMAX",
+    "VLLM_SM80_SHARD_ARGMAX",
 ])
 def test_combined_features_keep_default_off(monkeypatch, name):
     from vllm.sm80.envs import FORK_ENV_VARS
@@ -429,8 +429,8 @@ def test_combined_features_keep_default_off(monkeypatch, name):
     assert FORK_ENV_VARS[name]() is False
 
 
-@pytest.mark.parametrize("name", ["VLLM_DEV_AB_SWITCH", "VLLM_EXL3_EXPERT_PLACEMENT",
-                                  "VLLM_EXL3_EXPERT_PLACEMENT_SHA256", "VLLM_SM80_CAPTURE_DIR"])
+@pytest.mark.parametrize("name", ["VLLM_DEV_AB_SWITCH", "VLLM_SM80_CAPTURE",
+                                  "VLLM_SM80_REPLAY_DIR"])
 def test_combined_optional_paths_keep_empty_default(monkeypatch, name):
     from vllm.sm80.envs import FORK_ENV_VARS
 

@@ -27,25 +27,59 @@ graph replay:
    16    14.50 -> 13.66 1.06
    32    14.02 -> 15.14 0.93
 
-``VLLM_MOE_MASK_PADDING_MAX_TOKENS`` (8) bounds it at the top of that win region.
+The moe_router/fused_route_max_rows row of the sm80 tuning table
+(:func:`fused_route_max_rows`, 8 without a row) bounds it at the top of that
+win region; moe_router/route_v2_max_rows (:func:`route_v2_max_rows`) bounds
+``route``.
 """
 
 import torch
 
+from vllm.sm80 import tuning
 from vllm.sm80.kernels._platform import _is_sm80
 
 __all__ = [
     "use_ampere_moe_routing",
+    "fused_route_max_rows",
     "marlin_block_size_m",
     "stash_fused_align",
     "take_fused_align",
     "drop_fused_align",
     "fused_align_is_masked",
     "route_v2_masks_padding",
+    "route_v2_max_rows",
     "use_ampere_moe_route_v2",
     "maybe_moe_route_v2",
     "take_fused_routing",
 ]
+
+# The router shape route.py is built and validated for
+# (use_ampere_moe_route_v2), and the most rows it has a path for.
+_ROUTE_V2_SHAPE = {"n_experts": 288, "top_k": 8, "hidden": 4096}
+_ROUTE_V2_ROW_LIMIT = 64
+
+
+def fused_route_max_rows(top_k: int) -> int:
+    """Largest batch of the fused decode routing, which is also the largest
+    batch the MoE padding mask leaves unmasked: the
+    moe_router/fused_route_max_rows row of the sm80 tuning table, else 8."""
+    return tuning.lookup(
+        "moe_router", "fused_route_max_rows", {"top_k": int(top_k)}, 8
+    )
+
+
+def route_v2_max_rows() -> int:
+    """Largest batch of the fused router v2: the moe_router/route_v2_max_rows
+    row of the sm80 tuning table, else 32 (the largest batch it was validated
+    and timed at). Raises above 64, the most rows route.py handles."""
+    rows = tuning.lookup("moe_router", "route_v2_max_rows", _ROUTE_V2_SHAPE, 32)
+    if rows > _ROUTE_V2_ROW_LIMIT:
+        raise ValueError(
+            f"moe_router/route_v2_max_rows = {rows} exceeds "
+            f"{_ROUTE_V2_ROW_LIMIT}, the most rows the sm_80 fused MoE router "
+            "handles"
+        )
+    return rows
 
 
 def use_ampere_moe_routing(
@@ -69,7 +103,7 @@ def use_ampere_moe_routing(
 
     if not envs.VLLM_AMPERE_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_MOE_ROUTING:
         return False
-    if num_tokens < 1 or num_tokens > envs.VLLM_MOE_MASK_PADDING_MAX_TOKENS:
+    if num_tokens < 1 or num_tokens > fused_route_max_rows(topk):
         return False
     # The fused kernel is a single-CTA sigmoid top-k with no group phase.
     if scoring_func != "sigmoid":
@@ -216,7 +250,7 @@ def use_ampere_moe_route_v2(num_tokens: int, gate, router, x) -> bool:
 
     if not envs.VLLM_AMPERE_DECODE_KERNELS or not envs.VLLM_MOE_DECODE_ROUTE_V2:
         return False
-    if num_tokens < 1 or num_tokens > envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS:
+    if num_tokens < 1 or num_tokens > route_v2_max_rows():
         return False
     if gate is None or router is None:
         return False
@@ -258,8 +292,8 @@ def use_ampere_moe_route_v2(num_tokens: int, gate, router, x) -> bool:
 def route_v2_masks_padding(num_tokens: int) -> bool:
     """Whether route v2 applies the padding mask inside its launch at this
     batch size: VLLM_MOE_MASK_PADDING=1 and VLLM_GLM5_MOE_ROUTE_V2_MASK=1
-    (default), a batch the mask covers (above VLLM_MOE_MASK_PADDING_MAX_TOKENS
-    rows) and the one-launch kernel's range.
+    (default), a batch the mask covers (above fused_route_max_rows rows at
+    route v2's top-k) and the one-launch kernel's range.
     Outside it the mask edits the ids afterwards and drops the stash
     (`drop_fused_align`), as before. A static function of the shape, so eager
     runs, warmup and captured graphs agree."""
@@ -267,7 +301,7 @@ def route_v2_masks_padding(num_tokens: int) -> bool:
 
     if not envs.VLLM_MOE_MASK_PADDING or not envs.VLLM_GLM5_MOE_ROUTE_V2_MASK:
         return False
-    min_rows = int(envs.VLLM_MOE_MASK_PADDING_MAX_TOKENS)
+    min_rows = fused_route_max_rows(_ROUTE_V2_SHAPE["top_k"])
     if num_tokens <= min_rows:
         return False
     from vllm.sm80.kernels.moe.route import pad_supported
@@ -341,14 +375,13 @@ def maybe_moe_route_v2(gate, router, x):
     stash_fused_align(topk_ids, block_size, num_experts,
                       (sorted_ids, expert_ids, ntpp), is_padding=is_padding)
     if not _V2_ANNOUNCED:
-        from vllm import envs
         from vllm.logger import init_logger
 
         init_logger(__name__).info(
             "sm_80 fused MoE router active: gate GEMV + top-k + block "
             "alignment in one op for M <= %d "
             "[VLLM_MOE_DECODE_ROUTE_V2=1]",
-            envs.VLLM_GLM5_DECODE_MOE_ROUTE_V2_MAX_TOKENS,
+            route_v2_max_rows(),
         )
         _V2_ANNOUNCED = True
     return logits

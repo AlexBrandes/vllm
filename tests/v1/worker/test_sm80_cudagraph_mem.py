@@ -212,9 +212,7 @@ def _vllm_estimate(cap: Capture) -> int:
 
 def test_flag_defaults_off(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
-    monkeypatch.delenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", raising=False)
     assert envs.VLLM_CUDAGRAPH_ESTIMATE_SPLIT == 0
-    assert envs.VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB == 0
     assert not cudagraph_mem.enabled()
     assert not cudagraph_mem.tracing()
 
@@ -229,7 +227,7 @@ def test_levels(monkeypatch):
 @pytest.mark.parametrize("flag", ["0", "1", "2"])
 def test_select_worker(monkeypatch, flag):
     monkeypatch.setenv(FLAG, flag)
-    monkeypatch.delenv("VLLM_SM80_TARGET_SHARD_ARGMAX", raising=False)
+    monkeypatch.delenv("VLLM_SM80_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls=cudagraph_mem.UPSTREAM_WORKER)
     cudagraph_mem.select_worker(parallel)
     expected = cudagraph_mem.WORKER if flag != "0" else cudagraph_mem.UPSTREAM_WORKER
@@ -243,7 +241,7 @@ def test_select_worker(monkeypatch, flag):
 
 def test_select_worker_keeps_a_custom_worker(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.delenv("VLLM_SM80_TARGET_SHARD_ARGMAX", raising=False)
+    monkeypatch.delenv("VLLM_SM80_SHARD_ARGMAX", raising=False)
     parallel = SimpleNamespace(worker_cls="my.Worker")
     cudagraph_mem.select_worker(parallel)
     assert parallel.worker_cls == "my.Worker"
@@ -514,9 +512,16 @@ def test_history_stopped_when_no_capture(monkeypatch):
     assert calls == [True, False]
 
 
-@pytest.mark.parametrize("limit", ["0", "20"])
+@pytest.mark.parametrize("limit", [0, 20])
 def test_capture_max_split_scoped(monkeypatch, limit):
-    monkeypatch.setenv("VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB", limit)
+    from vllm.sm80 import tuning
+
+    asked = []
+
+    def lookup(op, param, key, default):
+        asked.append((op, param, dict(key), default))
+        return limit
+    monkeypatch.setattr(tuning, "lookup", lookup)
     monkeypatch.setattr(torch.cuda.memory, "get_allocator_backend", lambda: "native")
     monkeypatch.setattr(
         torch._C, "_accelerator_getAllocatorSettings",
@@ -531,7 +536,9 @@ def test_capture_max_split_scoped(monkeypatch, limit):
     runner.profile_cudagraph_memory()
     runner.capture_model()
 
-    if limit == "0":
+    assert asked and all(
+        a == ("cudagraph", "capture_max_split_mb", {}, 0) for a in asked)
+    if limit == 0:
         assert seen == []
     else:
         # Set and restored around the profiling and the real capture.

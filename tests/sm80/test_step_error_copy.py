@@ -19,7 +19,7 @@ class Event:
         self.syncs += 1
 
 
-@pytest.mark.parametrize("flag", [None, 0, 1])
+@pytest.mark.parametrize("flag", [None, 0, errors.CE_RING_TIMEOUT])
 def test_error_joins_the_existing_copy_event(monkeypatch, flag):
     monkeypatch.setattr(errors, "_buffers", {} if flag is None else {(0, 1): torch.tensor(flag)})
     events = []
@@ -38,8 +38,8 @@ def test_error_joins_the_existing_copy_event(monkeypatch, flag):
                                      stream, stream, False, None)
     assert len(events) == 1 and events[0].syncs == 0
     assert events[0].records == (1 if flag is None else 2)
-    if flag == 1:
-        with pytest.raises(ValueError, match="finite exponent span"):
+    if flag:
+        with pytest.raises(ValueError, match="copy-engine ring"):
             result.get_output()
         assert output.sampled_token_ids is None, "invalid tokens escaped before error checking"
     else:
@@ -49,7 +49,7 @@ def test_error_joins_the_existing_copy_event(monkeypatch, flag):
 
 
 def test_sync_runner_reuses_its_existing_event(monkeypatch):
-    monkeypatch.setattr(errors, "_buffers", {(None, 1): torch.tensor(1)})
+    monkeypatch.setattr(errors, "_buffers", {(None, 1): torch.tensor(errors.CE_RING_TIMEOUT)})
     class Runner:
         def __init__(self):
             self.transfer_event = Event()
@@ -60,7 +60,7 @@ def test_sync_runner_reuses_its_existing_event(monkeypatch):
     errors.install_output_checks(sync_runner=Runner)
     runner = Runner()
     original = runner.transfer_event
-    with pytest.raises(ValueError, match="finite exponent span"):
+    with pytest.raises(ValueError, match="copy-engine ring"):
         runner._to_list(torch.tensor([7]))
     assert runner.transfer_event is original
     assert original.records == original.syncs == 1

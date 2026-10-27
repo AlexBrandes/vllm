@@ -31,10 +31,10 @@ What changes on sm_80:
   (``vllm.sm80.plugin.HF_CONFIG_DEFAULTS``), the EXL3 head stores its FP32
   result in that dtype and both models' logits processors serve it
   (``Exl3HeadLogitsProcessor``);
-- with ``VLLM_SM80_TARGET_SHARD_ARGMAX`` the target's
-  ``compute_logits`` returns, inside a greedy-only sampling step of the fork
-  runner, rows that hold only the vocabulary-parallel argmax instead of the
-  all-gathered logits (``vllm/sm80/worker/target_argmax.py``).
+- with ``VLLM_SM80_SHARD_ARGMAX`` the target's ``compute_logits`` returns,
+  inside a greedy-only sampling step of the fork runner, rows that hold only
+  the vocabulary-parallel argmax instead of the all-gathered logits
+  (``vllm/sm80/worker/target_argmax.py``: ``ShardArgmaxLogits``).
 
 The attention layers are the platform's (``_select_dsv4_attn_cls``); the
 layer topology this supports is TP with whole-expert EP and no sequence
@@ -123,7 +123,7 @@ class DeepseekV4DecoderLayer(upstream_model.DeepseekV4DecoderLayer):
     takes the repeated embedding (its coefficients from the whole stream),
     an Engram layer injects into the previous layer's post, every other
     boundary is the previous sublayer's post fused with the next delayed pre.
-    With ``_split_reduce`` (VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE) an eager
+    With ``_split_reduce`` (VLLM_SM80_PREFILL_REDUCE_OVERLAP) an eager
     step of enough rows runs everything after the attention in two row slices
     (``sm80_split_reduce.py``). With ``_mhc_side``
     (VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM) the forward runs inside
@@ -378,11 +378,11 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             from .sm80_engram_wkv import adopt_replicated_wkv
 
             adopt_replicated_wkv(model)
-        if envs.VLLM_DEEPSEEK_V41_PREFILL_SPLIT_REDUCE:
+        if envs.VLLM_SM80_PREFILL_REDUCE_OVERLAP:
             sm80_split_reduce.adopt_split_reduce(
                 islice(model.layers, model.start_layer, model.end_layer)
             )
-        if envs.VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE:
+        if envs.VLLM_SM80_ALLREDUCE:
             _init_ce_ring(model)
         replay = model.decoder_replay_layers
         if replay is not None:
@@ -407,9 +407,10 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
 
 
 def _init_ce_ring(model) -> None:
-    """VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE: build the TP group's copy-engine
-    ring (collective), sized for the largest FP32 ``wo_b`` sum of a step:
-    ``max_num_batched_tokens`` rows of the hidden size in FP32."""
+    """VLLM_SM80_ALLREDUCE: build the TP group's copy-engine ring
+    (collective), the transport of the layer-owned sums the host-staged and
+    custom all-reduce do not take, sized for the largest FP32 ``wo_b`` sum of
+    a step: ``max_num_batched_tokens`` rows of the hidden size in FP32."""
     from vllm.distributed.parallel_state import get_tp_group
     from vllm.sm80.distributed.ce_ring_all_reduce import init_ce_ring
 
@@ -420,7 +421,7 @@ def _init_ce_ring(model) -> None:
     ring = init_ce_ring(group, rows * model.config.hidden_size * 4)
     logger.info_once(
         "DeepSeek-V4.1 sm_80: prefill-sized TP all-reduces run on the copy-engine "
-        "ring (VLLM_DEEPSEEK_V41_PREFILL_CE_ALLREDUCE=1): messages up to %d bytes, "
+        "ring (VLLM_SM80_ALLREDUCE=1): messages up to %d bytes, "
         "%.1f MiB of device memory per rank",
         ring.capacity_bytes,
         ring.device_bytes / 2**20,
@@ -428,7 +429,9 @@ def _init_ce_ring(model) -> None:
     )
 
 
-class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
+class DeepseekV41ForCausalLM(
+    target_argmax.ShardArgmaxLogits, upstream_vl.DeepseekV41ForCausalLM
+):
     """The DeepSeek-V4.1 vision wrapper with the sm_80 text model.
 
     The vision tower and aligner stay upstream's (BF16, replicated: EXL3 runs
@@ -449,18 +452,6 @@ class DeepseekV41ForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
             prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
         )
         Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
-
-    # target_argmax.refusal: compute_logits serves greedy-only steps.
-    target_argmax_logits = True
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        """Upstream's gathered logits; inside a greedy-only sampling step
-        (``VLLM_SM80_TARGET_SHARD_ARGMAX``) the rows that hold only
-        their argmax, without the all-gather
-        (``vllm/sm80/worker/target_argmax.py``)."""
-        if target_argmax.active():
-            return target_argmax.argmax_rows(self, hidden_states)
-        return super().compute_logits(hidden_states)
 
 
 class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):

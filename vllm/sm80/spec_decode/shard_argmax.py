@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Greedy DSpark Markov sampling with a per-rank argmax, without the
-all-gather of the draft logits.
+"""Greedy argmax over a vocabulary-parallel head without the all-gather of
+the logits: the slot kernels, and greedy DSpark Markov sampling on them.
+
+``VLLM_SM80_SHARD_ARGMAX`` covers greedy target sampling
+(``vllm/sm80/worker/target_argmax.py``, which uses these kernels) and greedy
+drafting over a vocabulary-parallel head. How each drafter takes its greedy
+drafts with the switch on, and which drafters the switch refuses, is
+:func:`drafting`.
 
 The DSpark drafter samples its block left to right: at step i the draft
 logits of position i are its base logits plus a Markov bias computed from the
@@ -9,7 +15,7 @@ token drafted at step i - 1, and a greedy draft is their argmax. Upstream
 builds the base logits with the vocabulary-parallel head and all-gathers
 them over the TP group (``compute_draft_logits``), only to take that argmax.
 
-With ``VLLM_DSPARK_SHARD_ARGMAX`` the drafter's
+With ``VLLM_SM80_SHARD_ARGMAX`` the drafter's
 ``compute_logits_local`` keeps each rank's own columns of the base logits,
 and every step:
 
@@ -57,16 +63,14 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 BLOCK = 4096  # columns per chunk; one slot per chunk
 LANES = 8  # BF16 lanes per slot: 4 key bytes, 3 index bytes, 1 zero
 STATS_LANES = 16  # BF16 lanes per rank's statistics: 3 FP32 words, 4 bytes each
 MAX_VOCAB = 1 << 24  # three index bytes
-SWITCH = "VLLM_DSPARK_SHARD_ARGMAX"
+SWITCH = "VLLM_SM80_SHARD_ARGMAX"
 
 
 @triton.jit
@@ -339,8 +343,31 @@ def pick(slots: torch.Tensor, vocab: int, num_slots: int | None = None) -> torch
     return out
 
 
+def shard_tokens(
+    local: torch.Tensor, rank: int, tp_size: int, vocab: int
+) -> torch.Tensor:
+    """torch.argmax of each gathered row, from this rank's shard ``local``
+    [rows, width] of vocabulary-parallel logits (padding columns kept): the
+    gathered row is the ranks' columns in rank order, cut at ``vocab``.
+    Every rank calls it with the same rows; with none, no rank enters the
+    all-reduce."""
+    rows, width = local.shape
+    if rows == 0:
+        return torch.empty(0, dtype=torch.int64, device=local.device)
+    col_start = rank * width
+    n_cols = min(max(vocab - col_start, 0), width)
+    cols = local[:, :n_cols]
+    if cols.dtype != torch.float32:
+        cols = cols.float()  # exact; keeps order, ties and NaN
+    chunks = triton.cdiv(width, BLOCK)
+    slots = chunk_slots(cols, col_start, rank, tp_size, chunks)
+    if tp_size > 1:
+        slots = tensor_model_parallel_all_reduce(slots)
+    return pick(slots, vocab)
+
+
 def refusal(speculator) -> str | None:
-    """Why the per-rank argmax cannot replace this speculator's sampling."""
+    """Why the per-rank argmax cannot replace this DSpark speculator's sampling."""
     model = speculator.model
     if not hasattr(model, "compute_logits_local"):
         return (
@@ -360,6 +387,151 @@ def refusal(speculator) -> str | None:
     return None
 
 
+def _markov_sampler(speculator) -> bool:
+    """Whether ``speculator`` samples its drafts with the DSpark Markov sampler
+    that :func:`shard_argmax_sampling` decorates (also through subclasses that
+    override and call it)."""
+    return any(
+        getattr(vars(cls).get("_sample_sequential"), "shard_argmax_sampler", False)
+        for cls in type(speculator).__mro__
+    )
+
+
+def _kind(speculator) -> str:
+    """How ``speculator`` drafts (see :func:`drafting`)."""
+    if speculator is None:
+        return "none"
+    if _markov_sampler(speculator):
+        return "markov"
+    if hasattr(speculator, "candidate_sampler"):
+        return "candidates"
+    if not hasattr(speculator, "sample_draft"):
+        return "headless"
+    if speculator.draft_logits is not None:
+        return "probabilistic"
+    return "sample_draft"
+
+
+def sample_draft_refusal(speculator) -> str | None:
+    """Why the per-rank argmax cannot replace the greedy argmax of this
+    speculator's ``sample_draft`` (:func:`adopt_sample_draft`)."""
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    name = type(speculator).__name__
+    if not isinstance(speculator, DraftModelSpeculator):
+        return f"{name} samples its drafts outside vLLM's draft-model speculator"
+    cls = type(speculator)
+    if (
+        cls.sample_draft is not DraftModelSpeculator.sample_draft
+        or cls.compute_draft_logits is not DraftModelSpeculator.compute_draft_logits
+    ):
+        return (
+            f"{name} computes or samples its draft logits its own way "
+            "(sample_draft, compute_draft_logits)"
+        )
+    if speculator.use_local_argmax_reduction:
+        return (
+            "speculative_config.use_local_argmax_reduction takes the drafts' "
+            "per-rank argmax already: unset it with the switch"
+        )
+    if speculator.acceptance_estimator is not None:
+        return "the acceptance estimator reads the full draft logits"
+    model = speculator.model
+    if not hasattr(model, "compute_logits_local"):
+        return (
+            f"{type(model).__name__} has no vocabulary-shard logits "
+            "(compute_logits_local)"
+        )
+    if getattr(model, "draft_id_to_target_id", None) is not None:
+        return "a reduced draft vocabulary maps draft ids to target ids"
+    processor = getattr(model, "logits_processor", None)
+    if not hasattr(getattr(model, "lm_head", None), "tp_rank") or processor is None:
+        return f"{type(model).__name__} has no vocabulary-parallel LM head"
+    if processor.org_vocab_size > MAX_VOCAB:
+        return f"a vocabulary above {MAX_VOCAB} tokens"
+    return None
+
+
+def drafting(speculator) -> tuple[str, str | None]:
+    """How the greedy drafts of ``speculator`` take their argmax with the
+    switch on, and why the switch cannot serve them (None when it can).
+
+    - The DSpark Markov sampler: the per-rank argmax of this module
+      (:func:`sample_sequential`), refused as :func:`refusal` says.
+    - A drafter that samples through vLLM's ``sample_draft`` (MTP, EAGLE,
+      DFlash): the per-rank argmax of its draft model's
+      ``compute_logits_local`` (:func:`adopt_sample_draft`), refused as
+      :func:`sample_draft_refusal` says.
+    - A candidate drafter (DFlash2, LiLiCorr): its selector picks among the
+      head's top-k candidates, which ``compute_candidates`` already takes per
+      rank (``LogitsProcessor.get_top_k_tokens``). No draft argmax over the
+      vocabulary: nothing to serve.
+    - Probabilistic drafting, no drafter, or one without a draft head
+      (n-gram): no draft argmax, nothing to serve.
+    """
+    kind = _kind(speculator)
+    name = type(speculator).__name__
+    if kind == "none":
+        return "no drafter", None
+    if kind == "markov":
+        return "the DSpark Markov sampler's per-rank argmax", refusal(speculator)
+    if kind == "candidates":
+        return (
+            f"{name} selects among the head's per-rank top-k candidates, no "
+            "draft argmax",
+            None,
+        )
+    if kind == "headless":
+        return f"{name} has no draft head", None
+    if kind == "probabilistic":
+        return f"{name} samples its drafts, no draft argmax", None
+    return f"{name} samples per rank (sample_draft)", sample_draft_refusal(speculator)
+
+
+def draft_tokens(model, hidden_states: torch.Tensor, spec_step_idx: int = 0) -> torch.Tensor:
+    """torch.argmax of ``model.compute_logits(hidden_states, spec_step_idx)``
+    without gathering the logits: the draft model's
+    ``compute_logits_local(hidden_states, spec_step_idx)`` (this rank's
+    vocabulary shard of the same logits, padding columns kept) through
+    :func:`shard_tokens`."""
+    local = model.compute_logits_local(hidden_states, spec_step_idx)
+    head = model.lm_head
+    return shard_tokens(
+        local, head.tp_rank, head.tp_size, model.logits_processor.org_vocab_size
+    )
+
+
+def adopt_sample_draft(speculator) -> bool:
+    """With the switch on, at load and before any draft graph is captured:
+    a greedy drafter that samples through vLLM's ``sample_draft`` takes its
+    drafts from :func:`draft_tokens` instead of the gathered logits' argmax
+    (the same tokens, ties and NaN included). Refuses (ValueError) a drafter
+    :func:`sample_draft_refusal` names; returns whether it adopted one (False
+    for the other kinds of :func:`drafting`)."""
+    if _kind(speculator) != "sample_draft":
+        return False
+    reason = sample_draft_refusal(speculator)
+    if reason is not None:
+        raise ValueError(f"{SWITCH}: {reason}")
+
+    def sample_draft(
+        hidden_states: torch.Tensor,
+        sample_src_positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        spec_step_idx: int = 0,
+        num_steps: int = 1,
+    ) -> torch.Tensor:
+        # Greedy: no draft logits are cached, no draw is seeded.
+        return draft_tokens(speculator.model, hidden_states, spec_step_idx)
+
+    speculator.sample_draft = sample_draft
+    return True
+
+
 def _enabled(speculator) -> bool:
     on = getattr(speculator, "_shard_argmax", None)
     if on is None:
@@ -368,11 +540,6 @@ def _enabled(speculator) -> bool:
             reason = refusal(speculator)
             if reason is not None:
                 raise ValueError(f"{SWITCH}: {reason}")
-            logger.info_once(
-                "DSpark greedy Markov sampling takes a per-rank argmax "
-                "(%s=1): no all-gather of the draft logits.",
-                SWITCH,
-            )
         speculator._shard_argmax = on
     return on
 
@@ -431,14 +598,30 @@ def shard_argmax_sampling(
     sample: Callable[..., None],
 ) -> Callable[..., None]:
     """Decorates ``DSparkSpeculator._sample_sequential``: with
-    ``VLLM_DSPARK_SHARD_ARGMAX`` the greedy drafts come from
+    ``VLLM_SM80_SHARD_ARGMAX`` the greedy drafts come from
     :func:`sample_sequential`; the switch refuses a speculator it cannot
-    serve (:func:`refusal`)."""
+    serve (:func:`refusal`). With the hot pair ``shard_argmax``
+    (``vllm.sm80.hot_swap``) both samplers are one pair site writing the
+    same ``draft_tokens``. The mark on the wrapper lets :func:`drafting`
+    find this sampler."""
 
     @functools.wraps(sample)
     def wrapper(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+        if hot_swap.listed("shard_argmax"):
+
+            def gathered() -> torch.Tensor:
+                sample(self, num_reqs, head_hidden)
+                return self.draft_tokens
+
+            def per_rank(out: torch.Tensor | None) -> torch.Tensor:
+                sample_sequential(self, num_reqs, head_hidden)
+                return self.draft_tokens
+
+            hot_swap.pair("shard_argmax", gathered, per_rank)
+            return None
         if not _enabled(self):
             return sample(self, num_reqs, head_hidden)
         sample_sequential(self, num_reqs, head_hidden)
 
+    wrapper.shard_argmax_sampler = True
     return wrapper

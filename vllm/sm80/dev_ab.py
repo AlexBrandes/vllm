@@ -45,7 +45,7 @@ server and a newer generation. RPC replies include the full graph inventory,
 K-table dispatch coverage and per-arm capture bytes. These are allocation deltas,
 not standalone graph-pool measurements; shared pool reuse is charged once.
 
-Diagnostic ``VLLM_SM80_CAPTURE_DIR`` cannot be combined with the A/B switch:
+Diagnostic ``VLLM_SM80_CAPTURE`` cannot be combined with the A/B switch:
 its graph-store bindings do not preserve both arm stores. Configuration refuses
 this composition before installing either A/B extension.
 
@@ -58,6 +58,12 @@ RPCs and ordered admission require both development gates. They record actual
 row order, verification/draft K, input tensors and target/draft descriptors,
 not merely the graphs captured at boot. Pin mismatches never count as identity.
 These synchronizing controls are for correctness, not timing.
+
+Several switches in one server, without a graph set per arm, are
+:mod:`vllm.sm80.hot_swap` (``VLLM_HOT_SWAP``): its pairs share the boot's
+allocations and graph shapes, and this extension carries its
+``set_hot_arms`` and ``get_hot_arms``. A switch whose arms capture different
+graphs, and the ordered batches above, stay here.
 """
 
 import functools
@@ -71,6 +77,7 @@ from typing import Any, NoReturn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 
 logger = init_logger(__name__)
 
@@ -142,39 +149,39 @@ def _set_env(name: str, on: bool) -> None:
 
 _QSA_MODULE = "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
 _QSA_MODEL_MODULE = "vllm.models.qwen4_exp.nvidia.indexer_qsa"
+_TOPK_GATE = "vllm.sm80.kernels.indexer.topk_tiefix_gate"
+_TOPK_ENV = "VLLM_SM80_TOPK_CANONICAL_TIES"
 
 
-def _qsa_module():
-    """The QSA indexer ops module, or None when the served model has no QSA
-    indexer. The model imports the ops module lazily (first attention step, or
-    the warmup after KV sizing), which is after the profiling capture resolves
-    the switch; importing it here reads the same boot value."""
-    if _QSA_MODEL_MODULE not in sys.modules:
-        return None
-    module = sys.modules.get(_QSA_MODULE)
-    if module is None:
+def _topk_gate():
+    """The shared indexer top-k gate, or None when the served model has no
+    indexer that calls it. The GLM sparse indexer imports it with the model;
+    the Qwen model imports its QSA ops module (and with it the gate) lazily
+    (first attention step, or the warmup after KV sizing), which is after the
+    profiling capture resolves the switch, so a loaded QSA model has its ops
+    module imported here; the gate reads the same boot value."""
+    if _TOPK_GATE not in sys.modules and _QSA_MODEL_MODULE in sys.modules:
         try:
-            module = importlib.import_module(_QSA_MODULE)
+            importlib.import_module(_QSA_MODULE)
         except ImportError:
             return None
-    return module
+    return sys.modules.get(_TOPK_GATE)
 
 
-def _qsa_unavailable(runner) -> str | None:
-    module = _qsa_module()
-    if module is None:
-        return "the Qwen QSA indexer is not loaded"
-    if not hasattr(module, "_QSA_TOPK_CANONICAL"):
-        return "this tree has no VLLM_QWEN4_QSA_TOPK_CANONICAL"
+def _topk_unavailable(runner) -> str | None:
+    if _topk_gate() is None:
+        return "the GLM or Qwen sparse indexer (shared top-k gate) is not loaded"
     return None
 
 
-def _qsa_apply(runner, on: bool) -> None:
-    module = _qsa_module()
-    _set_env("VLLM_QWEN4_QSA_TOPK_CANONICAL", on)
-    module._QSA_TOPK_CANONICAL = on
-    if on:
-        module._canonical_topk_fix()
+def _topk_apply(runner, on: bool) -> None:
+    """Both arms keep VLLM_SM80_TOPK_SORTED as booted: off sorts alone (when
+    on), on sorts inside the tie-fix launch."""
+    gate = _topk_gate()
+    _set_env(_TOPK_ENV, on)
+    for cached in (gate.use_sorted_topk, gate.use_tiefix_topk, gate.tiefix_split_rows):
+        cached.cache_clear()
+    gate.use_tiefix_topk()  # warms the kernels when on
 
 
 def _marlin_unavailable(runner) -> str | None:
@@ -199,25 +206,6 @@ def _marlin_apply(runner, on: bool) -> None:
             decode._warm_v2(torch.device(device), ws)
 
 
-_TIEFIX_GATE = "vllm.sm80.kernels.indexer.topk_tiefix_gate"
-
-
-def _tiefix_unavailable(runner) -> str | None:
-    if _env_flag("VLLM_GLM5_TOPK_SORTED"):
-        return "VLLM_GLM5_TOPK_SORTED needs the tie fix in both arms; unset it"
-    if _TIEFIX_GATE not in sys.modules:
-        return "the GLM sparse indexer is not loaded"
-    return None
-
-
-def _tiefix_apply(runner, on: bool) -> None:
-    gate = sys.modules[_TIEFIX_GATE]
-    _set_env("VLLM_GLM5_TOPK_TIEFIX", on)
-    for cached in (gate.use_sorted_topk, gate.use_tiefix_topk, gate.tiefix_split_rows):
-        cached.cache_clear()
-    gate.use_tiefix_topk()  # warms the kernels when on
-
-
 def _custom_allreduce():
     from vllm.distributed.parallel_state import get_tp_group
 
@@ -227,7 +215,7 @@ def _custom_allreduce():
 def _flags_unavailable(runner) -> str | None:
     if getattr(_custom_allreduce(), "_flags", None) is None:
         return (
-            "boot with VLLM_CUSTOM_ALLREDUCE_FLAGS=1 and the flags-in-data path "
+            "boot with VLLM_SM80_ALLREDUCE=1 and the flags-in-data path "
             "on; its off arm runs the existing kernel"
         )
     return None
@@ -250,8 +238,8 @@ def _kda_layers(runner) -> list:
 def _kda_unavailable(runner) -> str | None:
     if not any(m._pp_kda_prefill for m in _kda_layers(runner)):
         return (
-            "boot with VLLM_AMPERE_KDA_PREFILL_WIDE or _NARROW so a layer takes "
-            "the kernel; its off arm clears the layer gate"
+            "boot with VLLM_SM80_KDA_PREFILL so a layer takes the kernel; its "
+            "off arm clears the layer gate"
         )
     return None
 
@@ -295,7 +283,7 @@ def _argmax_apply(runner, on: bool) -> None:
     speculator._validate_local_argmax_reduction()
 
 
-_TARGET_ARGMAX_ENV = "VLLM_SM80_TARGET_SHARD_ARGMAX"
+_TARGET_ARGMAX_ENV = "VLLM_SM80_SHARD_ARGMAX"
 
 
 def _target_argmax_unavailable(runner) -> str | None:
@@ -312,7 +300,9 @@ def _target_argmax_current(runner) -> bool:
 
 def _target_argmax_apply(runner, on: bool) -> None:
     """Eager sampling only (no graph holds it); the on arm compiles the slot
-    kernels here, on one dummy row, so its first greedy step does not."""
+    kernels here, on one dummy row, so its first greedy step does not. The
+    arm is the switch's target half: the drafts keep the boot value (DSpark
+    reads the switch once, before its draft graphs are captured)."""
     from vllm.sm80.worker import target_argmax
 
     target_argmax.set_enabled(runner, on)
@@ -332,9 +322,10 @@ _ROUTER_GATE_ATTRS = (
 def _router_gates(runner) -> list:
     """The router gate of every Qwen4Exp MoE block, target and draft model.
 
-    With VLLM_QWEN4_ROUTER_FP32 set, the block calls ``set_out_dtype`` at
-    construction; ``GateLinear.forward`` reads the output dtype and the tier
-    flags on every call, so the two arms differ only in those fields.
+    With the text config field ``moe_router_dtype="float32"``, the block calls
+    ``set_out_dtype`` at construction; ``GateLinear.forward`` reads the output
+    dtype and the tier flags on every call, so the two arms differ only in
+    those fields.
     """
     module = sys.modules.get(_QWEN4_MODEL_MODULE)
     if module is None:
@@ -351,17 +342,16 @@ def _router_gates(runner) -> list:
 
 
 def _router_unavailable(runner) -> str | None:
-    if _env_flag("VLLM_QWEN4_ROUTER_FP32"):
-        return (
-            "boot with VLLM_QWEN4_ROUTER_FP32=0; its on arm sets the FP32 "
-            "router logits"
-        )
     gates = _router_gates(runner)
     if not gates:
         return "the served model has no Qwen4Exp MoE router gates"
     for gate in gates:
         if gate.out_dtype is not None:
-            return f"router gate {gate.prefix} already has out_dtype {gate.out_dtype}"
+            return (
+                f"router gate {gate.prefix} already has out_dtype "
+                f"{gate.out_dtype}; boot without moe_router_dtype in "
+                "--hf-overrides, the on arm sets the FP32 router logits"
+            )
         if gate._rocm_bf16x3_weight_eligible:
             return (
                 f"router gate {gate.prefix} would need the ROCm BF16x3 weight "
@@ -386,7 +376,6 @@ def _router_apply(runner, on: bool) -> None:
             for gate in _router_gates(runner)
         ],
     )
-    _set_env("VLLM_QWEN4_ROUTER_FP32", on)
     for gate, boot in gates:
         for attr, value in boot.items():
             setattr(gate, attr, value)
@@ -869,24 +858,6 @@ def _wo_a_methods(runner):
             yield method
 
 
-def _wo_a_unavailable(runner) -> str | None:
-    methods = list(_wo_a_methods(runner))
-    if not methods:
-        return "the served target/drafter has no grouped DeepSeek-V4.1 wo_a"
-    if any(getattr(m, "gemm", False) for m in methods):
-        # Strided rows change only the per-group Marlin GEMMs, which the
-        # grouped GEMM replaces: the switch would arm and change nothing.
-        return ("a grouped wo_a runs the grouped GEMM "
-                "(VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM=1); strided rows do not apply")
-    return None
-
-
-def _wo_a_apply(runner, on: bool) -> None:
-    _set_env("VLLM_DEEPSEEK_V41_WO_A_STRIDED", on)
-    for method in _wo_a_methods(runner):
-        method.strided_input = on
-
-
 def _wo_a_gemm_methods(runner):
     """The grouped wo_a methods that hold the grouped GEMM's codes."""
     from vllm.models.deepseek_v41.nvidia.ops.sm80_wo_a_grouped import (
@@ -977,12 +948,6 @@ SWITCHES: dict[str, Switch] = {
             lambda runner: any(g.gemv for g in _gemv_gates(runner)), _gate_gemv_apply,
         ),
         Switch(
-            "dsv41_wo_a_strided", "VLLM_DEEPSEEK_V41_WO_A_STRIDED", True, True,
-            _wo_a_unavailable,
-            lambda runner: any(m.strided_input for m in _wo_a_methods(runner)),
-            _wo_a_apply,
-        ),
-        Switch(
             "dsv41_wo_a_grouped_gemm", "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", True, False,
             _wo_a_gemm_unavailable,
             lambda runner: any(m.gemm for m in _wo_a_gemm_methods(runner)),
@@ -1041,10 +1006,9 @@ SWITCHES: dict[str, Switch] = {
             lambda runner: _env_flag("VLLM_EXL3_DENSE_SPLITK"), _splitk_apply,
         ),
         Switch(
-            "qsa_topk_canonical", "VLLM_QWEN4_QSA_TOPK_CANONICAL", True, False,
-            _qsa_unavailable,
-            lambda runner: bool(_qsa_module()._QSA_TOPK_CANONICAL),
-            _qsa_apply,
+            "topk_canonical_ties", _TOPK_ENV, True, False,
+            _topk_unavailable,
+            lambda runner: _env_flag(_TOPK_ENV), _topk_apply,
         ),
         Switch(
             "marlin_decode_v2", "VLLM_AMPERE_MARLIN_DECODE_V2", True, True,
@@ -1052,17 +1016,11 @@ SWITCHES: dict[str, Switch] = {
             lambda runner: _env_flag("VLLM_AMPERE_MARLIN_DECODE_V2"), _marlin_apply,
         ),
         Switch(
-            "glm5_topk_tiefix", "VLLM_GLM5_TOPK_TIEFIX", True, False,
-            _tiefix_unavailable,
-            lambda runner: _env_flag("VLLM_GLM5_TOPK_TIEFIX"), _tiefix_apply,
-        ),
-        Switch(
-            "custom_allreduce_flags", "VLLM_CUSTOM_ALLREDUCE_FLAGS", True, False,
+            "custom_allreduce_flags", "VLLM_SM80_ALLREDUCE", True, False,
             _flags_unavailable, _flags_current, _flags_apply,
         ),
         Switch(
-            "kda_prefill",
-            "VLLM_AMPERE_KDA_PREFILL_WIDE,VLLM_AMPERE_KDA_PREFILL_NARROW",
+            "kda_prefill", "VLLM_SM80_KDA_PREFILL",
             False, False,
             _kda_unavailable, _kda_current, _kda_apply,
         ),
@@ -1073,12 +1031,13 @@ SWITCHES: dict[str, Switch] = {
             _argmax_unavailable, _argmax_current, _argmax_apply,
         ),
         Switch(
-            "dsv41_target_shard_argmax", _TARGET_ARGMAX_ENV, False, True,
+            "target_shard_argmax", _TARGET_ARGMAX_ENV, False, True,
             _target_argmax_unavailable, _target_argmax_current,
             _target_argmax_apply,
         ),
         Switch(
-            "qwen4_router_fp32", "VLLM_QWEN4_ROUTER_FP32", True, False,
+            "qwen4_router_fp32", "hf_overrides.text_config.moe_router_dtype",
+            True, False,
             _router_unavailable, _router_current, _router_apply,
         ),
     )
@@ -1090,37 +1049,40 @@ SWITCHES: dict[str, Switch] = {
 # ---------------------------------------------------------------------------
 
 def configure(vllm_config) -> None:
-    """Inject :class:`DevABWorkerExtension` when VLLM_DEV_AB_SWITCH is set."""
+    """Inject :class:`DevABWorkerExtension` when VLLM_DEV_AB_SWITCH or
+    VLLM_HOT_SWAP (:mod:`vllm.sm80.hot_swap`) is set."""
     name = envs.VLLM_DEV_AB_SWITCH
-    if not name:
+    hot = hot_swap.configure(vllm_config)
+    if not name and not hot:
         return
-    if envs.VLLM_SM80_CAPTURE_DIR:
-        raise ValueError(
-            "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE_DIR"
-        )
-    if name not in SWITCHES:
-        raise ValueError(
-            f"VLLM_DEV_AB_SWITCH={name!r} is not one of: "
-            + ", ".join(sorted(SWITCHES))
-        )
+    what = f"VLLM_HOT_SWAP={envs.VLLM_HOT_SWAP}" if hot else f"VLLM_DEV_AB_SWITCH={name}"
+    if not hot:
+        if envs.VLLM_SM80_CAPTURE:
+            raise ValueError(
+                "VLLM_DEV_AB_SWITCH cannot be combined with VLLM_SM80_CAPTURE"
+            )
+        if name not in SWITCHES:
+            raise ValueError(
+                f"VLLM_DEV_AB_SWITCH={name!r} is not one of: "
+                + ", ".join(sorted(SWITCHES))
+            )
     parallel_config = vllm_config.parallel_config
     if parallel_config.worker_extension_cls not in ("", EXTENSION_QUALNAME):
         raise ValueError(
-            "VLLM_DEV_AB_SWITCH needs worker_extension_cls for its own setter; "
+            f"{what} needs worker_extension_cls for its own setter; "
             f"{parallel_config.worker_extension_cls!r} is already set"
         )
     parallel_config.worker_extension_cls = EXTENSION_QUALNAME
-    if envs.VLLM_SERVER_DEV_MODE:
+    if envs.VLLM_SERVER_DEV_MODE and not hot:
         from vllm.sm80.dev_ab_batch import configure as configure_ordered_batches
         configure_ordered_batches(vllm_config)
     if not envs.VLLM_SERVER_DEV_MODE:
         logger.warning_once(
-            "VLLM_DEV_AB_SWITCH=%s without VLLM_SERVER_DEV_MODE=1: "
-            "POST /collective_rpc is off, so the arm cannot be changed.", name
+            "%s without VLLM_SERVER_DEV_MODE=1: "
+            "POST /collective_rpc is off, so the arm cannot be changed.", what
         )
     logger.warning_once(
-        "VLLM_DEV_AB_SWITCH=%s: development server, both arms captured; "
-        "not for serving.", name
+        "%s: development server, both arms captured; not for serving.", what
     )
 
 
@@ -1437,6 +1399,8 @@ def with_ab_capture(capture):
     """Keep the ordinary capture body intact behind a default-neutral wrapper."""
     @functools.wraps(capture)
     def wrapped(runner, *, profile_only=False):
+        if hot_swap.active():
+            return hot_swap.capture(runner, capture, profile_only)
         per_arm = capture_model_per_arm(runner, profile_only)
         if per_arm is not None:
             return per_arm
@@ -1674,7 +1638,7 @@ def _set_arm(worker, arm: str, generation: int, replay: bool = True) -> dict[str
 
 class DevABWorkerExtension:
     """Worker methods for ``POST /collective_rpc``; injected only with
-    VLLM_DEV_AB_SWITCH set."""
+    VLLM_DEV_AB_SWITCH or VLLM_HOT_SWAP set."""
 
     def set_ab_arm(self, arm: str, generation: int, replay: bool = True) -> dict[str, Any]:
         """Switch while drained; replay=False supplies a same-arm eager control."""
@@ -1684,6 +1648,15 @@ class DevABWorkerExtension:
         """This worker's switch state."""
         _resolve(self.model_runner)
         return _report(self, True, "")
+
+    def set_hot_arms(self, on: list[str], generation: int) -> dict[str, Any]:
+        """Run the candidates of the VLLM_HOT_SWAP pairs in ``on``, the
+        incumbents of the rest; drained, on every rank or on none."""
+        return hot_swap.set_arms(self, on, generation)
+
+    def get_hot_arms(self) -> dict[str, Any]:
+        """This worker's hot pairs and the candidates running."""
+        return hot_swap.get_arms(self)
 
 
     def begin_ab_batch(self, manifest: dict, reference: str, establish: bool) -> dict:

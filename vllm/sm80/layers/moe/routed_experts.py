@@ -20,7 +20,6 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 logger = init_logger(__name__)
 
 _MASK_PADDING: bool | None = None
-_MASK_MIN_ROWS = 0
 
 
 def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
@@ -29,26 +28,30 @@ def mask_padding_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     the real rows then get the same expert blocks whatever the padding rows
     hold. In place keeps the tensor's identity, which the sm_80 fused decode
     routing uses to hand over its own alignment. Batches of at most
-    VLLM_MOE_MASK_PADDING_MAX_TOKENS rows (the fused router's range) are
-    skipped whether or not VLLM_AMPERE_DECODE_KERNELS is on; a cutoff of 0
-    masks every batch. A larger batch that the fused router v2 covered (up to
+    fused_route_max_rows rows at this top-k (the fused router's range, the
+    moe_router/fused_route_max_rows row of the sm80 tuning table) are skipped
+    whether or not VLLM_AMPERE_DECODE_KERNELS is on; a row of 0 masks every
+    batch. A larger batch that the fused router v2 covered (up to
     32 rows) had its alignment computed before the mask; that handoff is
     dropped here so the alignment is recomputed from the masked ids, unless
     the router already masked exactly these rows inside its launch
     (VLLM_GLM5_MOE_ROUTE_V2_MASK), in which case the ids and its alignment
     are already the masked ones and nothing is done. Returns topk_ids."""
-    global _MASK_PADDING, _MASK_MIN_ROWS
+    global _MASK_PADDING
     if _MASK_PADDING is None:
         import vllm.envs as envs
 
         _MASK_PADDING = bool(envs.VLLM_MOE_MASK_PADDING)
-        _MASK_MIN_ROWS = int(envs.VLLM_MOE_MASK_PADDING_MAX_TOKENS)
         if _MASK_PADDING:
             logger.info_once(
                 "MoE padding mask active: padding rows are routed to no "
                 "expert (VLLM_MOE_MASK_PADDING=1; set 0 to disable)"
             )
-    if not _MASK_PADDING or topk_ids.shape[0] <= _MASK_MIN_ROWS:
+    if not _MASK_PADDING:
+        return topk_ids
+    from vllm.sm80.kernels.moe import fused_route_max_rows
+
+    if topk_ids.shape[0] <= fused_route_max_rows(topk_ids.shape[1]):
         return topk_ids
     if not is_forward_context_available():
         return topk_ids

@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The sm_80 Engram table storage: the native row fetch (int64 offsets, the
 host row cache and its LRU semantics, TP head ownership, failed rows),
-telemetry, dequantization against the reference formula, the real shards
-(VLLM_ENGRAM_TEST_TABLE_DIR) and CUDA graph replay with changing ids (GPU
-only)."""
+telemetry, dequantization against the reference formula, tables attached
+from a table segment holder, the real shards (VLLM_ENGRAM_TEST_TABLE_DIR)
+and CUDA graph replay with changing ids (GPU only)."""
 
 import errno
+import hashlib
 import json
 import os
 import struct
+import subprocess
+import sys
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -1755,3 +1759,142 @@ def test_gpu_breakable_graph_replay_with_changing_ids(tables, monkeypatch, rank)
         assert table.telemetry()["lookups"] == len(steps) + 1
     finally:
         table.close()
+
+
+# ---------------------------------------------------------------------------
+# Tables attached from a table segment holder (VLLM_ENGRAM_SEGMENT)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _segment(tmp_path, paths):
+    """A table segment holder of ``paths`` (subprocess), ready."""
+    from vllm.sm80 import table_segment
+
+    sock = tmp_path / "seg.sock"
+    argv = [sys.executable, table_segment.__file__, "hold", "--socket", str(sock),
+            "--label", "test@0"]
+    for path in sorted(set(paths)):
+        with open(path, "rb") as file:
+            argv += ["--file", f"{path}={hashlib.sha256(file.read()).hexdigest()}"]
+    proc = subprocess.Popen(argv, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                if table_segment.request(str(sock), {"op": "status"})["state"] == "ready":
+                    break
+            except table_segment.SegmentError:
+                pass
+            assert proc.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        yield str(sock)
+    finally:
+        proc.terminate()
+        proc.wait(30)
+
+
+@pytest.mark.parametrize("owner", [(0, DIRECT_ROWS), (5, DIRECT_ROWS - 3)])
+def test_ram_placement_attached_matches_read(tmp_path, owner):
+    """Attached values and scales are the file's bytes, mapped read-only
+    without a copy; lookups match the read ram placement and the file."""
+    from vllm.sm80 import table_segment
+
+    files = _direct_table(tmp_path)
+    lo, hi = owner
+    with _segment(tmp_path, [files.values_path, files.scales_path]) as sock:
+        read = _store(files, lo, hi, cache_bytes=0, placement="ram")
+        attached = EngramRowStore(
+            files, lo, hi, placement="ram", cache_bytes=0, capacity=4096, segment=sock
+        )
+        try:
+            status = table_segment.request(sock, {"op": "status"})
+            assert len(status["clients"]) == 1
+            np.testing.assert_array_equal(attached.table.numpy(), read.table.numpy())
+            np.testing.assert_array_equal(attached.scales.numpy(), read.scales.numpy())
+            assert attached.table.shape == (hi - lo, DIM)
+            assert attached.cache_bytes == 0
+            ids = np.random.default_rng(9).integers(-3, DIRECT_ROWS + 3, 900)
+            for a, b, c in zip(
+                _fetch(attached, ids), _fetch(read, ids), _direct_expected(ids, lo, hi)
+            ):
+                np.testing.assert_array_equal(a, c)
+                np.testing.assert_array_equal(a, b)
+        finally:
+            read.close()
+            attached.close()
+        deadline = time.monotonic() + 10
+        while table_segment.request(sock, {"op": "status"})["clients"]:
+            assert time.monotonic() < deadline, "close did not detach"
+            time.sleep(0.05)
+
+
+def test_builder_passes_the_segment_and_skips_the_ram_fit_check(tmp_path, monkeypatch):
+    """With VLLM_ENGRAM_SEGMENT the builder hands the socket to the table
+    and does not run the ram fit check: an attached table allocates no
+    table memory (a host holding the segment would fail the check)."""
+    import vllm.config
+    import vllm.distributed
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("ram fit check ran for an attached table")
+
+    built = []
+
+    def build(*args, **kwargs):
+        built.append(kwargs)
+        raise RuntimeError("built")
+
+    monkeypatch.setattr(sm80_engram, "check_ram_placement_fits", refuse)
+    monkeypatch.setattr(sm80_engram, "Sm80EngramEmbedding", build)
+    monkeypatch.setattr(sm80_engram, "locate_engram_table", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    config = SimpleNamespace(
+        engram_config=None,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(engram_table_dir=str(tmp_path)),
+            hf_text_config=SimpleNamespace(),
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=None),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(vllm.distributed, "get_engram_dp_size", lambda: 1)
+    monkeypatch.setattr(vllm.distributed, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: TP
+    )
+    layout = SimpleNamespace(
+        layer_ids=(14,),
+        num_embeddings=(SMALL_ROWS,),
+        primes=((SMALL_HEADS,),),
+        head_dim=DIM,
+    )
+    monkeypatch.setenv("VLLM_ENGRAM_PLACEMENT", "ram")
+    sock = str(tmp_path / "holder.sock")
+    monkeypatch.setenv("VLLM_ENGRAM_SEGMENT", sock)
+    with pytest.raises(RuntimeError, match="built"):
+        sm80_engram.build_sm80_engram_embedding(layout, 0)
+    assert built[0]["segment"] == sock
+    assert built[0]["placement"] == "ram"
+
+
+def test_segment_refusals(tmp_path, monkeypatch):
+    from vllm import envs
+    from vllm.sm80.table_segment import SegmentError
+
+    monkeypatch.delenv("VLLM_ENGRAM_SEGMENT", raising=False)
+    assert envs.VLLM_ENGRAM_SEGMENT == ""
+    files = _direct_table(tmp_path)
+    with pytest.raises(ValueError, match="placement ram only"):
+        EngramRowStore(files, 0, 8, placement="ssd", cache_bytes=0, capacity=8,
+                       segment=str(tmp_path / "seg.sock"))
+    with pytest.raises(SegmentError, match="no table segment holder"):
+        EngramRowStore(files, 0, 8, placement="ram", cache_bytes=0, capacity=8,
+                       segment=str(tmp_path / "seg.sock"))
+    with _segment(tmp_path, [files.values_path]) as sock:
+        st = os.stat(files.values_path)
+        os.utime(files.values_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        with pytest.raises(SegmentError, match="not the file the holder read"):
+            EngramRowStore(files, 0, 8, placement="ram", cache_bytes=0, capacity=8,
+                           segment=sock)

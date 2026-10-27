@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the split tie fix + sort of the indexer top-k
-(VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS).
+(its row bound is the topk_select/split_rows row of the sm80 tuning table).
 
 ``topk_tiefix_(..., sort=True, split=True)`` runs two launches over (row,
 chunk) and must equal the one-program-per-row kernel with ``sort=True`` (and
@@ -20,7 +20,7 @@ import torch
 
 from tests.kernels.interpreter_child import run_in_interpreter_child
 from tests.kernels.topk_reference import canonical_topk, sorted_rows
-import vllm.envs as envs
+from tests.sm80.tuning_rows import use_rows
 from vllm.sm80.kernels.indexer import topk_tiefix_gate as gate
 from vllm.sm80.kernels.indexer.topk_tiefix_gate import (
     tiefix_split_rows,
@@ -111,28 +111,36 @@ def _clear():
         f.cache_clear()
 
 
-def test_flag_defaults_off():
-    assert envs.VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS == 0
+def _split_rows(monkeypatch, top_k, rows, indexer="kpool"):
+    use_rows(monkeypatch, ("topk_select", "split_rows",
+                           {"top_k": top_k, "indexer": indexer}, rows))
+
+
+def test_split_defaults_off(monkeypatch):
+    use_rows(monkeypatch)
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
     _clear()
     try:
-        assert tiefix_split_rows() == 0
+        assert tiefix_split_rows(512, "kpool") == 0
     finally:
         _clear()
 
 
-def test_flag_is_part_of_the_compile_key():
-    assert "VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS" in envs.compile_factors()
-
-
 def test_gate_needs_tiefix_and_sorted(monkeypatch):
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS", "4")
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
+    _split_rows(monkeypatch, 512, 4)
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.delenv("VLLM_SM80_TOPK_SORTED", raising=False)
     _clear()
     try:
-        assert tiefix_split_rows() == 0  # sort off
-        monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+        assert tiefix_split_rows(512, "kpool") == 0  # sort off
+        monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
         _clear()
-        assert tiefix_split_rows() == 4
+        assert tiefix_split_rows(512, "kpool") == 4
+        # Keyed by the selected width: another width keeps the default 0.
+        assert tiefix_split_rows(2048, "kpool") == 0
+        # And by the indexer: another indexer of the same width keeps it too.
+        assert tiefix_split_rows(512, "qsa") == 0
     finally:
         _clear()
 
@@ -153,24 +161,26 @@ def test_dispatch_passes_split(monkeypatch, mod):
         seen.append((k["sort"], k["split"]))
 
     monkeypatch.setattr(mod, "topk_tiefix_", spy)
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS", "4")
-    monkeypatch.setenv("VLLM_GLM5_TOPK_TIEFIX", "1")
-    monkeypatch.setenv("VLLM_GLM5_TOPK_SORTED", "1")
+    _split_rows(monkeypatch, 16, 4)  # idx below selects 16 per row
+    monkeypatch.setenv("VLLM_SM80_TOPK_CANONICAL_TIES", "1")
+    monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
     _clear()
     try:
         wide = torch.zeros(8, mod.SPLIT_MIN_COLS)
         ends = torch.full((8,), 10, dtype=torch.int32)
         idx = torch.zeros(8, 16, dtype=torch.int32)
-        gate.tiefix_topk_(wide, idx[:4], row_ends=ends, sort=True)
-        gate.tiefix_topk_(wide, idx, row_ends=ends, sort=True)
-        gate.tiefix_topk_(wide[:, :100], idx[:4], row_ends=ends, sort=True)
-        gate.tiefix_topk_(wide, idx[:4], row_ends=ends, sort=False)
+        gate.tiefix_topk_(wide, idx[:4], indexer="kpool", row_ends=ends, sort=True)
+        gate.tiefix_topk_(wide, idx, indexer="kpool", row_ends=ends, sort=True)
+        gate.tiefix_topk_(wide[:, :100], idx[:4], indexer="kpool", row_ends=ends,
+                          sort=True)
+        gate.tiefix_topk_(wide, idx[:4], indexer="kpool", row_ends=ends, sort=False)
         assert seen == [(True, True), (True, False), (True, False), (False, False)]
     finally:
         _clear()
 
 
 def test_flag_off_dispatch_is_unchanged(monkeypatch, mod):
+    use_rows(monkeypatch)
     seen = []
     monkeypatch.setattr(mod, "topk_tiefix_", lambda *a, **k: seen.append(k["split"]))
     _clear()
@@ -178,7 +188,7 @@ def test_flag_off_dispatch_is_unchanged(monkeypatch, mod):
         wide = torch.zeros(4, mod.SPLIT_MIN_COLS)
         ends = torch.full((4,), 10, dtype=torch.int32)
         idx = torch.zeros(4, 16, dtype=torch.int32)
-        gate.tiefix_topk_(wide, idx, row_ends=ends, sort=True)
+        gate.tiefix_topk_(wide, idx, indexer="kpool", row_ends=ends, sort=True)
         assert seen == [False]
     finally:
         _clear()

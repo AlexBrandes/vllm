@@ -45,16 +45,17 @@ history is recorded for the length of the profiling run and the live blocks
 behind ``held`` are listed by their vLLM call stack (diagnostics: the
 recording slows the profiling capture down).
 
-``VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB`` (default 0, off) sets the allocator's
-``max_split_size_mb`` for the length of both captures, as the worker already
-does for ``profile_run``: blocks above the limit are never split, so a small
-long-lived allocation made during a capture cannot keep a large free segment
-from being released.
+The sm_80 tuning table's ``cudagraph`` / ``capture_max_split_mb`` value
+(default 0, off) sets the allocator's ``max_split_size_mb`` for the length of
+both captures, as the worker already does for ``profile_run``: blocks above
+the limit are never split, so a small long-lived allocation made during a
+capture cannot keep a large free segment from being released.
 
 The worker and model runner subclasses that call in here are in
 ``graph_mem_worker``; without the flag nothing here runs (the fork platform
 also selects that worker for the greedy target argmax, whose runner then
-keeps vLLM's estimate).
+keeps vLLM's estimate). The speculator-manager retirement scope also runs with
+the upstream estimate: all profiling graphs must release their throwaway pool.
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.sm80 import hot_swap
 
 logger = init_logger(__name__)
 
@@ -77,6 +79,55 @@ _MiB = float(1 << 20)
 
 UPSTREAM_WORKER = "vllm.v1.worker.gpu_worker.Worker"
 WORKER = "vllm.sm80.worker.graph_mem_worker.GraphMemWorker"
+
+
+def _speculator_manager_slots(speculator: Any) -> list[tuple[dict, Any, bool]]:
+    """Direct manager attributes and manager entries in their dictionaries.
+
+    This is the ownership layout used by single- and multi-width speculators.
+    Do not walk model objects, tensors, or arbitrary nested state.
+    """
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+
+    if speculator is None:
+        return []
+    attributes = vars(speculator)
+    slots = []
+    seen = {id(attributes)}
+    for name, value in attributes.items():
+        if isinstance(value, CudaGraphManager):
+            slots.append((attributes, name, True))
+        elif isinstance(value, dict) and id(value) not in seen:
+            seen.add(id(value))
+            slots.extend(
+                (value, key, False)
+                for key, manager in value.items()
+                if isinstance(manager, CudaGraphManager)
+            )
+    return slots
+
+
+@contextmanager
+def profiling_speculator_graphs(speculator: Any, pool: Any) -> Iterator[None]:
+    """Bind every owned manager to profiling's pool, then discard its handles.
+
+    Real KV initialization rebuilds the managers. Clearing only the active
+    direct alias leaves width-indexed managers, their graphs and snapshots
+    alive and pins the shared throwaway pool. Dictionary entries are removed,
+    not replaced with None, so width selection cannot find a retired manager.
+    """
+    try:
+        for owner, key, _ in _speculator_manager_slots(speculator):
+            owner[key].pool = pool
+        yield
+    finally:
+        # Re-enumerate to include handles created lazily during capture; their
+        # constructors bind the globally swapped profiling pool.
+        for owner, key, attribute in _speculator_manager_slots(speculator):
+            if attribute:
+                owner[key] = None
+            else:
+                del owner[key]
 
 
 def enabled() -> bool:
@@ -89,11 +140,11 @@ def tracing() -> bool:
 
 def select_worker(parallel_config: Any) -> None:
     """With this flag or the greedy target argmax
-    (``VLLM_SM80_TARGET_SHARD_ARGMAX``), run the fork worker in place
-    of upstream's GPU worker (called by the fork platform's
-    ``check_and_update_config``). The argmax refuses another worker; the
-    estimate split only warns."""
-    argmax = bool(envs.VLLM_SM80_TARGET_SHARD_ARGMAX)
+    (``VLLM_SM80_SHARD_ARGMAX``, or its hot pair ``shard_argmax``), run the
+    fork worker in place of upstream's GPU worker (called by the fork
+    platform's ``check_and_update_config``). The argmax refuses another
+    worker; the estimate split only warns."""
+    argmax = bool(envs.VLLM_SM80_SHARD_ARGMAX) or hot_swap.listed("shard_argmax")
     if not (enabled() or argmax):
         return
     if parallel_config.worker_cls == UPSTREAM_WORKER:
@@ -101,7 +152,7 @@ def select_worker(parallel_config: Any) -> None:
     elif parallel_config.worker_cls != WORKER:
         if argmax:
             raise ValueError(
-                "VLLM_SM80_TARGET_SHARD_ARGMAX: the greedy target "
+                "VLLM_SM80_SHARD_ARGMAX: the greedy target "
                 f"argmax needs the fork GPU worker, not {parallel_config.worker_cls}"
             )
         logger.warning(
@@ -449,9 +500,12 @@ def _log_held(
 
 @contextmanager
 def _capture_max_split() -> Iterator[None]:
-    """``max_split_size_mb`` = VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB for the
-    length of a capture (0: unchanged), restoring the settings on exit."""
-    limit = envs.VLLM_CUDAGRAPH_CAPTURE_MAX_SPLIT_MB
+    """``max_split_size_mb`` = the tuning table's capture_max_split_mb for the
+    length of a capture (0, the default: unchanged), restoring the settings on
+    exit."""
+    from vllm.sm80 import tuning
+
+    limit = tuning.lookup("cudagraph", "capture_max_split_mb", {}, 0)
     if limit <= 0 or torch.cuda.memory.get_allocator_backend() != "native":
         yield
         return

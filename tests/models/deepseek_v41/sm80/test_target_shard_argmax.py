@@ -21,9 +21,12 @@
 - The seam: the fork runner samples inside ``target_argmax.step``, the sm_80
   target's ``compute_logits`` gathers outside a greedy-only step, the dummy
   sampler run warms the kernels, the switch selects the fork worker and
-  refuses other workers and runners.
+  refuses other workers and runners; a greedy-only step of a runner with
+  batch-sharded sampling samples unsharded and gets its sharder back.
 - The switch is off by default and refuses the targets it cannot serve, at
-  the first step and at the boot warmup.
+  the first step and at the boot warmup: among them an unsplit head (TP 1)
+  and a ``sample_draft`` drafter with vLLM's ``use_local_argmax_reduction``
+  set (two per-rank argmaxes).
 
     python -m pytest -q tests/models/deepseek_v41/sm80/test_target_shard_argmax.py
 """
@@ -40,7 +43,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[4]
-SWITCH = "VLLM_SM80_TARGET_SHARD_ARGMAX"
+SWITCH = "VLLM_SM80_SHARD_ARGMAX"
 NUM_SPEC = 3
 
 
@@ -187,7 +190,7 @@ def _rank_main(rank: int, tp: int, init_file: str, result_file: str,
 
     if block is not None:
         sa.BLOCK = block
-    ta.tensor_model_parallel_all_reduce = all_reduce
+    sa.tensor_model_parallel_all_reduce = all_reduce
     pad = tp * width - vocab
     # The served DeepSeek-V4.1 head has no padding (129280 = 4 x 32320); the
     # small CPU vocabularies pad, with NaN and +inf in the padding columns.
@@ -449,10 +452,10 @@ class _Target:
 
     target_argmax_logits = True
 
-    def __init__(self, vocab=97):
+    def __init__(self, vocab=97, tp_size=4):
         self.calls = []
         self.language_model = SimpleNamespace(
-            lm_head=SimpleNamespace(tp_rank=0, tp_size=1),
+            lm_head=SimpleNamespace(tp_rank=0, tp_size=tp_size),
             logits_processor=SimpleNamespace(org_vocab_size=vocab, logits_as_input=False),
         )
 
@@ -587,6 +590,29 @@ def test_greedy_requests_carry_no_top_k_top_p():
     assert (p.top_p, p.top_k, p.min_p) == (1.0, 0, 0.0)
 
 
+def test_a_greedy_only_step_samples_unsharded(monkeypatch, host_sampling):
+    """Batch-sharded sampling: a greedy-only step samples every row from the
+    argmax rows (no sharder while it runs); other steps keep the sharder."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.sm80.worker import target_argmax as ta
+
+    monkeypatch.setenv(SWITCH, "1")
+    sharder = object()
+    greedy = SamplingParams(temperature=0.0)
+    runner = _runner([greedy, greedy], batch_sharder=sharder)
+    with ta.step(runner, _batch(2), None):
+        assert ta.active() and runner.batch_sharder is None
+    assert runner.batch_sharder is sharder
+    with pytest.raises(RuntimeError, match="boom"):
+        with ta.step(runner, _batch(2), None):
+            raise RuntimeError("boom")
+    assert runner.batch_sharder is sharder
+    runner = _runner([greedy, SamplingParams(temperature=0.7)], batch_sharder=sharder)
+    with ta.step(runner, _batch(2), None):
+        assert not ta.active() and runner.batch_sharder is sharder
+    assert runner.batch_sharder is sharder
+
+
 def test_step_ends_on_an_error(monkeypatch, host_sampling):
     from vllm.sampling_params import SamplingParams
     from vllm.sm80.worker import target_argmax as ta
@@ -609,6 +635,23 @@ def test_switch_off_keeps_the_gather(monkeypatch, host_sampling):
     assert runner._target_shard_argmax is False
 
 
+def _mtp_like(local: bool):
+    """vLLM's MTP speculator, greedy, whose draft model has the vocabulary
+    shard logits; ``local``: use_local_argmax_reduction."""
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    s = object.__new__(MTPSpeculator)
+    s.draft_logits = None
+    s.use_local_argmax_reduction = local
+    s.acceptance_estimator = None
+    s.model = SimpleNamespace(
+        compute_logits_local=lambda h, step=0: h,
+        lm_head=SimpleNamespace(tp_rank=0, tp_size=4),
+        logits_processor=SimpleNamespace(org_vocab_size=97),
+    )
+    return s
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [
@@ -618,7 +661,8 @@ def test_switch_off_keeps_the_gather(monkeypatch, host_sampling):
         (dict(model=SimpleNamespace(target_argmax_logits=True,
                                     compute_logits_local=lambda h: h)), "vocabulary-parallel"),
         (dict(lora_config=object()), "LoRA"),
-        (dict(batch_sharder=object()), "batch-sharded"),
+        (dict(model=_Target(tp_size=1)), "TP 1"),
+        (dict(speculator=_mtp_like(local=True)), "use_local_argmax_reduction"),
     ],
 )
 def test_switch_refuses_what_it_cannot_serve(monkeypatch, host_sampling, overrides, reason):
@@ -639,8 +683,12 @@ def test_switch_refuses_logits_as_input_and_a_large_vocabulary(monkeypatch):
     from vllm.sm80.worker import target_argmax as ta
 
     target = _Target()
-    runner = SimpleNamespace(model=target, lora_config=None, batch_sharder=None,
+    runner = SimpleNamespace(model=target, lora_config=None, batch_sharder=object(),
                              target_argmax_steps=True)
+    # Batch-sharded sampling is served (a greedy-only step samples unsharded).
+    assert ta.refusal(runner) is None
+    # A greedy sample_draft drafter whose draft model has the shard logits.
+    runner.speculator = _mtp_like(local=False)
     assert ta.refusal(runner) is None
     target.language_model.logits_processor.logits_as_input = True
     assert "logits as input" in ta.refusal(runner)
