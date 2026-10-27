@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks that the attention ``wo_b`` sum under
-VLLM_SM80_ALLREDUCE_ROUND_ONCE and the MoE output sum under
-VLLM_DEEPSEEK_V41_MOE_ROUND_ONCE_ALLREDUCE are the same once-rounded function
+VLLM_SM80_ALLREDUCE_ROUND_ONCE and the MoE output sum under the same switch
+are the same once-rounded function
 of the ranks' BF16 partials wherever both round once, and where they differ.
 
 Four ranks' partials are reduced through the layers' own entry points
