@@ -284,11 +284,12 @@ value = 0
 evidence = "seed: VLLM_EXL3_MOE_CHUNK_ROWS default 0; Qwen3.8-Flash-Next"
 
 # topk_select/split_rows: most rows of the split tie fix + sort (0: off), per
-# selected width.
+# selected width and calling indexer (kpool: GLM; qsa: Qwen, never measured
+# split, so no row).
 [[row]]
 op = "topk_select"
 param = "split_rows"
-key = {top_k = 512}
+key = {top_k = 512, indexer = "kpool"}
 value = 8
 evidence = "seed: VLLM_GLM5_TOPK_TIEFIX_SPLIT_ROWS=8, GLM-5.3-Flash settings"
 

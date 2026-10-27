@@ -505,7 +505,7 @@ def _topk(
         block_topk,
         logits.shape[1],
     )
-    canonical_topk_(logits, block_indices, row_ends=visible_blocks)
+    canonical_topk_(logits, block_indices, indexer="qsa", row_ends=visible_blocks)
 
 
 def qsa_select_paged_decode(

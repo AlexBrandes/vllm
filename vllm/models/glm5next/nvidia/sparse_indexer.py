@@ -446,6 +446,7 @@ def sparse_attn_indexer_kpool(
                 canonical_topk_(
                     logits,
                     topk_dst,
+                    indexer="kpool",
                     row_starts=row_starts,
                     row_ends=row_ends,
                     relative=True,
@@ -736,7 +737,7 @@ def sparse_attn_indexer_kpool(
             attn_metadata_narrowed.max_seq_len,
         )
         # As after the prefill top-k.
-        canonical_decode_topk_(logits, topk_dst, seq_lens, next_n)
+        canonical_decode_topk_(logits, topk_dst, seq_lens, next_n, indexer="kpool")
         _merge_dcp_topk_global(
             logits,
             topk_dst,

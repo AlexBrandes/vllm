@@ -596,17 +596,18 @@ def test_topk_site_runs_the_booted_and_the_candidate_switches(
     monkeypatch.setattr(gate, "use_tiefix_topk", lambda: booted[0])
     monkeypatch.setattr(gate, "use_sorted_topk", lambda: booted[1])
     monkeypatch.setattr(gate.tuning, "lookup", lambda op, param, key, default: 8)
-    monkeypatch.setattr(gate, "tiefix_topk_", lambda logits, idx, *, row_ends, row_starts,
-                        relative, sort, split_rows: calls.append(("tiefix", sort, split_rows)))
+    monkeypatch.setattr(gate, "tiefix_topk_", lambda logits, idx, *, indexer, row_ends,
+                        row_starts, relative, sort, split_rows:
+                        calls.append(("tiefix", sort, split_rows)))
     topk_tiefix = types.ModuleType("topk_tiefix")
     topk_tiefix.sort_topk_rows_ = lambda idx: calls.append("sort")
     monkeypatch.setitem(sys.modules, "vllm.sm80.kernels.indexer.topk_tiefix", topk_tiefix)
     idx = object()
-    gate.canonical_topk_(object(), _IndexRows(idx), row_ends=None)
+    gate.canonical_topk_(object(), _IndexRows(idx), indexer="kpool", row_ends=None)
     assert sites == [pair] and calls == base
     calls.clear()
     sites.arm = True
-    gate.canonical_topk_(object(), _IndexRows(idx), row_ends=None)
+    gate.canonical_topk_(object(), _IndexRows(idx), indexer="kpool", row_ends=None)
     assert calls == cand
 
 
@@ -623,8 +624,8 @@ def test_topk_site_is_absent_without_a_pair(monkeypatch, listed, sites):
     listed()
     monkeypatch.setattr(gate, "use_tiefix_topk", lambda: False)
     monkeypatch.setattr(gate, "use_sorted_topk", lambda: False)
-    gate.canonical_topk_(object(), _IndexRows(1), row_ends=None)
-    gate.canonical_decode_topk_(object(), _IndexRows(1), None, 1)
+    gate.canonical_topk_(object(), _IndexRows(1), indexer="kpool", row_ends=None)
+    gate.canonical_decode_topk_(object(), _IndexRows(1), None, 1, indexer="kpool")
     assert sites == []
 
 

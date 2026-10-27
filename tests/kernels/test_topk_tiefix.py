@@ -136,7 +136,7 @@ def test_flag_off_does_not_touch_the_output(monkeypatch):
         seq = torch.tensor([[64], [40]], dtype=torch.int32)
         topk(logits, seq, 1, out, 8, 64)
         before = out.clone()
-        gate.canonical_decode_topk_(logits, out, seq, 1)
+        gate.canonical_decode_topk_(logits, out, seq, 1, indexer="kpool")
         assert calls == []
         assert torch.equal(out, before)
     finally:
@@ -245,7 +245,7 @@ def test_2d_seq_lens_through_the_decode_tie_fix(monkeypatch, tiefix):
         seq = torch.tensor([[900], [850], [600], [3]], dtype=torch.int32)
         out = torch.empty(4, 64, dtype=torch.int32)
         topk(logits, seq, 1, out, 64, 900)
-        gate.canonical_decode_topk_(logits, out, seq, 1)
+        gate.canonical_decode_topk_(logits, out, seq, 1, indexer="kpool")
         ref = canonical_topk(logits, 64, row_ends=seq.reshape(-1))
         assert row_sets(out) == row_sets(ref)
     finally:
@@ -375,7 +375,7 @@ def test_decode_tie_fix_passes_sort_when_both_flags(monkeypatch):
         logits = torch.zeros(4, 16)
         seq = torch.tensor([[16], [9]], dtype=torch.int32)
         gate.canonical_decode_topk_(
-            logits, torch.zeros(4, 8, dtype=torch.int32), seq, 2
+            logits, torch.zeros(4, 8, dtype=torch.int32), seq, 2, indexer="kpool"
         )
         assert seen.get("sort") is True
         # The per-row ends of the decode top-k kernels (next_n rows per request).

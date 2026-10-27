@@ -111,8 +111,9 @@ def _clear():
         f.cache_clear()
 
 
-def _split_rows(monkeypatch, top_k, rows):
-    use_rows(monkeypatch, ("topk_select", "split_rows", {"top_k": top_k}, rows))
+def _split_rows(monkeypatch, top_k, rows, indexer="kpool"):
+    use_rows(monkeypatch, ("topk_select", "split_rows",
+                           {"top_k": top_k, "indexer": indexer}, rows))
 
 
 def test_split_defaults_off(monkeypatch):
@@ -121,7 +122,7 @@ def test_split_defaults_off(monkeypatch):
     monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
     _clear()
     try:
-        assert tiefix_split_rows(512) == 0
+        assert tiefix_split_rows(512, "kpool") == 0
     finally:
         _clear()
 
@@ -132,12 +133,14 @@ def test_gate_needs_tiefix_and_sorted(monkeypatch):
     monkeypatch.delenv("VLLM_SM80_TOPK_SORTED", raising=False)
     _clear()
     try:
-        assert tiefix_split_rows(512) == 0  # sort off
+        assert tiefix_split_rows(512, "kpool") == 0  # sort off
         monkeypatch.setenv("VLLM_SM80_TOPK_SORTED", "1")
         _clear()
-        assert tiefix_split_rows(512) == 4
+        assert tiefix_split_rows(512, "kpool") == 4
         # Keyed by the selected width: another width keeps the default 0.
-        assert tiefix_split_rows(2048) == 0
+        assert tiefix_split_rows(2048, "kpool") == 0
+        # And by the indexer: another indexer of the same width keeps it too.
+        assert tiefix_split_rows(512, "qsa") == 0
     finally:
         _clear()
 
@@ -166,10 +169,11 @@ def test_dispatch_passes_split(monkeypatch, mod):
         wide = torch.zeros(8, mod.SPLIT_MIN_COLS)
         ends = torch.full((8,), 10, dtype=torch.int32)
         idx = torch.zeros(8, 16, dtype=torch.int32)
-        gate.tiefix_topk_(wide, idx[:4], row_ends=ends, sort=True)
-        gate.tiefix_topk_(wide, idx, row_ends=ends, sort=True)
-        gate.tiefix_topk_(wide[:, :100], idx[:4], row_ends=ends, sort=True)
-        gate.tiefix_topk_(wide, idx[:4], row_ends=ends, sort=False)
+        gate.tiefix_topk_(wide, idx[:4], indexer="kpool", row_ends=ends, sort=True)
+        gate.tiefix_topk_(wide, idx, indexer="kpool", row_ends=ends, sort=True)
+        gate.tiefix_topk_(wide[:, :100], idx[:4], indexer="kpool", row_ends=ends,
+                          sort=True)
+        gate.tiefix_topk_(wide, idx[:4], indexer="kpool", row_ends=ends, sort=False)
         assert seen == [(True, True), (True, False), (True, False), (False, False)]
     finally:
         _clear()
@@ -184,7 +188,7 @@ def test_flag_off_dispatch_is_unchanged(monkeypatch, mod):
         wide = torch.zeros(4, mod.SPLIT_MIN_COLS)
         ends = torch.full((4,), 10, dtype=torch.int32)
         idx = torch.zeros(4, 16, dtype=torch.int32)
-        gate.tiefix_topk_(wide, idx, row_ends=ends, sort=True)
+        gate.tiefix_topk_(wide, idx, indexer="kpool", row_ends=ends, sort=True)
         assert seen == [False]
     finally:
         _clear()

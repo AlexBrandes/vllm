@@ -235,5 +235,5 @@ def test_long_decode_without_ties_is_a_no_op(monkeypatch, branch):
     for sort in (False, True):
         _switches(monkeypatch, canonical=True, sort=sort)
         got = native.clone()
-        gate.canonical_topk_(logits, got, row_ends=visible)
+        gate.canonical_topk_(logits, got, indexer="qsa", row_ends=visible)
         assert torch.equal(got, _row_sets_sorted(native) if sort else native)

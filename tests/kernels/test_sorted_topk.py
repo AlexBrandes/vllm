@@ -137,9 +137,11 @@ def test_canonical_topk_dispatch(
     switches(canonical=canonical, sort=sort)
     logits = torch.zeros(2, 16)
     ends = torch.full((2,), 16, dtype=torch.int32)
-    gate.canonical_topk_(logits, torch.zeros(2, 4, dtype=torch.int32), row_ends=ends)
+    gate.canonical_topk_(logits, torch.zeros(2, 4, dtype=torch.int32), indexer="kpool",
+                         row_ends=ends)
     seq = torch.tensor([[16], [9]], dtype=torch.int32)
-    gate.canonical_decode_topk_(logits, torch.zeros(2, 4, dtype=torch.int32), seq, 1)
+    gate.canonical_decode_topk_(logits, torch.zeros(2, 4, dtype=torch.int32), seq, 1,
+                                indexer="kpool")
     assert seen == want * 2
 
 
@@ -153,7 +155,8 @@ def test_decode_off_computes_no_row_ends(switches, monkeypatch):
     switches(canonical=False, sort=False)
     seq = torch.tensor([[16], [9]], dtype=torch.int32)
     gate.canonical_decode_topk_(
-        torch.zeros(2, 16), torch.zeros(2, 4, dtype=torch.int32), seq, 1
+        torch.zeros(2, 16), torch.zeros(2, 4, dtype=torch.int32), seq, 1,
+        indexer="kpool",
     )
 
 
@@ -245,12 +248,15 @@ def test_glm_indexer_calls_the_gate_after_each_topk():
     dec_topk = src.index("get_indexer_topk(topk_backend)(")
     dec_fix = src.index("canonical_decode_topk_(")
     assert dec_topk < dec_fix < src.index("_merge_dcp_topk_global(", dec_topk)
+    # Its split row bound is the kpool row of the tuning table.
+    assert src.count('indexer="kpool"') == 2
 
 
 def test_qsa_indexer_calls_the_gate_after_its_topk():
     src = _function_source("vllm.models.qwen4_exp.nvidia.ops.qsa_indexer", "_topk")
     assert src.count("canonical_topk_(") == 1
     assert src.index("topk_op(") < src.index("canonical_topk_(")
+    assert 'indexer="qsa"' in src
 
 
 run_in_interpreter_child(globals())

@@ -9,7 +9,9 @@ is a function of the scores alone. ``VLLM_SM80_TOPK_SORTED``: each selected
 row is put in ascending order, -1 fill last, so attention reads the set in a
 fixed order. With both on, the sort runs inside the tie-fix launch, split
 over (row, chunk) programs up to the topk_select/split_rows row of the sm80
-tuning table.
+tuning table, keyed by the selected width and the calling indexer
+(``indexer``: "kpool" for GLM, "qsa" for Qwen), so a row tuned for one
+indexer never reaches another of the same width.
 
 The GLM kpool sparse indexer (``vllm/models/glm5next/nvidia/sparse_indexer.py``)
 calls :func:`canonical_topk_` after its prefill top-k and
@@ -77,12 +79,13 @@ def use_tiefix_topk() -> bool:
 
 
 @functools.cache
-def tiefix_split_rows(top_k: int) -> int:
+def tiefix_split_rows(top_k: int, indexer: str) -> int:
     """Row bound of the split tie fix + sort at ``top_k`` selected slots per
-    row (the topk_select/split_rows row of the sm80 tuning table; 0 = off,
-    the default). Only meaningful with the tie fix and the sort both on. Read
-    once per process and width; tests call cache_clear."""
-    rows = max(0, tuning.lookup("topk_select", "split_rows", {"top_k": top_k}, 0))
+    row of ``indexer`` (the topk_select/split_rows row of the sm80 tuning
+    table; 0 = off, the default). Only meaningful with the tie fix and the
+    sort both on. Read once per process, width and indexer; tests call
+    cache_clear."""
+    rows = _split_rows_row(top_k, indexer)
     if rows and not (use_tiefix_topk() and use_sorted_topk()):
         logger.info_once(
             "sm80 split tie-fix scan NOT active: the topk_select/split_rows "
@@ -93,18 +96,28 @@ def tiefix_split_rows(top_k: int) -> int:
         logger.info_once(
             "sm80 split tie-fix scan active: batches of at most %d rows over "
             "wide logits run the tie fix + sort over (row, chunk) programs "
-            "(topk_select/split_rows = %d at top_k %d in the sm80 tuning table)",
+            "(topk_select/split_rows = %d at top_k %d, indexer %s in the sm80 "
+            "tuning table)",
             rows,
             rows,
             top_k,
+            indexer,
         )
     return rows
+
+
+def _split_rows_row(top_k: int, indexer: str) -> int:
+    """The topk_select/split_rows table value at (``top_k``, ``indexer``)."""
+    return max(0, tuning.lookup(
+        "topk_select", "split_rows", {"top_k": top_k, "indexer": indexer}, 0
+    ))
 
 
 def tiefix_topk_(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
     *,
+    indexer: str,
     row_ends: torch.Tensor,
     row_starts: torch.Tensor | None = None,
     relative: bool = False,
@@ -114,16 +127,16 @@ def tiefix_topk_(
     """Resolve boundary ties of an exact top-k to the lowest indices, in
     place; with ``sort`` also sort each row (VLLM_SM80_TOPK_SORTED) in the
     same launch (two launches in all on the split path, ``use_split``, up to
-    ``split_rows`` rows; None: :func:`tiefix_split_rows`). See
-    ``topk_tiefix.py``; imported lazily so that with the flag unset nothing
-    new is loaded."""
+    ``split_rows`` rows; None: :func:`tiefix_split_rows` of ``indexer``).
+    See ``topk_tiefix.py``; imported lazily so that with the flag unset
+    nothing new is loaded."""
     from vllm.sm80.kernels.indexer.topk_tiefix import (
         topk_tiefix_,
         use_split,
     )
 
     if split_rows is None:
-        split_rows = tiefix_split_rows(int(topk_indices.shape[1]))
+        split_rows = tiefix_split_rows(int(topk_indices.shape[1]), indexer)
     split = sort and use_split(
         topk_indices.shape[0],
         logits.shape[1],
@@ -154,6 +167,7 @@ def _hot_pair() -> str | None:
 def _canonical(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
+    indexer: str,
     row_ends: torch.Tensor,
     row_starts: torch.Tensor | None,
     relative: bool,
@@ -165,6 +179,7 @@ def _canonical(
         tiefix_topk_(
             logits,
             topk_indices,
+            indexer=indexer,
             row_ends=row_ends,
             row_starts=row_starts,
             relative=relative,
@@ -182,6 +197,7 @@ def canonical_topk_(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
     *,
+    indexer: str,
     row_ends: torch.Tensor,
     row_starts: torch.Tensor | None = None,
     relative: bool = False,
@@ -191,7 +207,8 @@ def canonical_topk_(
     sorting each row in the same launch when VLLM_SM80_TOPK_SORTED is on too;
     with the sort alone, sort each row and keep the set. Both unset: nothing
     runs. ``row_ends``/``row_starts``/``relative`` describe each row's window
-    as the top-k kernel saw it (see ``topk_tiefix_``).
+    as the top-k kernel saw it (see ``topk_tiefix_``); ``indexer`` names the
+    calling indexer ("kpool", "qsa") for the split row bound's table key.
 
     With a hot pair of ``_HOT_PAIRS`` listed, this is its pair site: the
     incumbent runs the switches as booted, the candidate with the pair's
@@ -200,22 +217,23 @@ def canonical_topk_(
     ties, sort = use_tiefix_topk(), use_sorted_topk()
     hot = _hot_pair()
     if hot is None:
-        _canonical(logits, topk_indices, row_ends, row_starts, relative, ties, sort)
+        _canonical(
+            logits, topk_indices, indexer, row_ends, row_starts, relative, ties, sort
+        )
         return
     cand = (True, sort) if hot == "topk_canonical_ties" else (ties, True)
     split_rows = (
-        max(0, tuning.lookup(
-            "topk_select", "split_rows", {"top_k": int(topk_indices.shape[1])}, 0
-        ))
+        _split_rows_row(int(topk_indices.shape[1]), indexer)
         if all(cand) else 0
     )
     hot_swap.pair(
         hot,
         lambda: _canonical(
-            logits, topk_indices, row_ends, row_starts, relative, ties, sort
+            logits, topk_indices, indexer, row_ends, row_starts, relative, ties, sort
         ),
         lambda out: _canonical(
-            logits, topk_indices, row_ends, row_starts, relative, *cand, split_rows
+            logits, topk_indices, indexer, row_ends, row_starts, relative, *cand,
+            split_rows,
         ),
     )
 
@@ -225,6 +243,8 @@ def canonical_decode_topk_(
     topk_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     next_n: int,
+    *,
+    indexer: str,
 ) -> None:
     """:func:`canonical_topk_` after the decode top-k that
     ``SparseIndexerTopk`` (``get_indexer_topk``) just wrote into
@@ -234,5 +254,6 @@ def canonical_decode_topk_(
         canonical_topk_(
             logits,
             topk_indices,
+            indexer=indexer,
             row_ends=SparseIndexerTopk._row_ends(seq_lens, next_n, logits.shape[0]),
         )

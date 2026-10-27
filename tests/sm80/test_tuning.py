@@ -248,7 +248,7 @@ SERVED = [
     ("moe_prefill", "marlin_min_rows", {"gemm_n": 2048}, 384),
     ("moe_prefill", "marlin_min_rows", {"gemm_n": 512}, 384),
     ("moe_routed_gemm", "marlin_multi_max_rows", {"gemm_n": 2048}, 64),
-    ("topk_select", "split_rows", {"top_k": 512}, 8),
+    ("topk_select", "split_rows", {"top_k": 512, "indexer": "kpool"}, 8),
     ("allreduce", "flags_max_bytes", {"world_size": 4, "hidden": 4096}, 262144),
     ("allreduce", "host_max_bytes", {"world_size": 4, "hidden": 4096}, 524288),
     # Qwen3.8-Flash-Next (TP2)
@@ -269,6 +269,17 @@ def test_shipped_table_reproduces_the_served_values(
     monkeypatch.setattr(tuning, "_device_name", lambda: CARD)
     # A default nobody serves, so a missing row shows.
     assert tuning.lookup(op, param, key, -1) == value
+
+
+def test_split_rows_of_one_indexer_never_reach_another(monkeypatch, fresh):
+    """GLM's kpool and Qwen's QSA indexer both select 512 per row. The split
+    tie fix was measured on GLM only: GLM's key gets its seeded 8 rows, Qwen's
+    key no row, so the default 0 (one program per row, as Qwen always ran)."""
+    monkeypatch.setattr(tuning, "_device_name", lambda: CARD)
+    key = {"top_k": 512}
+    lookup = tuning.lookup
+    assert lookup("topk_select", "split_rows", dict(key, indexer="kpool"), 0) == 8
+    assert lookup("topk_select", "split_rows", dict(key, indexer="qsa"), 0) == 0
 
 
 def test_shipped_rows_have_evidence():
