@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_planning as kv_cache_planning
-from tests.v1.core.utils import new_kv_cache_spec, new_mamba_spec
+from tests.v1.core.utils import get_kv_cache_configs, new_kv_cache_spec, new_mamba_spec
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.sm80.kv_planning import fit_packed_kv_cache_groups, pool_concurrency_limit
 from vllm.utils.math_utils import cdiv
@@ -378,7 +378,7 @@ def test_pp_groups_fit_every_stage(monkeypatch, partition):
             assert sum(name in worker for name in group.layer_names) <= per_block
 
     num_blocks = 100
-    configs = kv_cache_planning.get_kv_cache_configs(
+    configs = get_kv_cache_configs(
         config, workers, [anchor * num_blocks + 1] * len(workers)
     )
     assert [c.num_blocks for c in configs] == [num_blocks] * len(workers)
@@ -413,9 +413,7 @@ def test_pp_without_block_drop_flags_nothing(monkeypatch):
     assert not any(g.is_eagle_group for g in groups)
     assert [len(g.layer_names) for g in _draft_groups(groups)] == [3, 2]
     workers = _split_specs_by_stage(specs, partition)
-    configs = kv_cache_planning.get_kv_cache_configs(
-        config, workers, [1 << 34] * len(workers)
-    )
+    configs = get_kv_cache_configs(config, workers, [1 << 34] * len(workers))
     sched = generate_scheduler_kv_cache_config(configs)
     assert not any(g.is_eagle_group for g in sched.kv_cache_groups)
 

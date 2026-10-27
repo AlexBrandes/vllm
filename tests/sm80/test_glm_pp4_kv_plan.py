@@ -57,7 +57,7 @@ def _stage(monkeypatch, stage):
 def test_every_pp4_stage_gets_tensors_for_exactly_its_layers(
     monkeypatch, meta_platform
 ):
-    from vllm.v1.core import kv_cache_planning
+    from tests.v1.core.utils import get_kv_cache_configs
 
     workers = []
     config = None
@@ -72,7 +72,7 @@ def test_every_pp4_stage_gets_tensors_for_exactly_its_layers(
     assert len(drafter) == 5
     assert not any(type(s) is SlidingWindowSpec for w in workers[:-1] for s in w.values())
 
-    configs = kv_cache_planning.get_kv_cache_configs(config, workers, [16 << 30] * _PP)
+    configs = get_kv_cache_configs(config, workers, [16 << 30] * _PP)
 
     assert len({c.num_blocks for c in configs}) == 1
     for specs, kv_cache_config in zip(workers, configs):
