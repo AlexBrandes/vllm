@@ -156,7 +156,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/distributed/host_shm_all_reduce.py` | 1,155 |
 | `vllm/sm80/distributed/pcie_p2p.py` | 183 |
 | `vllm/sm80/distributed/step_errors.py` | 167 |
-| `vllm/sm80/envs.py` | 1,648 |
+| `vllm/sm80/envs.py` | 1,654 |
 | `vllm/sm80/failed_inputs.py` | 144 |
 | `vllm/sm80/fla/__init__.py` | 2 |
 | `vllm/sm80/fla/autotune_pins.py` | 210 |
@@ -193,7 +193,7 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/model_registry.py` | 78 |
 | `vllm/sm80/parser_recovery.py` | 321 |
 | `vllm/sm80/platform.py` | 156 |
-| `vllm/sm80/plugin.py` | 356 |
+| `vllm/sm80/plugin.py` | 365 |
 | `vllm/sm80/spec_decode/__init__.py` | 2 |
 | `vllm/sm80/spec_decode/adaptive_k.py` | 366 |
 | `vllm/sm80/spec_decode/aux_fc_fold.py` | 184 |
@@ -216,13 +216,14 @@ The rest of the shared sm_80 code: the sparse MLA attention backend, the host-st
 | `vllm/sm80/worker/cudagraph_mem.py` | 528 |
 | `vllm/sm80/worker/execution_trace.py` | 150 |
 | `vllm/sm80/worker/graph_mem_worker.py` | 96 |
+| `vllm/sm80/worker/light_timing.py` | 396 |
 | `vllm/sm80/worker/mem_attribution.py` | 276 |
 | `vllm/sm80/worker/pp_draft_tail.py` | 1,017 |
 | `vllm/sm80/worker/pp_hop.py` | 210 |
 | `vllm/sm80/worker/state_index_check.py` | 299 |
 | `vllm/sm80/worker/target_argmax.py` | 278 |
 | `vllm/sm80/worker/trace_export.py` | 200 |
-| **80 files** | **24,994** |
+| **81 files** | **25,405** |
 
 ### `csrc/libtorch_stable/moe/ampere_marlin/`
 
@@ -563,6 +564,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/sm80/test_jit_extension_std.py` | 68 |
 | `tests/sm80/test_kernel_warmup_call.py` | 69 |
 | `tests/sm80/test_kv_planning.py` | 492 |
+| `tests/sm80/test_light_timing.py` | 291 |
 | `tests/sm80/test_modification_notices.py` | 80 |
 | `tests/sm80/test_moe_layers.py` | 297 |
 | `tests/sm80/test_mrv2_prepare_inputs_padding.py` | 126 |
@@ -622,7 +624,7 @@ Files added elsewhere, grouped by top-level directory.
 | `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
 | `tests/v1/worker/test_sm80_trace_export.py` | 216 |
 | `tests/v1/worker/test_state_index_check.py` | 351 |
-| **293 files** | **123,525** |
+| **294 files** | **123,816** |
 
 #### `tools/`
 
@@ -859,6 +861,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_SM80_CAPTURE` | `str` | `''` | `''` |
 | `VLLM_SM80_EXECUTION_TRACE` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_KDA_PREFILL` | `bool` | `False` | `'0'` |
+| `VLLM_SM80_LIGHT_TIMING` | `str` | `''` | `''` |
 | `VLLM_SM80_MARLIN_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_MHC_PREFILL` | `bool` | `False` | `'0'` |
 | `VLLM_SM80_PREFILL_REDUCE_OVERLAP` | `bool` | `False` | `'0'` |
@@ -876,7 +879,7 @@ The default is the value the accessor uses when the variable is unset, as writte
 | `VLLM_THIN_GEMM_GLUON` | `bool` | `False` | `'0'` |
 | `VLLM_THIN_GEMM_GLUON_FORCE_M` | `int` | `0` | `'0'` |
 | `VLLM_TOOL_CHOICE_NONE_MASK` | `bool` | `False` | `'0'` |
-| **110 variables** | | | |
+| **111 variables** | | | |
 
 ## 4. Unreferenced fork code
 
@@ -898,12 +901,12 @@ Fork-added product code is new files under `vllm/` or `csrc/` plus new build fil
 
 | Measure | Value |
 |---|---:|
-| Fork-added product files | 227 |
-| Fork-added product lines | 79,253 |
+| Fork-added product files | 228 |
+| Fork-added product lines | 79,664 |
 | Patched upstream files | 100 |
 | Patched upstream lines | +4,399 / -799 |
 | Patched upstream product files | 73 |
 | Patched upstream product lines | +2,918 / -249 |
-| Product lines added (new files and patches) | 82,171 |
-| Fork environment variables (flags) | 110 |
+| Product lines added (new files and patches) | 82,582 |
+| Fork environment variables (flags) | 111 |
 | Unreferenced fork definitions | 6 (51 lines) |

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_STATE_INDEX_CHECK: bool = False
     VLLM_SM80_EXECUTION_TRACE: bool = False
     VLLM_SM80_SERIAL_TRACE_EXPORT: bool = False
+    VLLM_SM80_LIGHT_TIMING: str = ""
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
@@ -310,6 +311,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_SM80_SERIAL_TRACE_EXPORT": lambda: bool(
         int(os.getenv("VLLM_SM80_SERIAL_TRACE_EXPORT", "0"))
     ),
+    # A JSON object (vllm.sm80.worker.light_timing): every forward of the
+    # named root modules captured into a CUDA graph stamps the GPU timer at
+    # each decoder layer and named scope into a device ring, dumped to files
+    # on request, with no host work per step. Diagnostic; empty: off.
+    "VLLM_SM80_LIGHT_TIMING": lambda: os.getenv("VLLM_SM80_LIGHT_TIMING", ""),
     # Opt in to the sm_80 decode kernels (mHC and MoE routing in
     # vllm/sm80/kernels/, the KDA decode step in vllm/models/glm5next/nvidia/ops/;
     # GA100-class parts only; measured on CMP 170HX, 70 SMs). Default OFF: with
