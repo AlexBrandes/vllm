@@ -1,5 +1,10 @@
 # vLLM on the CMP 170HX
 
+> **This branch is frozen.** The fork's home is now the
+> [`plugin`](https://github.com/AlexBrandes/vllm/tree/plugin) branch: the current
+> README, the recipes and new engine work are there. This branch stays as it is
+> for the recipes and links that pin it.
+
 Our home for running large models on NVIDIA CMP 170HX cards: engine improvements,
 reproducible recipes, and measurements from the hardware we actually use.
 
