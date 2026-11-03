@@ -15,10 +15,17 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 1 c
 | Path | Lines |
 |---|---:|
 | `.gitignore` | 4 |
+| `CITATION.cff` | 8 |
 | `LICENSE` | 201 |
 | `NOTICE` | 11 |
+| `README.md` | 112 |
 | `docs/development.md` | 118 |
 | `pyproject.toml` | 32 |
+| `recipes/qwen-flash-next-exl3/Dockerfile` | 23 |
+| `recipes/qwen-flash-next-exl3/README.md` | 148 |
+| `recipes/qwen-flash-next-exl3/results.json` | 317 |
+| `recipes/qwen-flash-next-exl3/serve.sh` | 43 |
+| `recipes/qwen-flash-next-w4a16/README.md` | 78 |
 | `tests/cmp170hx/seams.yaml` | 41 |
 | `tests/cmp170hx/test_modification_notices.py` | 169 |
 | `tests/cmp170hx/test_plugin_guard.py` | 133 |

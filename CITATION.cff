@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it."
+title: "AlexBrandes vLLM: engines and recipes for NVIDIA CMP 170HX"
+authors:
+  - name: AlexBrandes
+  - name: Morrowmake
+repository-code: "https://github.com/AlexBrandes/vllm"
+license: Apache-2.0
