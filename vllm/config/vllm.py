@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 
 import copy
 import getpass
@@ -1539,6 +1540,10 @@ class VllmConfig:
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
+        # Fail at startup if vLLM loaded its general plugins without the fork's.
+        from vllm_cmp170hx.guard import check_plugin_loaded
+
+        check_plugin_loaded()
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
