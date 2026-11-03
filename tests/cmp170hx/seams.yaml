@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Upstream seams the fork code relies on without editing them, pinned as
+# one upstream base has them (seams.yaml: the base in FORK.md;
+# seams.<base12>.yaml: the re-pin for another base).
+# Checked by tests/cmp170hx/test_seams.py. After checking an upstream change to
+# a seam, rewrite the pins with: python tests/cmp170hx/update_seams.py [ID ...]
+#
+# Fields:
+#   id         unique row name
+#   kind       function | method | class_attr | module_attr | dict_contract
+#   target     'module:qualname'
+#   why        what the fork code depends on
+#   sha256     sha256 of textwrap.dedent(inspect.getsource(obj)) (code kinds)
+#   signature  str(inspect.signature(obj)), object addresses removed (code kinds)
+#   type       type name of the value (attr kinds and dict_contract)
+#   value      exact value, for constants only (attr kinds, optional)
+#   dict_contract rows also require every value to be a zero-arg callable.
+
+seams:
+
+- id: plugins-load-general-plugins
+  kind: function
+  target: vllm.plugins:load_general_plugins
+  why: guard.check_plugin_loaded reads plugins_loaded as "this process loaded the general plugins"; load_general_plugins sets it once, before it calls each plugin's register
+  sha256: 59a85a7fa0b075b7569780e4184541365405b9d087de9802ad8d418adf8e010c
+  signature: ()
+
+- id: plugins-loaded-flag
+  kind: module_attr
+  target: vllm.plugins:plugins_loaded
+  why: guard.check_plugin_loaded reads this module-level bool
+  type: bool
+
+- id: plugins-load-plugins-by-group
+  kind: function
+  target: vllm.plugins:load_plugins_by_group
+  why: the VLLM_PLUGINS filter and the log-and-ignore of a plugin that fails to load, which the guard's error message names
+  sha256: 629f5a97f1674951faf5777570b3da05ef2a4a77b5db8118049ccf7b23ac6872
+  signature: '(group: str) -> dict[str, collections.abc.Callable[[], typing.Any]]'

@@ -1,0 +1,32 @@
+# The CMP 170HX plugin for vLLM: the vllm_cmp170hx package. vLLM calls
+# vllm_cmp170hx.plugin:register at startup (vllm.general_plugins entry point
+# "cmp170hx"), and vllm_cmp170hx/guard.py, called from the vLLM branch's hook
+# in VllmConfig.__post_init__, stops vLLM at startup when the plugin is missing.
+#
+# An engine is a vLLM branch (vllm/<upstream10>: upstream vLLM plus the fork's
+# commits) built as usual, with this package installed beside it:
+#   pip install --no-deps .
+# For a source tree used through PYTHONPATH, tools/cmp170hx/assemble.py writes
+# the entry-point metadata next to the package instead.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-cmp170hx"
+version = "0.1.0"
+description = "vLLM plugin for the NVIDIA CMP 170HX"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+cmp170hx = "vllm_cmp170hx.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_cmp170hx*"]
+
+[tool.ruff]
+line-length = 88

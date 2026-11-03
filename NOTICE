@@ -1,0 +1,11 @@
+vllm-cmp170hx
+Copyright 2026 Alex Brandes
+
+This product is vllm-cmp170hx, a plugin and a branch of vLLM
+(https://github.com/vllm-project/vllm), Copyright contributors to the vLLM
+project, licensed under the Apache License, Version 2.0.
+
+Its layout (plugin, vLLM branch and upstream seam pins), the startup guard and
+the seam tooling are adapted from vllm-sm80 by Morrowmake
+(https://github.com/Morrowmake/vllm-cmp170hx), Portions Copyright 2026
+Morrowmake, licensed under the Apache License, Version 2.0.
