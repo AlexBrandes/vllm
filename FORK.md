@@ -4,9 +4,9 @@
 
 This branch is the `vllm-cmp170hx` plugin of Alex Brandes's vLLM fork for the NVIDIA CMP 170HX: the import package `vllm_cmp170hx`, installed on the vLLM branch below (upstream vLLM plus the fork's commits). The license is Apache-2.0, as upstream.
 
-Upstream base: 165213f91169009bd78f8262a4bfd3b9a11bd841
+Upstream base: a0d7356b98e929c17051bac44f5a086e4117974d
 
-vLLM branch: vllm/165213f911 dfd888dbc04ba29622512eee70454a4b2feeda90
+vLLM branch: vllm/a0d7356b98 9a6c8afd74f9b299717736fbdc673c0d79118cea
 
 Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 1 commit on its upstream base and the 1 upstream file they change. This file is not listed in its own tables.
 
@@ -39,7 +39,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 1 c
 
 ## 2. Changes to upstream vLLM
 
-- `dfd888dbc0` Stop at startup when the vllm-cmp170hx plugin is missing
+- `9a6c8afd74` Stop at startup when the vllm-cmp170hx plugin is missing
 
 | Upstream file | Added | Removed |
 |---|---:|---:|

@@ -31,7 +31,7 @@ the [development guide](docs/development.md) has the rules and the steps.
 | Branch | Holds |
 | --- | --- |
 | **`plugin`** (default) | This page, the recipes, and the plugin |
-| `vllm/<upstream commit>` | Upstream vLLM at that commit plus our commits; the current one is `vllm/165213f911` |
+| `vllm/<upstream commit>` | Upstream vLLM at that commit plus our commits; the current one is `vllm/a0d7356b98` |
 | `main` | A clean mirror of upstream vLLM |
 
 Each recipe pins the exact engine it was validated with.

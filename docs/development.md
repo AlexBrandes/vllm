@@ -27,10 +27,10 @@ by file (see
 | Branch | Holds |
 |---|---|
 | `plugin` (default) | the plugin: `vllm_cmp170hx/`, its tests, its tools, `FORK.md` (a generated map of every file and every change to upstream vLLM), and the fork's landing page and recipes |
-| `vllm/165213f911`, … | upstream vLLM at that commit plus the fork's commits. A newer upstream gets a new `vllm/` branch; older ones stay, so engines pinned to them still build. |
+| `vllm/a0d7356b98`, … | upstream vLLM at that commit plus the fork's commits. A newer upstream gets a new `vllm/` branch; older ones stay as long as a recipe pins them. |
 | `main` | a plain mirror of upstream vLLM |
 
-The current line is upstream `165213f911` + `vllm/165213f911` + `plugin`.
+The current line is upstream `a0d7356b98` + `vllm/a0d7356b98` + `plugin`.
 
 ## Rules
 
@@ -82,7 +82,7 @@ The current line is upstream `165213f911` + `vllm/165213f911` + `plugin`.
 
 ```bash
 python tools/cmp170hx/assemble.py /path/to/asm \
-    --vllm vllm/165213f911 --plugin plugin \
+    --vllm vllm/a0d7356b98 --plugin plugin \
     --natives-from /path/to/site-packages/vllm   # optional
 cd /path/to/asm/plugin
 PYTHONPATH=/path/to/asm/engine:/path/to/asm/plugin python -m pytest tests/cmp170hx
