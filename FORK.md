@@ -6,9 +6,9 @@ This branch is the `vllm-cmp170hx` plugin of Alex Brandes's vLLM fork for the NV
 
 Upstream base: a0d7356b98e929c17051bac44f5a086e4117974d
 
-vLLM branch: vllm/a0d7356b98 9a6c8afd74f9b299717736fbdc673c0d79118cea
+vLLM branch: vllm/a0d7356b98 5e3c1322fd85284b8496100c0ed3a51865f918a3
 
-Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 1 commit on its upstream base and the 1 upstream file they change. This file is not listed in its own tables.
+Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 2 commits on its upstream base and the 3 upstream files they change. This file is not listed in its own tables.
 
 ## 1. Plugin files
 
@@ -26,21 +26,28 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 1 c
 | `recipes/qwen-flash-next-exl3/results.json` | 317 |
 | `recipes/qwen-flash-next-exl3/serve.sh` | 43 |
 | `recipes/qwen-flash-next-w4a16/README.md` | 78 |
-| `tests/cmp170hx/seams.yaml` | 41 |
+| `tests/cmp170hx/seams.yaml` | 48 |
 | `tests/cmp170hx/test_modification_notices.py` | 169 |
 | `tests/cmp170hx/test_plugin_guard.py` | 133 |
+| `tests/cmp170hx/test_prefill_budget.py` | 92 |
 | `tests/cmp170hx/test_seams.py` | 79 |
 | `tests/cmp170hx/update_seams.py` | 268 |
 | `tools/cmp170hx/assemble.py` | 119 |
 | `tools/cmp170hx/fork_map.py` | 136 |
-| `vllm_cmp170hx/__init__.py` | 18 |
+| `vllm_cmp170hx/__init__.py` | 21 |
+| `vllm_cmp170hx/envs.py` | 42 |
 | `vllm_cmp170hx/guard.py` | 39 |
-| `vllm_cmp170hx/plugin.py` | 25 |
+| `vllm_cmp170hx/plugin.py` | 44 |
+| `vllm_cmp170hx/sched/__init__.py` | 2 |
+| `vllm_cmp170hx/sched/prefill_budget.py` | 102 |
 
 ## 2. Changes to upstream vLLM
 
 - `9a6c8afd74` Stop at startup when the vllm-cmp170hx plugin is missing
+- `5e3c1322fd` Cap prefill beside running decodes (VLLM_MIXED_PREFILL_CHUNK)
 
 | Upstream file | Added | Removed |
 |---|---:|---:|
+| `tests/v1/core/test_prefill_budget.py` | 103 | 0 |
 | `vllm/config/vllm.py` | 5 | 0 |
+| `vllm/v1/core/sched/scheduler.py` | 20 | 0 |

@@ -4,6 +4,9 @@
 
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point
   ``cmp170hx``, and the startup check that it loaded.
+- ``envs``: the fork's environment variables, registered by the entry point.
+- ``sched``: scheduler policies the vLLM branch's scheduler hooks call
+  (``prefill_budget``: VLLM_MIXED_PREFILL_CHUNK).
 
 Importing this package does no work beyond placing its loggers: the upstream
 files that use a module here import that module directly.

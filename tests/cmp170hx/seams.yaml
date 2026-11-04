@@ -39,3 +39,10 @@ seams:
   why: the VLLM_PLUGINS filter and the log-and-ignore of a plugin that fails to load, which the guard's error message names
   sha256: 629f5a97f1674951faf5777570b3da05ef2a4a77b5db8118049ccf7b23ac6872
   signature: '(group: str) -> dict[str, collections.abc.Callable[[], typing.Any]]'
+
+- id: sched-get-request-counts
+  kind: method
+  target: vllm.v1.core.sched.scheduler:Scheduler.get_request_counts
+  why: sched.prefill_budget counts prompts awaiting prefill as the waiting count it returns plus the running prefill chunks
+  sha256: 865230b6ad6cebfee99e9a7c96aa93fdf1bf1c18c766f43ea2499e29e223c231
+  signature: (self) -> tuple[int, int]
