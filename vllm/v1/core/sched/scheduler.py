@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 import itertools
 import time
 from collections import defaultdict, deque
@@ -427,6 +428,11 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+        # Per-step prefill budget beside running decodes (fork plugin;
+        # VLLM_MIXED_PREFILL_CHUNK, off when unset).
+        from vllm_cmp170hx.sched.prefill_budget import PrefillBudget
+
+        self.cmp_prefill_budget = PrefillBudget(self)
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
@@ -613,6 +619,7 @@ class Scheduler(SchedulerInterface):
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            max_prefill_tokens = self.cmp_prefill_budget.cap_split(max_prefill_tokens)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -789,6 +796,8 @@ class Scheduler(SchedulerInterface):
         ):
             defer_prefills = True
 
+        self.cmp_prefill_budget.start_step()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -842,6 +851,9 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            num_new_tokens = self.cmp_prefill_budget.cap(
+                request, num_new_tokens, prefill=request.is_prefill_chunk
+            )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -1000,6 +1012,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            self.cmp_prefill_budget.charge(request, num_new_tokens)
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1330,6 +1343,12 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    num_new_tokens = self.cmp_prefill_budget.cap(
+                        request, num_new_tokens, prefill=not pad_spec_decode
+                    )
+                    if num_new_tokens == 0:
+                        # This step's prefill budget is spent.
+                        break
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1568,6 +1587,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                self.cmp_prefill_budget.charge(request, num_new_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
