@@ -137,15 +137,16 @@ Measured on **2× CMP 170HX, 170 W/card, PCIe Gen2 ×4/card**, on an image built
 with `docker build --no-cache` from this Dockerfile, with benchlib's
 SparkDash-compatible `public-v1` (SparkDash `3e6d4ef` protocol: greedy,
 thinking off, 400 output tokens, engine-direct). Values are medians of three
-complete runs. Decode in tokens/s; C2–C8 are aggregate throughput across that
-many simultaneous requests (at most four run at once, so C8 queues).
+complete runs. Decode in tokens/s; C2 and C4 are aggregate throughput across
+that many simultaneous requests. The recipe serves at most four sequences, so
+there is no C8 column.
 
-| Content | C1 | C2 total | C4 total | C8 total |
-| --- | ---: | ---: | ---: | ---: |
-| code | 76.5 | 109.9 | 151.4 | 137.0 |
-| json | 70.9 | 113.2 | 164.6 | 156.5 |
-| prose | 57.8 | 92.4 | 139.6 | 123.0 |
-| structured | 83.0 | 122.5 | 191.9 | 161.1 |
+| Content | C1 | C2 total | C4 total |
+| --- | ---: | ---: | ---: |
+| code | 76.5 | 109.9 | 151.4 |
+| json | 70.9 | 113.2 | 164.6 |
+| prose | 57.8 | 92.4 | 139.6 |
+| structured | 83.0 | 122.5 | 191.9 |
 
 Cold prefill, tokens/s:
 
@@ -153,7 +154,8 @@ Cold prefill, tokens/s:
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1,741 | 1,852 | 1,842 | 1,836 | 1,823 | 1,803 |
 
-[results.json](results.json) has every cell of the three runs, single-stream
+[results.json](results.json) has every cell of the three runs (including the
+protocol's C8 cells, where four requests wait in the queue), single-stream
 decode after 4K–128K prompts (benchlib's addition), the run IDs, the source
 fingerprint, the measured image ID and the EXL3 extension hash. A rebuild
 compiles its own extension and has its own image identity.

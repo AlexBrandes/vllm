@@ -51,14 +51,15 @@ pins, and its launch settings.
 
 These are our measurements on **2× CMP 170HX, 170 W/card, PCIe Gen2 ×4/card**.
 Decode uses the SparkDash `3e6d4ef` protocol: greedy sampling, thinking off,
-400 output tokens. Values are medians of three complete runs. C8 means total
-throughput across eight simultaneous requests, not the speed of each request.
+400 output tokens. Values are medians of three complete runs. C4 and C8 mean
+total throughput across four or eight simultaneous requests, not the speed of
+each request.
 
-| Recipe | Draft tokens | Code decode, C1 | Code decode, C8 total | Cold prefill, 32K |
+| Recipe | Code decode, C1 | Code decode, C4 total | Code decode, C8 total | Cold prefill, 32K |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.8-Flash-Next W4A16 · October 17 | 5 | 226.2 tok/s | 840.4 tok/s | 7,104 tok/s |
-| Qwen3.8-Flash-Next EXL3 · October 25 | 3 | 163.1 tok/s | 499.8 tok/s | 4,000 tok/s |
-| GLM-5.3-Flash EXL3 · November 5 | 3 | 76.5 tok/s | 137.0 tok/s | 1,836 tok/s |
+| Qwen3.8-Flash-Next W4A16 | 226.2 tok/s | 560.2 tok/s | 840.4 tok/s | 7,104 tok/s |
+| Qwen3.8-Flash-Next EXL3 | 163.1 tok/s | 355.5 tok/s | 499.8 tok/s | 4,000 tok/s |
+| GLM-5.3-Flash EXL3 | 76.5 tok/s | 151.4 tok/s | N/A | 1,836 tok/s |
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/c0db9613d146eda17338b84f2440ead5505f53c5#benchmarks)
 and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), and the
