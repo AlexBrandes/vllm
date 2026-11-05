@@ -17,6 +17,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
 )
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
     _HC_PRENORM_GEMM_TILELANG_KERNEL,
+    _MHC_FUSED_TILELANG_KERNEL,
     mhc_fused_post_pre_split_config,
 )
 from vllm.model_executor.kernels.mhc.torch import (
@@ -374,29 +375,6 @@ def test_deepseek_v41_mhc_overlap_preserves_outputs_on_replay(
         check(captured)
 
 
-def mhc_fused_post_pre_delayed_ref(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-    *mix_args: *tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, float, float, float, float, int
-    ],
-    pre_mix: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project the post result before it is rounded to BF16.
-
-    The fused kernel keeps the updated residual streams in registers, so its
-    projection sees the FP32 post result while the streams it stores are the
-    BF16 rounding of it.
-    """
-    post = torch.einsum("tij,tih->tjh", comb_res_mix, residual.float())
-    post = post + post_layer_mix * x.float().unsqueeze(-2)
-    return mhc_pre_delayed_torch(
-        post.bfloat16(), *mix_args, pre_mix=pre_mix, x=post.flatten(1)
-    )
-
-
 @pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
 @pytest.mark.parametrize("num_tokens", [0, 1, 8, 128])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
@@ -455,8 +433,8 @@ def test_deepseek_v41_mhc_fused_post_pre_delayed(num_tokens, hidden_size, carrie
     torch.testing.assert_close(residual_cur, residual_ref, atol=0, rtol=2**-7)
     torch.testing.assert_close(layer_input, layer_input_ref, atol=0, rtol=0)
 
-    post_ref, comb_ref, _, next_pre_ref = mhc_fused_post_pre_delayed_ref(
-        x, residual, post_layer_mix, comb_res_mix, *mix_args, pre_mix=pre_mix
+    post_ref, comb_ref, _, next_pre_ref = mhc_pre_delayed_torch(
+        residual_cur, *mix_args, pre_mix=pre_mix
     )
     # Above the fused kernel's token count the projection falls back to a
     # split-k TF32 GEMM over the stored BF16 streams.
@@ -1091,6 +1069,86 @@ def test_mhc_post_tilelang(num_tokens, hidden_size, hc_mult):
     )
 
     torch.testing.assert_close(out, ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
+def test_fused_mhc_statistics_use_the_stored_bf16_residual():
+    # The post mapping lands between BF16 values. Its following projection and
+    # RMS statistics must consume the same rounded residual as an unfused call.
+    hidden, hc, outputs = 4096, 4, 24
+    residual = torch.zeros((1, hc, hidden), dtype=torch.bfloat16, device=DEVICE)
+    x = torch.ones((1, hidden), dtype=torch.bfloat16, device=DEVICE)
+    post = torch.full((1, hc), 1 + 2**-9, dtype=torch.float32, device=DEVICE)
+    comb = torch.zeros((1, hc, hc), dtype=torch.float32, device=DEVICE)
+    weight = torch.full(
+        (outputs, hc, hidden), 1 / (hc * hidden), dtype=torch.float32, device=DEVICE
+    )
+    projection, sqrsum, stored = _MHC_FUSED_TILELANG_KERNEL(
+        comb, residual, post, x, weight, hc, hidden, outputs
+    )
+    torch.testing.assert_close(stored, torch.ones_like(stored), rtol=0, atol=0)
+    torch.testing.assert_close(
+        projection.sum(dim=0),
+        torch.ones((1, outputs), dtype=torch.float32, device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        sqrsum.sum(dim=0), stored.float().square().sum(dim=(1, 2)), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
+def test_tilelang_mhc_preserves_first_row_across_dispatch(monkeypatch):
+    monkeypatch.setattr("vllm.utils.deep_gemm.is_deep_gemm_supported", lambda: False)
+    monkeypatch.setattr(
+        "vllm.sm80.kernels.mhc.use_ampere_prefill_prenorm", lambda *_: False
+    )
+    monkeypatch.setattr(
+        "vllm.sm80.kernels.mhc.use_ampere_mhc_decode_v3",
+        lambda *args, **kwargs: False,
+    )
+    set_random_seed(19)
+    hidden, hc = 4096, 4
+    x = torch.randn((1, hidden), dtype=torch.bfloat16, device=DEVICE)
+    residual = torch.randn((1, hc, hidden), dtype=torch.bfloat16, device=DEVICE)
+    post = torch.rand((1, hc, 1), device=DEVICE)
+    comb = torch.randn((1, hc, hc), device=DEVICE).softmax(-1)
+    fn = torch.randn((hc * (hc + 2), hc * hidden), device=DEVICE) * 0.02
+    scale = torch.tensor([0.5, 0.25, 1.0], device=DEVICE)
+    base = torch.randn(hc * (hc + 2), device=DEVICE)
+    weight = torch.empty(hidden, dtype=torch.bfloat16, device=DEVICE).uniform_(0.5, 1.5)
+    expected = None
+    # Fused projection tiling, fusion cutoff, and both old pre-norm dispatch
+    # boundaries must leave an unchanged prefix row unchanged.
+    for rows in (1, 16, 32, 33, 128, 1024):
+        actual = torch.ops.vllm.mhc_fused_post_pre_tilelang(
+            x.expand(rows, -1).contiguous(),
+            residual.expand(rows, -1, -1).contiguous(),
+            post.expand(rows, -1, -1).contiguous(),
+            comb.expand(rows, -1, -1).contiguous(),
+            fn,
+            scale,
+            base,
+            1e-6,
+            1e-6,
+            1e-6,
+            2.0,
+            20,
+            norm_weight=weight,
+            norm_eps=1e-6,
+        )
+        if expected is None:
+            expected = tuple(tensor[:1].clone() for tensor in actual)
+        else:
+            for output, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(
+                    output[:1],
+                    reference,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda message, rows=rows: f"{rows} rows: {message}",
+                )
 
 
 @pytest.mark.skipif(

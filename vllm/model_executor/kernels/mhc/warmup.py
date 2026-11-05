@@ -8,6 +8,7 @@ from typing import Any
 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
     compute_num_split,
     mhc_pre_big_fuse_with_norm_tilelang,
+    mhc_prenorm_split_config,
 )
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.platforms import current_platform
@@ -51,9 +52,9 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
         extra_splits: Iterable[int] = (),
         **fields,
     ) -> list[CompileKey]:
-        # The split heuristic changes only at 64-token boundaries. Callers that
-        # reach this kernel through another GEMM (the fused post + pre-norm
-        # GEMM) pass the splits that GEMM picks in extra_splits.
+        # DeepGEMM splits change at 64-token boundaries; the FP32 fallback's
+        # geometry is fixed. Callers reaching this through another GEMM pass
+        # that kernel's split counts in extra_splits.
         splits = sorted(
             set(extra_splits)
             | (
@@ -62,7 +63,7 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
                     for num_tokens in range(1, max_tokens + 1, 64)
                 }
                 if is_deep_gemm_supported()
-                else {1}
+                else {mhc_prenorm_split_config(fields["rms_numel"])[0]}
             )
         )
         return self._trace_dispatch(self.dispatch)(n_splits=splits, **fields)

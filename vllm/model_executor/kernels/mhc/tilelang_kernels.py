@@ -54,26 +54,21 @@ def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     return split_k
 
 
-# ``mhc_fused_tilelang`` splits the hidden size across a fixed thread block, so
-# every (tile_n, n_thr) pair is one more kernel to compile. Tuned on GB300
-# (hc_mult 4, hidden_size 5120 and 7168) against the separate post + split-k
-# GEMM it replaces; the bands are coarse because the loss against a per-shape
-# optimum is ~1-2%, while one fixed config gives up to 18% at the top of the
-# range.
+# Fused and separate TileLang projections share flat-K splits and FP32
+# accumulation order. Projection tiles may vary with batching; reductions may
+# not, because tiny coefficient changes can cross downstream BF16 boundaries.
 _FUSED_POST_PRE_N_THR = 128
 _FUSED_POST_PRE_MAX_TOKENS = 32
-# At up to this many tokens the grid is too small to hide the latency of each
-# thread's serial loads, so when the hidden size allows, a twice wider block
-# over twice as many k-slices gives every thread a single pass instead of four
-# (hidden_size 4096, fused post + pre op on GB300 and SM120: 1.11-1.19x at one
-# token, 0.99-1.05x at four, no gain from five on). Tuned on SM100+ only.
-_FUSED_POST_PRE_SINGLE_PASS_MAX_TOKENS = 4
-_FUSED_POST_PRE_SINGLE_PASS = (2, 16, 256)
 
 
-@cache
-def _fused_post_pre_single_pass_supported() -> bool:
-    return current_platform.is_cuda() and current_platform.has_device_capability(100)
+def mhc_prenorm_split_config(input_size: int) -> tuple[int, int]:
+    """Return the batch-independent ``(n_splits, n_thr)`` for FP32 projection."""
+    n_thr = _FUSED_POST_PRE_N_THR
+    assert input_size > 0 and input_size % n_thr == 0
+    n_splits = 8
+    while input_size % (n_splits * n_thr):
+        n_splits //= 2
+    return n_splits, n_thr
 
 
 def mhc_fused_post_pre_split_config(
@@ -81,37 +76,21 @@ def mhc_fused_post_pre_split_config(
 ) -> tuple[int, int, int] | None:
     """Pick ``(tile_n, n_splits, n_thr)`` for the fused post + pre-norm GEMM.
 
-    Returns None when a separate post kernel followed by a split-k GEMM is the
-    better choice, or when the hidden size does not divide evenly across the
-    fused kernel's block. One source of truth for the dispatch decision, the
-    compile key and the launch, which must agree.
+    Returns None above the fusion token limit or when the hidden size does not
+    divide evenly across the fused kernel's block. One source of truth for the
+    dispatch decision, the compile key and the launch, which must agree.
     """
     if num_tokens > _FUSED_POST_PRE_MAX_TOKENS:
         return None
-    tile_n, n_splits, n_thr = _FUSED_POST_PRE_SINGLE_PASS
-    if (
-        num_tokens <= _FUSED_POST_PRE_SINGLE_PASS_MAX_TOKENS
-        and hidden_size == n_splits * n_thr
-        and (hc_mult * (hc_mult + 2)) % tile_n == 0
-        and _fused_post_pre_single_pass_supported()
-    ):
-        return tile_n, n_splits, n_thr
-    n_thr = _FUSED_POST_PRE_N_THR
-    if hidden_size % n_thr:
+    if hidden_size % _FUSED_POST_PRE_N_THR:
         return None
-    # The projection tiles supply the parallelism a small token count cannot,
-    # so the tile grows with the batch: 1.3x at one token and 1.03x at 32
-    # against a split-k GEMM given the split its own estimator computes.
-    if num_tokens < 16:
-        tile_n, n_splits = 2, 8
-    else:
-        tile_n, n_splits = 6, 8
-    # The kernel drops projection tiles and k-slices it cannot fill evenly.
+    n_splits, n_thr = mhc_prenorm_split_config(hidden_size * hc_mult)
+    # Column tiling changes parallelism without changing any dot product.
+    tile_n = 2 if num_tokens < 16 else 6
+    # Do not drop a partial projection tile.
     mix_size = hc_mult * (hc_mult + 2)
     while tile_n > 1 and mix_size % tile_n:
         tile_n -= 1
-    while n_splits > 1 and hidden_size % (n_splits * n_thr):
-        n_splits //= 2
     return tile_n, n_splits, n_thr
 
 
@@ -712,7 +691,7 @@ def mhc_fused_tilelang(
     split_k = T.dynamic("split_k")
     h = hidden
     h_blk = math.gcd(hidden, h_blk)
-    h_per_split = h // split_k
+    k_per_split = hc * h // split_k
     n_tiles = n_out // tile_n
 
     comb_mix: T.Tensor((m, hc, hc), T.float32)  # type: ignore[no-redef, valid-type]
@@ -724,7 +703,7 @@ def mhc_fused_tilelang(
     rp_out: T.Tensor((split_k, m), T.float32)  # type: ignore[no-redef, valid-type]
     residual_out: T.Tensor((m, hc, h), T.bfloat16)  # type: ignore[no-redef, valid-type]
 
-    h_iters = h_per_split // n_thr
+    k_iters = k_per_split // n_thr
     num_warps = n_thr // 32
 
     with T.Kernel(m, n_tiles, split_k, threads=n_thr) as (i_n, i_nt, i_ks):
@@ -736,15 +715,13 @@ def mhc_fused_tilelang(
         s_post = T.alloc_shared((hc,), T.float32)
         s_comb = T.alloc_shared((hc, hc), T.float32)
 
-        pm = T.alloc_local((hc,), T.float32)
-        cm = T.alloc_local((hc, hc), T.float32)
         acc = T.alloc_local((tile_n,), T.float32)
         sqr = T.alloc_local((1,), T.float32)
-        new_r = T.alloc_local((hc,), T.float32)
+        new_r = T.alloc_local((1,), T.float32)
 
         T.clear(acc)
         T.clear(sqr)
-        h_split_start = i_ks * h_per_split
+        k_split_start = i_ks * k_per_split
 
         if ENABLE_PDL:
             T.pdl_sync()
@@ -752,32 +729,38 @@ def mhc_fused_tilelang(
         T.copy(post_mix[i_n, 0], s_post)
         T.copy(comb_mix[i_n, 0, 0], s_comb)
 
-        for j in T.unroll(hc):
-            pm[j] = s_post[j]
-        for j in T.unroll(hc):
+        # Match the separate pre-norm kernel's flat-K traversal exactly.
+        for it in T.serial(k_iters):
+            i_k = k_split_start + it * n_thr + tid
+            j = i_k // h
+            h_idx = i_k % h
+            new_r[0] = T.call_pure_extern(
+                "float32", "__fmul_rn", s_post[j], T.float32(x_in[i_n, h_idx])
+            )
             for k in T.unroll(hc):
-                cm[k, j] = s_comb[k, j]
+                new_r[0] = T.call_pure_extern(
+                    "float32",
+                    "__fmaf_rn",
+                    s_comb[k, j],
+                    T.float32(residual_in[i_n, k, h_idx]),
+                    new_r[0],
+                )
+            # Post writes BF16 before the next pre block, including when fused.
+            new_r[0] = T.float32(T.bfloat16(new_r[0]))
 
-        # Each thread owns h_iters elements of the k-split's h slice.
-        for it in T.serial(h_iters):
-            h_idx = h_split_start + it * n_thr + tid
-
-            # Compute new residual from layer output and past residual
-            for j in T.unroll(hc):
-                new_r[j] = pm[j] * x_in[i_n, h_idx]
-                for k in T.unroll(hc):
-                    new_r[j] += cm[k, j] * residual_in[i_n, k, h_idx]
-
-            # populate residual_out and compute sqr sum
             if i_nt == 0:
-                for j in T.unroll(hc):
-                    residual_out[i_n, j, h_idx] = new_r[j]
-                    sqr[0] += new_r[j] * new_r[j]
-
-            # Per-thread FMA into acc[n]
+                residual_out[i_n, j, h_idx] = new_r[0]
+                sqr[0] = T.call_pure_extern(
+                    "float32", "__fmaf_rn", new_r[0], new_r[0], sqr[0]
+                )
             for n in T.unroll(tile_n):
-                for j in T.unroll(hc):
-                    acc[n] += weight_t[i_nt * tile_n + n, j, h_idx] * new_r[j]
+                acc[n] = T.call_pure_extern(
+                    "float32",
+                    "__fmaf_rn",
+                    new_r[0],
+                    weight_t[i_nt * tile_n + n, j, h_idx],
+                    acc[n],
+                )
 
         for n in T.unroll(tile_n):
             acc[n] = T.warp_reduce_sum(acc[n])
@@ -854,9 +837,17 @@ def mhc_post_tilelang(
             T.copy(b_shared, b_local)
             T.copy(d_shared, d_local)
             for i_hco, i1_h in T.Parallel(hc, h_blk):
-                x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+                x_local[i_hco, i1_h] = T.call_pure_extern(
+                    "float32", "__fmul_rn", c_local[i_hco], d_local[i1_h]
+                )
                 for i_hci in T.vectorized(hc):
-                    x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+                    x_local[i_hco, i1_h] = T.call_pure_extern(
+                        "float32",
+                        "__fmaf_rn",
+                        a_local[i_hci, i_hco],
+                        b_local[i_hci, i1_h],
+                        x_local[i_hco, i1_h],
+                    )
 
             T.copy(x_local, x[i_n, 0, i0_h * h_blk])
         if ENABLE_PDL:
@@ -907,9 +898,13 @@ def hc_prenorm_gemm_tilelang(
             for i_o in T.unroll(tile_n):
                 out_idx = i_t * tile_n + i_o
                 if out_idx < n_out:
-                    acc[i_o] += x_val * fn[out_idx, i_k]
+                    acc[i_o] = T.call_pure_extern(
+                        "float32", "__fmaf_rn", x_val, fn[out_idx, i_k], acc[i_o]
+                    )
             if i_t == 0:
-                sqr[0] += x_val * x_val
+                sqr[0] = T.call_pure_extern(
+                    "float32", "__fmaf_rn", x_val, x_val, sqr[0]
+                )
 
         for i_o in T.unroll(tile_n):
             acc[i_o] = T.warp_reduce_sum(acc[i_o])
@@ -1199,19 +1194,18 @@ class HcPrenormGemmTileLangKernel(
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         if max_tokens <= 0:
             return []
-        return self._trace_dispatch(self.dispatch)(
-            num_tokens=WarmupIntRange(
-                1,
-                max_tokens + 1,
-                advance=lambda value: (
-                    128 if value < 128 else 1024 if value < 1024 else max_tokens + 1
-                ),
-            ),
-            hc_hidden_size=hidden_size * hc_mult,
-            hidden_size=hidden_size,
-            hc_mult=hc_mult,
-            n_out=n_out,
-        )
+        n_splits, n_thr = mhc_prenorm_split_config(hidden_size * hc_mult)
+        return [
+            self.dispatch(
+                num_tokens=1,
+                hc_hidden_size=hidden_size * hc_mult,
+                hidden_size=hidden_size,
+                hc_mult=hc_mult,
+                n_out=n_out,
+                n_splits=n_splits,
+                n_thr=n_thr,
+            )
+        ]
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
         num_tokens = 128
@@ -1440,24 +1434,28 @@ class MhcPreBigFuseTileLangKernel(
                 use_pre_gemm_splits=False,
                 pre_gemm_k=0,
                 use_fused_tilelang=False,
+                n_splits=1,
             ),
             dict(
                 is_broadcast=False,
                 use_pre_gemm_splits=include_pre_gemm_splits,
                 pre_gemm_k=hc_mult * hidden_size,
                 use_fused_tilelang=False,
+                n_splits=mhc_prenorm_split_config(hc_mult * hidden_size)[0],
             ),
             dict(
                 is_broadcast=include_broadcast_splits,
                 use_pre_gemm_splits=include_broadcast_splits,
                 pre_gemm_k=hidden_size,
                 use_fused_tilelang=False,
+                n_splits=mhc_prenorm_split_config(hidden_size)[0],
             ),
             dict(
                 is_broadcast=False,
                 use_pre_gemm_splits=False,
                 pre_gemm_k=0,
                 use_fused_tilelang=True,
+                n_splits=mhc_prenorm_split_config(hc_mult * hidden_size)[0],
             ),
         )
         return self._trace_dispatch(self.dispatch)(
@@ -1467,7 +1465,6 @@ class MhcPreBigFuseTileLangKernel(
                 max_tokens + 1,
                 advance=lambda value: 8 if value < 8 else cdiv(value, 64) * 64 + 1,
             ),
-            n_splits=1,
             hidden_size=hidden_size,
             hc_mult=hc_mult,
             use_norm_weight=use_norm_weight,
