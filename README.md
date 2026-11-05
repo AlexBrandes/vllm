@@ -42,6 +42,7 @@ Each recipe pins the exact engine it was validated with.
 | --- | --- | --- | --- |
 | Qwen3.8-Flash-Next | W4A16 AutoRound | PP2 / TP1 | [W4A16 production recipe](recipes/qwen-flash-next-w4a16/README.md) — pinned container, download and launch scripts |
 | Qwen3.8-Flash-Next | EXL3 5.05 bpw | PP2 / TP1 | [EXL3 recipe](recipes/qwen-flash-next-exl3/README.md) — source-built container and the validated serving configuration |
+| GLM-5.3-Flash | EXL3 2.60 bpw | PP2 / TP1 | [EXL3 recipe](recipes/glm53-flash-exl3/README.md) — source-built container on the plugin layout, image and video input, DFlash2 drafter |
 
 Each recipe lists its hardware, storage and software requirements, its engine
 pins, and its launch settings.
@@ -57,9 +58,11 @@ throughput across eight simultaneous requests, not the speed of each request.
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3.8-Flash-Next W4A16 · October 17 | 5 | 226.2 tok/s | 840.4 tok/s | 7,104 tok/s |
 | Qwen3.8-Flash-Next EXL3 · October 25 | 3 | 163.1 tok/s | 499.8 tok/s | 4,000 tok/s |
+| GLM-5.3-Flash EXL3 · November 5 | 3 | 76.5 tok/s | 137.0 tok/s | 1,836 tok/s |
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/c0db9613d146eda17338b84f2440ead5505f53c5#benchmarks)
-and [EXL3 results](recipes/qwen-flash-next-exl3/results.json) identify their engine,
+and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), and the
+[GLM-5.3-Flash results](recipes/glm53-flash-exl3/results.json), identify their engine,
 configuration, and measurement runs. Each row measures a **whole recipe**: engine
 version, quantization, speculative depth and runtime settings differ between
 rows. Performance also depends on prompt content, concurrency, cooling, and
