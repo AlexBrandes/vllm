@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     VLLM_MIXED_PREFILL_CHUNK: int = 0
+    VLLM_PLE_DISK_READ_THREADS: int = 32
     # Type and default of each variable in FORK_ENV_VARS. Readers use
     # ``vllm.envs.X``, which resolves through vllm.envs.__getattr__.
     VLLM_AMPERE_MARLIN_BUILD: bool = False
@@ -608,6 +609,11 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # oldest-first (vllm_cmp170hx.sched.prefill_budget). 0 = off.
     "VLLM_MIXED_PREFILL_CHUNK": lambda: int(
         os.getenv("VLLM_MIXED_PREFILL_CHUNK", "0") or 0
+    ),
+    # Threads of the page-cache gather that reads Qwen4Exp's disk-offload PLE
+    # rows (vllm_cmp170hx.ple.disk_reader). 0 = upstream's serial preadv.
+    "VLLM_PLE_DISK_READ_THREADS": lambda: int(
+        os.getenv("VLLM_PLE_DISK_READ_THREADS", "32") or 0
     ),
     # Pipeline parallelism (V2 runner, TP=1): send each stage hand-off as one
     # flat device transfer instead of one per tensor (the GLM-5.3-Flash

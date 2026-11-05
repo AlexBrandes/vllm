@@ -1628,3 +1628,24 @@ seams:
   why: Exl3Experts implements this support check; FusedMoEExperts.is_supported_config must still call it with the MoE parallel config
   sha256: 68f0bee185b609b1374f9e0f5e0d5225e4a110d6b468d128e6ecb4acde0e9736
   signature: '(moe_parallel_config: vllm.model_executor.layers.fused_moe.config.FusedMoEParallelConfig) -> bool'
+
+- id: ple-disk-offload-accept-shard
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpPLEDiskOffloadEmbedding.accept_checkpoint_shard
+  why: ple.disk_reader locates shard i's ids as [i * _shard_size, (i + 1) * _shard_size) of org_vocab_size; this method records _shard_size, and row bytes are the plane's stored row as is
+  sha256: 6b0968cbca8ac56593216b40edc3536ef8f8db51f164cf8fed62e020d1f271ba
+  signature: '(self, shard_index: int, loaded_weight: torch.Tensor, shard_size: int, name: str) -> None'
+
+- id: ple-disk-offload-bind-file-shards
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpPLEDiskOffloadEmbedding.bind_file_shards
+  why: ple.disk_reader maps the files of _sources[name] = (fds, byte offsets), indexed by shard, which this method records from the loader's file-backed views
+  sha256: fd5c36a091b843f91a32670da91301f1474abc036812fe89e2cbf333240938a1
+  signature: '(self) -> None'
+
+- id: ple-disk-offload-stage-rows
+  kind: method
+  target: vllm.models.qwen4_exp.nvidia.ngram_embedding:Qwen4ExpPLEDiskOffloadEmbedding.stage_rows
+  why: ple.disk_reader is called through the _read_rows hook with sorted distinct ids already range-checked here, so its gather does no bounds check of its own
+  sha256: 3516ceafeb49b2623be5fa8633dc00747593a364b6d7df3ea8f7e9c4962c63c9
+  signature: '(self, num_tokens: int) -> None'

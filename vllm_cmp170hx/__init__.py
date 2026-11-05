@@ -22,6 +22,8 @@
 - ``sched``: the fork scheduler (fair chunked prefill, PP decode spreading,
   homogeneous PP steps, adaptive draft depth) and ``sched.prefill_budget``
   (VLLM_MIXED_PREFILL_CHUNK), which the vLLM branch's scheduler hooks call.
+- ``ple``: Qwen4Exp PLE row reads the vLLM branch's model hooks call
+  (``disk_reader``: VLLM_PLE_DISK_READ_THREADS).
 - ``plugin`` and ``guard``: the ``vllm.general_plugins`` entry point
   ``cmp170hx``, which registers the GLM-5.3 model code and ``kernels.exl3``,
   and the startup check that it loaded.
