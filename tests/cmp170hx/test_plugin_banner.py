@@ -31,6 +31,6 @@ def test_register_logs_once_per_process(monkeypatch):
 
     assert len(recorder.lines) == 1
     assert recorder.lines[0].startswith(
-        f"sm80 plugin registered ({guard.DISTRIBUTION} "
+        f"cmp170hx plugin registered ({guard.DISTRIBUTION} "
     )
     assert plugin.is_registered()

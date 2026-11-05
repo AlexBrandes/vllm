@@ -231,6 +231,7 @@ def _glm5_config(
         # against the visible GPUs, and only the grouping reads it here.
         config.parallel_config.pipeline_parallel_size = len(partition.split(","))
     config.speculative_config = SimpleNamespace(
+        speculator_config=SimpleNamespace(num_prefill_lookahead_tokens=0),
         method="dflash",
         num_speculative_tokens=3,
         parallel_drafting=True,

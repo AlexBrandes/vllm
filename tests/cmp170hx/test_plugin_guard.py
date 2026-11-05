@@ -30,10 +30,13 @@ def test_distribution_declares_the_register_entry_point():
     assert _entry_point() == "vllm_cmp170hx.plugin:register"
 
 
-def test_distribution_declares_no_platform_plugin():
-    """The fork runs on upstream's CUDA platform."""
+def test_distribution_declares_the_platform_plugin():
+    """The fork's CUDA platform comes from the same distribution."""
     data = tomllib.loads(PYPROJECT.read_text())
-    assert vllm.plugins.PLATFORM_PLUGINS_GROUP not in data["project"]["entry-points"]
+    platform_plugins = data["project"]["entry-points"][
+        vllm.plugins.PLATFORM_PLUGINS_GROUP
+    ]
+    assert platform_plugins == {"cmp170hx": "vllm_cmp170hx.plugin:platform_plugin"}
 
 
 def test_guard_ignores_a_process_without_plugins(monkeypatch):

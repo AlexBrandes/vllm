@@ -77,9 +77,8 @@ def test_plugin_registers_the_fork_variables():
 
 
 def test_the_import_time_readers_are_found():
-    # Reached from upstream's quantization config table through the
-    # DeepSeek V4.1 model code, whatever the checkpoint.
-    assert "vllm_cmp170hx.models.deepseek_v41.ops.sm80_mhc_side" in IMPORT_TIME_READERS
+    # Modules that read a fork variable when imported.
+    assert "vllm_cmp170hx.hot_swap" in IMPORT_TIME_READERS
 
 
 @pytest.mark.parametrize("module", IMPORT_TIME_READERS)

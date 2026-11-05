@@ -17,10 +17,8 @@
 - ``shard_tokens`` (Triton interpreter, one rank) is torch.argmax's over the
   row cut at the vocabulary, with ties, NaN, signed zeros and junk in the
   padding columns, in FP32 and BF16.
-- The target classes the switch reaches (DeepSeek-V4.1, GLM-5.3, Qwen4Exp on
-  sm_80) put ``ShardArgmaxLogits`` before their upstream class; the Qwen4Exp
-  classes add this rank's vocabulary shard of the logits and describe
-  themselves as the upstream classes they replace.
+- The target classes the switch reaches (GLM-5.3 on sm_80) put
+  ``ShardArgmaxLogits`` before their upstream class.
 
     python -m pytest -q tests/cmp170hx/test_shard_argmax.py
 """
@@ -316,8 +314,7 @@ def _load(qualified: str) -> type:
 
 @pytest.mark.parametrize(
     "architecture",
-    ["DeepseekV41ForCausalLM", "Glm5NextForCausalLM",
-     "Glm5NextForConditionalGeneration", "Qwen4ExpForConditionalGeneration"],
+    ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"],
 )
 def test_reached_targets_serve_greedy_steps(architecture):
     from vllm_cmp170hx import plugin
@@ -327,58 +324,3 @@ def test_reached_targets_serve_greedy_steps(architecture):
     assert cls.__bases__[0] is ShardArgmaxLogits and cls.__name__ == architecture
     assert cls.compute_logits is ShardArgmaxLogits.compute_logits
     assert cls.target_argmax_logits and hasattr(cls, "compute_logits_local")
-
-
-@pytest.mark.parametrize(
-    "architecture, module",
-    [("Qwen4ExpForConditionalGeneration", "model"), ("Qwen4ExpMTP", "mtp")],
-)
-def test_qwen_classes_match_upstream(architecture, module):
-    from vllm.model_executor.models.registry import ModelRegistry, _ModelInfo
-    from vllm_cmp170hx import plugin
-
-    upstream = getattr(importlib.import_module(f"vllm.models.qwen4_exp.nvidia.{module}"),
-                       architecture)
-    plugin.register_models()
-    cls = _load(plugin.MODEL_OVERRIDES[architecture])
-    assert ModelRegistry._try_load_model_cls(architecture) is cls
-    assert cls.__bases__[-1] is upstream and cls.__name__ == architecture
-    assert _ModelInfo.from_model_cls(cls) == _ModelInfo.from_model_cls(upstream)
-
-
-def test_qwen_classes_shard_the_logits(monkeypatch):
-    from vllm_cmp170hx import plugin
-    from vllm_cmp170hx.worker import target_argmax as ta
-
-    calls = []
-
-    def processor(head, h, skip_gather=False):
-        calls.append((head, skip_gather))
-        return h
-
-    head = object()
-    target_cls = _load(plugin.MODEL_OVERRIDES["Qwen4ExpForConditionalGeneration"])
-    model = target_cls.__new__(target_cls)
-    torch.nn.Module.__init__(model)
-    model.language_model = SimpleNamespace(
-        lm_head=head, logits_processor=processor,
-        compute_logits=lambda h: calls.append(("gather",)) or h,
-    )
-    h = torch.zeros(2, 4)
-    assert model.compute_logits_local(h) is h
-    assert calls == [(head, True)]
-    # Outside a greedy-only step the gathered logits, inside the argmax rows.
-    calls.clear()
-    assert model.compute_logits(h) is h
-    assert calls == [("gather",)]
-    monkeypatch.setattr(ta, "_active", True)
-    monkeypatch.setattr(ta, "argmax_rows", lambda m, x: ("rows", m, x))
-    assert model.compute_logits(h) == ("rows", model, h)
-
-    mtp_cls = _load(plugin.MODEL_OVERRIDES["Qwen4ExpMTP"])
-    mtp = mtp_cls.__new__(mtp_cls)
-    torch.nn.Module.__init__(mtp)
-    mtp.lm_head, mtp.logits_processor = head, processor
-    calls.clear()
-    assert mtp.compute_logits_local(h, 1) is h
-    assert calls == [(head, True)]
