@@ -28,6 +28,7 @@ def check_plugin_loaded() -> None:
     from vllm_cmp170hx import plugin
 
     if plugin.is_registered():
+        check_platform()
         return
     raise RuntimeError(
         f"vLLM loaded its general plugins, but not the fork's plugin "
@@ -36,4 +37,33 @@ def check_plugin_loaded() -> None:
         f"source tree). If VLLM_PLUGINS is set, it must include {PLUGIN_NAME!r}. "
         f"If the distribution is installed, the log above has "
         f"'Failed to load plugin {PLUGIN_NAME}' with the reason."
+    )
+
+
+def check_platform() -> None:
+    """Raise if the fork's plugin is loaded on CUDA without the fork's platform.
+
+    The general plugin and the platform plugin come from the same
+    distribution, but ``VLLM_PLUGINS`` filters both groups by name and a
+    platform plugin that fails during detection is only logged at debug level
+    (``vllm.platforms.resolve_current_platform_cls_qualname``). The platform
+    then silently stays upstream's.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return
+    from vllm_cmp170hx.platform import PLATFORM_CLASSES
+
+    if isinstance(current_platform, PLATFORM_CLASSES):
+        return
+    raise RuntimeError(
+        f"The fork's plugin {PLUGIN_NAME!r} is loaded, but the CUDA platform is "
+        f"{type(current_platform).__module__}.{type(current_platform).__name__}, "
+        f"not the fork's platform from the same distribution ({DISTRIBUTION}, "
+        f"vllm.platform_plugins entry point {PLUGIN_NAME} = "
+        f"vllm_cmp170hx.plugin:platform_plugin). Reinstall "
+        f"the distribution (pip install --no-deps .) so its "
+        f"metadata lists both entry points; if VLLM_PLUGINS is set, it must "
+        f"include {PLUGIN_NAME!r}."
     )

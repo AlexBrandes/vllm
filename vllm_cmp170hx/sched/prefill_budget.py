@@ -38,7 +38,7 @@ class PrefillBudget:
     def __init__(self, scheduler: "Scheduler") -> None:
         # The scheduler can be built in a process where the general plugin
         # did not run (unit tests); the variable must still resolve.
-        plugin.register_env_vars()
+        plugin.register_fork_env_vars()
         self.scheduler = scheduler
         self.chunk: int = envs.VLLM_MIXED_PREFILL_CHUNK
         # Prefill tokens left in this step; None while no budget applies.

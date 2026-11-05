@@ -32,7 +32,7 @@ def _budget(monkeypatch, chunk, scheduler) -> PrefillBudget:
 
 
 def test_env_var_is_registered_with_vllm():
-    plugin.register_env_vars()
+    plugin.register_fork_env_vars()
     for name, getter in FORK_ENV_VARS.items():
         assert envs.environment_variables[name] is getter
 

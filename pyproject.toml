@@ -1,13 +1,21 @@
-# The CMP 170HX plugin for vLLM: the vllm_cmp170hx package. vLLM calls
-# vllm_cmp170hx.plugin:register at startup (vllm.general_plugins entry point
-# "cmp170hx"), and vllm_cmp170hx/guard.py, called from the vLLM branch's hook
-# in VllmConfig.__post_init__, stops vLLM at startup when the plugin is missing.
+# The CMP 170HX plugin for vLLM: the vllm_cmp170hx package and its compiled
+# extensions (vllm_cmp170hx/_exl3_C.abi3.so and
+# vllm_cmp170hx/_ampere_marlin_C.abi3.so, built from csrc/ by
+# csrc/*/build_standalone.py). vLLM calls vllm_cmp170hx.plugin:register at
+# startup (vllm.general_plugins entry point "cmp170hx") and selects the
+# plugin's CUDA platform through vllm_cmp170hx.plugin:platform_plugin
+# (vllm.platform_plugins entry point "cmp170hx"); vllm_cmp170hx/guard.py,
+# called from the vLLM branch's hook in VllmConfig.__post_init__, stops vLLM at
+# startup when the plugin is missing.
 #
 # An engine is a vLLM branch (vllm/<upstream10>: upstream vLLM plus the fork's
 # commits) built as usual, with this package installed beside it:
 #   pip install --no-deps .
 # For a source tree used through PYTHONPATH, tools/cmp170hx/assemble.py writes
 # the entry-point metadata next to the package instead.
+#
+# licenses/exl3/ holds LICENSE and NOTICE (MIT grant of the adapted ExLlamaV3
+# code), so every install of the plugin carries them in its dist-info.
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -15,18 +23,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-cmp170hx"
-version = "0.1.0"
+version = "0.2.0"
 description = "vLLM plugin for the NVIDIA CMP 170HX"
-license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license = "Apache-2.0 AND MIT"
+license-files = ["LICENSE", "NOTICE", "licenses/exl3/LICENSE", "licenses/exl3/NOTICE"]
 requires-python = ">=3.10"
 
 [project.entry-points."vllm.general_plugins"]
 cmp170hx = "vllm_cmp170hx.plugin:register"
 
+[project.entry-points."vllm.platform_plugins"]
+cmp170hx = "vllm_cmp170hx.plugin:platform_plugin"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_cmp170hx*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.toml", "*.json", "*.so"]
 
 [tool.ruff]
 line-length = 88
