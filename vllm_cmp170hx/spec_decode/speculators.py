@@ -6,10 +6,11 @@ first and builds its own speculator when it returns None.
 
 - ``dspark``: :func:`vllm_cmp170hx.spec_decode.dspark_width.create_dspark_speculator`
   (draft widths, shard argmax, the DSpark switches).
-- ``dflash`` with a plain DFlash2 drafter (``DFlash2DraftModel``,
-  ``DFlash2BeamDraftModel``; not XPress or LiLiCorr, which vLLM's chain
-  picks first): :class:`Sm80DFlash2Speculator` (load-following draft width,
-  split draft tail).
+- the speculator vLLM resolves to its DFlash2 speculator
+  (``speculative_config.speculator_config.speculator_class``):
+  :class:`Sm80DFlash2Speculator`, its subclass (load-following draft width,
+  split draft tail). vLLM's own resolution decides which DFlash-family
+  speculator a draft checkpoint gets (XPress, LiLiCorr, DFlash2, ...).
 
 Everything else is vLLM's own speculator.
 """
@@ -17,9 +18,9 @@ Everything else is vLLM's own speculator.
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.speculative import XPRESS_ARCHITECTURES
 
-_DFLASH2_ARCHITECTURES = frozenset({"DFlash2DraftModel", "DFlash2BeamDraftModel"})
+# The upstream speculator Sm80DFlash2Speculator extends.
+UPSTREAM_DFLASH2 = "vllm.v1.worker.gpu.spec_decode.dflash2.speculator.DFlash2Speculator"
 
 
 def create_speculator(vllm_config: VllmConfig, device: torch.device):
@@ -30,14 +31,8 @@ def create_speculator(vllm_config: VllmConfig, device: torch.device):
         from vllm_cmp170hx.spec_decode.dspark_width import create_dspark_speculator
 
         return create_dspark_speculator(vllm_config, device)
-    if speculative_config.method != "dflash":
-        return None
-    architectures = speculative_config.draft_model_config.architectures
-    if (
-        any(arch in XPRESS_ARCHITECTURES for arch in architectures)
-        or "LiLiCorrDraftModel" in architectures
-        or not _DFLASH2_ARCHITECTURES.intersection(architectures)
-    ):
+    speculator_config = speculative_config.speculator_config
+    if getattr(speculator_config, "speculator_class", None) != UPSTREAM_DFLASH2:
         return None
     from vllm_cmp170hx.spec_decode.dflash2_speculator import Sm80DFlash2Speculator
 
