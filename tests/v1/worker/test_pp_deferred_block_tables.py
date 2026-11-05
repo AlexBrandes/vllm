@@ -75,10 +75,11 @@ def _fake_runner(align_mode: bool, step_idx_mapping: torch.Tensor):
         num_sampled=torch.ones(3, dtype=torch.int32),
         num_rejected=torch.zeros(3, dtype=torch.int32),
         idx_mapping=torch.tensor([5, -1, 7], dtype=torch.int32),
+        draft_tokens=None,
         step_idx_mapping=step_idx_mapping,
     )
     runner = SimpleNamespace(
-        pp_handler=SimpleNamespace(get_prev_sampled_outputs=lambda _d: dict(outputs)),
+        pp_handler=SimpleNamespace(get_prev_sampled_outputs=lambda: dict(outputs)),
         req_states=SimpleNamespace(draft_tokens=None),
         model_state=SimpleNamespace(_align_mode=align_mode),
         block_tables=SimpleNamespace(

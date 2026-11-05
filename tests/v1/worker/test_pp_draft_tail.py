@@ -27,6 +27,11 @@ import vllm.v1.worker.gpu.pp_utils as pp_utils
 from vllm_cmp170hx.worker import pp_draft_tail as dt
 from vllm_cmp170hx.worker.pp_handler import Sm80PPHandler
 
+pytestmark = pytest.mark.skip(
+    reason="the draft tail and the split draft event are refused on this vLLM base "
+    "(vllm-project/vllm#63219 moved PP drafts to per-step slots)"
+)
+
 FLAG = "VLLM_PP_DRAFT_TAIL_STAGE"
 
 # --------------------------------------------------------------------------
