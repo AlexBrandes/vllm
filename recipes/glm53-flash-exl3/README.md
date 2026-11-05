@@ -21,7 +21,7 @@ at [`2a4e137909`](https://github.com/AlexBrandes/vllm/commit/2a4e1379093a84fd085
   EXL3 kernels.
 - NVIDIA driver 580 or newer (CUDA 13.0), Docker and the NVIDIA Container Toolkit.
 - About 110 GB of NVMe storage for the checkpoint, 2.3 GB for the drafter, plus
-  the engine image (8.3 GB) and compilation caches.
+  the engine image (about 26 GB once built) and compilation caches.
 - A working Hugging Face `hf` CLI to download the checkpoint and drafter.
 
 The launcher does **not** modify drivers, power limits, PCIe settings, host page
