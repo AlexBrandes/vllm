@@ -96,6 +96,24 @@ upstream commit, which a source tree does not have.
 For an installed engine, build vLLM from the vLLM branch and install the
 plugin beside it with `pip install --no-deps .` from this branch.
 
+## Code shared with vllm-sm80
+
+The plugin's sm_80 code for GLM-5.3-Flash (model, layer and op overrides, the
+fork CUDA platform and scheduler, the DFlash drafters, the attention, indexer,
+KDA, mHC, MoE and Marlin kernels, KV planning and the PP handler) is
+vllm-sm80's, taken from its `plugin-dev` at `b2c9487dd5` and renamed to
+`vllm_cmp170hx`; its queue hooks for those parts are commits on the vLLM
+branch. Only what GLM-5.3 reaches is carried: DeepSeek-V4.1, Qwen4Exp and
+vllm-sm80's launcher are not, and GLM-5.3 is the only architecture the plugin
+replaces. EXL3 (`vllm_cmp170hx/kernels/exl3`, `csrc/exl3`) is this fork's own
+line, not vllm-sm80's later EXL3.
+
+To bring in later vllm-sm80 changes, diff their `plugin-dev` between
+`b2c9487dd5` and the new commit, keep the files this plugin carries, rename
+`vllm_sm80` to `vllm_cmp170hx` (and `tests/sm80` to `tests/cmp170hx`), and apply
+the result with a three-way merge. Queue changes for upstream files go to the
+matching feature commit on the vLLM branch.
+
 ## Contributing to vllm-sm80
 
 Morrowmake's vllm-sm80 uses the same layout under `vllm_sm80/`. Their changes
