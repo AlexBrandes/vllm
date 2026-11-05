@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 """Utility methods for model layers."""
 
 import functools
@@ -864,6 +866,10 @@ def dispatch_unquantized_gemm(
         return cpu_unquantized_gemm
     elif not current_platform.is_cuda():
         return default_unquantized_gemm
+    if envs.VLLM_THIN_GEMM:  # sm_80 thin-M BF16 GEMM (vllm_cmp170hx/kernels/thin_gemm/)
+        from vllm_cmp170hx.kernels.thin_gemm import ampere_thin_gemm, use_ampere_thin_gemm
+        if use_ampere_thin_gemm():
+            return ampere_thin_gemm
 
     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
     if backend_spec is None:

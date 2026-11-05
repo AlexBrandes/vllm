@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 import torch
 
+from vllm_cmp170hx.kernels import mhc as sm80_mhc
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -42,6 +45,8 @@ def _hc_prenorm_gemm_outputs(
     )
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
+    elif sm80_mhc.try_prenorm(x, fn, out, sqrsum, num_tokens):
+        pass
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
             _HC_PRENORM_GEMM_TILELANG_KERNEL,
