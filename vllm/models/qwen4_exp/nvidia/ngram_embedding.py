@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 """Qwen4Exp n-gram embeddings with device, pinned-host and disk storage."""
 
 import mmap
@@ -211,6 +212,12 @@ class Qwen4ExpPLEDiskOffloadEmbedding(Qwen4ExpPLEEmbedding):
         rows: torch.Tensor,
     ) -> None:
         """Read one plane's rows for sorted distinct ids into `rows`."""
+        # Threaded page-cache gather (fork plugin; VLLM_PLE_DISK_READ_THREADS,
+        # 0 = the serial reads below).
+        from vllm_cmp170hx.ple.disk_reader import read_rows
+
+        if read_rows(self, name, shard, local, rows):
+            return
         fds, bases = self._sources[name]
         page, row_bytes = mmap.PAGESIZE, rows.shape[1]
         start = bases[shard] + local * row_bytes

@@ -1304,6 +1304,34 @@ def test_disk_offload_fails_closed_on_truncation_and_reload(
         module.load_weights([("ngram_embedding.shard_0.weight", torch.zeros(6, 32))])
 
 
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "nvfp4"])
+def test_disk_offload_threaded_gather_matches_serial_reads(
+    monkeypatch, tmp_path, fmt
+) -> None:
+    """The fork plugin's threaded gather (VLLM_PLE_DISK_READ_THREADS > 0)
+    stages the same bytes as the serial reads (0)."""
+    ids = torch.tensor([[0, 23], [5, 6], [12, 17], [23, 23], [6, 7], [11, 18]])
+    staged = []
+    for threads in ("0", "4"):
+        monkeypatch.setenv("VLLM_PLE_DISK_READ_THREADS", threads)
+        path = tmp_path / f"model-{threads}.safetensors"
+        _save_ple_checkpoint(path, fmt)
+        module = _make_ple_from_checkpoint(monkeypatch, path, fmt, disk_offload=True)
+        embedding = module.ngram_embedding
+        embedding.copy_ids_to_host(ids)
+        embedding.stage_rows(ids.shape[0])
+        staged.append(
+            {
+                name: staging[: ids.shape[0]].view(torch.uint8).clone()
+                for name, (staging, _, _) in embedding._planes.items()
+            }
+        )
+    serial, threaded = staged
+    assert serial.keys() == threaded.keys()
+    for name in serial:
+        assert torch.equal(serial[name], threaded[name])
+
+
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:
     conv_state_len = 6
     dilation = 2
