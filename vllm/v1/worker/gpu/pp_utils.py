@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
@@ -131,6 +133,12 @@ class PPHandler:
     def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
+
+        Besides the postprocess_sampled arguments, the dict carries
+        ``step_idx_mapping``: that step's unfiltered batch -> request mapping,
+        from which the caller can rebuild the step's batch-order block tables
+        (batch-indexed consumers such as the mamba align postprocess must not
+        read the rows of a later step's batch).
         """
         if not self.queue:
             return None
@@ -160,6 +168,7 @@ class PPHandler:
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
             draft_tokens=slot.draft_tokens,
+            step_idx_mapping=slot.idx_mapping,
         )
 
     def broadcast_drafts(self, draft_tokens: torch.Tensor) -> None:

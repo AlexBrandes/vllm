@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 """Warmup kernels used during model execution.
 This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
@@ -258,6 +260,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+    from vllm_cmp170hx.kernels.warmup import warmup_from_worker as sm80_warmup
+    sm80_warmup(worker, cudagraph_capture_sizes)  # sm_80 JIT, scratch before capture
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:

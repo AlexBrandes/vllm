@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
@@ -29,6 +31,12 @@ def init_speculator(
 
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    # The plugin's speculator first (imported here: vllm.config imports this
+    # package's speculator configs).
+    from vllm_cmp170hx.spec_decode.speculators import create_speculator as sm80_speculator
+
+    if (speculator := sm80_speculator(vllm_config, device)) is not None:
+        return speculator
     speculator_config = speculative_config.speculator_config
     qualname = speculator_config.speculator_class
     if qualname is None:
