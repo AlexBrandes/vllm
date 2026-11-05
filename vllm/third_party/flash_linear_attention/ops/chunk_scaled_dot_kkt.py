@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Songlin Yang, Yu Zhang
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 #
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+# Modified by Morrowmake for CMP 170HX support; see repository history.
 
 import torch
 
@@ -15,6 +17,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+from vllm_cmp170hx.fla.pinned_autotune import pinned_autotune
 from .utils import FLA_CHUNK_SIZE
 
 # On RDNA (gfx11xx/gfx12xx) WMMA only
@@ -34,7 +37,7 @@ if current_platform.is_rocm():
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@pinned_autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]
