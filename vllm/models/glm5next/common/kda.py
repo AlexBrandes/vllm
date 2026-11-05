@@ -17,6 +17,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.checkpoint import (
@@ -249,6 +250,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config
+        if getattr(saved_quant_config, "split_glm5_kda_input", False):
+            self.quant_config = saved_quant_config
 
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
@@ -268,25 +271,51 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             max_num_tokens=vllm_config.scheduler_config.max_num_seqs,
         )
 
-        # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
-        # Order matches checkpoint's fused_qkvbfg_a_proj convention.
-        # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
-        self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
-            self.hidden_size,
-            [
-                projection_size,  # q (shard 0)
-                projection_size,  # k (shard 1)
-                projection_size,  # v (shard 2)
-                self.num_heads,  # b (shard 3)
-                self.head_dim,  # f_a (shard 4, replicated)
-                self.head_dim,  # g_a (shard 5, replicated)
-            ],
-            replicated_shard_ids=(4, 5),
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvbfg_a",
-        )
+        # EXL3 stores q/k/v in one packed matrix while b/f_a/g_a remain BF16.
+        # Keep the original single-GEMM path for checkpoint formats whose six
+        # projections use one representation.
+        if getattr(self.quant_config, "split_glm5_kda_input", False):
+            if self.tp_size != 1:
+                raise ValueError("GLM-5.3 EXL3 KDA requires tensor parallel size one")
+            self.in_proj_qkvbfg_a = None
+            self.qkv_proj: ReplicatedLinear | None = ReplicatedLinear(
+                self.hidden_size,
+                3 * projection_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.bfg_a_proj: MergedColumnParallelLinear | None = (
+                MergedColumnParallelLinear(
+                    self.hidden_size,
+                    [self.num_heads, self.head_dim, self.head_dim],
+                    bias=False,
+                    quant_config=None,
+                    disable_tp=True,
+                    prefix=f"{prefix}.bfg_a_proj",
+                )
+            )
+        else:
+            self.qkv_proj = None
+            self.bfg_a_proj = None
+            # Merge q, k, v, b, f_a, g_a projections into one GEMM.
+            # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
+            self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
+                self.hidden_size,
+                [
+                    projection_size,
+                    projection_size,
+                    projection_size,
+                    self.num_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                replicated_shard_ids=(4, 5),
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvbfg_a",
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -468,8 +497,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        if self.qkv_proj is None:
+            assert self.in_proj_qkvbfg_a is not None
+            projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        else:
+            assert self.bfg_a_proj is not None
+            qkv = self.qkv_proj(hidden_states)[0]
+            bfg_a = self.bfg_a_proj(hidden_states)[0]
+            projected = torch.cat((qkv, bfg_a), dim=-1)
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,

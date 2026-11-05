@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 import typing
 from collections.abc import Callable, Iterable
 
@@ -12,6 +13,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -26,6 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import (
+    WeightsMapper,
     extract_layer_index,
     get_fused_shared_expert_layers,
     maybe_prefix,
@@ -36,6 +39,7 @@ from vllm.sequence import IntermediateTensors
 
 from .model import (
     Glm5NextDecoderLayer,
+    Glm5NextForConditionalGeneration,
     Glm5NextMLAAttention,
     Glm5NextMoE,
     _fused_shared_expert_name,
@@ -56,7 +60,22 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        # EXL3 checkpoints pack eh_proj; every other format keeps it a plain
+        # unquantized linear.
+        quant_config = vllm_config.quant_config
+        self.eh_proj: nn.Module
+        if getattr(quant_config, "quantize_glm5_attention", False) is True:
+            self.eh_proj = ReplicatedLinear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.eh_proj",
+            )
+        else:
+            self.eh_proj = nn.Linear(
+                config.hidden_size * 2, config.hidden_size, bias=False
+            )
 
         topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -101,6 +120,8 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
         )
         hidden_states = self.eh_proj(eh_input)
+        if isinstance(hidden_states, tuple):  # ReplicatedLinear: (output, bias)
+            hidden_states = hidden_states[0]
         # Fuse the residual add and final RMSNorm. Glm5NextMoE already performs
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
@@ -209,6 +230,11 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = Glm5NextForConditionalGeneration.packed_modules_mapping
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."}
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
@@ -335,6 +361,12 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name == "model.embed_tokens.weight":
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -431,6 +463,11 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # EXL3 streams plain tensors individually and independently checks every
+        # runtime parameter and checkpoint source after the complete load.
+        if self.quant_config is not None and self.quant_config.get_name() == "exl3":
+            return loaded_params
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:

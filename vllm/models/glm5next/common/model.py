@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 
 from collections.abc import Iterable
 from typing import ClassVar, Literal
@@ -407,7 +408,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=quant_config
+                if getattr(quant_config, "quantize_glm5_attention", False)
+                else None,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_use_nope,
@@ -871,6 +874,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Indexer: fuse wk and weights_proj
             (".wk_weights_proj", ".wk", 0),
             (".wk_weights_proj", ".weights_proj", 1),
+            # EXL3 KDA keeps packed q/k/v separate from plain b/f_a/g_a.
+            (".bfg_a_proj", ".b_proj", 0),
+            (".bfg_a_proj", ".f_a_proj", 1),
+            (".bfg_a_proj", ".g_a_proj", 2),
             # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
             (".in_proj_qkvbfg_a", ".q_proj", 0),
             (".in_proj_qkvbfg_a", ".k_proj", 1),
@@ -944,6 +951,26 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             ):
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
 
+            # GLM-5.3 stores the KDA causal-convolution kernels as one q|k|v
+            # tensor; the fused runtime conv1d takes its thirds as shards 0/1/2.
+            if name.endswith(".self_attn.conv1d.weight"):
+                if loaded_weight.shape[0] % 3:
+                    raise ValueError(
+                        f"KDA conv1d output dimension must be divisible by 3: {name}"
+                    )
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                shard_size = loaded_weight.shape[0] // 3
+                for shard_id in range(3):
+                    param.weight_loader(
+                        param,
+                        loaded_weight.narrow(0, shard_id * shard_size, shard_size),
+                        shard_id,
+                    )
+                loaded_params.add(name)
+                continue
+
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
             # weights_proj into wk_weights_proj.
             if _try_load_fp8_indexer_wk(
@@ -989,8 +1016,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                # QKV fusion: skip if fused module doesn't exist in model
-                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
+                if name_mapped not in params_dict:
                     continue
                 name = name_mapped
                 # Skip loading extra bias for GPTQ models.
@@ -1171,15 +1197,12 @@ class Glm5NextForConditionalGeneration(
     has_inner_state: ClassVar[Literal[True]] = True
     is_hybrid: ClassVar[Literal[True]] = True
 
-    # GLM-5.3-Flash stores the dense-MLP gate/up as separate tensors (like
-    # ``Glm4vMoeForConditionalGeneration``, ``glm4_moe`` and ``deepseek_v2``),
-    # so the fused ``gate_up_proj`` must expand to its real shard names for
-    # per-layer quant-scheme resolution. The identity ``gate_up_proj`` entry
-    # inherited from ``Glm4vForConditionalGeneration`` (pre-fused gate_up_proj)
-    # would otherwise route the module to ``global_quant_config`` and mismatch
-    # at load for mixed-precision Quark checkpoints.
+    # Runtime fusions must resolve to the checkpoint's independently stored
+    # projections for quantization-method selection and packed EXL3 ownership.
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
 
     # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
@@ -1226,13 +1249,11 @@ class Glm5NextForConditionalGeneration(
                 config.text_config,
                 config.vision_config,
                 norm_eps=_VISION_RMS_NORM_EPS,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
+                # FP8 checkpoints leave the vision tower in BF16; EXL3
+                # checkpoints pack its linear projections.
+                quant_config=vllm_config.quant_config
+                if getattr(vllm_config.quant_config, "quantize_glm5_attention", False)
+                else None,
                 input_norm=build_mm_input_norm(self.model_config),
                 prefix=maybe_prefix(prefix, "visual"),
             )
