@@ -627,7 +627,9 @@ class Scheduler(SchedulerInterface):
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             if prefill_limit is not None:
                 max_prefill_tokens = prefill_limit
-            max_prefill_tokens = self.cmp_prefill_budget.cap_split(max_prefill_tokens)
+            # Called unbound on scheduler stand-ins too (upstream's tests).
+            if (budget := getattr(self, "cmp_prefill_budget", None)) is not None:
+                max_prefill_tokens = budget.cap_split(max_prefill_tokens)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
