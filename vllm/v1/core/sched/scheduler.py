@@ -9,6 +9,13 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm_cmp170hx.sched.hooks import (
+    failed_inputs,
+    mamba_block_size,
+    mamba_subblock_end,
+    sm80_step,
+)
+
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -34,7 +41,6 @@ from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
-from vllm_cmp170hx.sched.hooks import failed_inputs, mamba_block_size, sm80_step
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -633,6 +639,12 @@ class Scheduler(SchedulerInterface):
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
+            else:
+                # A block wider than one chunk: equal sub-block chunks with
+                # the fork scheduler (vllm_cmp170hx.sched.hooks).
+                end = mamba_subblock_end(
+                    self, start, end, block_size, max_prefill_tokens
+                )
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
