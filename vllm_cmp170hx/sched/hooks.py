@@ -76,6 +76,39 @@ def mamba_block_size(scheduler: Any) -> int:
     )
 
 
+# Sub-block chunk ends are rounded up to this many tokens (the KDA/FLA chunk).
+SUBBLOCK_ALIGN = 64
+
+
+def mamba_subblock_end(
+    scheduler: Any, start: int, end: int, block_size: int, max_prefill_tokens: int
+) -> int:
+    """End of a prefill chunk inside a Mamba block wider than one chunk.
+
+    Upstream advances such a block in chunks of the full budget and a remainder
+    (a 4608-token block under a 2048-token budget: 2048, 2048, 512). Under
+    pipeline parallelism at most two micro-batches are in flight, so the first
+    stage finishes the short chunk and waits for the next stage's full one;
+    on GLM-5.3-Flash PP2 that idles each card ~725 ms per block, ~20% of cold
+    prefill. With the fork scheduler the block is cut into equal parts of
+    ceil(block / ceil(block / budget)) tokens, rounded up to SUBBLOCK_ALIGN
+    (4608 / 2048 -> three chunks of 1536), measured from the block start, so
+    every chunk still ends on or before the block boundary. A chunk with no
+    sub-block end inside it (budget-limited) keeps upstream's end. Without the
+    fork mixin the end is upstream's."""
+    if (
+        getattr(scheduler, "mamba_state_block_size", None) is None
+        or block_size <= max_prefill_tokens
+    ):
+        return end
+    parts = -(-block_size // max_prefill_tokens)
+    width = -(-block_size // parts)
+    width = min(max_prefill_tokens, -(-width // SUBBLOCK_ALIGN) * SUBBLOCK_ALIGN)
+    block_start = start - start % block_size
+    sub_end = block_start + (end - block_start) // width * width
+    return sub_end if sub_end > start else end
+
+
 def failed_inputs(scheduler: Any, model_runner_output: Any):
     """Request IDs whose step output was computed from inputs a worker could
     not produce (``ModelRunnerOutput.failed_req_ids``); see

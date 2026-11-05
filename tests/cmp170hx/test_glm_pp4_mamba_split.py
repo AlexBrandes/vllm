@@ -56,7 +56,9 @@ PROMPT_LEN = 14000
 RETENTIONS = [None, 0, PP4_BLOCK]
 
 
-def _scheduler(kda_block: int, retention: int | None = None) -> Sm80Scheduler:
+def _scheduler(
+    kda_block: int, retention: int | None = None, max_batched: int = MAX_BATCHED
+) -> Sm80Scheduler:
     """A scheduler with GLM's group geometry: MLA and KDA at ``kda_block``, the
     drafter's sliding-window group at 1152 (the hit unit at both layouts)."""
     vllm_config = VllmConfig(
@@ -71,7 +73,7 @@ def _scheduler(kda_block: int, retention: int | None = None) -> Sm80Scheduler:
         ),
         scheduler_config=SchedulerConfig(
             max_num_seqs=8,
-            max_num_batched_tokens=MAX_BATCHED,
+            max_num_batched_tokens=max_batched,
             max_model_len=65536,
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
@@ -155,7 +157,10 @@ def _prefill(scheduler: Sm80Scheduler, request, first_chunk_limit: int | None):
     limit = first_chunk_limit
     while request.num_computed_tokens < request.num_tokens:
         start = request.num_computed_tokens
-        budget = min(request.num_tokens - start, limit or MAX_BATCHED)
+        budget = min(
+            request.num_tokens - start,
+            limit or scheduler.scheduler_config.max_num_batched_tokens,
+        )
         num_new = scheduler._mamba_block_aligned_split(
             request, budget, prefill_limit=limit
         )
@@ -261,3 +266,53 @@ def test_tp4_control(
     scheduler = _scheduler(HIT_UNIT, retention)
     _, chunks, stale = _prefill(scheduler, _request("a", prompt_len), first_chunk_limit)
     assert stale == [], f"{stale}; {chunks}"
+
+
+# GLM-5.3-Flash PP2 serving: 4608-token MLA/KDA blocks, a 2048-token budget.
+PP2_BATCHED = 2048
+
+
+@pytest.mark.parametrize(
+    "max_batched,width", [(PP2_BATCHED, 1536), (MAX_BATCHED, 2304), (1000, 960)]
+)
+@pytest.mark.parametrize("prompt_len", [12000, 16384])
+def test_wide_kda_block_is_cut_into_equal_chunks(
+    max_batched: int, width: int, prompt_len: int
+) -> None:
+    """A block wider than the budget advances in equal parts (2048 / 2048 /
+    512 left the first pipeline stage idle behind the short chunk), every
+    4608 boundary is still a chunk end, and no hashed KDA block is stale."""
+    scheduler = _scheduler(PP4_BLOCK, max_batched=max_batched)
+    _, chunks, stale = _prefill(scheduler, _request("e", prompt_len), None)
+    assert stale == []
+    ends = {end for _, end in chunks}
+    boundaries = range(PP4_BLOCK, prompt_len, PP4_BLOCK)
+    assert all(b in ends for b in boundaries), chunks
+    last_full = max((b for b in boundaries), default=0)
+    for start, end in chunks:
+        if end <= last_full:
+            # Equal parts from the block start; a part ends early only at
+            # the block boundary.
+            assert end - start == width or end % PP4_BLOCK == 0, chunks
+            assert end - start <= max_batched
+
+
+def test_subblock_end_cases() -> None:
+    from vllm_cmp170hx.sched.hooks import mamba_subblock_end
+
+    fork = _scheduler(PP4_BLOCK, max_batched=PP2_BATCHED)
+    # From a block start, mid-block, and across the boundary.
+    assert mamba_subblock_end(fork, 0, 2048, PP4_BLOCK, 2048) == 1536
+    assert mamba_subblock_end(fork, 1536, 3584, PP4_BLOCK, 2048) == 3072
+    assert mamba_subblock_end(fork, 3072, 5120, PP4_BLOCK, 2048) == 4608
+    # A resumed request on the 1152 hit grid re-aligns to the part grid.
+    assert mamba_subblock_end(fork, 1152, 3200, PP4_BLOCK, 2048) == 3072
+    # Budget-limited: no part end inside the chunk keeps upstream's end.
+    assert mamba_subblock_end(fork, 1600, 2100, PP4_BLOCK, 2048) == 2100
+    # A block that fits the budget, and a scheduler without the fork mixin.
+    assert mamba_subblock_end(fork, 0, 2048, 1152, 2048) == 2048
+
+    class Upstream:
+        pass
+
+    assert mamba_subblock_end(Upstream(), 0, 2048, PP4_BLOCK, 2048) == 2048

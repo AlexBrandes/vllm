@@ -1548,8 +1548,8 @@ seams:
 - id: sched-scheduler-mamba-split
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler._mamba_block_aligned_split
-  why: fair prefill passes the align-mode chunk ceiling as its fifth argument (prefill_limit) and the Mamba state grid comes from vllm_cmp170hx.sched.hooks.mamba_block_size
-  sha256: ac345d9231e57acb540172af52b65aff2dfe92f0b6dd2dcc51ca29f519620c76
+  why: fair prefill passes the align-mode chunk ceiling as its fifth argument (prefill_limit), the Mamba state grid comes from vllm_cmp170hx.sched.hooks.mamba_block_size, and a block wider than one chunk is cut by vllm_cmp170hx.sched.hooks.mamba_subblock_end
+  sha256: b8917f4c568216931e418bef9c47c5e9b4aa7f294be87aec3b8391f3630f16a0
   signature: '(self, request: vllm.v1.request.Request, num_new_tokens: int, num_new_local_computed_tokens: int = 0, num_external_computed_tokens: int = 0, prefill_limit: int | None = None) -> int'
 
 - id: sched-scheduler-reserve-prefill-lookahead
