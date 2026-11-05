@@ -47,9 +47,6 @@ seams:
   sha256: 865230b6ad6cebfee99e9a7c96aa93fdf1bf1c18c766f43ea2499e29e223c231
   signature: (self) -> tuple[int, int]
 
-# Seams of the code from vllm-sm80 (Morrowmake), pinned on its base and
-# re-pinned on this one.
-
 - id: glm-registry-register-model
   kind: method
   target: vllm.model_executor.models.registry:_ModelRegistry.register_model
@@ -61,14 +58,14 @@ seams:
   kind: method
   target: vllm.model_executor.models.registry:_ModelInfo.from_model_cls
   why: model information is read from the registered class (architecture = class name, interface flags); the fork GLM classes keep the upstream names and bases so it stays the same
-  sha256: cddf5cdfafdf92e72235ca91fbe4b2d855b978b630545f37e3cf6f93765a9f50
+  sha256: 31f31a90d3e7413a835a288fa7996a2a4b47f6d980a2cda31f58b1717728ada3
   signature: '(model: type[torch.nn.modules.module.Module]) -> ''_ModelInfo'''
 
 - id: glm-model-init
   kind: method
   target: vllm.models.glm5next.common.model:Glm5NextModel.__init__
   why: fork Glm5NextModel.adopt takes the upstream-built backbone; it reads config (mhc, hc_mult, hidden_size, aux_hidden_state_tensor) and replaces the embed_tokens PPMissingLayer in place; the copied forward reads layers/_active_layers, norm, is_sequence_parallel, device; upstream's _aux_post_op is built but unused by the copied forward
-  sha256: 4e161bcc34686526f852cbe60f1aab19bf3e689e7ae90b8ba5e28370e58283bb
+  sha256: b401dfe8638958711fb9b83da4109df1d3394a2f0b66f24a51c4406aea98969a
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: glm-model-forward
@@ -96,7 +93,7 @@ seams:
   kind: method
   target: vllm.models.glm5next.common.model:Glm5NextForConditionalGeneration.__init__
   why: builds language_model through the registry under 'Glm5NextForCausalLM' (so it is the fork text model) and aliases nothing for PP; the fork wrapper adds the alias after it
-  sha256: 7fc1f4469599236ae305b0fffb2a995945aa2c8ce1197fd9f47aa642edbed876
+  sha256: 8a24aee0f80b107b42ff379aef8a4c27b67e590e7def5b256e83cf02de133b66
   signature: '(self, *, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: glm-glm4v-forward
@@ -152,8 +149,8 @@ seams:
   kind: function
   target: vllm.model_executor.models.utils:spec_decode_needs_target_embed
   why: decides when the last pipeline stage builds the target embedding for its drafter
-  sha256: b67f5776a6b810f85082b54615c2510d8b40ec3465dd73921b57532bb74dc738
-  signature: '(vllm_config: vllm.config.vllm.VllmConfig, *, include_mtp: bool = False) -> bool'
+  sha256: fe6d1fcf303de3ab3fa3a413f7ddb03a1282c44b76648ea9c25f8c9f78db28b0
+  signature: '(vllm_config: vllm.config.vllm.VllmConfig) -> bool'
 
 - id: glm-logits-processor-forward
   kind: method
@@ -249,7 +246,7 @@ seams:
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention.__init__
   why: the fork layer sets its decode, RecoverSSM and KDA prefill attributes after it; it reads local_num_heads, head_dim, kda_prefill_backend, kda_safe_gate, kda_lower_bound and allocates nothing after the point where that code sat
-  sha256: e5f80788808e94055721ada8af59c089c9b357b88027c9f449654f5260668ae8
+  sha256: 1c942e5b2c32c9cd7320e5f27d7d66de7d3b4e507fd4f7bd2c4ba712b971804a
   signature: '(self, config: transformers.models.glm5_next.configuration_glm5_next.Glm5NextTextConfig, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
 
 - id: glm-kda-get-kv-cache-spec
@@ -263,14 +260,14 @@ seams:
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention.forward
   why: hands the rest of the layer (f_b_proj / g_b_proj, core_attn_out, _forward, o_norm, o_proj) to the fork layer's sm80_forward_tail(hidden_states, qkv, beta, f_a, g_a) right after the input projections; sm80_forward_tail is this method's tail with the deferred projections and the norm inside _forward, so a change to the tail must be carried into it
-  sha256: 6eb07879a757bcb0b151ce3e336ec2e80fdd747d879008173c9a0273829169a4
+  sha256: 1534a7ff9ea6f7a79974521d0cbe2a8c735a18cbb916e7cad69b23966b0e10fa
   signature: '(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor'
 
 - id: glm-kda-forward-body
   kind: method
   target: vllm.models.glm5next.common.kda:Glm5NextLinearAttention._forward
   why: the fork layer's _forward runs it nested in its own eager break after _kda_deferred_step, which mirrors its metadata, cache, conv-state layout and merged conv weight reads; it reads the fork layer's _kda_mixed (spec-row conv skipped, spec rows from that callable) and sm80_chunk_kda (the chunked prefill call)
-  sha256: 9f357032ed3099257e81e16df87ffec54f018b116cabd187875aafc4049b639d
+  sha256: 8f2620306c9803246b705ac4eb9c3bb57f138e7761228d0f386237ba555d0a76
   signature: '(self, qkv_proj_states: torch.Tensor, g1: torch.Tensor, beta: torch.Tensor, core_attn_out: torch.Tensor) -> None'
 
 - id: glm-mamba-get-attn-backend
@@ -291,14 +288,14 @@ seams:
   kind: method
   target: vllm.v1.attention.backends.gdn_attn:GDNAttentionMetadataBuilder.__init__
   why: the fork builder creates the RecoverSSM state after it, where the base did; reads use_spec_decode and sets supports_update_block_table
-  sha256: fd0361d456c1dbc35a5b0d43fd79905de5bd6790d2d0d28d941883819250a51c
+  sha256: 755e55c244070d7bbea8983c4142bd7ac2a08b462646c0e0ddfe8d28a5aa0008
   signature: '(self, kv_cache_spec: vllm.v1.kv_cache_interface.MambaSpec, layer_names: list[str], vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
 
 - id: glm-gdn-builder-build
   kind: method
   target: vllm.v1.attention.backends.gdn_attn:GDNAttentionMetadataBuilder.build
   why: returns a new GDNAttentionMetadata and leaves common_attn_metadata as passed; num_spec_decodes and spec_sequence_masks_cpu are its fields, so the fork builder can copy it into the GLM metadata, add the bound and wrap RecoverSSM
-  sha256: bff79834e2e3dfb76965f10d2c01d9e1f2f9338b22649f49e371f5228876b1e3
+  sha256: 0b8f429c2bb009e015d7cec4d3023e3c2fed3542a0e27d6810f809a076657b24
   signature: '(self, common_prefix_len: int, common_attn_metadata: vllm.v1.attention.backend.CommonAttentionMetadata, num_accepted_tokens: torch.Tensor | None = None, num_decode_draft_tokens_cpu: torch.Tensor | None = None, fast_build: bool = False) -> vllm.v1.attention.backends.gdn_attn.GDNAttentionMetadata'
 
 - id: glm-gdn-builder-capture
@@ -347,7 +344,7 @@ seams:
   kind: function
   target: vllm.models.glm5next.common.model:Glm5NextForConditionalGeneration
   why: whole upstream class the fork Glm5NextForConditionalGeneration extends (bases, including SupportsEagle3, class attributes and methods it inherits)
-  sha256: 0424e61bc7429deba96bb92874e7e542cb6310d8c03f9c9d94138654d66ccc7c
+  sha256: 49ec02bb442f476d2155071b2cdbc3d7d11ae2a650097fe1a7e67e450c52078f
   signature: '(*, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: envs-getattr
@@ -388,7 +385,7 @@ seams:
   kind: function
   target: vllm.envs:compile_factors
   why: compile cache keys iterate environment_variables, so fork vars enter the hash unless listed as ignored
-  sha256: a504c5982c72b9142921f4631dd215cd052b2802759d3ce7e2fcb44dd4244167
+  sha256: 7a75a78a1b4de11e0303a493d054bf8155a963b1f80b42cf5b0260a52d8f4bdd
   signature: () -> dict[str, object]
 
 - id: config-hash-factors
@@ -436,7 +433,7 @@ seams:
   kind: method
   target: vllm.v1.engine.core:EngineCore.__init__
   why: loads general plugins (running the fork register()) in the engine core process
-  sha256: 8c8e0712fed99f947057644b6c7d85219d6da002d9d67c561fe0d59bea96e24e
+  sha256: 7ed6712cd10678fe04d54539bf5331521ce5cc0a4e6907c43b11c6cf450a12f3
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, executor_class: type[vllm.v1.executor.abstract.Executor], log_stats: bool, executor_fail_callback: collections.abc.Callable | None = None, include_finished_set: bool = False)'
 
 - id: caller-worker-init-worker
@@ -457,7 +454,7 @@ seams:
   kind: method
   target: vllm.config.vllm:VllmConfig.__post_init__
   why: calls the fork plugin guard, which checks that the fork plugin was loaded
-  sha256: fe845e6c67eec63d6f7b06c23f3c12e1f9a68722b790228e757aef4a74d98be0
+  sha256: bfee45ba6d410d52d269ad314c899ba27fb9809bb3e2b3f5deab595f7e541b50
   signature: (self)
 
 - id: platform-plugins-group
@@ -567,7 +564,7 @@ seams:
   kind: method
   target: vllm.distributed.device_communicators.cuda_communicator:CudaCommunicator.__init__
   why: Sm80CudaCommunicator runs it, then swaps ca_comm to Sm80CustomAllreduce (flags) and builds the host-staged all-reduce; relies on the attribute names ca_comm, qr_comm, fi_ar_comm, fi_pcie_ipc_ar_comm, aiter_ar_comm, use_aiter_allreduce, symm_mem_comm, pynccl_comm and on it calling _log_all_reduce_backend_selection last
-  sha256: 045ed7c3d32f550dce9ba3b6b1d6397577c113381eb262d0c7d1385999a56072
+  sha256: bdffde4672bdd058f8f5ff606e8eb0a3296363d933454176e9a3bc810a3c11b4
   signature: '(self, cpu_group: torch.distributed.distributed_c10d.ProcessGroup, device: torch.device | None = None, device_group: torch.distributed.distributed_c10d.ProcessGroup | None = None, unique_name: str = '''', global_ranks: list[int] | None = None, global_world_size: int | None = None, tcp_store_group: vllm.distributed.utils.StatelessProcessGroup | None = None, use_all2all: bool = False)'
 
 - id: comm-cuda-communicator-all-reduce
@@ -637,7 +634,7 @@ seams:
   kind: method
   target: vllm.distributed.stateless_coordinator:StatelessGroupCoordinator.__init__
   why: asserts the platform communicator class is upstream CudaCommunicator; the fork platform returns its own class only while a fork all-reduce switch is set
-  sha256: beb8864873e7c8e06fb2f5b3a581b72a960f314987692af4232247cd64e02fc5
+  sha256: 5aed5252867f5e2569d919f0ba8b51cd83f48d252e55b4ec2c6c0534630b8ea1
   signature: '(self, group_ranks: list[list[int]], local_rank: int, torch_distributed_backend: str | torch.distributed.distributed_c10d.Backend, use_device_communicator: bool, coord_store: torch.distributed.distributed_c10d.Store, use_message_queue_broadcaster: bool = False, group_name: str | None = None, host: str = ''127.0.0.1'', global_rank: int = 0, global_world_size: int = 1, use_all2all: bool = False)'
 
 - id: envs-cache-switches
@@ -665,8 +662,8 @@ seams:
   kind: function
   target: vllm.model_executor.layers.fused_moe.layer:FusedMoEFactory
   why: instantiates MoERunner and RoutedExperts by their upstream names unless a model passes its own classes
-  sha256: 31103b2b1d0db0e26f3b916c4a68fbad3f25eb97c0f0b57aa44473735169af3f
-  signature: '(num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, intermediate_pad: int | None = None, params_dtype: torch.dtype | None = None, renormalize: bool = True, use_grouped_topk: bool = False, num_expert_group: int | None = None, topk_group: int | None = None, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, tp_size: int | None = None, dp_size: int | None = None, pcp_size: int | None = None, prefix: str = '''', custom_routing_function: collections.abc.Callable | None = None, router: vllm.model_executor.layers.fused_moe.router.fused_moe_router.FusedMoERouter | None = None, scoring_func: str = ''softmax'', routed_scaling_factor: float = 1.0, swiglu_limit: float | None = None, swiglu_alpha: float | None = None, swiglu_beta: float | None = None, activation_situ_beta: float | None = None, activation_situ_linear_beta: float | None = None, e_score_correction_bias: torch.Tensor | None = None, apply_router_weight_on_input: bool = False, activation: str = ''silu'', enable_eplb: bool = False, num_redundant_experts: int = 0, has_bias: bool = False, is_sequence_parallel: bool = False, reduce_results: bool = True, ckpt_names: tuple[str, str, str | None] = (''gate_proj'', ''down_proj'', ''up_proj''), is_fused_checkpoint_transposed: bool = False, n_shared_experts: int | None = None, fuse_shared_experts: bool = False, shared_expert_prefix: str | None = None, router_logits_dtype: torch.dtype | None = None, gate: torch.nn.modules.module.Module | None = None, shared_experts: torch.nn.modules.module.Module | None = None, shared_expert_gate: torch.nn.modules.module.Module | None = None, routed_input_transform: torch.nn.modules.module.Module | None = None, routed_output_transform: torch.nn.modules.module.Module | None = None, apply_routed_scale_to_output: bool = False, zero_expert_type: str | None = None, hash_indices_table: torch.Tensor | None = None, bias_vl: torch.Tensor | None = None, image_sentinel_lo: int = 0, runner_cls: type[vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner] | None = None, runner_args: dict[str, typing.Any] | None = None, routed_experts_cls: type[vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts] | None = None, moe_config_cls: type[vllm.model_executor.layers.fused_moe.config.FusedMoEConfig] | None = None, routed_experts_args: dict[str, typing.Any] | None = None, skip_padding: bool = False) -> vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner'
+  sha256: 75a8f6c403f9eb3141059ac900ad97d8d57e02744e2e6bfac81675297070cc46
+  signature: '(num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, intermediate_pad: int | None = None, params_dtype: torch.dtype | None = None, renormalize: bool = True, use_grouped_topk: bool = False, num_expert_group: int | None = None, topk_group: int | None = None, quant_config: vllm.model_executor.layers.quantization.base_config.QuantizationConfig | None = None, tp_size: int | None = None, dp_size: int | None = None, pcp_size: int | None = None, prefix: str = '''', custom_routing_function: collections.abc.Callable | None = None, router: vllm.model_executor.layers.fused_moe.router.fused_moe_router.FusedMoERouter | None = None, scoring_func: str = ''softmax'', routed_scaling_factor: float = 1.0, swiglu_limit: float | None = None, swiglu_alpha: float | None = None, swiglu_beta: float | None = None, activation_situ_beta: float | None = None, activation_situ_linear_beta: float | None = None, qat_activation_key: vllm.model_executor.layers.quantization.utils.quant_utils.QuantKey | None = None, e_score_correction_bias: torch.Tensor | None = None, apply_router_weight_on_input: bool = False, activation: str = ''silu'', enable_eplb: bool = False, num_redundant_experts: int = 0, has_bias: bool = False, is_sequence_parallel: bool = False, reduce_results: bool = True, ckpt_names: tuple[str, str, str | None] = (''gate_proj'', ''down_proj'', ''up_proj''), is_fused_checkpoint_transposed: bool = False, n_shared_experts: int | None = None, fuse_shared_experts: bool = False, shared_expert_prefix: str | None = None, router_logits_dtype: torch.dtype | None = None, gate: torch.nn.modules.module.Module | None = None, shared_experts: torch.nn.modules.module.Module | None = None, shared_expert_gate: torch.nn.modules.module.Module | None = None, routed_input_transform: torch.nn.modules.module.Module | None = None, routed_output_transform: torch.nn.modules.module.Module | None = None, apply_routed_scale_to_output: bool = False, zero_expert_type: str | None = None, hash_indices_table: torch.Tensor | None = None, bias_vl: torch.Tensor | None = None, image_sentinel_lo: int = 0, runner_cls: type[vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner] | None = None, runner_args: dict[str, typing.Any] | None = None, routed_experts_cls: type[vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts] | None = None, moe_config_cls: type[vllm.model_executor.layers.fused_moe.config.FusedMoEConfig] | None = None, routed_experts_args: dict[str, typing.Any] | None = None, skip_padding: bool = False) -> vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner'
 
 - id: moe-runner-init
   kind: method
@@ -707,7 +704,7 @@ seams:
   kind: method
   target: vllm.model_executor.layers.fused_moe.runner.moe_runner:MoERunner._forward_impl
   why: maybe_forward_async runs before the gate; the unfused gate is called as self.gate(hidden_states) (route v2 at the gate)
-  sha256: 8d779351ef1887174ac8ed979a5186a5c4beeea6bfa532cfbfd171768fb91f6f
+  sha256: 2fc5a3bff379763ba84c9fe57ad34147df23778268d6a9c33c991015dadd47a8
   signature: '(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, shared_experts_input: torch.Tensor | None, input_ids: torch.Tensor | None = None) -> torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.UnfinalizedMoEOutput | tuple[torch.Tensor, torch.Tensor | vllm.model_executor.layers.fused_moe.moe_output.UnfinalizedMoEOutput]'
 
 - id: moe-runner-apply-quant-method
@@ -777,14 +774,14 @@ seams:
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.grouped_topk_router:GroupedTopKRouter._compute_routing
   why: overridden; the fused paths go in front of it and replicate its valid_grouping test, every other call delegates
-  sha256: 2f23712f5d331f74e8adead46a057579b039aee2ccbe3a39e3058e20afa17a91
+  sha256: c33b7682e817d34f733c7b0999cae2ba0cb12d062c9ded3463a9079917fd30c4
   signature: '(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, indices_type: torch.dtype | None, *, input_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]'
 
 - id: moe-gate-linear-forward
   kind: method
   target: vllm.model_executor.layers.fused_moe.router.gate_linear:GateLinear.forward
   why: overridden; delegated to unless route v2 ran
-  sha256: db765e4453699a1c270879046d214e773409f2ca5dc386b9c0e05ebaf7860aaa
+  sha256: f9cda319fd7fd641bb81315afdf1a0e2ec0f4bd4da92d13dc7de99a92fa77dbd
   signature: '(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.nn.parameter.Parameter | None]'
 
 - id: moe-gate-linear-return
@@ -938,7 +935,7 @@ seams:
   kind: function
   target: vllm.model_executor.models.qwen3_dflash2:DFlash2Qwen3ForCausalLM
   why: whole upstream class the fork DFlash2Qwen3ForCausalLM extends; the fork sets only model_cls, the rest (candidate logits processor, compute_candidates) is inherited
-  sha256: 69ccb58b065f17f392a805c0449b601271493ce97d927945c67a7e8c34438497
+  sha256: 82a68a70683bb4d7efd317fef1d442e2ee40f71ee5bb0248a07259f2e1ea09b8
   signature: '(*, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''') -> None'
 
 - id: drafter-dflash2-model-init
@@ -980,14 +977,14 @@ seams:
   kind: function
   target: vllm.model_executor.models.qwen3_dflash2:_score_edges
   why: the fork's _predecessor_ids/_combine_edges copy its two expressions so the sharded forward scores edges exactly as the replicated one
-  sha256: a5d28b7fbe6ac14036fa4e778f11fdcf7747a333aacbed8271f0178ec53820e9
+  sha256: 4d0825415852ad45fbe7caf6ac98833185fc5c027dec44ad0cd5fda589521632
   signature: '(predecessor_table: torch.Tensor, successor_table: torch.Tensor, candidate_ids: torch.Tensor, unary_logits: torch.Tensor, hidden: torch.Tensor, anchor_token_ids: torch.Tensor, top_k: int) -> torch.Tensor'
 
 - id: drafter-dflash-model-class
   kind: function
   target: vllm.model_executor.models.qwen3_dflash:DFlashQwen3Model
   why: the fork DFlash2Qwen3Model.__init__ calls DFlashQwen3Model.__init__ directly (the support_torch_compile wrapper) and adopts the convs of the layers it builds through decoder_layer_cls
-  sha256: e57c8138f92a70d0b7f95230f50724c84c29a6606342c5fc22390af70ae99ce5
+  sha256: 369be491e08fde93005d619a3065125bb97ff2a0283f9f524d7719b5d4190a82
   signature: '(*args, vllm_config: vllm.config.vllm.VllmConfig | None = None, prefix: str = '''', **kwargs: Any) -> None'
 
 - id: drafter-dflash-causal-lm-init
@@ -1008,7 +1005,7 @@ seams:
   kind: function
   target: vllm.model_executor.models.lilicorr:LiLiCorrForCausalLM
   why: whole upstream class the fork LiLiCorrForCausalLM extends; the fork sets only model_cls
-  sha256: 66fafe51b69732c9ce7097fe30ef2cb73a88d6575c912f1591e51590c917c8f8
+  sha256: b92a85f360950021100abfc38136cb4574b555e4ae15ad7cf73efae35e404661
   signature: '(*, vllm_config: vllm.config.vllm.VllmConfig, prefix: str = '''')'
 
 - id: drafter-support-torch-compile
@@ -1043,7 +1040,7 @@ seams:
   kind: function
   target: vllm.model_executor.layers.quantization:get_quantization_config
   why: a registered method resolves through _CUSTOMIZED_METHOD_TO_QUANT_CONFIG, so a checkpoint whose quant_method is "exl3" gets Exl3Config
-  sha256: b8a9bc0c86e91383fd3c2143a9f1d3aa8567a96e9595c355b9a12909f277b48f
+  sha256: 889adb9df64fb0db89380721fe16b1532eae7fcbb85d07d50fd60a4ab2d32298
   signature: '(quantization: str) -> type[vllm.model_executor.layers.quantization.base_config.QuantizationConfig]'
 
 - id: model-config-verify-quantization
@@ -1197,22 +1194,22 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model
   why: the estimate split runner overrides it (keyword-only profile_only, returns the free-memory drop in bytes); the worker calls it once for the real capture after the KV cache is sized
-  sha256: d5b2efcf1b37e94f9123fb8116d0a97a66944b1a27b354154246858963fb1042
+  sha256: c5a3082d86e6e644daf4c8e17f2a209b2d9760031f7667659c52ff2f7b71294e
   signature: '(self, *, profile_only: bool = False) -> int'
 
 - id: graphmem-runner-profile-cudagraph-memory
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.profile_cudagraph_memory
   why: the estimate split runner overrides it and calls it unbound; the worker subtracts its return value from the KV cache
-  sha256: 7a895d562c9a9408e0feedc1359862e16b800ded2529cb480895243379a9163e
+  sha256: 8bdbe7cc520bcb727df2565989f1c14fa6be9da26b028d0f19e0b631d76b1be3
   signature: (self) -> int
 
 - id: graphmem-manager-capture
   kind: method
   target: vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture
   why: the estimate split sets _max_full_descs_to_capture and _capture_mem_samples to None in the profiling capture; None must mean every FULL graph is captured and no per-graph sample is taken
-  sha256: 7ab498e2e81ba4c4b05bc7e77eb3a9598db97293d10f62fda2473c4cc4e9ca6d
-  signature: '(self, create_forward_fn: vllm.v1.worker.gpu.cudagraph_utils.CreateForwardFn, progress_bar_desc: str = ''Capturing CUDA graphs'') -> None'
+  sha256: cfbb63b0fbf7c20d4d81cd1ac114233f0c85400be5e05f06fabc736cb544a6bf
+  signature: '(self, create_forward_fn: vllm.v1.worker.gpu.cudagraph_utils.CreateForwardFn, progress_bar_desc: str = ''Capturing CUDA graphs'', stream: torch.cuda.streams.Stream | None = None) -> None'
 
 - id: graphmem-extrapolate-full
   kind: function
@@ -1267,7 +1264,7 @@ seams:
   kind: function
   target: vllm.model_executor.kernels.mhc.tilelang:mhc_fused_post_pre_tilelang
   why: vllm::sm80_mhc_fused_post_pre runs it unchanged outside the v3 shapes and, for v3, hands the decode kernel the norm weight the way this body normalizes it (bf16, contiguous)
-  sha256: 354fdc25500efe425255e9b9684242f4725c09b893d9e30211faad5b6013ef4d
+  sha256: 87a62df56feb7a6121740981113e799e29b4318604908bbb0baacce5c0faa865
   signature: '(x: torch.Tensor, residual: torch.Tensor, post_layer_mix: torch.Tensor, comb_res_mix: torch.Tensor, fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, rms_eps: float, hc_pre_eps: float, hc_sinkhorn_eps: float, hc_post_mult_value: float, sinkhorn_repeat: int, n_splits: int = 1, tile_n: int = 1, norm_weight: torch.Tensor | None = None, norm_eps: float = 1e-06) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]'
 
 - id: layers-mhc-fused-post-pre-fake
@@ -1288,15 +1285,15 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu_worker:Worker._compile_or_warm_up_model
   why: kernel_warmup, then (V2 runner, JIT warmup on) warmup_kernels, then capture_model with no step between; the fork runner's capture_model runs the speculative-decoding warmup first, where warmup_kernels used to end; GraphMemWorker._compile_or_warm_up_model overrides it, runs it whole and then finalizes the moved draft tail
-  sha256: c1b89fcda3c985fa24e5698e5b17be284721cf49beddd8e5a37498c36ba62509
+  sha256: ad6f5edb6dcef5f5cb447837e99544b7fec3c61a6c0b971096e038956c800e86
   signature: (self) -> vllm.v1.worker.worker_base.CompilationTimes
 
 - id: worker-init-speculator
   kind: function
   target: vllm.v1.worker.gpu.spec_decode:init_speculator
   why: asks vllm_cmp170hx.spec_decode.speculators.create_speculator first; the factory repeats its dflash precedence (XPress, then LiLiCorr, then the DFlash2 architectures) to pick only plain DFlash2 and DSpark
-  sha256: 3d4758cd416ec133c4d18befe047e9d8ecd1c8058f7c403855c56d0c5ae6ad6f
-  signature: '(vllm_config: vllm.config.vllm.VllmConfig, device: torch.device, req_states: ''RequestState'')'
+  sha256: fe84bffc466490475ec0ada14d6d917ce6d25311c501ce10fbc26d90e51f856f
+  signature: '(vllm_config: ''VllmConfig'', device: torch.device, req_states: ''RequestState'')'
 
 - id: worker-dflash-init
   kind: method
@@ -1337,36 +1334,36 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample_tokens
   why: the fork runner reads execute_model_state.num_spec_tokens_to_schedule before it clears the state; a non-last stage then calls pp_handler.receive(input_batch), and the last stage broadcast_drafts after the drafter
-  sha256: 820961af906d82a190dc33ac8eb296bc5ae3542f6f7576f4539626ff76ce273c
+  sha256: a38ee54dcdbceae79a5eb3d01d3bc80bab0dbe148848d1f4fa31fd0cced92232
   signature: '(self, grammar_output: vllm.v1.core.sched.output.GrammarOutput | None) -> vllm.v1.worker.gpu.async_utils.AsyncOutput | vllm.v1.outputs.ModelRunnerOutput | None'
 
 - id: worker-runner-load-model
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model
   why: sets model_memory_usage (the load window's consumed memory), which the fork runner logs after it
-  sha256: efbbb082a6934a10c718ab7b3b431fa9b47a092f856db07e6a1d6e0ca9336418
+  sha256: 8a5241cb35634efcc4b198266cb6853861d16c71bdcbb03b79b5438c61888ae8
   signature: '(self, load_dummy_weights: bool = False, *args, model: torch.nn.modules.module.Module | None = None, **kwargs) -> None'
 
 - id: worker-pp-handler-init
   kind: method
   target: vllm.v1.worker.gpu.pp_utils:PPHandler.__init__
   why: Sm80PPHandler builds it with these keyword arguments, then adds its state and a second sibling device group for the draft tail
-  sha256: 49e1cc0ce0a2d8a94951d64626fa353f878371a9506d63195f95971a1f2953ed
+  sha256: 26527c65466d326eaeb9f59d11a659ebc5b1d8532e99014ab675484c2c84e9b8
   signature: '(self, max_num_reqs: int, num_speculative_steps: int, device: torch.device)'
 
 - id: worker-pp-handler-receive
   kind: method
   target: vllm.v1.worker.gpu.pp_utils:PPHandler.receive
   why: records the slot's event right after the drafts broadcast whose root pp_hooks.drafts_src picks; Sm80PPHandler moves that event to draft_event and puts the early event in the slot
-  sha256: 5897889d39957037c83acc7daf787e83ffee5b1d1d6d89609e57d8a3f292aa0d
-  signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch) -> bool'
+  sha256: 5ba60f7301ac2514d8b2aad64c8449de52ffa8c2c7d9166583caf56e90f4af4f
+  signature: '(self, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch, recv_drafts: bool) -> bool'
 
 - id: worker-pp-handler-broadcast-drafts
   kind: method
   target: vllm.v1.worker.gpu.pp_utils:PPHandler.broadcast_drafts
   why: Sm80PPHandler sends the tail payload in its place on a step whose draft tail runs on the tail stage
-  sha256: a3024d9ef0a6d59c9f51598d968b23ae18c04042ee2a2ba4811d883275ae1084
-  signature: '(self, draft_tokens: torch.Tensor, input_batch: vllm.v1.worker.gpu.input_batch.InputBatch) -> None'
+  sha256: c57c1006b2658ba619dc34976e670a7fc93c5ec1f7c7e707e70f50a3a65ff8fc
+  signature: '(self, draft_tokens: torch.Tensor) -> None'
 
 - id: worker-mamba-group-info
   kind: method
@@ -1379,7 +1376,7 @@ seams:
   kind: method
   target: vllm.v1.worker.gpu_worker:Worker.init_device
   why: the fork worker checks the Marlin MoE decode extension before it
-  sha256: f3b3a4ec2776c2ba5a9f2e6e6bc2323214539f315374ee549923befc03ad65eb
+  sha256: 6f8814fd6212df7c5ab2fa81d480aa520b4617661002ffff824c787e80bee101
   signature: (self)
 
 - id: kda-recoverssm-compact-conv-state-kernel
@@ -1447,14 +1444,14 @@ seams:
   kind: method
   target: vllm.model_executor.models.qwen3_dflash:DFlashQwen3ForCausalLM.combine_hidden_states
   why: DFlashDraftMixin returns the folded fc output (rounded to the fc weight dtype) when aux_fc_folded is set and calls this method otherwise; it must return hidden_states unchanged when the model takes no aux hidden states
-  sha256: 8bbefec5535cc3b16c83572aabf66747528ee234330ef7c2262ac3755fd1a4d1
+  sha256: 441446802f4686ee965483338206c115259b3d392a47e85965e852b44b19fc5d
   signature: '(self, hidden_states: torch.Tensor) -> torch.Tensor'
 
 - id: glm-indexer-forward
   kind: method
   target: vllm.models.glm5next.common.attention:Indexer.forward
   why: calls sm80_indexer.k_weights, quant_q and gate_score in place of its k / fp32 weights block, its Hadamard quant + weight scale and its gate projection; those functions keep upstream's code for the paths the fork switches leave unchanged, so a change to those blocks must be carried into them
-  sha256: 482b676ec1eb2ffd41a537072c9c70cf50562ff3d96d2d81bb0894ca33774a81
+  sha256: 78f0b7e7229fda066d0a0d100553b0eaef273900aeb0e9e4959131d98bfc24f8
   signature: '(self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb) -> torch.Tensor'
 
 - id: glm-indexer-weight-scale
@@ -1468,14 +1465,14 @@ seams:
   kind: function
   target: vllm.models.glm5next.nvidia.sparse_indexer:sparse_attn_indexer_kpool
   why: calls the sm80_indexer hooks at the top-k fill, the prefill logits (Triton rows [ks, ke) instead of compressed rows) and both top-k selections, the decode positions, the paged decode logits function and the decode pool expansion; the Triton adapters rely on its argument order and on as_fp32_logits passing fp32 logits through
-  sha256: 6d0940a6e6066cb8920a9f246bd3131c6e5b8e32a61787ea5392f8603b265dff
+  sha256: d37133c56bcf2d737ea431c75e97d289f660b9dfe1790ca92d7b53a4fd80eaa9
   signature: '(hidden_states: torch.Tensor, k_cache_prefix: vllm.utils.torch_utils.LayerName, kv_cache: torch.Tensor, q_quant: torch.Tensor, q_scale: torch.Tensor | None, k: torch.Tensor, weights: torch.Tensor, quant_block_size: int, scale_fmt: str | None, topk_tokens: int, head_dim: int, max_pool_len: int, total_seq_lens: int, topk_indices_buffer: torch.Tensor, skip_k_cache_insert: bool, use_fp4_cache: bool = False, gate_score: torch.Tensor | None = None, compress_ape: torch.Tensor | None = None, index_kpool: int = 1, positions: torch.Tensor | None = None, tail_kv_cache: torch.Tensor | None = None, tail_prefix: str | None = None, topk_backend: str = ''auto'', dcp_rank: int = 0, dcp_world_size: int = 1, cp_kv_cache_interleave_size: int = 1) -> torch.Tensor'
 
 - id: glm-sparse-indexer-op-init
   kind: method
   target: vllm.models.glm5next.nvidia.sparse_indexer:SparseAttnIndexerKpool.__init__
   why: the fork op subclass runs it first; it must raise only when DeepGEMM is not installed (the vendored copy is) and set use_fp4_cache
-  sha256: 987e725dc854db88a1f15d3787fe0f275dde3255783ba1a8fcc421f22183e2d0
+  sha256: 06d03d1a13ba7b3ecfce0b4a58579f277645774b299dc52d4feefc1aede0cf3e
   signature: '(self, k_cache, quant_block_size: int, scale_fmt: str, topk_tokens: int, head_dim: int, max_pool_len: int, max_total_seq_len: int, topk_indices_buffer: torch.Tensor, skip_k_cache_insert: bool = False, use_fp4_cache: bool = False, tail_cache=None)'
 
 - id: glm-custom-op-new
@@ -1517,21 +1514,21 @@ seams:
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler.__init__
   why: Sm80SchedulerMixin.__init__ runs after it and reads vllm_config, scheduler_config, parallel_config, use_pp, num_spec_tokens and kv_cache_config; fair prefill reads running, waiting, kv_holding_waiting, max_num_active_reqs, num_waiting_for_streaming_input, _pause_state, num_prefill_lookahead, need_mamba_block_aligned_split and max_num_scheduled_tokens set here
-  sha256: e2459991e9a5dcdab8be620a30db1e1f531ab150da020c32af2647a838f7aaa4
+  sha256: 5aa8cf4cb0f5cec20dd12c87e003eccc9fdb29efc52e3136451b6520df470374
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, kv_cache_config: vllm.v1.kv_cache_interface.KVCacheConfig, structured_output_manager: vllm.v1.structured_output.StructuredOutputManager, block_size: int, hash_block_size: int | None = None, mm_registry: vllm.multimodal.registry.MultiModalRegistry = <vllm.multimodal.registry.MultiModalRegistry object>, include_finished_set: bool = False, log_stats: bool = False) -> None'
 
 - id: sched-scheduler-schedule
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler.schedule
   why: Sm80SchedulerMixin.schedule picks the step's draft widths and truncates drafts before calling it, so nothing ahead of the running loop may size a request; a request running at the start of a step never reaches the waiting loop (it runs only when nothing was preempted), and the waiting loop's only scheduled drafts are the uniform-decode placeholders, which the mixin marks as padded from the output
-  sha256: 14be1cae9993ca5e8978522d7d68f5aa01ee0d2a5002b58e06784b9aff51b3fd
+  sha256: 2d3e218f511c2c16157f73dbe2530de8825ff3f4bfa7170acbb3a3f465859d56
   signature: '(self, throttle_prefills: bool = False) -> vllm.v1.core.sched.output.SchedulerOutput'
 
 - id: sched-scheduler-update-from-output
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler.update_from_output
   why: Sm80SchedulerMixin.update_from_output feeds the DSpark host-width rounds the step's output before calling it with the same arguments
-  sha256: 3ecd1fa58f8839d7ad5a42431545ba764913f609ffccf1522ad884a9e4defe8f
+  sha256: df0e00d8870e171342c8bc1c43240879d5c08b9b0ac1b46d73e3e3f49e0e1566
   signature: '(self, scheduler_output: vllm.v1.core.sched.output.SchedulerOutput, model_runner_output: vllm.v1.outputs.ModelRunnerOutput) -> dict[int, vllm.v1.engine.EngineCoreOutputs]'
 
 - id: sched-scheduler-make-spec-decoding-stats
@@ -1545,14 +1542,14 @@ seams:
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler._free_request
   why: called once per finished request; Sm80SchedulerMixin overrides it to drop the request's adaptive-k state first
-  sha256: 024636560a9c7436ccaf9fc5f7bca4de3829e5ba7fd878af5595dcd9cc6391a9
+  sha256: 490df4622688764de757b84a8c3c95af406bda559ada38eda37f17ba049e832f
   signature: '(self, request: vllm.v1.request.Request, delay_free_blocks: bool = False) -> tuple[dict[str, typing.Any] | None, dict[str, typing.Any] | None]'
 
 - id: sched-scheduler-mamba-split
   kind: method
   target: vllm.v1.core.sched.scheduler:Scheduler._mamba_block_aligned_split
   why: fair prefill passes the align-mode chunk ceiling as its fifth argument (prefill_limit) and the Mamba state grid comes from vllm_cmp170hx.sched.hooks.mamba_block_size
-  sha256: 771929accac989ea2f3151dda3d4cfe53b59ec4e7756055a0d07088f0f584457
+  sha256: ac345d9231e57acb540172af52b65aff2dfe92f0b6dd2dcc51ca29f519620c76
   signature: '(self, request: vllm.v1.request.Request, num_new_tokens: int, num_new_local_computed_tokens: int = 0, num_external_computed_tokens: int = 0, prefill_limit: int | None = None) -> int'
 
 - id: sched-scheduler-reserve-prefill-lookahead
@@ -1566,7 +1563,7 @@ seams:
   kind: method
   target: vllm.v1.core.sched.async_scheduler:AsyncScheduler._update_after_schedule
   why: hands every scheduled decode the same placeholder spec_token_ids list, so the adaptive-k truncation rebinds the list instead of mutating it
-  sha256: 43a8c1ed4cdc278442cb8997ad8c874d9b7a3026cf8e66ff16670fcfceada714
+  sha256: a491441367ea17a58bdb0a49ee416f22cd543359d2d69ac595e513016f1c5ed1
   signature: '(self, scheduler_output: vllm.v1.core.sched.output.SchedulerOutput) -> None'
 
 - id: sched-config-get-scheduler-cls
@@ -1580,14 +1577,14 @@ seams:
   kind: method
   target: vllm.v1.core.sched.async_scheduler:AsyncScheduler.__init__
   why: Sm80AsyncScheduler's mixin __init__ and dev_ab_batch.OrderedAdmission run after it; it must still pass every argument on to Scheduler.__init__ (sched-scheduler-init)
-  sha256: dfdc4ab3827e748496ef73e3b2da9fe02e5442929e307e05d9d2beae93ce91df
+  sha256: 2b463182e1629e044e6a12232a8c0f517dfc44ebc4de90ee46bd6758ec4f69dc
   signature: (self, *args, **kwargs) -> None
 
 - id: worker-runner-init
   kind: method
   target: vllm.v1.worker.gpu.model_runner:GPUModelRunner.__init__
   why: GraphMemModelRunner.__init__ runs it first, then reads self.vllm_config to set adaptive_k_enabled and the decode graph-miss counter that runner_hooks reads each step
-  sha256: 3f002499fe4bd3060795c17e147465529c32532c7acb64f7f8dd4b03d9b6bb09
+  sha256: 15e5a0d508116dee3d3cd047863f6e4119701801bb46ca7434f50ca43a577fd4
   signature: '(self, vllm_config: vllm.config.vllm.VllmConfig, device: torch.device)'
 
 - id: worker-dflash2-init
