@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Morrowmake for CMP 170HX support; see repository history.
+# Modified by Alex Brandes for CMP 170HX support; see repository history.
 
 import argparse
 import copy
@@ -136,6 +138,7 @@ from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.version import __version__ as VLLM_VERSION
+from vllm_cmp170hx import engine_args as sm80_engine_args
 
 if TYPE_CHECKING:
     from vllm.config.quantization import QuantizationConfigArgs
@@ -1975,6 +1978,7 @@ class EngineArgs:
             default=None,
             help="Select KDA decode backend.",
         )
+        sm80_engine_args.add_cli_args(parser)
         return parser
 
     @classmethod
@@ -1986,6 +1990,7 @@ class EngineArgs:
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
+        sm80_engine_args.from_cli_args(engine_args, args)
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
