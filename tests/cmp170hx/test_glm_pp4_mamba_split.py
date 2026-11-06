@@ -316,3 +316,20 @@ def test_subblock_end_cases() -> None:
         pass
 
     assert mamba_subblock_end(Upstream(), 0, 2048, PP4_BLOCK, 2048) == 2048
+    # No prefill tokens left this step: upstream's end, no division by zero.
+    assert mamba_subblock_end(fork, 0, 0, PP4_BLOCK, 0) == 0
+    assert mamba_subblock_end(fork, 1536, 1536, PP4_BLOCK, 0) == 1536
+
+
+def test_spent_prefill_budget_schedules_no_tokens() -> None:
+    """Beside running decodes, VLLM_MIXED_PREFILL_CHUNK caps each step's
+    prefill; once an older prompt has spent it, the next prompt is sized at 0
+    tokens and the aligned split gets a 0-token limit. It must schedule nothing
+    for that prompt this step (promote-01, 2026-11-05: ZeroDivisionError on
+    the first 16k request at concurrency 4)."""
+    scheduler = _scheduler(PP4_BLOCK, max_batched=PP2_BATCHED)
+    request = _request("w", 16384)
+    for start in (0, 1536, PP4_BLOCK):
+        request.num_computed_tokens = start
+        assert scheduler._mamba_block_aligned_split(request, 0, prefill_limit=0) == 0
+

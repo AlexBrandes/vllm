@@ -95,9 +95,12 @@ def mamba_subblock_end(
     (4608 / 2048 -> three chunks of 1536), measured from the block start, so
     every chunk still ends on or before the block boundary. A chunk with no
     sub-block end inside it (budget-limited) keeps upstream's end. Without the
-    fork mixin the end is upstream's."""
+    fork mixin the end is upstream's, and so is it when the step has no
+    prefill tokens left (a spent VLLM_MIXED_PREFILL_CHUNK budget beside
+    running decodes gives 0)."""
     if (
         getattr(scheduler, "mamba_state_block_size", None) is None
+        or max_prefill_tokens <= 0
         or block_size <= max_prefill_tokens
     ):
         return end
