@@ -40,7 +40,7 @@ Each recipe pins the exact engine it was validated with.
 
 | Model | Format | Layout | Start here |
 | --- | --- | --- | --- |
-| Qwen3.8-Flash-Next | W4A16 AutoRound | PP2 / TP1 | [W4A16 production recipe](recipes/qwen-flash-next-w4a16/README.md) — pinned container, download and launch scripts |
+| Qwen3.8-Flash-Next | W4A16 AutoRound | PP2 / TP1 | [W4A16 recipe](recipes/qwen-flash-next-w4a16/README.md) — pinned container on the plugin layout, image and video input, download and launch scripts |
 | Qwen3.8-Flash-Next | EXL3 5.05 bpw | PP2 / TP1 | [EXL3 recipe](recipes/qwen-flash-next-exl3/README.md) — source-built container and the validated serving configuration |
 | GLM-5.3-Flash | EXL3 2.60 bpw | PP2 / TP1 | [EXL3 recipe](recipes/glm53-flash-exl3/README.md) — source-built container on the plugin layout, image and video input, DFlash2 drafter |
 
@@ -57,11 +57,11 @@ each request.
 
 | Recipe | Code decode, C1 | Code decode, C4 total | Code decode, C8 total | Cold prefill, 32K |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.8-Flash-Next W4A16 | 226.2 tok/s | 560.2 tok/s | 840.4 tok/s | 7,104 tok/s |
+| Qwen3.8-Flash-Next W4A16 | 234.4 tok/s | 581.9 tok/s | 827.3 tok/s | 7,426 tok/s |
 | Qwen3.8-Flash-Next EXL3 | 163.1 tok/s | 355.5 tok/s | 499.8 tok/s | 4,000 tok/s |
 | GLM-5.3-Flash EXL3 | 76.5 tok/s | 151.4 tok/s | N/A | 1,836 tok/s |
 
-The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/c0db9613d146eda17338b84f2440ead5505f53c5#benchmarks)
+The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
 and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), and the
 [GLM-5.3-Flash results](recipes/glm53-flash-exl3/results.json), identify their engine,
 configuration, and measurement runs. Each row measures a **whole recipe**: engine

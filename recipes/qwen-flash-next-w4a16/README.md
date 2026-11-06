@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next W4A16 on two CMP 170HX cards
 
-This is our earlier production recipe: Intel's W4A16 AutoRound checkpoint,
-pipeline parallelism across two cards, and the BF16 N-gram (PLE) table read from
-NVMe. The runnable recipe lives in
+Intel's W4A16 AutoRound checkpoint, pipeline parallelism across two cards, text,
+image and video input, and the N-gram (PLE) table read from NVMe through the page
+cache. The runnable recipe lives in
 [AlexBrandes/cmp170hx-qwen38-flash-next](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next).
 This page pins that release rather than duplicating its scripts.
 
@@ -19,17 +19,17 @@ This page pins that release rather than duplicating its scripts.
 ```bash
 git clone https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next.git
 cd cmp170hx-qwen38-flash-next
-git checkout --detach c0db9613d146eda17338b84f2440ead5505f53c5
+git checkout --detach 501279ab072692f26f5638d134a9d40482f1788b
 ./download.sh
 ./start.sh
 ```
 
-`download.sh` fetches the pinned model and derives the W4A16 MTP draft head.
-`start.sh` uses Docker and, by default, invokes `host-tune.sh` through sudo:
-it sets the cards to 170 W, changes NVMe readahead, drops the host page cache,
-and compacts memory. **Those are host-wide changes.** Use `HOST_TUNE=0 ./start.sh`
-to leave the host settings alone; the published performance may not apply.
-Do not start this alongside another service using the same GPUs.
+`download.sh` fetches the pinned model. `start.sh` uses Docker and, by default,
+invokes `host-tune.sh` through sudo: it sets the cards to 170 W, changes NVMe
+readahead, drops the host page cache, and compacts memory. **Those are host-wide
+changes.** Use `HOST_TUNE=0 ./start.sh` to leave the host settings alone; the
+published performance may not apply. Do not start this alongside another service
+using the same GPUs.
 
 The API is local-only at `http://127.0.0.1:8000`, model
 `qwen3.8-flash-next-w4a16`. Wait for readiness before sending a request:
@@ -43,36 +43,33 @@ curl --fail http://127.0.0.1:8000/v1/chat/completions \
 
 Stop only the recipe's container with `./stop.sh` from that checkout.
 For settings, reasoning, tool calls, and troubleshooting, use the
-[pinned recipe README](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/c0db9613d146eda17338b84f2440ead5505f53c5/README.md).
+[pinned recipe README](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/501279ab072692f26f5638d134a9d40482f1788b/README.md).
 
 ## Release identity
 
 | Component | Pin |
 | --- | --- |
-| Recipe | `c0db9613d146eda17338b84f2440ead5505f53c5` |
-| Engine branch | `AlexBrandes/vllm:cmp170hx-qwen38-flash-next` |
-| Engine commit | `02acf67ca10bb0c6efddd5454facb3bfe5dba7d9` (vLLM v0.30.0 + six commits) |
-| Image | `ghcr.io/alexbrandes/cmp170hx-qwen38-flash-next@sha256:d6fc872d943b3e9e5cc9eb583b51d72af200e039fbbb7401700bb38d665f0957` |
+| Recipe | `501279ab072692f26f5638d134a9d40482f1788b` |
+| Upstream vLLM | wheel for `a0d7356b98e929c17051bac44f5a086e4117974d` |
+| vLLM branch | `vllm/a0d7356b98` at `ea2ef399a614ea72b65b15804000342f629a850f` |
+| Plugin | `plugin` at `bbba5c27cf9e367e3652b876d53ea7e1c80f16e5` |
+| Image | `ghcr.io/alexbrandes/cmp170hx-qwen38-flash-next@sha256:a87f558b57e60b4f3c796d7be11d12199ce77f393df6ed1c40181ce932717757` |
 | Checkpoint | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` at `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897` |
 | Layout | PP2 / TP1, layer partition 26/22 |
 | Context / concurrency | 262,144 tokens / up to 8 sequences |
-| Speculation / graphs | MTP5 / FULL_AND_PIECEWISE with breakable PLE segments |
+| Speculation / graphs | MTP5 with an NVFP4 draft head / FULL_AND_PIECEWISE |
+| PLE table | vLLM `disk_offload`, rows gathered by the plugin's threaded page-cache reader |
 
-The [public results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/c0db9613d146eda17338b84f2440ead5505f53c5/results/2026-10-17.json)
-and [benchmark tables](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/c0db9613d146eda17338b84f2440ead5505f53c5#benchmarks)
-cover three runs of this release on October 17, 2026. They are not measurements
-of the newer EXL3 engine or of every subsequent production configuration change.
-
-The engine changes include PP support, correct recurrent-state copies, a W4A16
-draft head, graph-safe PLE lookup, bounded prefill scheduling, and fused QSA prepare.
-They remain preserved on their original branch while the newer engine line is
-consolidated. Do not substitute the moving `cmp170hx` branch for this release pin.
+The [public results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/501279ab072692f26f5638d134a9d40482f1788b/results/2026-11-05.json)
+and [benchmark tables](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
+cover three public-v1 runs of this image on November 5, 2026, plus correctness,
+image and video input, needle, context window, HumanEval and GSM8K.
 
 ## Credits and licenses
 
 The engine is Apache-2.0; the standalone recipe is MIT, and model weights have
-their own license. Its [NOTICE](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/c0db9613d146eda17338b84f2440ead5505f53c5/NOTICE)
-credits the original PP/PLE work by polyuij42-del and nguyenthimy2022kg-alt,
-upstream vLLM's QSA fusion, Qwen, Intel AutoRound, and the benchmark authors.
+their own license. Its [NOTICE](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/blob/501279ab072692f26f5638d134a9d40482f1788b/NOTICE)
+credits the PLE reader's community origins (polyuij42-del and nguyenthimy2022kg-alt),
+Morrowmake's vllm-sm80 layout, Qwen, Intel AutoRound, and the benchmark authors.
 See the [fork credits](../../README.md#credits) for CMPUnlocker, Morrowmake,
 PixelML, and the wider CMP community.
