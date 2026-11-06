@@ -8,9 +8,13 @@ Context is 225,280 tokens with up to four sequences.
 This recipe runs on the fork's current engine: upstream vLLM
 [`a0d7356b98`](https://github.com/vllm-project/vllm/commit/a0d7356b98e929c17051bac44f5a086e4117974d),
 the vLLM branch [`vllm/a0d7356b98`](https://github.com/AlexBrandes/vllm/tree/vllm/a0d7356b98)
-at [`2a4e137909`](https://github.com/AlexBrandes/vllm/commit/2a4e1379093a84fd0852c197bb76c09a34a0473f), and the
+at [`ea2ef399a6`](https://github.com/AlexBrandes/vllm/commit/ea2ef399a614ea72b65b15804000342f629a850f), and the
 [`vllm-cmp170hx` plugin](../../README.md) at
-[`947ef7c7e1`](https://github.com/AlexBrandes/vllm/commit/947ef7c7e1a96135521dce27cf953178816da42e).
+[`d5cb84150b`](https://github.com/AlexBrandes/vllm/commit/d5cb84150bb0327224d7caa72aae1135f2bd2d92).
+The measurements below were taken on plugin `947ef7c7e1` and vLLM branch `2a4e137909`. Those pins
+crashed the engine when a long prompt arrived while other requests were decoding
+(`ZeroDivisionError` in the prefill split); `d5cb84150b` fixes that and changes nothing else
+that GLM-5.3-Flash runs. The compiled EXL3 extension is byte-identical.
 
 ## Requirements
 
@@ -35,7 +39,7 @@ From a checkout of this fork's `plugin` branch:
 ```bash
 git clone --branch plugin https://github.com/AlexBrandes/vllm.git
 cd vllm
-docker build -t glm53-flash-exl3:947ef7c recipes/glm53-flash-exl3
+docker build -t glm53-flash-exl3:d5cb841 recipes/glm53-flash-exl3
 ```
 
 The [Dockerfile](Dockerfile) starts from NVIDIA's CUDA 13.0 development image,
@@ -80,7 +84,7 @@ docker run --rm --name glm53-flash-exl3-pp2 \
   -p 127.0.0.1:8000:8000 \
   -v "$MODEL_DIR:/model:ro" -v "$DRAFT_DIR:/draft:ro" -v "$CACHE_DIR:/cache" \
   -v "$PWD/recipes/glm53-flash-exl3/chat_template.jinja:/model/chat_template.jinja:ro" \
-  glm53-flash-exl3:947ef7c
+  glm53-flash-exl3:d5cb841
 ```
 
 The last mount replaces the checkpoint's chat template with
@@ -113,7 +117,7 @@ measured configuration apart from paths and bind address.
 
 | Setting | Value |
 | --- | --- |
-| Engine | upstream `a0d7356b98`, vLLM branch `2a4e137909`, plugin `947ef7c7e1` |
+| Engine | upstream `a0d7356b98`, vLLM branch `ea2ef399a6`, plugin `d5cb84150b` (measured on `2a4e137909` / `947ef7c7e1`) |
 | Checkpoint | `turboderp/GLM-5.3-Flash-exl3` `sc_2.60bpw`, revision `24781209f2862a939cc21e01d256c943bd1a58a3` |
 | Drafter | `incoai/GLM-5.3-Flash-DFlash2`, revision `bf582e4eacc1810f76656d1811693ff6c6737d2a`; BF16, `stream_mean` auxiliary state |
 | Pipeline / tensor parallelism | 2 / 1; layer partition 23/22 |

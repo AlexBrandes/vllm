@@ -19,7 +19,12 @@
     "measured_image_id": "sha256:ee218f38789644c2b42d8bcbc79b4dc18a5bb25cc7c33ca5491486dcd8d7156c",
     "measured_image_build": "docker build --no-cache of this Dockerfile on the measured host",
     "native_extension_sha256": "316dccf116412a8c24f834613a569deecea20dae2f8705fff9003957de8a521f",
-    "note": "the EXL3 extension is compiled at build time; a rebuild has its own image identity and extension hash"
+    "note": "the EXL3 extension is compiled at build time; a rebuild has its own image identity and extension hash",
+    "recipe_pins_since_2026_11_06": {
+      "vllm_branch_commit": "ea2ef399a614ea72b65b15804000342f629a850f",
+      "plugin_commit": "d5cb84150bb0327224d7caa72aae1135f2bd2d92",
+      "note": "plugin d5cb84150b fixes a ZeroDivisionError in the sub-block prefill split when a long prompt arrives beside running decodes (a 0-token prefill budget); the vLLM branch commit past 2a4e137909 is Qwen4Exp-only. Same native extension sha256. The measurements in this file are from the pins above it."
+    }
   },
   "checkpoint": {
     "repo": "turboderp/GLM-5.3-Flash-exl3",
