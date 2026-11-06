@@ -6,48 +6,476 @@ This branch is the `vllm-cmp170hx` plugin of Alex Brandes's vLLM fork for the NV
 
 Upstream base: a0d7356b98e929c17051bac44f5a086e4117974d
 
-vLLM branch: vllm/a0d7356b98 5e3c1322fd85284b8496100c0ed3a51865f918a3
+vLLM branch: vllm/a0d7356b98 ea2ef399a614ea72b65b15804000342f629a850f
 
-Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 2 commits on its upstream base and the 3 upstream files they change. This file is not listed in its own tables.
+Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 commits on its upstream base and the 55 upstream files they change. This file is not listed in its own tables.
 
 ## 1. Plugin files
 
 | Path | Lines |
 |---|---:|
+| `.github/ISSUE_TEMPLATE/050-engine-bug.yml` | 43 |
 | `.gitignore` | 4 |
 | `CITATION.cff` | 8 |
 | `LICENSE` | 201 |
 | `NOTICE` | 11 |
-| `README.md` | 112 |
-| `docs/development.md` | 118 |
-| `pyproject.toml` | 32 |
+| `README.md` | 116 |
+| `csrc/ampere_marlin/build_standalone.py` | 101 |
+| `csrc/ampere_marlin/common_tiles.h` | 19 |
+| `csrc/ampere_marlin/decode_orig.cu` | 416 |
+| `csrc/ampere_marlin/decode_v2.cu` | 404 |
+| `csrc/ampere_marlin/kernel_selector_tiles.h` | 35 |
+| `csrc/ampere_marlin/kernels_tiles_sm80.cu` | 25 |
+| `csrc/ampere_marlin/marlin_moe_kernel.h` | 75 |
+| `csrc/ampere_marlin/marlin_moe_ops.cuh` | 770 |
+| `csrc/ampere_marlin/marlin_moe_template.h` | 2238 |
+| `csrc/ampere_marlin/module.cpp` | 28 |
+| `csrc/ampere_marlin/prefill_tiles.cu` | 30 |
+| `csrc/core/scalar_type.hpp` | 363 |
+| `csrc/exl3/build_standalone.py` | 111 |
+| `csrc/exl3/codec.cuh` | 236 |
+| `csrc/exl3/codec_moe_v2.cuh` | 92 |
+| `csrc/exl3/codec_prefill.cuh` | 68 |
+| `csrc/exl3/common.h` | 66 |
+| `csrc/exl3/dense.cu` | 149 |
+| `csrc/exl3/dense_mma.cu` | 858 |
+| `csrc/exl3/dense_mma.h` | 24 |
+| `csrc/exl3/dense_prefill_tc.cu` | 1218 |
+| `csrc/exl3/dense_prefill_tc.h` | 72 |
+| `csrc/exl3/dense_splitk.cu` | 621 |
+| `csrc/exl3/dense_splitk.h` | 26 |
+| `csrc/exl3/gemm.cu` | 870 |
+| `csrc/exl3/gemm.cuh` | 86 |
+| `csrc/exl3/module.cpp` | 105 |
+| `csrc/exl3/moe.cu` | 542 |
+| `csrc/exl3/moe_prefill.cu` | 2062 |
+| `csrc/exl3/moe_prefill.h` | 114 |
+| `csrc/exl3/moe_v2.cu` | 1055 |
+| `csrc/exl3/moe_v2.h` | 23 |
+| `csrc/exl3/ops.h` | 46 |
+| `csrc/exl3/ple.cu` | 234 |
+| `csrc/exl3/ple.h` | 53 |
+| `csrc/exl3/ple_read.cpp` | 549 |
+| `csrc/exl3/reference.cu` | 447 |
+| `csrc/quantization/marlin/dequant.h` | 609 |
+| `csrc/quantization/marlin/marlin.cuh` | 152 |
+| `csrc/quantization/marlin/marlin_dtypes.cuh` | 149 |
+| `csrc/quantization/marlin/marlin_mma.h` | 268 |
+| `csrc/torch_utils.h` | 88 |
+| `docs/THIRD_PARTY.md` | 133 |
+| `docs/development.md` | 136 |
+| `docs/features/quantization/exl3.md` | 118 |
+| `docs/features/speculative_decoding/adaptive_k.md` | 168 |
+| `licenses/exl3/LICENSE` | 21 |
+| `licenses/exl3/NOTICE` | 45 |
+| `pyproject.toml` | 46 |
+| `recipes/glm53-flash-exl3/Dockerfile` | 67 |
+| `recipes/glm53-flash-exl3/README.md` | 193 |
+| `recipes/glm53-flash-exl3/chat_template.jinja` | 226 |
+| `recipes/glm53-flash-exl3/results.json` | 460 |
+| `recipes/glm53-flash-exl3/serve.sh` | 44 |
 | `recipes/qwen-flash-next-exl3/Dockerfile` | 23 |
 | `recipes/qwen-flash-next-exl3/README.md` | 148 |
 | `recipes/qwen-flash-next-exl3/results.json` | 317 |
 | `recipes/qwen-flash-next-exl3/serve.sh` | 43 |
-| `recipes/qwen-flash-next-w4a16/README.md` | 78 |
-| `tests/cmp170hx/seams.yaml` | 48 |
+| `recipes/qwen-flash-next-w4a16/README.md` | 75 |
+| `tests/cmp170hx/seams.yaml` | 1651 |
+| `tests/cmp170hx/test_dev_ab_atomic.py` | 137 |
+| `tests/cmp170hx/test_dev_ab_batch.py` | 330 |
+| `tests/cmp170hx/test_drafter_registrations.py` | 129 |
+| `tests/cmp170hx/test_exl3_platform_verification.py` | 65 |
+| `tests/cmp170hx/test_exl3_plugin.py` | 105 |
+| `tests/cmp170hx/test_fork_env_vars.py` | 149 |
+| `tests/cmp170hx/test_glm_pp4_draft_fc_staging.py` | 86 |
+| `tests/cmp170hx/test_glm_pp4_kv_plan.py` | 89 |
+| `tests/cmp170hx/test_glm_pp4_mamba_split.py` | 318 |
+| `tests/cmp170hx/test_glm_registrations.py` | 314 |
+| `tests/cmp170hx/test_import_cuda_init.py` | 168 |
+| `tests/cmp170hx/test_indexer_deep_gemm_gates.py` | 50 |
+| `tests/cmp170hx/test_jit_extension_cache.py` | 160 |
+| `tests/cmp170hx/test_jit_extension_std.py` | 68 |
+| `tests/cmp170hx/test_kernel_warmup_call.py` | 69 |
+| `tests/cmp170hx/test_kv_planning.py` | 461 |
+| `tests/cmp170hx/test_light_timing.py` | 291 |
 | `tests/cmp170hx/test_modification_notices.py` | 169 |
-| `tests/cmp170hx/test_plugin_guard.py` | 133 |
+| `tests/cmp170hx/test_moe_layers.py` | 277 |
+| `tests/cmp170hx/test_mrv2_prepare_inputs_padding.py` | 151 |
+| `tests/cmp170hx/test_ple_disk_reader.py` | 127 |
+| `tests/cmp170hx/test_plugin_banner.py` | 36 |
+| `tests/cmp170hx/test_plugin_distribution.py` | 88 |
+| `tests/cmp170hx/test_plugin_guard.py` | 136 |
 | `tests/cmp170hx/test_prefill_budget.py` | 92 |
+| `tests/cmp170hx/test_profile_retirement.py` | 177 |
+| `tests/cmp170hx/test_registrations.py` | 126 |
 | `tests/cmp170hx/test_seams.py` | 79 |
+| `tests/cmp170hx/test_shard_argmax.py` | 326 |
+| `tests/cmp170hx/test_step_error_copy.py` | 66 |
+| `tests/cmp170hx/test_step_error_dispatch.py` | 72 |
+| `tests/cmp170hx/test_triton_mla_sparse_block_stride.py` | 151 |
+| `tests/cmp170hx/test_tuning.py` | 288 |
+| `tests/cmp170hx/tuning_rows.py` | 39 |
 | `tests/cmp170hx/update_seams.py` | 268 |
+| `tests/distributed/flags_z_bits.py` | 309 |
+| `tests/distributed/test_custom_all_reduce_flags.py` | 1476 |
+| `tests/distributed/test_custom_all_reduce_flags_z_gpu.py` | 117 |
+| `tests/distributed/test_host_shm_all_reduce.py` | 570 |
+| `tests/distributed/test_host_shm_setup_agreement.py` | 242 |
+| `tests/distributed/test_pcie_p2p_gate.py` | 510 |
+| `tests/entrypoints/anthropic/test_sm80_inline_system.py` | 50 |
+| `tests/kernels/ampere_sass.py` | 81 |
+| `tests/kernels/interpreter_child.py` | 107 |
+| `tests/kernels/kda_fold_world.py` | 614 |
+| `tests/kernels/kda_recover_reference.py` | 20 |
+| `tests/kernels/moe/test_moe_mask_padding.py` | 209 |
+| `tests/kernels/moe/test_moe_mask_padding_route_v2.py` | 419 |
+| `tests/kernels/moe/test_moe_route_v2_mask.py` | 410 |
+| `tests/kernels/moe/test_shared_experts_reorder.py` | 490 |
+| `tests/kernels/moe_align_reference.py` | 87 |
+| `tests/kernels/quantization/exl3_real_cases.py` | 374 |
+| `tests/kernels/quantization/test_exl3_dense_mma.py` | 596 |
+| `tests/kernels/quantization/test_exl3_dense_mma_real_inputs.py` | 295 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc.py` | 1280 |
+| `tests/kernels/quantization/test_exl3_dense_prefill_tc_real_inputs.py` | 282 |
+| `tests/kernels/quantization/test_exl3_dense_splitk.py` | 468 |
+| `tests/kernels/quantization/test_exl3_dense_splitk_real_inputs.py` | 322 |
+| `tests/kernels/quantization/test_exl3_gemm_bitexact.py` | 363 |
+| `tests/kernels/quantization/test_exl3_glm_moe_prefill_gates.py` | 144 |
+| `tests/kernels/quantization/test_exl3_kernels.py` | 374 |
+| `tests/kernels/quantization/test_exl3_moe_prefill.py` | 391 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_glm.py` | 637 |
+| `tests/kernels/quantization/test_exl3_moe_prefill_real_inputs.py` | 262 |
+| `tests/kernels/quantization/test_exl3_moe_v2.py` | 598 |
+| `tests/kernels/quantization/test_exl3_moe_v2_real_inputs.py` | 345 |
+| `tests/kernels/quantization/test_exl3_step_phase.py` | 120 |
+| `tests/kernels/replay_inputs.py` | 51 |
+| `tests/kernels/test_ampere_bundle_interactions.py` | 240 |
+| `tests/kernels/test_ampere_decode.py` | 475 |
+| `tests/kernels/test_ampere_decode_mhc_v3.py` | 420 |
+| `tests/kernels/test_ampere_idx_glue.py` | 840 |
+| `tests/kernels/test_ampere_indexer_decode_raw_k.py` | 270 |
+| `tests/kernels/test_ampere_kda_dispatch.py` | 841 |
+| `tests/kernels/test_ampere_kda_fold.py` | 1028 |
+| `tests/kernels/test_ampere_kda_prefill_metadata.py` | 579 |
+| `tests/kernels/test_ampere_kda_recover.py` | 1007 |
+| `tests/kernels/test_ampere_kda_small_stack.py` | 492 |
+| `tests/kernels/test_ampere_kda_step_tile.py` | 185 |
+| `tests/kernels/test_ampere_marlin_decode_v2.py` | 617 |
+| `tests/kernels/test_ampere_marlin_optional.py` | 238 |
+| `tests/kernels/test_ampere_marlin_pp_mid_rows.py` | 406 |
+| `tests/kernels/test_ampere_marlin_prefill_tiles.py` | 864 |
+| `tests/kernels/test_ampere_moe_route.py` | 407 |
+| `tests/kernels/test_ampere_pp_kda_prefill.py` | 452 |
+| `tests/kernels/test_ampere_pp_marlin_prefill.py` | 706 |
+| `tests/kernels/test_ampere_pp_sparse_mla_prefill.py` | 618 |
+| `tests/kernels/test_ampere_prefill.py` | 955 |
+| `tests/kernels/test_ampere_prefill_pack_bf16x2.py` | 149 |
+| `tests/kernels/test_ampere_smla_prefill_pred_load.py` | 430 |
+| `tests/kernels/test_ampere_thin_gemm.py` | 241 |
+| `tests/kernels/test_ampere_thin_gemm_concat.py` | 964 |
+| `tests/kernels/test_ampere_thin_gemm_gluon.py` | 989 |
+| `tests/kernels/test_ampere_thin_gemm_gluon_real_inputs.py` | 242 |
+| `tests/kernels/test_ampere_thin_gemm_v74.py` | 286 |
+| `tests/kernels/test_ampere_tp4_kda_prefill.py` | 365 |
+| `tests/kernels/test_ampere_tp4_marlin_prefill.py` | 408 |
+| `tests/kernels/test_deterministic_moe_align.py` | 411 |
+| `tests/kernels/test_fla_autotune_pin.py` | 614 |
+| `tests/kernels/test_replay_inputs.py` | 56 |
+| `tests/kernels/test_sorted_topk.py` | 267 |
+| `tests/kernels/test_sparse_kv_row_offsets.py` | 173 |
+| `tests/kernels/test_topk_reference.py` | 114 |
+| `tests/kernels/test_topk_tiefix.py` | 458 |
+| `tests/kernels/test_topk_tiefix_split.py` | 320 |
+| `tests/kernels/thin_gemm_real_cases.py` | 148 |
+| `tests/kernels/topk_reference.py` | 59 |
+| `tests/model_executor/layers/test_exl3_layers.py` | 632 |
+| `tests/model_executor/model_loader/test_exl3_manifest.py` | 249 |
+| `tests/model_executor/model_loader/test_exl3_pipeline.py` | 155 |
+| `tests/models/fixtures/native_checkpoint_configs/glm53_dflash2/config.json` | 61 |
+| `tests/models/fixtures/native_checkpoint_configs/glm53_flash/config.json` | 2636 |
+| `tests/models/fixtures/native_checkpoint_configs/provenance.json` | 19 |
+| `tests/models/fixtures/native_checkpoint_configs/qwen38_flash_next/config.json` | 167 |
+| `tests/models/glm5next/test_aux_hidden_states_pp.py` | 226 |
+| `tests/models/glm5next/test_drafter_rope_fit.py` | 200 |
+| `tests/models/glm5next/test_drafter_selector_shard.py` | 170 |
+| `tests/models/glm5next/test_exl3_construction.py` | 260 |
+| `tests/models/glm5next/test_kda_spec_bound.py` | 134 |
+| `tests/models/glm5next/test_pp_fold_draft_fc.py` | 190 |
+| `tests/models/glm5next/test_router_logits_dtype.py` | 135 |
+| `tests/models/test_glm5next_local_logits.py` | 73 |
+| `tests/models/test_native_checkpoint_config_meta.py` | 416 |
+| `tests/models/test_native_checkpoint_wrapper_meta.py` | 268 |
+| `tests/parser/engine/sm80_parsers.py` | 31 |
+| `tests/parser/engine/test_deepseek_v41_tool_args.py` | 295 |
+| `tests/parser/engine/test_glm47_tool_choice_none.py` | 265 |
+| `tests/plugins_tests/conftest.py` | 17 |
+| `tests/test_retired_env_vars.py` | 369 |
+| `tests/v1/attention/test_glm_metadata_reuse.py` | 228 |
+| `tests/v1/attention/test_indexer_logits_budget_exact.py` | 224 |
+| `tests/v1/attention/test_indexer_prefill_chunk_budget.py` | 139 |
+| `tests/v1/attention/test_kpool_tail_padding_invariant.py` | 49 |
+| `tests/v1/attention/test_sm80_triton_mla_sparse_decode.py` | 76 |
+| `tests/v1/core/sm80_utils.py` | 43 |
+| `tests/v1/core/test_fair_prefill.py` | 863 |
+| `tests/v1/core/test_mamba_decode_progress.py` | 101 |
+| `tests/v1/core/test_mamba_inflight_states.py` | 291 |
+| `tests/v1/core/test_pp_homogeneous_steps.py` | 146 |
+| `tests/v1/core/test_pp_spread_decodes.py` | 73 |
+| `tests/v1/core/test_scheduler_failed_inputs.py` | 108 |
+| `tests/v1/core/test_sm80_mamba_scratch.py` | 119 |
+| `tests/v1/core/test_sm80_prompt_tail_padding.py` | 130 |
+| `tests/v1/kv_connector/conftest.py` | 17 |
+| `tests/v1/spec_decode/dspark_host_width_cases.json` | 1 |
+| `tests/v1/spec_decode/test_adaptive_k.py` | 221 |
+| `tests/v1/spec_decode/test_dspark_confidence_dump.py` | 310 |
+| `tests/v1/spec_decode/test_dspark_depth_hint.py` | 170 |
+| `tests/v1/spec_decode/test_dspark_host_width.py` | 423 |
+| `tests/v1/spec_decode/test_dspark_host_width_gpu.py` | 124 |
+| `tests/v1/spec_decode/test_dspark_row_mask_conf.py` | 457 |
+| `tests/v1/spec_decode/test_dspark_row_mask_gpu.py` | 294 |
+| `tests/v1/spec_decode/test_dspark_row_mask_kernel.py` | 560 |
+| `tests/v1/spec_decode/test_dspark_row_mask_reject.py` | 379 |
+| `tests/v1/spec_decode/test_dspark_width.py` | 271 |
+| `tests/v1/spec_decode/test_dspark_zero_draft.py` | 390 |
+| `tests/v1/spec_decode/test_glm5_dflash_accept_depth.py` | 343 |
+| `tests/v1/spec_decode/test_glm5_dflash_adaptive_k.py` | 419 |
+| `tests/v1/spec_decode/test_glm5_dflash_draft_width.py` | 492 |
+| `tests/v1/worker/test_deferred_state_copies_cpu.py` | 117 |
+| `tests/v1/worker/test_gpu_async_failed_tokens.py` | 112 |
+| `tests/v1/worker/test_gumbel_vocab_clamp.py` | 45 |
+| `tests/v1/worker/test_mamba_block_size_resolution.py` | 58 |
+| `tests/v1/worker/test_mem_attribution.py` | 70 |
+| `tests/v1/worker/test_pp_deferred_block_tables.py` | 188 |
+| `tests/v1/worker/test_pp_draft_tail.py` | 1236 |
+| `tests/v1/worker/test_pp_hop.py` | 187 |
+| `tests/v1/worker/test_pp_split_draft_event.py` | 140 |
+| `tests/v1/worker/test_sm80_cudagraph_mem.py` | 524 |
+| `tests/v1/worker/test_sm80_execution_trace.py` | 124 |
+| `tests/v1/worker/test_sm80_profile_retirement_gpu.py` | 161 |
+| `tests/v1/worker/test_sm80_trace_export.py` | 216 |
+| `tests/v1/worker/test_state_index_check.py` | 351 |
 | `tools/cmp170hx/assemble.py` | 119 |
 | `tools/cmp170hx/fork_map.py` | 136 |
-| `vllm_cmp170hx/__init__.py` | 21 |
-| `vllm_cmp170hx/envs.py` | 42 |
-| `vllm_cmp170hx/guard.py` | 39 |
-| `vllm_cmp170hx/plugin.py` | 44 |
-| `vllm_cmp170hx/sched/__init__.py` | 2 |
+| `vllm_cmp170hx/__init__.py` | 46 |
+| `vllm_cmp170hx/attention/__init__.py` | 2 |
+| `vllm_cmp170hx/attention/triton_mla_sparse.py` | 386 |
+| `vllm_cmp170hx/capture.py` | 696 |
+| `vllm_cmp170hx/config.py` | 57 |
+| `vllm_cmp170hx/dev_ab.py` | 1672 |
+| `vllm_cmp170hx/dev_ab_batch.py` | 369 |
+| `vllm_cmp170hx/distributed/__init__.py` | 2 |
+| `vllm_cmp170hx/distributed/communicator.py` | 561 |
+| `vllm_cmp170hx/distributed/custom_all_reduce_flags.py` | 1222 |
+| `vllm_cmp170hx/distributed/host_shm_all_reduce.py` | 1155 |
+| `vllm_cmp170hx/distributed/pcie_p2p.py` | 183 |
+| `vllm_cmp170hx/distributed/step_errors.py` | 167 |
+| `vllm_cmp170hx/engine_args.py` | 103 |
+| `vllm_cmp170hx/envs.py` | 1500 |
+| `vllm_cmp170hx/failed_inputs.py` | 207 |
+| `vllm_cmp170hx/fla/__init__.py` | 2 |
+| `vllm_cmp170hx/fla/autotune_pins.py` | 210 |
+| `vllm_cmp170hx/fla/pinned_autotune.py` | 384 |
+| `vllm_cmp170hx/guard.py` | 69 |
+| `vllm_cmp170hx/hot_swap.py` | 911 |
+| `vllm_cmp170hx/jit_extension.py` | 150 |
+| `vllm_cmp170hx/kernels/__init__.py` | 19 |
+| `vllm_cmp170hx/kernels/_platform.py` | 33 |
+| `vllm_cmp170hx/kernels/attention/__init__.py` | 8 |
+| `vllm_cmp170hx/kernels/attention/sparse_prefill_mla.py` | 480 |
+| `vllm_cmp170hx/kernels/attention/sparse_prefill_mla_pp.py` | 380 |
+| `vllm_cmp170hx/kernels/attention/triton_e4m3.py` | 142 |
+| `vllm_cmp170hx/kernels/attention/triton_mla_remap_cache.py` | 168 |
+| `vllm_cmp170hx/kernels/attention/triton_mla_sparse.py` | 612 |
+| `vllm_cmp170hx/kernels/attention/triton_mqa_logits.py` | 628 |
+| `vllm_cmp170hx/kernels/exl3/__init__.py` | 13 |
+| `vllm_cmp170hx/kernels/exl3/dense_mma.py` | 151 |
+| `vllm_cmp170hx/kernels/exl3/dense_prefill_tc.py` | 711 |
+| `vllm_cmp170hx/kernels/exl3/loader.py` | 313 |
+| `vllm_cmp170hx/kernels/exl3/ops.py` | 983 |
+| `vllm_cmp170hx/kernels/exl3/quant.py` | 1207 |
+| `vllm_cmp170hx/kernels/exl3/step_phase.py` | 108 |
+| `vllm_cmp170hx/kernels/exl3/utils.py` | 382 |
+| `vllm_cmp170hx/kernels/idx_glue_gate.py` | 75 |
+| `vllm_cmp170hx/kernels/indexer/__init__.py` | 9 |
+| `vllm_cmp170hx/kernels/indexer/topk_tiefix.py` | 571 |
+| `vllm_cmp170hx/kernels/indexer/topk_tiefix_gate.py` | 259 |
+| `vllm_cmp170hx/kernels/kda/__init__.py` | 17 |
+| `vllm_cmp170hx/kernels/kda/commit_plan.py` | 225 |
+| `vllm_cmp170hx/kernels/kda/recover.py` | 1053 |
+| `vllm_cmp170hx/kernels/marlin_moe/__init__.py` | 12 |
+| `vllm_cmp170hx/kernels/marlin_moe/decode.py` | 420 |
+| `vllm_cmp170hx/kernels/marlin_moe/experts.py` | 105 |
+| `vllm_cmp170hx/kernels/marlin_moe/extension.py` | 170 |
+| `vllm_cmp170hx/kernels/marlin_moe/prefill.py` | 506 |
+| `vllm_cmp170hx/kernels/marlin_moe/split_align.py` | 224 |
+| `vllm_cmp170hx/kernels/mhc/__init__.py` | 160 |
+| `vllm_cmp170hx/kernels/mhc/decode.py` | 953 |
+| `vllm_cmp170hx/kernels/mhc/fused_op.py` | 145 |
+| `vllm_cmp170hx/kernels/mhc/prenorm.py` | 470 |
+| `vllm_cmp170hx/kernels/mhc/prenorm_workspace.py` | 118 |
+| `vllm_cmp170hx/kernels/mhc/warmup.py` | 46 |
+| `vllm_cmp170hx/kernels/moe/__init__.py` | 400 |
+| `vllm_cmp170hx/kernels/moe/align.py` | 406 |
+| `vllm_cmp170hx/kernels/moe/route.py` | 1109 |
+| `vllm_cmp170hx/kernels/moe/routing.py` | 709 |
+| `vllm_cmp170hx/kernels/moe/sum.py` | 83 |
+| `vllm_cmp170hx/kernels/moe/warmup.py` | 110 |
+| `vllm_cmp170hx/kernels/thin_gemm/__init__.py` | 209 |
+| `vllm_cmp170hx/kernels/thin_gemm/concat.py` | 280 |
+| `vllm_cmp170hx/kernels/thin_gemm/gluon.py` | 299 |
+| `vllm_cmp170hx/kernels/thin_gemm/thin_gemm_gluon.py` | 968 |
+| `vllm_cmp170hx/kernels/thin_gemm/thin_gemm_v74.py` | 1037 |
+| `vllm_cmp170hx/kernels/thin_gemm/warmup.py` | 154 |
+| `vllm_cmp170hx/kernels/warmup.py` | 132 |
+| `vllm_cmp170hx/kernels/warmup_utils.py` | 37 |
+| `vllm_cmp170hx/kv_planning.py` | 655 |
+| `vllm_cmp170hx/layers/__init__.py` | 4 |
+| `vllm_cmp170hx/layers/grouped_linear.py` | 94 |
+| `vllm_cmp170hx/layers/moe/__init__.py` | 19 |
+| `vllm_cmp170hx/layers/moe/gate.py` | 44 |
+| `vllm_cmp170hx/layers/moe/routed_experts.py` | 103 |
+| `vllm_cmp170hx/layers/moe/router.py` | 129 |
+| `vllm_cmp170hx/layers/moe/runner.py` | 177 |
+| `vllm_cmp170hx/layers/moe/shared_experts.py` | 134 |
+| `vllm_cmp170hx/model_registry.py` | 91 |
+| `vllm_cmp170hx/models/__init__.py` | 2 |
+| `vllm_cmp170hx/models/glm5next/__init__.py` | 7 |
+| `vllm_cmp170hx/models/glm5next/model_state.py` | 113 |
+| `vllm_cmp170hx/models/glm5next/ops/__init__.py` | 2 |
+| `vllm_cmp170hx/models/glm5next/ops/idx_glue.py` | 538 |
+| `vllm_cmp170hx/models/glm5next/ops/idx_glue_gates.py` | 99 |
+| `vllm_cmp170hx/models/glm5next/ops/kda_decode.py` | 1054 |
+| `vllm_cmp170hx/models/glm5next/ops/kda_prefill.py` | 1405 |
+| `vllm_cmp170hx/models/glm5next/sm80_indexer.py` | 258 |
+| `vllm_cmp170hx/models/glm5next/sm80_indexer_op.py` | 34 |
+| `vllm_cmp170hx/models/glm5next/sm80_kda.py` | 659 |
+| `vllm_cmp170hx/models/glm5next/sm80_mla.py` | 123 |
+| `vllm_cmp170hx/models/glm5next/sm80_model.py` | 470 |
+| `vllm_cmp170hx/parsers/__init__.py` | 75 |
+| `vllm_cmp170hx/parsers/glm47.py` | 71 |
+| `vllm_cmp170hx/parsers/ling3.py` | 27 |
+| `vllm_cmp170hx/platform.py` | 170 |
+| `vllm_cmp170hx/ple/__init__.py` | 2 |
+| `vllm_cmp170hx/ple/disk_reader.py` | 147 |
+| `vllm_cmp170hx/plugin.py` | 421 |
+| `vllm_cmp170hx/sched/__init__.py` | 69 |
+| `vllm_cmp170hx/sched/hooks.py` | 121 |
 | `vllm_cmp170hx/sched/prefill_budget.py` | 102 |
+| `vllm_cmp170hx/sched/scheduler.py` | 476 |
+| `vllm_cmp170hx/sched/step.py` | 233 |
+| `vllm_cmp170hx/spec_decode/__init__.py` | 2 |
+| `vllm_cmp170hx/spec_decode/adaptive_k.py` | 453 |
+| `vllm_cmp170hx/spec_decode/aux_fc_fold.py` | 190 |
+| `vllm_cmp170hx/spec_decode/dflash2_model.py` | 426 |
+| `vllm_cmp170hx/spec_decode/dflash2_speculator.py` | 332 |
+| `vllm_cmp170hx/spec_decode/dflash_draft.py` | 136 |
+| `vllm_cmp170hx/spec_decode/dflash_width.py` | 125 |
+| `vllm_cmp170hx/spec_decode/dspark_confidence.py` | 369 |
+| `vllm_cmp170hx/spec_decode/dspark_depth_hint.py` | 160 |
+| `vllm_cmp170hx/spec_decode/dspark_host_width.py` | 422 |
+| `vllm_cmp170hx/spec_decode/dspark_row_mask.py` | 364 |
+| `vllm_cmp170hx/spec_decode/dspark_row_mask_conf.py` | 274 |
+| `vllm_cmp170hx/spec_decode/dspark_row_mask_kernel.py` | 331 |
+| `vllm_cmp170hx/spec_decode/dspark_row_mask_reject.py` | 48 |
+| `vllm_cmp170hx/spec_decode/dspark_width.py` | 116 |
+| `vllm_cmp170hx/spec_decode/lilicorr_model.py` | 33 |
+| `vllm_cmp170hx/spec_decode/shard_argmax.py` | 627 |
+| `vllm_cmp170hx/spec_decode/speculators.py` | 39 |
+| `vllm_cmp170hx/spec_decode/warmup.py` | 196 |
+| `vllm_cmp170hx/tuning.py` | 278 |
+| `vllm_cmp170hx/tuning/nvidia-cmp-170hx.toml` | 351 |
+| `vllm_cmp170hx/worker/__init__.py` | 2 |
+| `vllm_cmp170hx/worker/adaptive_k_graphs.py` | 148 |
+| `vllm_cmp170hx/worker/cudagraph_mem.py` | 476 |
+| `vllm_cmp170hx/worker/execution_trace.py` | 150 |
+| `vllm_cmp170hx/worker/graph_mem_worker.py` | 179 |
+| `vllm_cmp170hx/worker/light_timing.py` | 396 |
+| `vllm_cmp170hx/worker/mem_attribution.py` | 276 |
+| `vllm_cmp170hx/worker/pp_draft_tail.py` | 1054 |
+| `vllm_cmp170hx/worker/pp_handler.py` | 186 |
+| `vllm_cmp170hx/worker/pp_hooks.py` | 82 |
+| `vllm_cmp170hx/worker/pp_hop.py` | 210 |
+| `vllm_cmp170hx/worker/runner_hooks.py` | 225 |
+| `vllm_cmp170hx/worker/state_index_check.py` | 352 |
+| `vllm_cmp170hx/worker/target_argmax.py` | 278 |
+| `vllm_cmp170hx/worker/trace_export.py` | 200 |
+| `vllm_cmp170hx/worker/worker_hooks.py` | 127 |
 
 ## 2. Changes to upstream vLLM
 
 - `9a6c8afd74` Stop at startup when the vllm-cmp170hx plugin is missing
 - `5e3c1322fd` Cap prefill beside running decodes (VLLM_MIXED_PREFILL_CHUNK)
+- `3a476f33dc` sm_80 engine arguments and adaptive draft depth
+- `4b373ac55b` Fork scheduler hooks
+- `134da3efdb` KV cache planning for MLA + Mamba hybrids
+- `5d307ffed9` Fail only the requests whose model inputs a worker could not produce
+- `f61a7498cc` V2 model runner, worker and PP handler hooks
+- `61d28d0955` KDA state: RecoverSSM commit plan and state-index checks
+- `b53d34e0e9` GLM-5.3 indexer and attention on sm_80
+- `c263527e12` sm_80 kernels behind shared ops: mHC pre-norm, Marlin MoE, MoE align, thin GEMM
+- `719626184a` Pinned autotune configs for the vendored flash-linear-attention kernels
+- `fcdbab0617` tool_choice=none decode mask for the GLM-4.7 parsers
+- `aa54017e1e` Clamp sampled token ids to the vocabulary
+- `fc3e1298b3` GLM-5.3-Flash EXL3 checkpoints
+- `0ba7ead1ff` PP: share the target embedding with a drafter whose own is a PP placeholder
+- `503812f5df` mHC TileLang: batch-invariant reductions and BF16 residual statistics
+- `9c50da6896` Prefill budget: leave the Mamba split alone on scheduler stand-ins
+- `2a4e137909` Equal sub-block prefill chunks when a Mamba block is wider than one chunk
+- `ea2ef399a6` Threaded page-cache gather for disk-offload PLE rows
 
 | Upstream file | Added | Removed |
 |---|---:|---:|
+| `tests/kernels/mhc/test_mhc_kernels.py` | 83 | 25 |
+| `tests/models/qwen4_exp/test_ple.py` | 28 | 0 |
 | `tests/v1/core/test_prefill_budget.py` | 103 | 0 |
-| `vllm/config/vllm.py` | 5 | 0 |
-| `vllm/v1/core/sched/scheduler.py` | 20 | 0 |
+| `tests/v1/worker/test_gpu_warmup_blocks.py` | 9 | 1 |
+| `tests/v1/worker/test_mamba_hybrid_model_state.py` | 2 | 0 |
+| `vllm/config/vllm.py` | 10 | 0 |
+| `vllm/engine/arg_utils.py` | 5 | 0 |
+| `vllm/model_executor/kernels/mhc/tilelang.py` | 33 | 8 |
+| `vllm/model_executor/kernels/mhc/tilelang_kernels.py` | 83 | 86 |
+| `vllm/model_executor/kernels/mhc/warmup.py` | 5 | 4 |
+| `vllm/model_executor/layers/attention/mla_attention.py` | 10 | 5 |
+| `vllm/model_executor/layers/fused_moe/experts/marlin_moe.py` | 10 | 0 |
+| `vllm/model_executor/layers/fused_moe/moe_align_block_size.py` | 8 | 0 |
+| `vllm/model_executor/layers/utils.py` | 6 | 0 |
+| `vllm/model_executor/warmup/kernel_warmup.py` | 4 | 0 |
+| `vllm/models/glm5next/common/attention.py` | 6 | 14 |
+| `vllm/models/glm5next/common/kda.py` | 65 | 24 |
+| `vllm/models/glm5next/common/model.py` | 38 | 17 |
+| `vllm/models/glm5next/common/mtp.py` | 38 | 1 |
+| `vllm/models/glm5next/nvidia/ops/kpool_compress.py` | 49 | 14 |
+| `vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py` | 9 | 6 |
+| `vllm/models/glm5next/nvidia/sparse_indexer.py` | 45 | 5 |
+| `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` | 7 | 0 |
+| `vllm/renderers/online_renderer.py` | 4 | 0 |
+| `vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py` | 4 | 1 |
+| `vllm/third_party/flash_linear_attention/ops/chunk_o.py` | 4 | 1 |
+| `vllm/third_party/flash_linear_attention/ops/chunk_scaled_dot_kkt.py` | 4 | 1 |
+| `vllm/third_party/flash_linear_attention/ops/cumsum.py` | 5 | 2 |
+| `vllm/third_party/flash_linear_attention/ops/index.py` | 14 | 2 |
+| `vllm/third_party/flash_linear_attention/ops/kda.py` | 9 | 6 |
+| `vllm/third_party/flash_linear_attention/ops/l2norm.py` | 5 | 2 |
+| `vllm/third_party/flash_linear_attention/ops/solve_tril.py` | 6 | 3 |
+| `vllm/third_party/flash_linear_attention/ops/utils.py` | 32 | 7 |
+| `vllm/third_party/flash_linear_attention/ops/wy_fast.py` | 4 | 1 |
+| `vllm/v1/attention/backends/mla/indexer.py` | 4 | 1 |
+| `vllm/v1/attention/backends/recoverssm_metadata.py` | 6 | 0 |
+| `vllm/v1/core/kv_cache_planning.py` | 4 | 0 |
+| `vllm/v1/core/kv_cache_utils.py` | 4 | 0 |
+| `vllm/v1/core/sched/scheduler.py` | 69 | 7 |
+| `vllm/v1/executor/multiproc_executor.py` | 4 | 2 |
+| `vllm/v1/kv_cache_interface.py` | 8 | 1 |
+| `vllm/v1/outputs.py` | 7 | 0 |
+| `vllm/v1/worker/gpu/async_utils.py` | 12 | 0 |
+| `vllm/v1/worker/gpu/block_table.py` | 8 | 3 |
+| `vllm/v1/worker/gpu/cudagraph_utils.py` | 42 | 9 |
+| `vllm/v1/worker/gpu/model_runner.py` | 42 | 8 |
+| `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` | 7 | 0 |
+| `vllm/v1/worker/gpu/model_states/recoverssm.py` | 5 | 9 |
+| `vllm/v1/worker/gpu/pp_utils.py` | 9 | 0 |
+| `vllm/v1/worker/gpu/sample/gumbel.py` | 10 | 1 |
+| `vllm/v1/worker/gpu/spec_decode/__init__.py` | 8 | 0 |
+| `vllm/v1/worker/gpu/spec_decode/eagle/utils.py` | 7 | 2 |
+| `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` | 9 | 2 |
+| `vllm/v1/worker/gpu_model_runner.py` | 8 | 0 |
+| `vllm/v1/worker/gpu_worker.py` | 8 | 2 |
