@@ -166,12 +166,13 @@ compiles its own extension and has its own image identity.
 
 ### Quality
 
-Same image and session, greedy, thinking off, sent to the engine directly.
+Sent to the engine directly. Greedy with thinking off, except GPQA Diamond.
 
 | Check | Result |
 | --- | --- |
 | HumanEval, pass@1 (164 problems) | **142/164** (86.6%) |
 | GSM8K (1,319 test questions) | **1,228/1,319** (93.1%) |
+| GPQA Diamond (198 questions, thinking on) | **172/198** (86.9%) |
 | Needle retrieval at 4K, 16K, 32K and 64K | 16/16 |
 | 225,280-token window | 225,279 prompt tokens + 1 output token accepted; 225,280 refused |
 | Image and video input | 7/7 (three images from 64×64 to 4000×3000, two images in one prompt, two short videos) |
@@ -182,6 +183,9 @@ Same image and session, greedy, thinking off, sent to the engine directly.
 - **GSM8K** runs vLLM's `tests/evals/gsm8k/gsm8k_eval.py` in its chat mode:
   5-shot, 1,024 tokens, the last integer in the reply. The script's default
   completion mode scores 1,190/1,319.
+- **GPQA Diamond** uses OpenAI simple-evals' prompt and answer pattern, with
+  thinking on, temperature 1.0 and top_p 0.95 (the checkpoint's
+  `generation_config.json`), up to 65,536 tokens per reply, one pass.
 - With thinking off, replies about video can open with a short description of
   the frames before the answer.
 
