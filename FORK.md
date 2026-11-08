@@ -69,11 +69,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `licenses/exl3/LICENSE` | 21 |
 | `licenses/exl3/NOTICE` | 45 |
 | `pyproject.toml` | 46 |
-| `recipes/glm53-flash-exl3/Dockerfile` | 67 |
-| `recipes/glm53-flash-exl3/README.md` | 193 |
-| `recipes/glm53-flash-exl3/chat_template.jinja` | 226 |
-| `recipes/glm53-flash-exl3/results.json` | 460 |
-| `recipes/glm53-flash-exl3/serve.sh` | 44 |
+| `recipes/glm53-flash-exl3/README.md` | 73 |
 | `recipes/qwen-flash-next-exl3/Dockerfile` | 23 |
 | `recipes/qwen-flash-next-exl3/README.md` | 148 |
 | `recipes/qwen-flash-next-exl3/results.json` | 317 |
@@ -88,7 +84,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `tests/cmp170hx/test_fork_env_vars.py` | 149 |
 | `tests/cmp170hx/test_glm_pp4_draft_fc_staging.py` | 86 |
 | `tests/cmp170hx/test_glm_pp4_kv_plan.py` | 89 |
-| `tests/cmp170hx/test_glm_pp4_mamba_split.py` | 318 |
+| `tests/cmp170hx/test_glm_pp4_mamba_split.py` | 335 |
 | `tests/cmp170hx/test_glm_registrations.py` | 314 |
 | `tests/cmp170hx/test_import_cuda_init.py` | 168 |
 | `tests/cmp170hx/test_indexer_deep_gemm_gates.py` | 50 |
@@ -358,7 +354,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `vllm_cmp170hx/ple/disk_reader.py` | 147 |
 | `vllm_cmp170hx/plugin.py` | 421 |
 | `vllm_cmp170hx/sched/__init__.py` | 69 |
-| `vllm_cmp170hx/sched/hooks.py` | 121 |
+| `vllm_cmp170hx/sched/hooks.py` | 124 |
 | `vllm_cmp170hx/sched/prefill_budget.py` | 102 |
 | `vllm_cmp170hx/sched/scheduler.py` | 476 |
 | `vllm_cmp170hx/sched/step.py` | 233 |
