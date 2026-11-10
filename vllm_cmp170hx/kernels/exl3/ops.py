@@ -948,6 +948,14 @@ def _linear(
     logical_out: int,
     row_chunk: int,
 ) -> torch.Tensor:
+    if dense_prefill_tc.active and dense_prefill_tc.once_takes(
+        x, trellis, bits_x2, codebook, logical_out
+    ):
+        from vllm_cmp170hx.kernels.exl3 import dense_prefill_once
+
+        return dense_prefill_once.linear(
+            x, trellis, suh, svh, bits_x2, codebook, logical_out
+        )
     workspace = _linear_scratch(x.device)
     out = torch.empty((x.shape[0], logical_out), dtype=x.dtype, device=x.device)
     operator = linear_out_splitk if _dense_splitk else linear_out

@@ -407,6 +407,32 @@ def _resolve_prefill_tc() -> None:
         scope="process",
     )
     _prefill_active = True
+    from vllm_cmp170hx.kernels.exl3 import dense_prefill_once
+
+    if dense_prefill_once.enabled():
+        dense_prefill_once.preallocate(torch.device("cuda", torch.cuda.current_device()))
+
+
+def once_takes(x, trellis, bits_x2: int, codebook: int, logical_out: int) -> bool:
+    """Lab: whether this whole _linear call takes the decode-once prefill path
+    (dense_prefill_once; VLLM_EXL3_DENSE_PREFILL_ONCE). Same phase gate and
+    matrix set as the tensor-core prefill operator; the call is not split into
+    _linear's row chunks."""
+    from vllm_cmp170hx.kernels.exl3 import dense_prefill_once
+
+    if not _prefill_active or not dense_prefill_once.enabled():
+        return False
+    padded_in, padded_out = trellis.shape[0] * 16, trellis.shape[1] * 16
+    if (
+        codebook != VALIDATED_CODEBOOK
+        or (padded_in, padded_out, bits_x2) not in _served_matrices
+        or not dense_prefill_once.takes(x.shape[0], x.shape[1], trellis, logical_out)
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    return step_phase.prefill_step(
+        _max_decode_query_len, require_explicit=_require_explicit_prefill
+    )
 
 
 def _resolve_decode_tc() -> None:
