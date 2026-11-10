@@ -59,7 +59,9 @@ MOE_GLM_Q4N_EXPERT_BITS = (5, 6)
 
 
 def split_moe_key(key: int) -> tuple[int, int]:
-    """(stored bits_x2, codebook) of a layer key: mul1 keys are bits_x2, Q4N keys bits_x2 + 64."""
+    """(stored bits_x2, codebook) of a layer key: mul1 bits_x2; Q4N bits_x2 + 64; Q4N-X bits_x2 + 128."""
+    if key >= 2 * Q4N_KEY_OFFSET:
+        return key - 2 * Q4N_KEY_OFFSET, 4
     return (key - Q4N_KEY_OFFSET, 3) if key >= Q4N_KEY_OFFSET else (key, 2)
 
 # moe_out_decode_tc (csrc/exl3/moe_prefill.cu, the small-row schedule) covers
@@ -352,7 +354,7 @@ def moe_prefill_closed_reason(
             metadata,
         )
     stored, codebook = split_moe_key(bits_x2)
-    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook == 3 else MOE_PREFILL_GLM_EXPERT_BITS
+    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook >= 3 else MOE_PREFILL_GLM_EXPERT_BITS
     if stored not in allowed:
         return f"GLM prefill runs the 5-bit or 3.5-bit family (Q4N: 2.5 or 3-bit), not key {bits_x2}"
     expected_meta = [
@@ -401,7 +403,7 @@ def moe_decode_tc_closed_reason(
             "serves the GLM family; other decode calls keep their kernels)"
         )
     stored, codebook = split_moe_key(bits_x2)
-    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook == 3 else MOE_PREFILL_GLM_EXPERT_BITS
+    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook >= 3 else MOE_PREFILL_GLM_EXPERT_BITS
     if stored not in allowed:
         return f"GLM decode runs the 5-bit or 3.5-bit family (Q4N: 2.5 or 3-bit), not key {bits_x2}"
     expected_meta = [

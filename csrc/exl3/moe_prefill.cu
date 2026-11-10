@@ -1024,6 +1024,14 @@ constexpr int kGlmQ4NKey = 5 + kQ4NFormatOffset;
 using GlmQ4N6Family = Family<4096, 2048, 6, 10, 64, 3>;
 using GlmQ4N6DecodeFamily = Family<4096, 2048, 6, 10, 8, 3>;
 constexpr int kGlmQ4N6Key = 6 + kQ4NFormatOffset;
+// Q4N-X (codebook 4): keys bits_x2 + 128.
+constexpr int kQ4NXFormatOffset = 128;
+using GlmQ4NXFamily = Family<4096, 2048, 5, 10, 64, 4>;
+using GlmQ4NXDecodeFamily = Family<4096, 2048, 5, 10, 8, 4>;
+using GlmQ4NX6Family = Family<4096, 2048, 6, 10, 64, 4>;
+using GlmQ4NX6DecodeFamily = Family<4096, 2048, 6, 10, 8, 4>;
+constexpr int kGlmQ4NXKey = 5 + kQ4NXFormatOffset;
+constexpr int kGlmQ4NX6Key = 6 + kQ4NXFormatOffset;
 
 template <class S>
 __device__ __forceinline__ uint32_t next_stage(uint32_t offset) {
@@ -1079,9 +1087,9 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
   uint32_t w_lane[Ring::kLoadWords];
   int shift;
   bool q4n_zero_hi = false;
-  if constexpr (S::kCodebook == 3) {
+  if constexpr (S::kCodebook == 3 || S::kCodebook == 4) {
     // Q4N: hi/lo ring words around the window start; lane 0 starts before the tile (zero prefix).
-    const int start = Q4NRing<S::kBitsX2>::start(lane);
+    const int start = Q4NRing<S::kBitsX2, S::kCodebook>::start(lane);
     const uint32_t base = smem + S::kStageW + TPW * warp * S::kTileBytes;
     if (start < 0) {
       q4n_zero_hi = true;
@@ -1090,7 +1098,7 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
       w_lane[1] = base;
     } else {
       const int w0 = start >> 5;
-      const int w1 = w0 + 1 < Q4NRing<S::kBitsX2>::kWords ? w0 + 1 : w0;
+      const int w1 = w0 + 1 < Q4NRing<S::kBitsX2, S::kCodebook>::kWords ? w0 + 1 : w0;
       shift = start & 31;
       w_lane[0] = base + 4 * w0;
       w_lane[1] = base + 4 * w1;
@@ -1125,10 +1133,10 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
       for (int j = 0; j < TPW; ++j) {
         const uint32_t tile_off =
             read + step * (S::kBlockTiles * S::kTileBytes) + j * S::kTileBytes;
-        if constexpr (S::kCodebook == 3) {
+        if constexpr (S::kCodebook == 3 || S::kCodebook == 4) {
           const uint32_t lo = lds32(w_lane[1] + tile_off);
           const uint32_t hi = q4n_zero_hi ? 0u : lds32(w_lane[0] + tile_off);
-          q4n_fragment<S::kBitsX2>(hi, lo, shift, a[j]);
+          q4n_fragment<S::kBitsX2, S::kCodebook>(hi, lo, shift, a[j]);
         } else {
           uint32_t words[Ring::kLoadWords];
 #pragma unroll
@@ -1191,7 +1199,7 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
         if (r < rows) {
           const int64_t pos = first + r;
           float scale = p.unscale[pos * 3 + S::kFirst + pi];
-          if constexpr (S::kCodebook == 3) scale = __fmul_rn(scale, kQ4NAlpha);
+          if constexpr (S::kCodebook >= 3) scale = __fmul_rn(scale, kQ4NAlpha);
           int64_t row = pos;
           if constexpr (S::kProjections == 1 && S::kFirst < 2)
             row = p.row_map[pos];
@@ -1514,7 +1522,7 @@ int64_t workspace_elements(int64_t assignments, int64_t hidden,
 // "1": one plane; "pair": both planes as independent MMAs. Returns kPlanes.
 template <class F>
 int prefill_one_plane() {
-  if constexpr (F::kCodebook == 3) {
+  if constexpr (F::kCodebook >= 3) {
     return 1;
   } else if constexpr (F::kTileRows <= 8) {
     return 0;
@@ -1581,7 +1589,7 @@ void launch_decode_gemm(const Gemm& p, int64_t items, cudaStream_t stream) {
 // Q4N families (a new format with no bitwise contract to keep) run one FP16 activation plane: the activation's
 // FP16 rounding (~2^-11 relative) is far below the 2.5-bit weight error, and it halves the MMAs.
 template <class F>
-constexpr int q4n_planes() { return F::kCodebook == 3 ? 1 : 0; }
+constexpr int q4n_planes() { return F::kCodebook >= 3 ? 1 : 0; }
 
 template <class F, bool kDownOnly = false>
 void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
@@ -1731,6 +1739,16 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64,
                                 rows, topk, out, workspace, stream);
       return;
     }
+    if (bits_x2 == kGlmQ4NXKey) {
+      run_family<GlmQ4NXFamily>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                local_experts, rows, topk, out, workspace, stream);
+      return;
+    }
+    if (bits_x2 == kGlmQ4NX6Key) {
+      run_family<GlmQ4NX6Family>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                 local_experts, rows, topk, out, workspace, stream);
+      return;
+    }
     TORCH_CHECK(
         bits_x2 == Glm35Family::kBitsX2,
         "EXL3 MoE prefill runs the GLM 5-bit or 3.5-bit family, not bits_x2 ",
@@ -1789,6 +1807,17 @@ void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
     run_family<GlmQ4N6DecodeFamily, false>(
         x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
         metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    return;
+  }
+  if (bits_x2 == kGlmQ4NXKey || bits_x2 == kGlmQ4NX6Key) {
+    TORCH_CHECK(!kDownOnly && activated_down == nullptr,
+                "EXL3 Q4N MoE decode serves the full tensor-core mode only");
+    if (bits_x2 == kGlmQ4NXKey)
+      run_family<GlmQ4NXDecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                             metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    else
+      run_family<GlmQ4NX6DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                              metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
     return;
   }
   TORCH_CHECK(

@@ -19,7 +19,8 @@ from vllm_cmp170hx.kernels.exl3 import ops as exl3_ops
 
 import os
 Q4N_BX2 = int(os.environ.get("Q4N_BX2", "5"))
-Q4N_KEY = Q4N_BX2 + 64
+Q4N_CB = int(os.environ.get("Q4N_CB", "3"))   # 3: Q4N (L = 16); 4: Q4N-X (L = 32 - KV)
+Q4N_KEY = Q4N_BX2 + (128 if Q4N_CB == 4 else 64)
 MULT = 0x83DCD12D
 ALPHA = 1.0 / 6.519202405202649
 
@@ -32,11 +33,12 @@ def q4n_core(trellis):
     bits = ((words[..., :, None] >> (31 - np.arange(32))) & 1).reshape(tk, tn, words.shape[-1] * 32)
     core = np.zeros((tk * 16, tn * 16))
     KV = 2 * (h // 8)  # stored halfwords 8 * bits_x2 -> KV = 2 * bits_x2
+    Lb = 32 - KV if Q4N_CB == 4 else 16
     nb = words.shape[-1] * 32
     for i in range(64):
         end = (i + 1) * KV
         st = np.zeros((tk, tn), dtype=np.int64)
-        for b in range(end - 16, end):
+        for b in range(end - Lb, end):
             st = (st << 1) | (bits[..., b] if b >= 0 else 0)
         p = (st * MULT) & 0xFFFFFFFF
         lane, j = i >> 1, i & 1
@@ -82,8 +84,8 @@ def q4n_experts(seed=10157):
         dense.append(mats)
     rms = sorted(float(w[0].pow(2).mean().sqrt()) for w in dense)
     scale = 2.0 * G.LIMIT / (G.GHIDDEN ** 0.5 * rms[len(rms) // 2])
-    meta = [[[G.GHIDDEN, G.GINTERMEDIATE, Q4N_BX2, 3], [G.GHIDDEN, G.GINTERMEDIATE, Q4N_BX2, 3],
-             [G.GINTERMEDIATE, G.GHIDDEN, Q4N_BX2, 3]]] * G.GLOCAL
+    meta = [[[G.GHIDDEN, G.GINTERMEDIATE, Q4N_BX2, Q4N_CB], [G.GHIDDEN, G.GINTERMEDIATE, Q4N_BX2, Q4N_CB],
+             [G.GINTERMEDIATE, G.GHIDDEN, Q4N_BX2, Q4N_CB]]] * G.GLOCAL
     return SimpleNamespace(
         owners=owners,
         pointers=torch.tensor([sets[s] for s in G.SET_OF], dtype=torch.int64, device=device),
@@ -193,7 +195,7 @@ def main():
         res[name]["decode_mean_abs_err"], res[name]["decode_max_abs_err"] = m, mx
         m, mx = rel_errors(glm, G._p, pre, 100)
         res[name]["prefill_mean_abs_err"], res[name]["prefill_max_abs_err"] = m, mx
-        key, cb = (5, 2) if name == "mul1" else (Q4N_KEY, 3)
+        key, cb = (5, 2) if name == "mul1" else (Q4N_KEY, Q4N_CB)
         res[name]["decode_ms"] = {r: round(timing(key, cb, r), 4) for r in (1, 2, 4, 8)}
         res[name]["prefill_ms"] = {r: round(timing_prefill(key, cb, r), 3) for r in (512, 2048)}
         print(name, json.dumps(res[name]), flush=True)

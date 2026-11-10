@@ -20,7 +20,7 @@ _DTYPE_BYTES = {
     "I64": 8,
     "F64": 8,
 }
-_MARKERS = {"mcg": (1, 0xCBAC1FED), "mul1": (2, 0x83DCD12D), "q4n": (3, 0x83DCD12D)}
+_MARKERS = {"mcg": (1, 0xCBAC1FED), "mul1": (2, 0x83DCD12D), "q4n": (3, 0x83DCD12D), "q4nx": (4, 0x83DCD12D)}
 PLE_AUXILIARIES = (
     "head_bias",
     "head_offsets",
@@ -194,7 +194,7 @@ class Exl3Manifest:
             self.matrices[prefix] = self._matrix(prefix, tensor)
         packed_keys = {k for matrix in self.matrices.values() for k in matrix.keys}
         for name in self.tensors:
-            if name.endswith((".suh", ".svh", ".mcg", ".mul1", ".q4n")):
+            if name.endswith((".suh", ".svh", ".mcg", ".mul1", ".q4n", ".q4nx")):
                 if name not in packed_keys:
                     raise ValueError(f"Orphan EXL3 quantization tensor: {name}")
             if (
@@ -262,7 +262,7 @@ class Exl3Manifest:
         if struct.unpack("<I", header.read_bytes())[0] != value:
             raise ValueError(f"Unsupported EXL3 codebook multiplier: {prefix}")
         bits_x2 = stride // 8
-        if codebook == 3:
+        if codebook >= 3:
             if bits_x2 not in (5, 6):
                 raise ValueError(f"Unsupported Q4N bitrate: {prefix}")
         elif not (bits_x2 in range(2, 17, 2) or (codebook == 2 and bits_x2 in (3, 5, 7))):

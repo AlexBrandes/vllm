@@ -12,20 +12,24 @@ namespace exl3 {
 constexpr int kQ4NFormatOffset = 64;  // bits_x2 key = bits_x2 + 64 marks a Q4N tensor
 constexpr float kQ4NAlpha = 0.15339208f;  // 1 / 6.519202405202649
 
-template <int BitsX2>
+// Codebook 3 (Q4N): 16-bit state. Codebook 4 (Q4N-X): the longest state whose two lane states fit one 32-bit
+// window, L = 32 - KV (22 at 2.5 bpw, 20 at 3.0 bpw). Everything else is shared.
+template <int BitsX2, int Codebook = 3>
 struct Q4NRing {
   static constexpr int kKV = 2 * BitsX2;
+  static constexpr int kL = Codebook == 4 ? 32 - kKV : 16;
   static constexpr int kWords = 4 * BitsX2;  // 64 * kKV / 32
-  // First bit of lane L's 26-bit window (states 2L, 2L + 1): (2L + 1) KV - 16; negative only for lane 0.
-  __device__ static __forceinline__ int start(int lane) { return (2 * lane + 1) * kKV - 16; }
+  // First bit of lane L's window (states 2L, 2L + 1): (2L + 1) KV - L; negative only for lane 0.
+  __device__ static __forceinline__ int start(int lane) { return (2 * lane + 1) * kKV - kL; }
 };
 
 // hi:lo = the two ring words around the window start (hi = 0 before the tile); shift = start mod 32.
-template <int BitsX2>
+template <int BitsX2, int Codebook = 3>
 __device__ __forceinline__ void q4n_fragment(uint32_t hi, uint32_t lo, int shift, uint32_t (&a)[4]) {
+  using R = Q4NRing<BitsX2, Codebook>;
   const uint32_t u = __funnelshift_l(lo, hi, shift);
-  const uint32_t s0 = u >> 16;
-  const uint32_t s1 = (u >> (16 - Q4NRing<BitsX2>::kKV)) & 0xffffu;
+  const uint32_t s0 = u >> (32 - R::kL);
+  const uint32_t s1 = (u >> (32 - R::kL - R::kKV)) & ((1u << R::kL) - 1u);
   const uint32_t off = 0xe40fe40fu;  // FP16 -1039 (= -(1024 + 15)) in both halves
 #pragma unroll
   for (int j = 0; j < 2; ++j) {

@@ -1246,7 +1246,7 @@ def _layer_bits_x2(metadata) -> int | None:
         return None
     bits, codebook = formats.pop()
     # Q4N layers (codebook 3) are dispatched by key bits_x2 + 64 (ops.split_moe_key).
-    return bits + 64 if codebook == 3 else bits
+    return bits + 128 if codebook == 4 else bits + 64 if codebook == 3 else bits
 
 
 def _unaligned_trellis_reason(pointers) -> str | None:
