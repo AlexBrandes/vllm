@@ -1510,7 +1510,9 @@ int64_t workspace_elements(int64_t assignments, int64_t hidden,
 // "1": one plane; "pair": both planes as independent MMAs. Returns kPlanes.
 template <class F>
 int prefill_one_plane() {
-  if constexpr (F::kTileRows <= 8) {
+  if constexpr (F::kCodebook == 3) {
+    return 1;
+  } else if constexpr (F::kTileRows <= 8) {
     return 0;
   } else {
     static const int mode = [] {
@@ -1563,15 +1565,19 @@ inline int decode_gemm_stages() {
   }();
   return stages;
 }
-template <class S>
+template <class S, int kPlanes = 0>
 void launch_decode_gemm(const Gemm& p, int64_t items, cudaStream_t stream) {
   switch (decode_gemm_stages()) {
-    case 4: launch_gemm<Staged<S, 4>>(p, items, stream); break;
-    case 6: launch_gemm<Staged<S, 6>>(p, items, stream); break;
-    case 8: launch_gemm<Staged<S, 8>>(p, items, stream); break;
-    default: launch_gemm<S>(p, items, stream); break;
+    case 4: launch_gemm<Staged<S, 4>, kPlanes>(p, items, stream); break;
+    case 6: launch_gemm<Staged<S, 6>, kPlanes>(p, items, stream); break;
+    case 8: launch_gemm<Staged<S, 8>, kPlanes>(p, items, stream); break;
+    default: launch_gemm<S, kPlanes>(p, items, stream); break;
   }
 }
+// Q4N families (a new format with no bitwise contract to keep) run one FP16 activation plane: the activation's
+// FP16 rounding (~2^-11 relative) is far below the 2.5-bit weight error, and it halves the MMAs.
+template <class F>
+constexpr int q4n_planes() { return F::kCodebook == 3 ? 1 : 0; }
 
 template <class F, bool kDownOnly = false>
 void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
@@ -1634,7 +1640,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     {
       const int64_t items = max_tiles * GateUp::kProjections * GateUp::kColBlocks;
       if constexpr (kTileRows == 8) {
-        launch_decode_gemm<GateUp>(p, items, stream);
+        launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
       } else {
         switch (prefill_one_plane<F>()) {
           case 1: launch_gemm<GateUp, 1>(p, items, stream); break;
@@ -1663,7 +1669,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   {
     const int64_t items = max_tiles * Down::kProjections * Down::kColBlocks;
     if constexpr (kTileRows == 8) {
-      launch_decode_gemm<Down>(p, items, stream);
+      launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
     } else {
       switch (prefill_one_plane<F>()) {
         case 1: launch_gemm<Down, 1>(p, items, stream); break;
