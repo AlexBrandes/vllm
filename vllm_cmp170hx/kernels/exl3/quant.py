@@ -326,6 +326,42 @@ class Exl3PackedWeight(nn.Module):
             or not 0 < logical_out <= self.padded_out
         ):
             raise ValueError("EXL3 logical dimensions exceed assigned packed blocks")
+        from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+        # Lab: an INT8 sidecar built from the original checkpoint replaces the
+        # trellis for whole (unsharded) matrices it covers (VLLM_EXL3_DENSE_W8).
+        self.w8_mode = (
+            dense_w8.covers(matrix.prefix)
+            and len(output_slices) == 1
+            and input_slice.start == 0
+            and input_slice.stop == matrix.padded_in
+            and output_slices[0].start == 0
+            and output_slices[0].stop == matrix.padded_out
+            and logical_in == matrix.padded_in
+        )
+        if self.w8_mode:
+            n = logical_out
+            self.w8 = nn.Parameter(
+                torch.empty(n, self.padded_in, dtype=torch.int8), requires_grad=False
+            )
+            self.sw = nn.Parameter(
+                torch.empty(n, dtype=torch.float32), requires_grad=False
+            )
+            self.trellis = nn.Parameter(
+                torch.empty(0, dtype=torch.int16), requires_grad=False
+            )
+            self.svh = nn.Parameter(
+                torch.empty(0, dtype=torch.float16), requires_grad=False
+            )
+            self.suh = nn.Parameter(
+                torch.empty(
+                    0 if matrix.prefix == "lm_head" else self.padded_in,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            self.loaded = False
+            return
         self.trellis = nn.Parameter(
             torch.empty(
                 self.padded_in // 16,
@@ -346,6 +382,23 @@ class Exl3PackedWeight(nn.Module):
     def load(self, files, ledger):
         manifest = ledger.manifest
         prefix = self.matrix.prefix
+        if self.w8_mode:
+            from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+            w8 = dense_w8.tensor(prefix, "w8")
+            if tuple(w8.shape) != tuple(self.w8.shape):
+                raise ValueError(
+                    f"EXL3 dense W8 sidecar shape {tuple(w8.shape)} != "
+                    f"{tuple(self.w8.shape)} for {prefix}"
+                )
+            self.w8.data.copy_(w8)
+            self.sw.data.copy_(dense_w8.tensor(prefix, "sw"))
+            if self.suh.numel():
+                self.suh.data.copy_(dense_w8.tensor(prefix, "suh"))
+            for key in self.matrix.keys:
+                ledger.mark(key, "consumed", prefix)
+            self.loaded = True
+            return
         ks = slice(self.input_slice.start // 16, self.input_slice.stop // 16)
         header = manifest.tensors[f"{prefix}.trellis"]
         packed = files[header.path].get_slice(header.name)
@@ -453,6 +506,20 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise ValueError(f"Unloaded EXL3 matrix: {weight.matrix.prefix}")
             if not all(p.is_cuda for p in weight.parameters()):
                 raise ValueError("EXL3 packed weights and scales must remain on CUDA")
+            if weight.w8_mode:
+                from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+                dense_w8.load_libs()
+                if weight.matrix.prefix == "lm_head":
+                    q, s = dense_w8.marlin_pack_lm_head(weight.w8.data, weight.sw.data)
+                    weight.marlin_q = nn.Parameter(q, requires_grad=False)
+                    weight.marlin_s = nn.Parameter(s, requires_grad=False)
+                    weight.w8 = nn.Parameter(
+                        torch.empty(0, dtype=torch.int8, device=q.device),
+                        requires_grad=False,
+                    )
+                self.row_chunks.append(0)
+                continue
             self.row_chunks.append(
                 exl3_ops.linear_row_chunk(weight.padded_in, weight.padded_out)
             )
@@ -461,15 +528,24 @@ class Exl3LinearMethod(LinearMethodBase):
         shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1]).contiguous()
         outputs = [
-            torch.ops.vllm.exl3_linear(
-                x,
-                weight.trellis,
-                weight.suh,
-                weight.svh,
-                weight.matrix.bits_x2,
-                weight.matrix.codebook,
-                weight.logical_out,
-                row_chunk,
+            (
+                torch.ops.vllm.exl3_w8_lm_head(
+                    x, weight.marlin_q, weight.marlin_s, weight.logical_out,
+                    weight.padded_in,
+                )
+                if weight.w8_mode and weight.matrix.prefix == "lm_head"
+                else torch.ops.vllm.exl3_w8_linear(x, weight.w8, weight.sw, weight.suh)
+                if weight.w8_mode
+                else torch.ops.vllm.exl3_linear(
+                    x,
+                    weight.trellis,
+                    weight.suh,
+                    weight.svh,
+                    weight.matrix.bits_x2,
+                    weight.matrix.codebook,
+                    weight.logical_out,
+                    row_chunk,
+                )
             )
             for weight, row_chunk in zip(layer.exl3_weights, self.row_chunks)
         ]

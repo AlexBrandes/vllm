@@ -424,3 +424,11 @@ class DFlash2Qwen3Model(qwen3_dflash2.DFlash2Qwen3Model):
 
 class DFlash2Qwen3ForCausalLM(DFlashDraftMixin, qwen3_dflash2.DFlash2Qwen3ForCausalLM):
     model_cls = DFlash2Qwen3Model
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        # Lab: weight-only Marlin drafter (VLLM_DFLASH_DRAFT_QUANT=w8|w4; default off).
+        from vllm_cmp170hx.spec_decode import draft_quant
+
+        draft_quant.quantize_drafter(self)
+        return loaded
