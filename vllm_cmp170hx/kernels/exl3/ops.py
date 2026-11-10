@@ -53,6 +53,14 @@ MOE_PREFILL_MAX_ROWS = 3460
 MOE_PREFILL_GLM_MAX_ROWS = 2312
 MOE_PREFILL_GLM_SHAPE = (4096, 2048, 8, 288, 288)
 MOE_PREFILL_GLM_EXPERT_BITS = (5, 7)
+# Q4N (codebook 3, lab): the layer key passed as bits_x2 is the stored bits_x2 + Q4N_KEY_OFFSET.
+Q4N_KEY_OFFSET = 64
+MOE_GLM_Q4N_EXPERT_BITS = (5,)
+
+
+def split_moe_key(key: int) -> tuple[int, int]:
+    """(stored bits_x2, codebook) of a layer key: mul1 keys are bits_x2, Q4N keys bits_x2 + 64."""
+    return (key - Q4N_KEY_OFFSET, 3) if key >= Q4N_KEY_OFFSET else (key, 2)
 
 # moe_out_decode_tc (csrc/exl3/moe_prefill.cu, the small-row schedule) covers
 # decode-step calls of 1..MOE_DECODE_TC_MAX_ROWS rows of the exact GLM family
@@ -343,12 +351,14 @@ def moe_prefill_closed_reason(
             global_experts,
             metadata,
         )
-    if bits_x2 not in MOE_PREFILL_GLM_EXPERT_BITS:
-        return f"GLM prefill runs the 5-bit or 3.5-bit family, not bits_x2 {bits_x2}"
+    stored, codebook = split_moe_key(bits_x2)
+    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook == 3 else MOE_PREFILL_GLM_EXPERT_BITS
+    if stored not in allowed:
+        return f"GLM prefill runs the 5-bit or 3.5-bit family (Q4N: 2.5-bit), not key {bits_x2}"
     expected_meta = [
-        [4096, 2048, bits_x2, 2],
-        [4096, 2048, bits_x2, 2],
-        [2048, 4096, bits_x2, 2],
+        [4096, 2048, stored, codebook],
+        [4096, 2048, stored, codebook],
+        [2048, 4096, stored, codebook],
     ]
     return _moe_family_closed_reason(
         capability,
@@ -390,12 +400,14 @@ def moe_decode_tc_closed_reason(
             f"{MOE_PREFILL_GLM_SHAPE[:2]} (the small-row decode schedule "
             "serves the GLM family; other decode calls keep their kernels)"
         )
-    if bits_x2 not in MOE_PREFILL_GLM_EXPERT_BITS:
-        return f"GLM decode runs the 5-bit or 3.5-bit family, not bits_x2 {bits_x2}"
+    stored, codebook = split_moe_key(bits_x2)
+    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook == 3 else MOE_PREFILL_GLM_EXPERT_BITS
+    if stored not in allowed:
+        return f"GLM decode runs the 5-bit or 3.5-bit family (Q4N: 2.5-bit), not key {bits_x2}"
     expected_meta = [
-        [4096, 2048, bits_x2, 2],
-        [4096, 2048, bits_x2, 2],
-        [2048, 4096, bits_x2, 2],
+        [4096, 2048, stored, codebook],
+        [4096, 2048, stored, codebook],
+        [2048, 4096, stored, codebook],
     ]
     return _moe_family_closed_reason(
         capability,

@@ -1241,8 +1241,12 @@ def _layer_bits_x2(metadata) -> int | None:
     ``[hidden, intermediate, bits_x2, codebook]`` row per projection, so the
     format is entry 2 of each row.
     """
-    bits = {int(projection[2]) for expert in metadata for projection in expert}
-    return bits.pop() if len(bits) == 1 else None
+    formats = {(int(projection[2]), int(projection[3])) for expert in metadata for projection in expert}
+    if len(formats) != 1:
+        return None
+    bits, codebook = formats.pop()
+    # Q4N layers (codebook 3) are dispatched by key bits_x2 + 64 (ops.split_moe_key).
+    return bits + 64 if codebook == 3 else bits
 
 
 def _unaligned_trellis_reason(pointers) -> str | None:
