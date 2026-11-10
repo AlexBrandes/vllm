@@ -953,9 +953,11 @@ def _linear(
     ):
         from vllm_cmp170hx.kernels.exl3 import dense_prefill_once
 
-        return dense_prefill_once.linear(
+        once = dense_prefill_once.linear(
             x, trellis, suh, svh, bits_x2, codebook, logical_out
         )
+        if once is not None:
+            return once
     workspace = _linear_scratch(x.device)
     out = torch.empty((x.shape[0], logical_out), dtype=x.dtype, device=x.device)
     operator = linear_out_splitk if _dense_splitk else linear_out

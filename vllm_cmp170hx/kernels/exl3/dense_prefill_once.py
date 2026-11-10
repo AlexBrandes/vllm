@@ -70,19 +70,23 @@ def load() -> None:
     )
 
 
-def _stream_buffers(device: torch.device):
-    """Per-stream weight chunk, activation and per-token scale buffers. The
-    shared-expert aux stream overlaps the compute stream, so each stream has
-    its own. Allocated on first use."""
-    stream = torch.cuda.current_stream(device)
-    key = stream.cuda_stream
+# The shared-expert aux stream only runs the shared-expert projections (K <= 4096,
+# N x K <= 2048 x 4096), so its buffers are sized for those.
+AUX_MAX_K = 4096
+AUX_CHUNK_BYTES = 16 << 20
+
+
+def _stream_buffers(device: torch.device, *, max_k: int = MAX_K,
+                    chunk_bytes: int = CHUNK_BYTES, create: bool = False):
+    """Per-stream weight chunk, activation and per-token scale buffers (the aux
+    stream overlaps the compute stream, so each has its own). Created only by
+    preallocate, before memory profiling; None for a stream without buffers."""
+    key = torch.cuda.current_stream(device).cuda_stream
     bufs = _buffers.get(key)
-    if bufs is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("decode-once buffers must exist before graph capture")
-        act_bytes = MAX_ROWS * MAX_K * (1 if MODE == "i8" else 2)
+    if bufs is None and create:
+        act_bytes = MAX_ROWS * max_k * (1 if MODE == "i8" else 2)
         bufs = (
-            torch.empty(CHUNK_BYTES, dtype=torch.int8, device=device),
+            torch.empty(chunk_bytes, dtype=torch.int8, device=device),
             torch.empty(act_bytes, dtype=torch.int8, device=device),
             torch.empty(MAX_ROWS, dtype=torch.float32, device=device),
         )
@@ -96,7 +100,7 @@ def preallocate(device: torch.device) -> None:
     if not enabled():
         return
     load()
-    _stream_buffers(device)
+    _stream_buffers(device, create=True)
     try:
         from vllm.utils.torch_utils import aux_stream
 
@@ -105,7 +109,8 @@ def preallocate(device: torch.device) -> None:
         aux = None
     if aux is not None:
         with torch.cuda.stream(aux):
-            _stream_buffers(device)
+            _stream_buffers(device, max_k=AUX_MAX_K, chunk_bytes=AUX_CHUNK_BYTES,
+                            create=True)
 
 
 def takes(rows: int, in_features: int, trellis: torch.Tensor, logical_out: int) -> bool:
@@ -135,12 +140,19 @@ def _column_scales(trellis, svh, bits_x2, codebook):
 
 
 def linear(x, trellis, suh, svh, bits_x2: int, codebook: int, logical_out: int):
+    """The decode-once result, or None when this stream's buffers cannot hold
+    the call (the caller then runs the shipped path)."""
     rows, k = x.shape
     n = trellis.shape[1] * 16
-    wbuf, abuf, sbuf = _stream_buffers(x.device)
-    out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
+    bufs = _stream_buffers(x.device)
     elem = 1 if MODE == "i8" else 2
-    chunk = max(128, (CHUNK_BYTES // (k * elem)) // 128 * 128)
+    if bufs is None or rows * k * elem > bufs[1].numel():
+        return None
+    wbuf, abuf, sbuf = bufs
+    chunk = (wbuf.numel() // (k * elem)) // 128 * 128
+    if chunk < 128:
+        return None
+    out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
     if MODE == "i8":
         sw, inv = _column_scales(trellis, svh, bits_x2, codebook)
         xq = abuf[: rows * k].view(rows, k)
