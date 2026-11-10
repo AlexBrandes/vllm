@@ -120,6 +120,32 @@ def distinct_tables(codebook, n_experts=64, seed=3):
     return keep, torch.tensor(rows, dtype=torch.int64, device="cuda"), torch.tensor(meta, dtype=torch.int64, device="cuda")
 
 
+def timing_prefill(key, codebook, rows):
+    """One moe_out_prefill call: rows tokens x top-8 over 64 distinct experts (uniform routing)."""
+    keep, pointers, meta = distinct_tables(codebook)
+    topk = 8
+    g = torch.Generator().manual_seed(5)
+    local_ids = torch.argsort(torch.rand(rows, 64, generator=g), dim=1)[:, :topk].cuda()
+    weights = torch.full((rows, topk), 1.0 / topk, dtype=torch.float32, device="cuda")
+    expert_map = torch.arange(G.GGLOBAL, dtype=torch.int32, device="cuda")
+    x = (torch.randn(rows, G.GHIDDEN, device="cuda") * 0.05).to(torch.bfloat16)
+    out = torch.empty_like(x)
+    ws = torch.empty(exl3_ops.moe_workspace_size_prefill(rows, G.GHIDDEN, G.GINTERMEDIATE, topk, G.GLOCAL),
+                     dtype=torch.float32, device="cuda")
+    call = lambda: exl3_ops.moe_out_prefill(x, local_ids, weights, pointers, meta, expert_map,
+                                            G.GINTERMEDIATE, key, out, ws)
+    for _ in range(3):
+        call()
+    ts = []
+    for _ in range(11):
+        s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+        s.record(); call(); e.record(); torch.cuda.synchronize()
+        ts.append(s.elapsed_time(e))
+    ts.sort()
+    del keep
+    return ts[len(ts) // 2]
+
+
 def timing(key, codebook, rows):
     keep, pointers, meta = distinct_tables(codebook)
     topk = 8
@@ -163,6 +189,7 @@ def main():
         res[name]["prefill_mean_abs_err"], res[name]["prefill_max_abs_err"] = m, mx
         key, cb = (5, 2) if name == "mul1" else (Q4N_KEY, 3)
         res[name]["decode_ms"] = {r: round(timing(key, cb, r), 4) for r in (1, 2, 4, 8)}
+        res[name]["prefill_ms"] = {r: round(timing_prefill(key, cb, r), 3) for r in (512, 2048)}
         print(name, json.dumps(res[name]), flush=True)
     for phase in ("decode", "prefill"):
         mean_ratio = res["q4n"][f"{phase}_mean_abs_err"] / res["mul1"][f"{phase}_mean_abs_err"]
@@ -170,7 +197,8 @@ def main():
         res[f"{phase}_gate"] = {"mean_ratio": round(mean_ratio, 4), "max_ratio": round(max_ratio, 4),
                                 "pass": mean_ratio <= 1.10 and max_ratio <= 1.25}
     res["decode_speedup"] = {r: round(res["mul1"]["decode_ms"][r] / res["q4n"]["decode_ms"][r], 3) for r in (1, 2, 4, 8)}
-    print(json.dumps({k: res[k] for k in ("decode_gate", "prefill_gate", "decode_speedup")}, indent=1))
+    res["prefill_speedup"] = {r: round(res["mul1"]["prefill_ms"][r] / res["q4n"]["prefill_ms"][r], 3) for r in (512, 2048)}
+    print(json.dumps({k: res[k] for k in ("decode_gate", "prefill_gate", "decode_speedup", "prefill_speedup")}, indent=1))
     json.dump(res, open(sys.argv[1] if len(sys.argv) > 1 else "/out/q4n-moe-check.json", "w"), indent=1, default=str)
 
 
