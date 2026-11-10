@@ -17,7 +17,9 @@ import torch
 from tests.kernels.quantization import test_exl3_moe_prefill_glm as G
 from vllm_cmp170hx.kernels.exl3 import ops as exl3_ops
 
-Q4N_KEY = 5 + 64
+import os
+Q4N_BX2 = int(os.environ.get("Q4N_BX2", "5"))
+Q4N_KEY = Q4N_BX2 + 64
 MULT = 0x83DCD12D
 ALPHA = 1.0 / 6.519202405202649
 
@@ -27,10 +29,12 @@ def q4n_core(trellis):
     tk, tn, h = trellis.shape
     halves = trellis.astype(np.int64) & 0xFFFF
     words = halves[..., 0::2] | (halves[..., 1::2] << 16)  # (tk, tn, 20) uint32 values
-    bits = ((words[..., :, None] >> (31 - np.arange(32))) & 1).reshape(tk, tn, 640)
+    bits = ((words[..., :, None] >> (31 - np.arange(32))) & 1).reshape(tk, tn, words.shape[-1] * 32)
     core = np.zeros((tk * 16, tn * 16))
+    KV = 2 * (h // 8)  # stored halfwords 8 * bits_x2 -> KV = 2 * bits_x2
+    nb = words.shape[-1] * 32
     for i in range(64):
-        end = (i + 1) * 10
+        end = (i + 1) * KV
         st = np.zeros((tk, tn), dtype=np.int64)
         for b in range(end - 16, end):
             st = (st << 1) | (bits[..., b] if b >= 0 else 0)
@@ -67,7 +71,7 @@ def q4n_experts(seed=10157):
     for _ in range(G.SHARED + 1):
         ptrs, mats = [], []
         for k, n in ((G.GHIDDEN, G.GINTERMEDIATE), (G.GHIDDEN, G.GINTERMEDIATE), (G.GINTERMEDIATE, G.GHIDDEN)):
-            trellis = rng.integers(-(2 ** 15), 2 ** 15, (k // 16, n // 16, 40)).astype(np.int16)
+            trellis = rng.integers(-(2 ** 15), 2 ** 15, (k // 16, n // 16, 8 * Q4N_BX2)).astype(np.int16)
             suh = (rng.choice([-1.0, 1.0], k) * rng.uniform(0.5, 1.5, k)).astype(np.float16)
             svh = (rng.choice([-1.0, 1.0], n) * rng.uniform(0.5, 1.5, n) / 64).astype(np.float16)
             tensors = [torch.from_numpy(v).to(device) for v in (trellis, suh, svh)]
@@ -78,8 +82,8 @@ def q4n_experts(seed=10157):
         dense.append(mats)
     rms = sorted(float(w[0].pow(2).mean().sqrt()) for w in dense)
     scale = 2.0 * G.LIMIT / (G.GHIDDEN ** 0.5 * rms[len(rms) // 2])
-    meta = [[[G.GHIDDEN, G.GINTERMEDIATE, 5, 3], [G.GHIDDEN, G.GINTERMEDIATE, 5, 3],
-             [G.GINTERMEDIATE, G.GHIDDEN, 5, 3]]] * G.GLOCAL
+    meta = [[[G.GHIDDEN, G.GINTERMEDIATE, Q4N_BX2, 3], [G.GHIDDEN, G.GINTERMEDIATE, Q4N_BX2, 3],
+             [G.GINTERMEDIATE, G.GHIDDEN, Q4N_BX2, 3]]] * G.GLOCAL
     return SimpleNamespace(
         owners=owners,
         pointers=torch.tensor([sets[s] for s in G.SET_OF], dtype=torch.int64, device=device),
@@ -110,13 +114,15 @@ def distinct_tables(codebook, n_experts=64, seed=3):
     for _ in range(n_experts):
         row = []
         for k, n in ((G.GHIDDEN, G.GINTERMEDIATE), (G.GHIDDEN, G.GINTERMEDIATE), (G.GINTERMEDIATE, G.GHIDDEN)):
-            tr = torch.randint(-32768, 32768, (k // 16, n // 16, 40), generator=g, dtype=torch.int32).to(torch.int16).cuda()
+            bx2 = 5 if codebook == 2 else Q4N_BX2
+            tr = torch.randint(-32768, 32768, (k // 16, n // 16, 8 * bx2), generator=g, dtype=torch.int32).to(torch.int16).cuda()
             suh = torch.ones(k, dtype=torch.float16, device="cuda"); svh = torch.ones(n, dtype=torch.float16, device="cuda") / 64
             keep += [tr, suh, svh]; row.append([tr.data_ptr(), suh.data_ptr(), svh.data_ptr()])
         rows.append(row)
     rows += [rows[i % n_experts] for i in range(G.GLOCAL - n_experts)]
-    meta = [[[G.GHIDDEN, G.GINTERMEDIATE, 5, codebook], [G.GHIDDEN, G.GINTERMEDIATE, 5, codebook],
-             [G.GINTERMEDIATE, G.GHIDDEN, 5, codebook]]] * G.GLOCAL
+    bx2 = 5 if codebook == 2 else Q4N_BX2
+    meta = [[[G.GHIDDEN, G.GINTERMEDIATE, bx2, codebook], [G.GHIDDEN, G.GINTERMEDIATE, bx2, codebook],
+             [G.GINTERMEDIATE, G.GHIDDEN, bx2, codebook]]] * G.GLOCAL
     return keep, torch.tensor(rows, dtype=torch.int64, device="cuda"), torch.tensor(meta, dtype=torch.int64, device="cuda")
 
 
