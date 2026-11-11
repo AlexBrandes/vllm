@@ -289,6 +289,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculative_config is not None
             and self.speculative_config.speculator_config.prefer_dense_token_history
         )
+        # Qwen3.8-27B: the DFlash2 lookup lane scans the token history every
+        # step; keep it dense on the GPU (max_num_reqs x max_model_len int32).
+        from vllm.v1.worker.gpu.spec_decode.dflash2 import lookup_cmp as _lookup_cmp
+
+        self._cmp_lookup = (
+            _lookup_cmp.DFlashLookup(self.device)
+            if _lookup_cmp.enabled_for(self.speculative_config)
+            else None
+        )
+        if self._cmp_lookup is not None:
+            use_dense_all_token_ids = True
 
         # General request states.
         self.req_states = RequestState(
@@ -2411,6 +2422,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
+                )
+            if self._cmp_lookup is not None:
+                # Qwen3.8-27B: lookup-augmented drafting (a long verbatim match
+                # in the request's own history overwrites the drafted block)
+                self._cmp_lookup.fuse(
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.total_len.gpu,
+                    input_batch.idx_mapping,
+                    draft_tokens,
                 )
             if not sm80.store_drafts(self, input_batch, draft_tokens, num_spec_tokens):
                 if num_spec_tokens < self.num_speculative_steps:

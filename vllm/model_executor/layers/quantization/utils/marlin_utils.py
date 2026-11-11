@@ -12,8 +12,12 @@ from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fusion import cmp_int8_act_fusion as _cmp_act
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils import (
+    cmp_w4a8_prefill as _cmp_w4a8_prefill,
+)
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_quant_int8,
 )
@@ -437,6 +441,64 @@ def get_marlin_workspace(device: torch.device) -> torch.Tensor:
     )
 
 
+_CMP_MARLIN_TUNED = None
+_CMP_MARLIN_LIBRARY = None
+
+
+def _load_cmp_marlin_routes() -> None:
+    """Qwen3.8-27B (K3 Marlin routes): route W4A8 Marlin
+    GEMMs through the host-only dispatcher built from
+    vllm-cmp170hx csrc/marlin_routes (upstream
+    a0d7356b98 Marlin host code over the wheel's installed device kernels; a
+    measured (M, K, N) -> tile / threads / CTAs-per-SM table for int8 calls,
+    stock otherwise). Fails closed on a hash mismatch."""
+    global _CMP_MARLIN_TUNED, _CMP_MARLIN_LIBRARY
+    import hashlib
+    import os
+
+    path = os.environ.get("VLLM_CMP_MARLIN_ROUTES", "")
+    if not path:
+        return
+    with open(path, "rb") as fh:
+        if hashlib.file_digest(fh, "sha256").hexdigest() != os.environ.get(
+            "VLLM_CMP_MARLIN_ROUTES_SHA256", ""
+        ):
+            raise RuntimeError(f"VLLM_CMP_MARLIN_ROUTES identity mismatch: {path}")
+    schema = (
+        "Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
+        "Tensor? b_bias_or_none, Tensor b_scales, Tensor? a_scales, "
+        "Tensor? global_scale, Tensor? b_zeros_or_none, "
+        "Tensor workspace, int b_type_id, SymInt size_m, SymInt size_n, "
+        "SymInt size_k, bool use_atomic_add, bool use_fp32_reduce, "
+        "bool is_zp_float"
+    )
+    lib = torch.library.Library("_CMP_marlin", "DEF")
+    # A build with our stage-variant kernels takes a stages argument on
+    # its explicit-geometry op; its source-manifest.json says so.
+    stages_arg = ""
+    manifest = os.path.join(os.path.dirname(path), "source-manifest.json")
+    if os.path.exists(manifest):
+        import json as _json
+
+        with open(manifest) as fh:
+            if _json.load(fh).get("stages"):
+                stages_arg = ", int stages"
+    lib.define(
+        "marlin_gemm(" + schema + ", int thread_k, int thread_n, "
+        "int num_threads, int blocks_per_sm" + stages_arg + ") -> Tensor"
+    )
+    lib.define("marlin_gemm_tuned(" + schema + ") -> Tensor")
+    torch.ops.load_library(path)
+    _CMP_MARLIN_LIBRARY = lib
+    _CMP_MARLIN_TUNED = torch.ops._CMP_marlin.marlin_gemm_tuned
+    logger.info(
+        "marlin_gemm: routing W4A8 GEMMs through the CMP host dispatcher %s", path
+    )
+
+
+_load_cmp_marlin_routes()
+
+
 def _marlin_gemm(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,
@@ -456,6 +518,35 @@ def _marlin_gemm(
 ) -> torch.Tensor:
     if workspace is None:
         workspace = get_marlin_workspace(a.device)
+    # Qwen3.8-27B: large-M W4A8 calls (prefill chunks) through a
+    # dense INT8 GEMM on weights rebuilt from Marlin's layout
+    # (cmp_w4a8_prefill.py; VLLM_CMP_W4A8_PREFILL_MIN_M).
+    if b_bias is None and _cmp_w4a8_prefill.use_for(a, size_m, b_zeros, b_q_type_id):
+        return _cmp_w4a8_prefill.prefill_gemm(
+            a, a_scales, b_q_weight, b_scales, size_m, size_n, size_k, b_scales.dtype
+        )
+    # Qwen3.8-27B: K3 Marlin routes (W4A8 calls through the CMP host
+    # dispatcher, vllm-cmp170hx csrc/marlin_routes) when VLLM_CMP_MARLIN_ROUTES
+    # names a matching build.
+    if _CMP_MARLIN_TUNED is not None and a.dtype == torch.int8:
+        return _CMP_MARLIN_TUNED(
+            a,
+            None,
+            b_q_weight,
+            b_bias,
+            b_scales,
+            a_scales,
+            global_scale,
+            b_zeros,
+            workspace,
+            b_q_type_id,
+            size_m,
+            size_n,
+            size_k,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
     return torch.ops._C.marlin_gemm(
         a,
         None,
@@ -720,7 +811,21 @@ def get__quant_fp8_method() -> QuantFP8:
 def get_marlin_input_dtype(prefix: str | None = None):
     if envs.VLLM_MARLIN_INPUT_DTYPE is None:
         return
-    elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
+    # Qwen3.8-27B (port of HyperQwen's
+    # marlin-int8-layer-select.patch): per-layer include/exclude regexes for
+    # the int8/fp8 activation path (the LM head and the MTP module stay
+    # 16-bit by default).
+    import os as _os
+    import re as _re
+
+    _exc = _os.environ.get("VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp")
+    _inc = _os.environ.get("VLLM_MARLIN_INT8_INCLUDE_RE", "")
+    if prefix is not None:
+        if _exc and _re.search(_exc, prefix):
+            return
+        if _inc and not _re.search(_inc, prefix):
+            return
+    if envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
         return torch.int8
     elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "fp8":
         if not current_platform.is_device_capability(
@@ -762,11 +867,16 @@ def apply_gptq_marlin_linear(
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
     input_dtype: torch.dtype | None = None,
+    input_scales: torch.Tensor | None = None,
+    orig_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
     padded_n, padded_k = marlin_repacked_nk(weight, wtype.size_bits)
+    if input_scales is not None:
+        # Qwen3.8-27B: input already int8 per token (cmp_int8_act_fusion.py)
+        assert reshaped_x.dtype == torch.int8 and padded_k == input_size_per_partition
     reshaped_x = marlin_pad_dim(reshaped_x, input_size_per_partition, padded_k)
 
     use_atomic_add = should_use_atomic_add_reduce(
@@ -774,16 +884,27 @@ def apply_gptq_marlin_linear(
         n=padded_n,
         k=padded_k,
         device=input.device,
-        dtype=input.dtype,
+        dtype=orig_dtype if orig_dtype is not None else input.dtype,
     )
 
     a_scales = None
-    if input_dtype == torch.int8:
+    if input_scales is not None:
+        a_scales = input_scales.reshape(-1, 1)
+        if input_global_scale is not None:
+            a_scales = a_scales * input_global_scale
+    elif input_dtype == torch.int8:
         assert wtype == scalar_types.uint4b8, (
             "W8A8-INT8 is not supported by marlin kernel."
         )
-        reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
-        a_scales = a_scales * input_global_scale
+        if _cmp_act.ENABLED and reshaped_x.stride(-1) == 1:
+            # Qwen3.8-27B: one kernel for the per-token quant and the global
+            # scale multiply (same fp32 ops as the two below)
+            reshaped_x, a_scales = _cmp_act.per_token_quant_int8_g(
+                reshaped_x, input_global_scale
+            )
+        else:
+            reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
+            a_scales = a_scales * input_global_scale
     elif input_dtype == torch.float8_e4m3fn:
         assert wtype == scalar_types.uint4b8, (
             "INT8 weight + FP8 activation is not supported."

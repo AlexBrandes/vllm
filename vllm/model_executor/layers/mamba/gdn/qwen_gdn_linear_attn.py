@@ -1195,6 +1195,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return mixed_qkv_out, z_out, b_out, a_out
 
+    def strided_mixed_qkv(self, mixed_qkv):
+        """(1, seq, heads, dim) views of q, k, v inside mixed_qkv (no copy).
+        Same values as rearrange_mixed_qkv; only valid for consumers that take
+        token strides (the spec-decode fused_sigmoid_gating_delta_rule_update)."""
+        if mixed_qkv is None:
+            return None, None, None
+        if mixed_qkv.stride(-1) != 1:
+            return self.rearrange_mixed_qkv(mixed_qkv)
+        q_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        query = mixed_qkv[:, :q_dim].unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0)
+        key = (
+            mixed_qkv[:, q_dim : 2 * q_dim]
+            .unflatten(-1, (-1, self.head_k_dim))
+            .unsqueeze(0)
+        )
+        value = (
+            mixed_qkv[:, 2 * q_dim : 2 * q_dim + v_dim]
+            .unflatten(-1, (-1, self.head_v_dim))
+            .unsqueeze(0)
+        )
+        return query, key, value
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
 
@@ -1898,7 +1921,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        # Qwen3.8-27B: strided q/k/v views straight into the conv output; the
+        # spec-decode recurrent kernel reads token strides (fused_sigmoid_gating)
+        query_spec, key_spec, value_spec = self.strided_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (

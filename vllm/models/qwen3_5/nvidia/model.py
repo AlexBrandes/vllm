@@ -49,6 +49,7 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     flashinfer_trtllm_fused_allreduce_norm,
     fused_allreduce_gemma_rms_norm,
 )
+from vllm.model_executor.layers.fusion import cmp_int8_act_fusion as _cmp_act
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
@@ -141,6 +142,13 @@ def _norm_quant_key(linear: nn.Module) -> QuantKey | None:
     key = get_input_quant_key(linear)
     if key == kFp8StaticTensorSym:
         return key
+    # Qwen3.8-27B: int8 per-token for W4A8 Marlin (cmp_int8_act_fusion.py)
+    if (
+        key == _cmp_act.KEY
+        and _cmp_act.ENABLED
+        and get_tensor_model_parallel_world_size() == 1
+    ):
+        return key
     # The norm writes block scales for exactly K = hidden_size, in whole
     # 4-column scale tiles (weights only require K % 32 == 0).
     if (
@@ -160,6 +168,22 @@ def _fused_gdn_gated_rms_norm_quant(
     **kwargs,
 ) -> torch.Tensor | QuantizedActivation:
     """GDN gated norm, quantized for out_proj when it takes static FP8."""
+    if (
+        _cmp_act.ENABLED
+        and _cmp_act.GDN_NORM
+        and get_input_quant_key(out_proj) == _cmp_act.KEY
+    ):
+        # Qwen3.8-27B: int8 per token for the W4A8 Marlin out_proj
+        q, qs = _cmp_act.gdn_gated_rms_norm_int8(
+            x=x, gscale=_cmp_act.consumer_gscale(out_proj), **kwargs
+        )
+        return QuantizedActivation(
+            data=q,
+            scale=qs,
+            orig_dtype=x.dtype,
+            orig_shape=x.shape,
+            quant_key=_cmp_act.KEY,
+        )
     if get_input_quant_key(out_proj) != kFp8StaticTensorSym:
         fused_gdn_gated_rms_norm(x=x, out=out, **kwargs)
         return out
@@ -239,6 +263,19 @@ class Qwen3_5RMSNorm(nn.Module):
             return None, *self(x, residual)
 
         assert linear is not None
+        if key == _cmp_act.KEY and not allreduce:
+            q, qs, y = _cmp_act.gemma_add_rms_norm_int8(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+                write_y,
+                gscale=_cmp_act.consumer_gscale(linear),
+            )
+            qa = QuantizedActivation(
+                data=q, scale=qs, orig_dtype=x.dtype, orig_shape=x.shape, quant_key=key
+            )
+            return qa, y, x if residual is None else residual
         nvfp4 = key == kNvfp4Dynamic
         scale = linear.input_global_scale_inv if nvfp4 else linear.input_scale
         if allreduce:
@@ -492,9 +529,14 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
 
         self.vocab_size = config.vocab_size
 
+        # Qwen3.8-27B (port of HyperQwen's
+        # qwen3_5-embed-quant.patch): route the embedding table through the
+        # quantized-embedding path when the checkpoint packs it.
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):

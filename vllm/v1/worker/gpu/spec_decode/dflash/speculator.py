@@ -355,6 +355,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
+        # Qwen3.8-27B: a DSpine drafter (vllm_cmp170hx
+        # spec_decode/dspine_model.py) returns [m, 2H] = (normed rows, the last
+        # code write's pre-write state); its greedy refinement tail then
+        # replaces the plain argmax draft.
+        dspine_raw = None
+        if getattr(self.model, "dspine_tail", None) is not None and (
+            last_hidden_states.shape[-1] == 2 * self.model.config.hidden_size
+        ):
+            half = self.model.config.hidden_size
+            dspine_raw = last_hidden_states[:, half:]
+            last_hidden_states = last_hidden_states[:, :half]
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
@@ -368,6 +379,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.draft_logits,
             num_steps=self.num_speculative_steps,
         )
+        if dspine_raw is not None:
+            q = self.num_query_per_req
+            anchors = self.input_buffers.input_ids[: num_reqs * q].view(num_reqs, q)[
+                :, 0
+            ]
+            draft_tokens = self.model.dspine_tail(
+                sample_hidden_states,
+                dspine_raw[self.sample_indices[:num_sample]],
+                anchors,
+                self.num_speculative_steps,
+            ).to(draft_tokens.dtype)
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )

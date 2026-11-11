@@ -38,6 +38,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     ssm_state_indices,
     num_accepted_tokens,
     scale,
+    stride_qt,  # token strides (elements) of q/k/v/a/b; heads contiguous within a token
+    stride_kt,
+    stride_vt,
+    stride_at,
+    stride_bt,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
     B: tl.constexpr,
@@ -80,19 +85,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
+    p_q = q + bos * stride_qt + i_h * K + o_k
+    p_k = k + bos * stride_kt + i_h * K + o_k
+    p_v = v + bos * stride_vt + i_hv * V + o_v
 
     p_A_log = A_log + i_hv
     if not IS_KDA:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_at + i_hv
         p_dt_bias = dt_bias + i_hv
     else:
-        p_a = a + (bos * HV + i_hv) * K + o_k
+        p_a = a + bos * stride_at + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
 
-    p_b = b + bos * HV + i_hv
+    p_b = b + bos * stride_bt + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -170,12 +175,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_qt
+        p_k += stride_kt
         p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
+        p_v += stride_vt
+        p_b += stride_bt
+        p_a += stride_at
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -238,17 +243,31 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    # Qwen3.8-27B: q/k/v/a/b may be strided token rows (views into the packed
+    # conv output / ba projection); only the per-token head layout must be
+    # contiguous. Avoids five .contiguous() copies per GDN layer and step.
+    def _tok_view(x, inner):
+        if (x.stride(-1) != 1 or (inner > 1 and x.stride(-2) != x.shape[-1])
+                or (x.dim() > inner + 1 and x.shape[0] > 1)):
+            x = x.contiguous()   # batched (B > 1) inputs keep the dense layout
+        return x
+    q = _tok_view(q, 2)
+    k = _tok_view(k, 2)
+    v = _tok_view(v, 2)
+    a = _tok_view(a, 2 if is_kda else 1)
+    b = _tok_view(b, 1)
+    tok = lambda x, nd: x.stride(-nd - 1) if x.dim() > nd else x.numel()  # noqa: E731
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
+        a=a,
+        b=b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
+        q=q,
+        k=k,
+        v=v,
         o=o,
         h0=initial_state,
         ht=final_state,
@@ -256,6 +275,11 @@ def fused_sigmoid_gating_delta_rule_update(
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
+        stride_qt=tok(q, 2),
+        stride_kt=tok(k, 2),
+        stride_vt=tok(v, 2),
+        stride_at=tok(a, 2 if is_kda else 1),
+        stride_bt=tok(b, 1),
         N=N,
         T=T,
         B=B,

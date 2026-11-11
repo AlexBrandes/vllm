@@ -66,7 +66,34 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+
+        # Qwen3.8-27B (port of HyperQwen's
+        # qwen3_5-mtp-draft-vocab.patch): if the checkpoint ships
+        # mtp_draft_vocab_ids.pt and mtp.draft_lm_head.*, the drafter scores
+        # only those rows instead of the full LM head; every other id gets
+        # -inf. Speculative decoding stays exact (the target verifies), only
+        # acceptance can change. MTP_DRAFT_VOCAB=0 turns it off.
+        import os as _os
+
+        self.draft_lm_head = None
+        self.draft_vocab_ids = None
+        _ids_path = _os.path.join(model_config.model, "mtp_draft_vocab_ids.pt")
+        if (
+            _os.path.exists(_ids_path)
+            and _os.environ.get("MTP_DRAFT_VOCAB", "1") != "0"
+        ):
+            _ids = torch.load(_ids_path, map_location="cpu").to(torch.long)
+            self.draft_vocab_ids = _ids
+            self.draft_lm_head = ParallelLMHead(
+                int(_ids.numel()),
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "draft_lm_head"),
+            )
+            logger.info("MTP drafter uses a %d-token draft head", int(_ids.numel()))
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -217,6 +244,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # Qwen3.8-27B: vocab-truncated draft head
+        self.draft_logits_processor = (
+            LogitsProcessor(int(self.model.draft_vocab_ids.numel()))
+            if getattr(self.model, "draft_lm_head", None) is not None
+            else None
+        )
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -267,11 +300,27 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         )
         return hidden_states
 
+    def _draft_ids(self, device: torch.device) -> torch.Tensor:
+        ids = self.model.draft_vocab_ids
+        if ids.device != device:
+            ids = ids.to(device)
+            self.model.draft_vocab_ids = ids
+        return ids
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        # Qwen3.8-27B: vocab-truncated draft head
+        if self.draft_logits_processor is not None:
+            sub = self.draft_logits_processor(self.model.draft_lm_head, hidden_states)
+            if sub is None:
+                return None
+            ids = self._draft_ids(sub.device)
+            full = sub.new_full((sub.shape[0], self.config.vocab_size), float("-inf"))
+            full.index_copy_(1, ids, sub)
+            return full
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_top_tokens(
@@ -279,6 +328,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        # Qwen3.8-27B: vocab-truncated draft head (argmax over its rows,
+        # mapped back to target ids)
+        if self.draft_logits_processor is not None:
+            top = self.draft_logits_processor.get_top_tokens(
+                self.model.draft_lm_head, hidden_states
+            )
+            return self._draft_ids(top.device)[top]
         # One lm_head is shared by all MTP modules, as in compute_logits.
         return super().get_top_tokens(hidden_states)
 
@@ -291,6 +347,9 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         def remap_weight_names(weights):
             for name, weight in weights:
                 if self.is_unused_checkpoint_weight(name):
+                    continue
+                # Qwen3.8-27B: skip the truncated draft head when disabled
+                if "draft_lm_head" in name and self.model.draft_lm_head is None:
                     continue
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")

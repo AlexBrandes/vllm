@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_num_attention_heads_from_layers,
 )
+from vllm.v1.attention.ops import cmp_fi_verify as _cmp_fi
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
@@ -1019,7 +1020,95 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             attn_metadata.rswa_window = self.rswa_window
             attn_metadata.rswa_window_tensor = self.persistent_rswa_window_tensor
 
+        # Qwen3.8-27B: FlashInfer verify attention, planned once
+        # per step from host upper-bound lengths (cmp_fi_verify.py).
+        attn_metadata.cmp_fi = None
+        # A FULL graph captured with FlashInfer replays only its own plan, so
+        # every verify-shaped batch is planned (deterministic in the batch
+        # shape); without a host upper bound the exact lengths are fetched.
+        # Only the verify shape (every request 1 + num_speculative_tokens
+        # queries, padded requests 0) -- the shape FULL graphs capture; a
+        # wrapper's row count is fixed by its first plan in graph mode, so
+        # other uniform batches (e.g. a lone prefill tail) keep Triton.
+        if (
+            _cmp_fi.ENABLED
+            and causal is True
+            and max_query_len > 1
+            and max_query_len == self._cmp_fi_qlen()
+            and self.kv_cache_dtype in (torch.bfloat16, torch.float16)
+        ):
+            qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+            ql = qsl[1:] - qsl[:-1]
+            if bool(((ql == max_query_len) | (ql == 0)).all()):
+                st = self._cmp_fi_state()
+                if st is not None:
+                    seq_ub = common_attn_metadata.seq_lens_cpu_upper_bound
+                    if seq_ub is None:
+                        seq_ub = _cmp_fi.exact_seq_lens_cpu(seq_lens)
+                    try:
+                        w = st.plan(num_reqs, qsl, seq_ub, seq_lens, block_table_tensor)
+                    except Exception as e:  # never fatal: this batch keeps Triton
+                        logger.warning_once(
+                            "cmp: FlashInfer verify plan failed, "
+                            "Triton for this batch: %s",
+                            e,
+                        )
+                        w = None
+                    if w is not None:
+                        # the wrapper and the planned token count (its run()
+                        # checks q rows == qo_indptr[-1])
+                        attn_metadata.cmp_fi = (w, int(qsl[-1]))
+
         return attn_metadata
+
+    def _cmp_fi_qlen(self) -> int:
+        q = getattr(self, "_cmp_fi_q", None)
+        if q is None:
+            spec = getattr(self.vllm_config, "speculative_config", None)
+            n = (
+                getattr(spec, "num_speculative_tokens", None)
+                if spec is not None
+                else None
+            )
+            q = self._cmp_fi_q = (1 + int(n)) if n else -1
+        return q
+
+    def _cmp_fi_state(self):
+        st = getattr(self, "_cmp_fi_st", False)
+        if st is False:
+            st = None
+            try:
+                from vllm.v1.attention.backends.utils import get_per_layer_parameters
+
+                params = get_per_layer_parameters(
+                    self.vllm_config, self.layer_names, FlashAttentionImpl
+                )
+                scales = {p.sm_scale for p in params.values()}
+                if len(scales) == 1 and all(
+                    p.window_left < 0 and not p.logits_soft_cap and not p.has_sinks
+                    for p in params.values()
+                ):
+                    st = _cmp_fi.get(
+                        self.num_heads_q,
+                        self.num_heads_kv,
+                        self.headdim,
+                        self.block_size,
+                        scales.pop(),
+                        self.model_config.dtype,
+                        self.device,
+                        self.vllm_config.scheduler_config.max_num_seqs,
+                        self.model_config.max_model_len,
+                        group_key=sorted(self.layer_names),
+                        ub_slack=max(self._cmp_fi_qlen() - 1, 1),
+                    )
+                    logger.info(
+                        "cmp: FlashInfer verify attention on for %d layers", len(params)
+                    )
+            except Exception as e:  # never fatal: the Triton verify path stays
+                logger.warning("cmp: FlashInfer verify attention off: %s", e)
+                st = None
+            self._cmp_fi_st = st
+        return st
 
     def update_block_table(
         self,
@@ -1409,6 +1498,108 @@ class FlashAttentionImpl(AttentionImpl):
                     sliding_window_size is not None and sliding_window_size[1] >= 0
                 )
                 causal = not has_window
+
+            # Qwen3.8-27B (port of HyperQwen's
+            # spec-decode-attn.patch): split-KV Triton attention for
+            # speculative-decode verify batches (1 < queries/request <= QMAX).
+            # FlashAttention does not split the KV sequence when
+            # max_seqlen_q > 1, leaving most SMs idle at depth.
+            if (
+                _spec_attn_enabled()
+                and 1
+                < max_seqlen_q
+                <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
+                and not is_quantized_kv_cache(self.kv_cache_dtype)
+                and (
+                    sliding_window_size is None
+                    or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
+                )
+                and not self.logits_soft_cap
+                and self.alibi_slopes is None
+                and self.sinks is None
+                and causal is True
+                and dynamic_causal is None
+                and mm_mask_mod is None
+                and rswa_mask_mod_fn is None
+            ):
+                _fi = getattr(attn_metadata, "cmp_fi", None)
+                if _fi is not None:
+                    _w, _n = _fi
+                    _w.run(query[:_n], (key_cache, value_cache), out=output[:_n])
+                    return output
+                _spec_attn_run(
+                    self,
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                )
+                return output
+
+            # Qwen3.8-27B: a single request's large prefill
+            # chunk reads its KV through FA2's contiguous varlen kernel
+            # (128x64 tiles, 8 warps at head dim 256) instead of the paged
+            # split-KV kernel (64x64, 4 warps): gather the request's blocks
+            # into one buffer first (~1.25-1.31x incl. the gather on the CMP
+            # 170HX, 8K-128K). VLLM_CMP_PREFILL_CONTIG_ATTN=<min query rows>.
+            _cmin = _cmp_contig_min_q()
+            if (
+                _cmin
+                and cu_seqlens_q.shape[0] == 2
+                and max_seqlen_q >= _cmin
+                and max_seqlen_k <= _cmp_contig_max_k()
+                and self.vllm_flash_attn_version == 2
+                and not self.fa4_hd256
+                and not is_quantized_kv_cache(self.kv_cache_dtype)
+                and (
+                    sliding_window_size is None
+                    or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
+                )
+                and not self.logits_soft_cap
+                and self.alibi_slopes is None
+                and self.sinks is None
+                and causal is True
+                and dynamic_causal is None
+                and mm_mask_mod is None
+                and rswa_mask_mod_fn is None
+            ):
+                bs = key_cache.shape[1]
+                idx = block_table[0, : cdiv(max_seqlen_k, bs)]
+                k = key_cache[idx].reshape(-1, *key_cache.shape[2:])[:max_seqlen_k]
+                v = value_cache[idx].reshape(-1, *value_cache.shape[2:])[:max_seqlen_k]
+                _i8min = _cmp_int8_attn_min_k()
+                if _i8min and max_seqlen_k >= _i8min and query.dtype == torch.bfloat16:
+                    # INT8 Q.K^T prefill attention (cmp_int8_prefill_attn.py)
+                    from vllm.v1.attention.ops import cmp_int8_prefill_attn as _ia
+
+                    _ia.prefill_attn(
+                        query[:num_actual_tokens],
+                        k,
+                        v,
+                        output[:num_actual_tokens],
+                        self.scale,
+                    )
+                    return output
+                cu_k = torch.zeros(2, dtype=torch.int32, device=query.device)
+                cu_k[1:] = seqused_k[:1]
+                flash_attn_varlen_func(
+                    q=query[:num_actual_tokens],
+                    k=k,
+                    v=v,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    fa_version=2,
+                )
+                return output
 
             num_splits = attn_metadata.max_num_splits
             if self.fa4_hd256:
@@ -1895,3 +2086,105 @@ def _make_rswa_mask_mod():
 
 
 _FA4_DENSE_ATTENTION_KERNEL = FA4DenseAttentionKernel()
+
+
+# ---- Qwen3.8-27B: split-KV spec-decode attention (HyperQwen port) ----
+_SPEC_ATTN = {}
+
+
+def _spec_attn_enabled() -> bool:
+    import os
+
+    return os.environ.get("VLLM_SPEC_DECODE_ATTN", "0") == "1"
+
+
+_SPEC_ATTN_QMAX: int | None = None
+
+
+def _spec_attn_qmax(group: int) -> int:
+    # Fixed for the life of the server: the partial buffers are sized once and
+    # a captured CUDA graph holds their addresses.
+    global _SPEC_ATTN_QMAX
+    if _SPEC_ATTN_QMAX is None:
+        import os
+
+        from vllm.config import get_current_vllm_config
+        from vllm.v1.attention.ops.spec_decode_attn import BLOCK_M, QMAX_TOKENS
+
+        n = 0
+        try:
+            spec = get_current_vllm_config().speculative_config
+            n = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+        except Exception:
+            n = 0
+        n = int(os.environ.get("VLLM_SPEC_DECODE_ATTN_QMAX", n or 0)) or n
+        _SPEC_ATTN_QMAX = min(QMAX_TOKENS, max(n, BLOCK_M // group))
+    return _SPEC_ATTN_QMAX
+
+
+def _spec_attn_run(
+    impl,
+    q,
+    key_cache,
+    value_cache,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    block_table,
+    max_seqlen_q,
+):
+    from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
+
+    key = (impl.num_heads, impl.head_size, q.device)
+    att = _SPEC_ATTN.get(key)
+    if att is None:
+        from vllm.config import get_current_vllm_config
+
+        try:
+            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        except Exception:
+            max_reqs = 256
+        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
+        att = SpecDecodeAttention(
+            max_reqs,
+            impl.num_heads,
+            impl.head_size,
+            q.device,
+            qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
+        )
+        _SPEC_ATTN[key] = att
+    att.run(
+        q,
+        key_cache,
+        value_cache,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        impl.scale,
+        cu_seqlens_q.shape[0] - 1,
+        max_seqlen_q,
+    )
+
+
+# ---- Qwen3.8-27B: contiguous-KV prefill attention ----
+def _cmp_contig_min_q() -> int:
+    import os
+
+    return int(os.environ.get("VLLM_CMP_PREFILL_CONTIG_ATTN", "0") or 0)
+
+
+def _cmp_int8_attn_min_k() -> int:
+    # INT8 Q.K^T prefill attention for a contiguous-KV chunk with at least
+    # this many keys (0 = off)
+    import os
+
+    return int(os.environ.get("VLLM_CMP_PREFILL_INT8_ATTN", "0") or 0)
+
+
+def _cmp_contig_max_k() -> int:
+    # the gathered K+V buffer is 2 * max_k * kv_heads * head_dim * 2 bytes
+    # (Qwen3.8-27B: 4 KiB per token, 512 MiB at 131,072): keep it bounded
+    import os
+
+    return int(os.environ.get("VLLM_CMP_PREFILL_CONTIG_ATTN_MAX_K", "131072") or 131072)
