@@ -64,7 +64,7 @@ For settings, reasoning, tool calls, and the chat template, use the
 
 The [public results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/results/2026-11-11.json)
 and [benchmark tables](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/tree/0294590212713617fdfa5d5be46385f30c657f6a#benchmarks)
-cover three public-v1 runs on November 5, 2026, plus correctness, image and video
+cover three public-v1 runs, plus correctness, image and video
 input, needle, context window, HumanEval, GSM8K and GPQA Diamond.
 
 ## Credits and licenses

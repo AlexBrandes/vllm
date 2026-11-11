@@ -63,7 +63,7 @@ each request.
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3.8-Flash-Next W4A16 | 234.4 tok/s | 581.9 tok/s | 827.3 tok/s | 7,426 tok/s |
 | Qwen3.8-Flash-Next EXL3 | 163.1 tok/s | 355.5 tok/s | 499.8 tok/s | 4,000 tok/s |
-| GLM-5.3-Flash EXL3 | 76.5 tok/s | 151.4 tok/s | N/A | 1,836 tok/s |
+| GLM-5.3-Flash EXL3 | 88.3 tok/s | 170.5 tok/s | N/A | 2,501 tok/s |
 | Qwen3.8-27B W4A16 (one card) | 343.5 tok/s | 868.3 tok/s | 1,233.8 tok/s | 3,629 tok/s |
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
