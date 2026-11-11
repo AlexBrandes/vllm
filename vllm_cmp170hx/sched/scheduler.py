@@ -23,6 +23,13 @@ tests/cmp170hx/seams.yaml.
 """
 
 import itertools
+import os as _os
+
+# Qwen3.8-27B: time-budgeted prefill pieces beside decodes (see
+# Sm80Scheduler._cmp_time_budgeted_piece).
+_CMP_PIECE_BUDGET_MS = float(_os.environ.get("VLLM_CMP_PIECE_BUDGET_MS", "0") or 0)
+_CMP_PIECE_COST = tuple(float(x) for x in
+                        _os.environ.get("VLLM_CMP_PIECE_COST", "160,0.153,0.00308").split(","))
 from typing import Any
 
 import vllm.envs as envs
@@ -279,7 +286,8 @@ class Sm80SchedulerMixin:
         if self.prefill_chunk_with_decodes > 0 and any(
             not r.is_prefill_chunk for r in self.running
         ):
-            total = min(total, self.prefill_chunk_with_decodes)
+            total = min(total, max(self.prefill_chunk_with_decodes,
+                                   self._cmp_time_budgeted_piece()))
 
         per_request = total
         if self.max_num_partial_prefills > 0:
@@ -321,6 +329,35 @@ class Sm80SchedulerMixin:
         # any sane setting (the lookahead is a handful of tokens).
         floor = self.num_prefill_lookahead + 1
         return max(total, floor), max(per_request, floor)
+
+    def _cmp_time_budgeted_piece(self) -> int:
+        """Qwen3.8-27B: the prefill piece beside running decodes,
+        sized by time instead of tokens. VLLM_CMP_PIECE_BUDGET_MS (0 = off)
+        is the step-time budget; VLLM_CMP_PIECE_COST = "c,a,b" models a step
+        that prefills T rows of a prompt already ``ctx`` tokens in as
+        c + T * (a + b * ctx / 1000) milliseconds (fit on the CMP 170HX
+        Qwen3.8-27B with the INT8 prefill path: 160, 0.153, 0.00308). The
+        piece is the largest multiple of 256 rows inside the budget; the
+        caller never lets it fall below ``prefill_chunk_with_decodes`` or rise
+        above the step's token budget. ``ctx`` is the deepest prefill in
+        flight (running chunks and the head of the waiting queue)."""
+        budget = _CMP_PIECE_BUDGET_MS
+        if budget <= 0:
+            return 0
+        c, a, b = _CMP_PIECE_COST
+        ctx = 0
+        for r in self.running:
+            if r.is_prefill_chunk:
+                ctx = max(ctx, r.num_computed_tokens)
+        if self.waiting:
+            try:
+                ctx = max(ctx, next(iter(self.waiting)).num_computed_tokens)
+            except Exception:
+                pass
+        per_row = a + b * ctx / 1000.0
+        if per_row <= 0 or budget <= c:
+            return 0
+        return int((budget - c) / per_row) // 256 * 256
 
     def _short_prefill_bypass(self, num_remaining: int) -> bool:
         """Whether a prefill with ``num_remaining`` tokens left is neither

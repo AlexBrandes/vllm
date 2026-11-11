@@ -91,6 +91,12 @@ DRAFTER_OVERRIDES = {
         "vllm_cmp170hx.spec_decode.lilicorr_model:LiLiCorrForCausalLM",
         "vllm.model_executor.models.lilicorr",
     ),
+    # Qwen3.8-27B: DSpine drafter (experimental) (DFlash + code bridge), our
+    # W4A16 port of tencent/Qwen3.8-27B-DSpine-b16 (spec_decode/dspine_model.py).
+    "DFlashDSpineDraftModel": (
+        "vllm_cmp170hx.spec_decode.dspine_model:DSpineQwen3ForCausalLM",
+        "vllm.model_executor.models.qwen3_dflash",
+    ),
 }
 
 
@@ -418,4 +424,17 @@ def register_fork_env_vars() -> None:
     from vllm_cmp170hx.envs import register_env_vars
 
     register_env_vars(envs.environment_variables)
+    # Qwen3.8-27B: switches that change the traced model graph
+    # must be compile-cache factors (envs.compile_factors hashes this table),
+    # or a cached graph from the other setting is loaded.
+    import os as _os
+
+    envs.environment_variables.setdefault(
+        "VLLM_CMP_INT8_ACT_FUSION",
+        lambda: _os.getenv("VLLM_CMP_INT8_ACT_FUSION", "0"),
+    )
+    envs.environment_variables.setdefault(
+        "VLLM_CMP_INT8_ACT_FUSION_GDN",
+        lambda: _os.getenv("VLLM_CMP_INT8_ACT_FUSION_GDN", "0"),
+    )
     _env_vars_registered = True
