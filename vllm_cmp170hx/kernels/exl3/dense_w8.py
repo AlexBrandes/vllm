@@ -3,8 +3,8 @@
 """Lab (default off): serve dense EXL3 matrices from an INT8 sidecar built from the original
 checkpoint (VLLM_EXL3_DENSE_W8=<sidecar .safetensors>).
 
-The sidecar (runtime/glm53-exl3-campaign/decode-int8-20261110/convert_dense.py) holds, per EXL3
-matrix prefix:
+The sidecar (built by tools/convert_dense.py in github.com/AlexBrandes/cmp170hx-glm53-flash-exl3)
+holds, per EXL3 matrix prefix:
   <prefix>.w8  int8 [N, K]  original weight in EXL3's rotated input space
                             (x W^T = H128(x * suh) W_r^T), one scale per output row
   <prefix>.sw  fp32 [N]
