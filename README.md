@@ -63,7 +63,7 @@ each request.
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
 and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), and the
-[GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/e5db2d8271495f3e2e5ab9c8f4a7fcbaaa99041c/results/2026-11-05.json), identify their engine,
+[GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/results/2026-11-11.json), identify their engine,
 configuration, and measurement runs. Each row measures a **whole recipe**: engine
 version, quantization, speculative depth and runtime settings differ between
 rows. Performance also depends on prompt content, concurrency, cooling, and
