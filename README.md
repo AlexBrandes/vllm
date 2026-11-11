@@ -5,8 +5,9 @@ this hardware, reproducible recipes, and measurements from the cards we actually
 use.
 
 The focus is getting useful performance out of **64 GiB cards at 170 W joined by
-PCIe Gen2 ×4 links**, not assuming an NVLink or ×16 setup. Our recipes split
-models across cards and do not require GPU peer-to-peer transport.
+PCIe Gen2 ×4 links**, not assuming an NVLink or ×16 setup. Our multi-card
+recipes split models across cards and do not require GPU peer-to-peer transport;
+Qwen3.8-27B runs on one card, including the 40 GB version.
 
 ## How this repository is organized
 
@@ -32,6 +33,7 @@ the [development guide](docs/development.md) has the rules and the steps.
 | --- | --- |
 | **`plugin`** (default) | This page, the recipes, and the plugin |
 | `vllm/<upstream commit>` | Upstream vLLM at that commit plus our commits; the current one is `vllm/a0d7356b98` |
+| `qwen38-27b/vllm`, `qwen38-27b/plugin` | The Qwen3.8-27B engine: its vLLM commits over `vllm/a0d7356b98` and its plugin changes, pinned by its recipe |
 | `main` | A clean mirror of upstream vLLM |
 
 Each recipe pins the exact engine it was validated with.
@@ -43,13 +45,15 @@ Each recipe pins the exact engine it was validated with.
 | Qwen3.8-Flash-Next | W4A16 AutoRound | PP2 / TP1 | [W4A16 recipe](recipes/qwen-flash-next-w4a16/README.md) — pinned container on the plugin layout, image and video input, download and launch scripts |
 | Qwen3.8-Flash-Next | EXL3 5.05 bpw | PP2 / TP1 | [EXL3 recipe](recipes/qwen-flash-next-exl3/README.md) — source-built container and the validated serving configuration |
 | GLM-5.3-Flash | EXL3 2.60 bpw | PP2 / TP1 | [EXL3 recipe](recipes/glm53-flash-exl3/README.md) — pinned container, image and video input, DFlash2 drafter, download and launch scripts |
+| Qwen3.8-27B | W4A16 AutoRound | one card | [W4A16 recipe](recipes/qwen38-27b/README.md) — pinned container for one 64 GB or 40 GB card, image and video input, DFlash2 drafter, download and launch scripts |
 
 Each recipe lists its hardware, storage and software requirements, its engine
 pins, and its launch settings.
 
 ## Measured performance
 
-These are our measurements on **2× CMP 170HX, 170 W/card, PCIe Gen2 ×4/card**.
+These are our measurements at **170 W/card on PCIe Gen2 ×4 links**: two 64 GiB
+cards for the PP2 recipes, one 40 GB card for Qwen3.8-27B.
 Decode uses the SparkDash `3e6d4ef` protocol: greedy sampling, thinking off,
 400 output tokens. Values are medians of three complete runs. C4 and C8 mean
 total throughput across four or eight simultaneous requests, not the speed of
@@ -60,10 +64,12 @@ each request.
 | Qwen3.8-Flash-Next W4A16 | 234.4 tok/s | 581.9 tok/s | 827.3 tok/s | 7,426 tok/s |
 | Qwen3.8-Flash-Next EXL3 | 163.1 tok/s | 355.5 tok/s | 499.8 tok/s | 4,000 tok/s |
 | GLM-5.3-Flash EXL3 | 76.5 tok/s | 151.4 tok/s | N/A | 1,836 tok/s |
+| Qwen3.8-27B W4A16 (one card) | 343.5 tok/s | 868.3 tok/s | 1,233.8 tok/s | 3,629 tok/s |
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
-and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), and the
-[GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/results/2026-11-11.json), identify their engine,
+and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), the
+[GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/results/2026-11-11.json), and the
+[Qwen3.8-27B results](https://github.com/AlexBrandes/cmp170hx-qwen38-27b/blob/6587a76a6fdccd1c355536cedf57564e6f0c800b/results/2026-11-11.json) identify their engine,
 configuration, and measurement runs. Each row measures a **whole recipe**: engine
 version, quantization, speculative depth and runtime settings differ between
 rows. Performance also depends on prompt content, concurrency, cooling, and
