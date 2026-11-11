@@ -698,6 +698,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 decode_query_len,
                 workspace,
             ) = self._moe_decode_tc(layer, metadata, max_rows, workspace)
+        # Q4N / Q4N-X experts (codebook 3/4) have no base-kernel path: the base MoE
+        # GEMM (csrc/exl3/gemm.cu) traps on any format outside mul1/codebook 1-2.
+        # Such a layer must run every call on the tensor-core kernels, so both
+        # gates must be open and the layer format uniform.
+        q4n = any(int(proj[3]) >= 3 for expert in metadata for proj in expert)
+        if q4n:
+            key = _layer_bits_x2(metadata)
+            missing = [
+                name
+                for name, ok in (
+                    ("uniform Q4N expert format", key is not None),
+                    ("VLLM_EXL3_MOE_PREFILL_TC gate", bool(prefill_decode_len)),
+                    ("VLLM_EXL3_MOE_DECODE_TC gate", bool(decode_tc_rows)),
+                )
+                if not ok
+            ]
+            if missing:
+                raise ValueError(
+                    "EXL3 Q4N routed experts run only on the tensor-core kernels "
+                    "(the base MoE GEMM has no codebook 3/4 path); missing: "
+                    + ", ".join(missing)
+                )
         experts = Exl3Experts(
             self.moe,
             self.moe_quant_config,
@@ -715,6 +737,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             decode_tc_rows=decode_tc_rows,
             decode_tc_bits_x2=decode_tc_bits_x2,
             decode_query_len=decode_query_len,
+            q4n_tc_only=q4n,
         )
         self.moe_kernel = mk.FusedMoEKernel(prepare, experts)
 
@@ -983,6 +1006,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         decode_tc_rows=0,
         decode_tc_bits_x2=0,
         decode_query_len=0,
+        q4n_tc_only=False,
     ):
         super().__init__(moe, quant)
         self.intermediate_size = intermediate_size
@@ -1004,6 +1028,9 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         self.decode_tc_bits_x2 = decode_tc_bits_x2
         # 1 + num_speculative_tokens: the bound of the decode step check.
         self.decode_query_len = decode_query_len
+        # Q4N layers: every call on the tensor-core kernels, whatever the step
+        # phase or capture state (the base kernels trap on codebook 3/4).
+        self.q4n_tc_only = q4n_tc_only
         from vllm_cmp170hx.kernels.exl3.ops import (
             MOE_PREFILL_GLM_MAX_ROWS,
             MOE_PREFILL_MAX_ROWS,
@@ -1105,6 +1132,13 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             or a2_scale is not None
         ):
             raise ValueError("EXL3 MoE requires unquantized, unweighted BF16 inputs")
+        if self.q4n_tc_only:
+            self._apply_q4n(
+                rows, hidden_states, topk_ids, topk_weights, w1, w2,
+                self.expert_map if expert_map is None else expert_map,
+                output, workspace2.view(torch.float32),
+            )
+            return
         operator = moe_out_v2 if 0 < rows <= self.moe_v2_rows else moe_out
         if self.prefill_decode_len:
             operator = self._prefill_operator(rows, operator)
@@ -1160,6 +1194,39 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
                 self.intermediate_size,
                 output,
                 workspace2.view(torch.float32),
+            )
+
+    def _apply_q4n(self, rows, x, ids, weights, ptrs, meta, expert_map, out, ws):
+        """Q4N routing: 1..decode_tc_rows rows on moe_out_decode_tc; up to
+        MOE_PREFILL_MIN_ROWS - 1 rows on moe_out_decode_tc in decode_tc_rows
+        slices (each token's routed output depends only on its own routes, and
+        the slice count is fixed by the row count, so capture is safe); larger
+        calls on moe_out_prefill within its workspace bound."""
+        from vllm_cmp170hx.kernels.exl3.ops import (
+            MOE_PREFILL_MIN_ROWS,
+            moe_out_decode_tc,
+            moe_out_prefill,
+        )
+
+        if rows == 0:
+            return
+        if rows >= MOE_PREFILL_MIN_ROWS:
+            if rows > self.prefill_max_rows:
+                raise ValueError(
+                    f"EXL3 Q4N MoE call of {rows} rows exceeds the tensor-core "
+                    f"prefill bound {self.prefill_max_rows}"
+                )
+            moe_out_prefill(
+                x, ids, weights, ptrs, meta, expert_map,
+                self.intermediate_size, self.prefill_bits_x2, out, ws,
+            )
+            return
+        step = self.decode_tc_rows
+        for lo in range(0, rows, step):
+            hi = min(rows, lo + step)
+            moe_out_decode_tc(
+                x[lo:hi], ids[lo:hi], weights[lo:hi], ptrs, meta, expert_map,
+                self.intermediate_size, self.decode_tc_bits_x2, out[lo:hi], ws,
             )
 
     def _prefill_operator(self, rows: int, operator):
