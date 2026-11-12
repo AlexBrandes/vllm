@@ -851,6 +851,77 @@ __global__ void __launch_bounds__(32 * (F::kIntermediate / 128))
   if (threadIdx.x == 0) unscale[pos * 3 + 2] = pow2(-e);
 }
 
+// Lab (VLLM_EXL3_Q4N_PREFILL=i8, Q4N-X prefill families only): converts the
+// split operand rows the operand kernels just wrote (hi + lo = v 2^e) into
+// per-row symmetric INT8 for the u8 x s8 IMMA GEMM (run_tile_i8). One warp per
+// (sorted position, projection) task, P tasks per position (2: gate/up rows of
+// K = hidden; 1: the down row of K = intermediate), projection index first + p.
+// q = rint(y 127 / max|y|); 2^-e becomes 2^-e max|y| / 127 in unscale. Within
+// every 16-value block, value kk is stored at byte 4 ((kk & 7) >> 1) + (kk & 1)
+// + 2 (kk >> 3): the m16n8k32 B position whose k matches the Q4N lane layout
+// (byte c of a state is k = 2t + (c & 1) + 8 (c >> 1), at IMMA k = 4t + c).
+// The INT8 row and the FP32 row sum of q (for the codebook's -15 offset) are
+// written into the row's lo region, 256 values per step in increasing order:
+// step c overwrites lo halves [128c, 128c + 128), already read by step c / 2.
+template <int K>
+__global__ void __launch_bounds__(32 * kOperandWarps)
+    i8_operand(const int* table, __half* operand, float* unscale, int P,
+               int first) {
+  static_assert(K % 256 == 0, "256-value steps");
+  const int lane = threadIdx.x & 31;
+  const int64_t tasks = int64_t(table[0]) * P;
+  for (int64_t task = int64_t(blockIdx.x) * kOperandWarps + (threadIdx.x >> 5);
+       task < tasks; task += int64_t(gridDim.x) * kOperandWarps) {
+    const int64_t pos = task / P;
+    const int proj = static_cast<int>(task % P);
+    const __half* hi = operand + task * 2 * K;
+    const __half* lo = hi + K;
+    unsigned char* q8 = reinterpret_cast<unsigned char*>(operand + task * 2 * K + K);
+    float peak = 0.0f;
+    for (int c = 0; c < K / 256; ++c) {
+      const int k0 = 256 * c + 8 * lane;
+      float h[8], l[8];
+      load8(hi + k0, true, h);
+      load8(lo + k0, true, l);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) peak = fmaxf(peak, fabsf(h[i] + l[i]));
+    }
+#pragma unroll
+    for (int d = 16; d >= 1; d >>= 1)
+      peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, d));
+    const float qs = peak > 0.0f ? 127.0f / peak : 0.0f;
+    int rsum = 0;
+    for (int c = 0; c < K / 256; ++c) {
+      const int k0 = 256 * c + 8 * lane;
+      float h[8], l[8];
+      load8(hi + k0, true, h);
+      load8(lo + k0, true, l);
+      int q[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        q[i] = max(-127, min(127, __float2int_rn((h[i] + l[i]) * qs)));
+        rsum += q[i];
+      }
+      __syncwarp();
+      unsigned char* blk = q8 + (k0 & ~15);
+      const int half8 = (k0 >> 3) & 1;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint16_t v = uint16_t(uint8_t(int8_t(q[2 * j]))) |
+                           uint16_t(uint16_t(uint8_t(int8_t(q[2 * j + 1]))) << 8);
+        *reinterpret_cast<uint16_t*>(blk + 4 * j + 2 * half8) = v;
+      }
+      __syncwarp();
+    }
+#pragma unroll
+    for (int d = 16; d >= 1; d >>= 1) rsum += __shfl_xor_sync(0xffffffffu, rsum, d);
+    if (lane == 0) {
+      *reinterpret_cast<float*>(q8 + K) = static_cast<float>(rsum);
+      unscale[pos * 3 + first + proj] *= peak / 127.0f;
+    }
+  }
+}
+
 // --------------------------------------------------------------------------
 // Expert GEMM.
 
@@ -879,6 +950,27 @@ __device__ __forceinline__ void mma(const uint32_t (&a)[4], uint32_t b0,
       : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(c[0]),
         "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+// d += A B, u8 A (Q4N-X nibble sums 0..30) x s8 B (INT8 operand rows), s32.
+__device__ __forceinline__ void mma_u8s8(const uint32_t (&a)[4], uint32_t b0,
+                                         uint32_t b1, int (&d)[4]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldmatrix2_at(uint32_t address, uint32_t (&r)[2]) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+               : "=r"(r[0]), "=r"(r[1])
+               : "r"(address));
+}
+// The four nibble-sum codebook values (0..30, before the -15 offset) of a
+// Q4N state as the u8 bytes of one A register (byte c = value c).
+__device__ __forceinline__ uint32_t q4n_nibble_sums(uint32_t state) {
+  const uint32_t p = state * 0x83DCD12Du;
+  return ((p >> 4) & 0x0f0f0f0fu) + (p & 0x0f0f0f0fu);
 }
 
 // Two mul1 codebook values as an FP16 pair (low half = s0): exactly
@@ -1163,6 +1255,12 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
           // 1 -- the FP16 hi plane alone (activation rounded once to FP16), one
           // MMA per k16; 2 -- both planes as independent MMAs added in FP32 RN
           // (no lo -> hi dependency); 0 -- the shipped lo-seeded pair.
+          // 3 (lab "acc"): the hi plane alone, accumulated inside the MMA
+          // across k (tensor-core summation order, no per-k16 FP32 add).
+          if constexpr (kPlanes == 3) {
+            mma(a[j], bg[0], bg[1], sum[j][g], sum[j][g]);
+            continue;
+          }
           float d[4];
           if constexpr (kPlanes == 1) {
             mma(a[j], bg[0], bg[1], zero, d);
@@ -1212,6 +1310,122 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
   }
 }
 
+// Lab INT8 K loop (kPlanes 4, Q4N-X only; VLLM_EXL3_Q4N_PREFILL=i8): the
+// operand stage holds each route-tile row's 64 INT8 values of the chunk (four
+// 16-byte vectors, vector c at c ^ ((row >> 1) & 3)); per k32 step s (two per
+// chunk) the A fragment is the nibble-sum bytes of trellis tiles 2s (k 0..15:
+// a0 row g, a1 row g + 8) and 2s + 1 (k 16..31: a2, a3), B one ldmatrix.x2 per
+// 8-row group (vectors 2s, 2s + 1). s32 accumulation over the whole K; the
+// epilogue removes the codebook offset with the row's INT8 sum:
+// out = (acc - 15 sum q) unscale kQ4NAlpha.
+template <int kG, class S, class Load>
+__device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
+                                            Load& load, int rows, int first,
+                                            int pi, int cb) {
+  static_assert(S::kCodebook == 4, "INT8 path: Q4N-X only");
+  constexpr int TPW = S::kTPW;
+  using R = Q4NRing<S::kBitsX2, S::kCodebook>;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  int acc[TPW][kG][4];
+#pragma unroll
+  for (int j = 0; j < TPW; ++j)
+#pragma unroll
+    for (int g = 0; g < kG; ++g)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[j][g][i] = 0;
+  const int start = R::start(lane);
+  const uint32_t wbase = smem + S::kStageW + TPW * warp * S::kTileBytes;
+  bool zero_hi = false;
+  int shift;
+  uint32_t w_hi, w_lo;
+  if (start < 0) {
+    zero_hi = true;
+    shift = start + 32;
+    w_hi = w_lo = wbase;
+  } else {
+    const int w0 = start >> 5;
+    const int w1 = w0 + 1 < R::kWords ? w0 + 1 : w0;
+    shift = start & 31;
+    w_hi = wbase + 4 * w0;
+    w_lo = wbase + 4 * w1;
+  }
+  // ldmatrix.x2 row address: lanes 0..7 vector 2s, 8..15 vector 2s + 1 of rows
+  // 8 g + lane % 8 (lanes 16..31 repeat them).
+  const int lr = lane & 7;
+  const int lv = (lane >> 3) & 1;
+  const uint32_t b_row = smem + lr * 64;
+  const int b_swz = (lr >> 1) & 3;
+
+#pragma unroll
+  for (int s = 0; s < S::kStages - 1; ++s) {
+    load();
+    copy_commit();
+  }
+  uint32_t read = 0;
+  for (int chunk = 0; chunk < S::kChunks; ++chunk) {
+    copy_wait<S::kStages - 2>();
+    __syncthreads();
+    if (chunk + S::kStages - 1 < S::kChunks) load();
+    copy_commit();
+#pragma unroll
+    for (int s = 0; s < kSteps / 2; ++s) {
+      uint32_t a[TPW][4];
+#pragma unroll
+      for (int j = 0; j < TPW; ++j) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t off = read + (2 * s + h) * (S::kBlockTiles * S::kTileBytes) +
+                               j * S::kTileBytes;
+          const uint32_t lo = lds32(w_lo + off);
+          const uint32_t hi = zero_hi ? 0u : lds32(w_hi + off);
+          const uint32_t u = __funnelshift_l(lo, hi, shift);
+          const uint32_t s0 = u >> (32 - R::kL);
+          const uint32_t s1 = (u >> (32 - R::kL - R::kKV)) & ((1u << R::kL) - 1u);
+          a[j][2 * h] = q4n_nibble_sums(s0);
+          a[j][2 * h + 1] = q4n_nibble_sums(s1);
+        }
+      }
+      const uint32_t vec = static_cast<uint32_t>(((2 * s + lv) ^ b_swz) * 16);
+#pragma unroll
+      for (int g = 0; g < kG; ++g) {
+        uint32_t b[2];
+        ldmatrix2_at(b_row + read + g * 8 * 64 + vec, b);
+#pragma unroll
+        for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][g]);
+      }
+    }
+    read = next_stage<S>(read);
+  }
+
+  const int t = lane & 3;
+#pragma unroll
+  for (int j = 0; j < TPW; ++j) {
+    const int col = (cb * S::kBlockTiles + TPW * warp + j) * 16 + (lane >> 2);
+#pragma unroll
+    for (int g = 0; g < kG; ++g) {
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        const int r = 8 * g + 2 * t + c;
+        if (r < rows) {
+          const int64_t pos = first + r;
+          const unsigned char* orow = reinterpret_cast<const unsigned char*>(
+              p.operand + pos * S::kRowHalves + int64_t(pi) * 2 * S::kK + S::kK);
+          const float offset = 15.0f * *reinterpret_cast<const float*>(orow + S::kK);
+          const float scale =
+              __fmul_rn(p.unscale[pos * 3 + S::kFirst + pi], kQ4NAlpha);
+          int64_t row = pos;
+          if constexpr (S::kProjections == 1 && S::kFirst < 2)
+            row = p.row_map[pos];
+          float* out = p.out + (row * S::kProjections + pi) * S::kN + col;
+          out[0] = (static_cast<float>(acc[j][g][c]) - offset) * scale;
+          out[8] = (static_cast<float>(acc[j][g][2 + c]) - offset) * scale;
+        }
+      }
+    }
+  }
+}
+
 // Block items: (route tile, projection, column block of 16 kBlockTiles), column
 // blocks fastest so concurrently running blocks share the tile's operand rows
 // in L2.
@@ -1249,10 +1463,12 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
       "operand copy layout");
   constexpr int kStepVectors = S::kBlockTiles * S::kTileBytes / 16;
   constexpr int kWVectors = kSteps * kStepVectors;
-  constexpr int kOperandVectors = S::kTileRows * 16;
+  // kPlanes 4 (lab INT8): 4 vectors (64 INT8 values) per row and chunk.
+  constexpr bool kI8 = kPlanes == 4;
+  constexpr int kOperandVectors = S::kTileRows * (kI8 ? 4 : 16);
   constexpr int kStageVectors = kOperandVectors + kWVectors;
   constexpr int kCopies = (kStageVectors + kThreads - 1) / kThreads;
-  constexpr int kOperandAdvance = kKC * 2;  // bytes per thread and chunk
+  constexpr int kOperandAdvance = kI8 ? kKC : kKC * 2;  // bytes per thread and chunk
   const int padded_rows = (rows + 7) & ~7;
   const char* src[kCopies];
   uint32_t dst[kCopies];
@@ -1263,7 +1479,19 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
     const int v = tid + j * kThreads;
     // A dead slot addresses the last live vector; its copy is never issued.
     const int at = v < kStageVectors ? v : kStageVectors - 1;
-    if (at < kOperandVectors) {
+    if (kI8 && at < kOperandVectors) {
+      // INT8 row r (in the lo region: K halves past the row's hi plane),
+      // vector c of the chunk stored at c ^ ((r >> 1) & 3).
+      const int r = at / 4;
+      const int c = at & 3;
+      src[j] = reinterpret_cast<const char*>(
+                   operand + int64_t(r < rows ? r : 0) * S::kRowHalves + S::kK) +
+               c * 16;
+      dst[j] = smem + r * 64 + ((c ^ ((r >> 1) & 3)) * 16);
+      size[j] =
+          v < kOperandVectors && r < padded_rows ? (r < rows ? 16 : 0) : -1;
+      advance[j] = kOperandAdvance;
+    } else if (at < kOperandVectors) {
       const int part = at / (8 * S::kTileRows);
       const int r = (at / 8) % S::kTileRows;
       const int c = at & 7;
@@ -1300,7 +1528,20 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
     stage = next_stage<S>(stage);
   };
 
-  if constexpr (S::kTileRows == 8) {
+  if constexpr (kI8) {
+    static_assert(S::kTileRows == 64, "INT8 path: prefill families");
+    switch ((rows + 7) >> 3) {
+#define EXL3_GROUPS_I8(G)                                          \
+  case G:                                                          \
+    run_tile_i8<G, S>(p, smem, load, rows, tile.y, pi, cb);        \
+    break;
+      EXL3_GROUPS_I8(1)
+      EXL3_GROUPS_I8(2) EXL3_GROUPS_I8(3) EXL3_GROUPS_I8(4) EXL3_GROUPS_I8(5)
+          EXL3_GROUPS_I8(6) EXL3_GROUPS_I8(7) EXL3_GROUPS_I8(8)
+#undef EXL3_GROUPS_I8
+              default : break;
+    }
+  } else if constexpr (S::kTileRows == 8) {
     // A decode route tile holds at most one 8-row group (route above).
     run_tile<1, S, kPlanes>(p, smem, load, rows, tile.y, pi, cb);
   } else {
@@ -1520,10 +1761,23 @@ int64_t workspace_elements(int64_t assignments, int64_t hidden,
 // instead of keeping ~22 significand bits -- so it is a lab variant under the
 // TC admission policy. 8-row decode families are never affected.
 // "1": one plane; "pair": both planes as independent MMAs. Returns kPlanes.
+// Lab additions (2026-11-12, routed-prefill inner-loop study): "acc" (3) runs
+// the hi plane alone with the k16 products accumulated inside the MMA; for the
+// Q4N families VLLM_EXL3_Q4N_PREFILL selects fp16 (default, 1), acc (3) or,
+// for Q4N-X only, i8 (4: per-row INT8 activations on u8 x s8 IMMA).
 template <class F>
 int prefill_one_plane() {
   if constexpr (F::kCodebook >= 3) {
-    return 1;
+    static const int mode = [] {
+      const char* v = std::getenv("VLLM_EXL3_Q4N_PREFILL");
+      const std::string s(v == nullptr ? "" : v);
+      if (s.empty() || s == "fp16") return 1;
+      if (s == "acc") return 3;
+      TORCH_CHECK(s == "i8", "VLLM_EXL3_Q4N_PREFILL must be fp16, acc or i8");
+      TORCH_CHECK(F::kCodebook == 4, "VLLM_EXL3_Q4N_PREFILL=i8 serves Q4N-X (codebook 4) only");
+      return 4;
+    }();
+    return mode;
   } else if constexpr (F::kTileRows <= 8) {
     return 0;
   } else {
@@ -1533,8 +1787,9 @@ int prefill_one_plane() {
       const std::string s(v);
       if (s == "1") return 1;
       if (s == "pair") return 2;
+      if (s == "acc") return 3;
       TORCH_CHECK(s.empty() || s == "0",
-                  "VLLM_EXL3_MOE_PREFILL_ONE_PLANE must be 0, 1 or pair");
+                  "VLLM_EXL3_MOE_PREFILL_ONE_PLANE must be 0, 1, pair or acc");
       return 0;
     }();
     return mode;
@@ -1657,6 +1912,16 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
         switch (prefill_one_plane<F>()) {
           case 1: launch_gemm<GateUp, 1>(p, items, stream); break;
           case 2: launch_gemm<GateUp, 2>(p, items, stream); break;
+          case 3: launch_gemm<GateUp, 3>(p, items, stream); break;
+          case 4:
+            if constexpr (F::kCodebook == 4) {
+              i8_operand<kHidden>
+                  <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
+                      table, operand, unscale, 2, 0);
+              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              launch_gemm<GateUp, 4>(p, items, stream);
+            }
+            break;
           default: launch_gemm<GateUp>(p, items, stream); break;
         }
       }
@@ -1686,6 +1951,16 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
       switch (prefill_one_plane<F>()) {
         case 1: launch_gemm<Down, 1>(p, items, stream); break;
         case 2: launch_gemm<Down, 2>(p, items, stream); break;
+        case 3: launch_gemm<Down, 3>(p, items, stream); break;
+        case 4:
+          if constexpr (F::kCodebook == 4) {
+            i8_operand<kIntermediate>
+                <<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
+                    table, operand, unscale, 1, 2);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            launch_gemm<Down, 4>(p, items, stream);
+          }
+          break;
         default: launch_gemm<Down>(p, items, stream); break;
       }
     }
