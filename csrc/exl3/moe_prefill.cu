@@ -863,7 +863,13 @@ __global__ void __launch_bounds__(32 * (F::kIntermediate / 128))
 // The INT8 row and the FP32 row sum of q (for the codebook's -15 offset) are
 // written into the row's lo region, 256 values per step in increasing order:
 // step c overwrites lo halves [128c, 128c + 128), already read by step c / 2.
-template <int K>
+// kBlock (VLLM_EXL3_Q4N_PREFILL=i8b / i8bg): one scale per 128-value block
+// (H128 rotates within a block, so block magnitudes differ) in a single pass;
+// the block scales max|y_b| / 127 and the FP32 block sums of q follow the INT8
+// row in the lo region (K / 128 scales, then K / 128 sums), written after the
+// last read; unscale keeps 2^-e. Lanes 0..15 hold block 2c of step c, 16..31
+// block 2c + 1.
+template <int K, bool kBlock = false>
 __global__ void __launch_bounds__(32 * kOperandWarps)
     i8_operand(const int* table, __half* operand, float* unscale, int P,
                int first) {
@@ -877,6 +883,58 @@ __global__ void __launch_bounds__(32 * kOperandWarps)
     const __half* hi = operand + task * 2 * K;
     const __half* lo = hi + K;
     unsigned char* q8 = reinterpret_cast<unsigned char*>(operand + task * 2 * K + K);
+    if constexpr (kBlock) {
+      float bscale[K / 256];
+      int bsum[K / 256];
+#pragma unroll
+      for (int c = 0; c < K / 256; ++c) {
+        const int k0 = 256 * c + 8 * lane;
+        float h[8], l[8], y[8];
+        load8(hi + k0, true, h);
+        load8(lo + k0, true, l);
+        float bp = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          y[i] = h[i] + l[i];
+          bp = fmaxf(bp, fabsf(y[i]));
+        }
+#pragma unroll
+        for (int d = 8; d >= 1; d >>= 1)
+          bp = fmaxf(bp, __shfl_xor_sync(0xffffffffu, bp, d));
+        const float qs = bp > 0.0f ? 127.0f / bp : 0.0f;
+        int q[8];
+        int s = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          q[i] = max(-127, min(127, __float2int_rn(y[i] * qs)));
+          s += q[i];
+        }
+#pragma unroll
+        for (int d = 8; d >= 1; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
+        bscale[c] = bp / 127.0f;
+        bsum[c] = s;
+        __syncwarp();
+        unsigned char* blk = q8 + (k0 & ~15);
+        const int half8 = (k0 >> 3) & 1;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint16_t v = uint16_t(uint8_t(int8_t(q[2 * j]))) |
+                             uint16_t(uint16_t(uint8_t(int8_t(q[2 * j + 1]))) << 8);
+          *reinterpret_cast<uint16_t*>(blk + 4 * j + 2 * half8) = v;
+        }
+        __syncwarp();
+      }
+      if ((lane & 15) == 0) {
+        float* meta = reinterpret_cast<float*>(q8 + K);
+        const int odd = lane >> 4;
+#pragma unroll
+        for (int c = 0; c < K / 256; ++c) {
+          meta[2 * c + odd] = bscale[c];
+          meta[K / 128 + 2 * c + odd] = static_cast<float>(bsum[c]);
+        }
+      }
+      continue;
+    }
     float peak = 0.0f;
     for (int c = 0; c < K / 256; ++c) {
       const int k0 = 256 * c + 8 * lane;
@@ -1318,22 +1376,45 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
 // 8-row group (vectors 2s, 2s + 1). s32 accumulation over the whole K; the
 // epilogue removes the codebook offset with the row's INT8 sum:
 // out = (acc - 15 sum q) unscale kQ4NAlpha.
-template <int kG, class S, class Load>
+// kBlock: per-128-k block scales (i8_operand<K, true>): s32 accumulation per
+// block (two chunks), then facc += (acc - 15 sum_b) scale_b per token row.
+template <int kG, class S, bool kBlock, class Load>
 __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
                                             Load& load, int rows, int first,
                                             int pi, int cb) {
   static_assert(S::kCodebook == 4, "INT8 path: Q4N-X only");
+  static_assert(!kBlock || (128 % kKC == 0 && S::kK % 128 == 0), "128-k blocks");
   constexpr int TPW = S::kTPW;
   using R = Q4NRing<S::kBitsX2, S::kCodebook>;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   int acc[TPW][kG][4];
+  float facc[TPW][kG][4];
 #pragma unroll
   for (int j = 0; j < TPW; ++j)
 #pragma unroll
     for (int g = 0; g < kG; ++g)
 #pragma unroll
-      for (int i = 0; i < 4; ++i) acc[j][g][i] = 0;
+      for (int i = 0; i < 4; ++i) {
+        acc[j][g][i] = 0;
+        facc[j][g][i] = 0.0f;
+      }
+  // Block metadata (scales, then sums) of this lane's token rows 8 g + 2 t + c.
+  const float* meta[kG][2];
+  {
+    const int t = lane & 3;
+#pragma unroll
+    for (int g = 0; g < kG; ++g)
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        const int r = 8 * g + 2 * t + c;
+        const int64_t pos = first + (r < rows ? r : 0);
+        meta[g][c] = reinterpret_cast<const float*>(
+            reinterpret_cast<const unsigned char*>(
+                p.operand + pos * S::kRowHalves + int64_t(pi) * 2 * S::kK + S::kK) +
+            S::kK);
+      }
+  }
   const int start = R::start(lane);
   const uint32_t wbase = smem + S::kStageW + TPW * warp * S::kTileBytes;
   bool zero_hi = false;
@@ -1395,6 +1476,28 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
         for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][g]);
       }
     }
+    if constexpr (kBlock) {
+      if ((chunk & 1) == 1) {   // end of 128-k block chunk / 2
+        const int blk = chunk >> 1;
+#pragma unroll
+        for (int g = 0; g < kG; ++g) {
+          float sc[2], off[2];
+#pragma unroll
+          for (int c = 0; c < 2; ++c) {
+            sc[c] = __ldg(meta[g][c] + blk);
+            off[c] = 15.0f * __ldg(meta[g][c] + S::kK / 128 + blk);
+          }
+#pragma unroll
+          for (int j = 0; j < TPW; ++j)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              facc[j][g][i] = fmaf(static_cast<float>(acc[j][g][i]) - off[i & 1], sc[i & 1],
+                                   facc[j][g][i]);
+              acc[j][g][i] = 0;
+            }
+        }
+      }
+    }
     read = next_stage<S>(read);
   }
 
@@ -1418,8 +1521,13 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
           if constexpr (S::kProjections == 1 && S::kFirst < 2)
             row = p.row_map[pos];
           float* out = p.out + (row * S::kProjections + pi) * S::kN + col;
-          out[0] = (static_cast<float>(acc[j][g][c]) - offset) * scale;
-          out[8] = (static_cast<float>(acc[j][g][2 + c]) - offset) * scale;
+          if constexpr (kBlock) {
+            out[0] = facc[j][g][c] * scale;
+            out[8] = facc[j][g][2 + c] * scale;
+          } else {
+            out[0] = (static_cast<float>(acc[j][g][c]) - offset) * scale;
+            out[8] = (static_cast<float>(acc[j][g][2 + c]) - offset) * scale;
+          }
         }
       }
     }
@@ -1463,8 +1571,9 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
       "operand copy layout");
   constexpr int kStepVectors = S::kBlockTiles * S::kTileBytes / 16;
   constexpr int kWVectors = kSteps * kStepVectors;
-  // kPlanes 4 (lab INT8): 4 vectors (64 INT8 values) per row and chunk.
-  constexpr bool kI8 = kPlanes == 4;
+  // kPlanes 4 / 5 (lab INT8, per-row / per-128-k block scales): 4 vectors
+  // (64 INT8 values) per row and chunk.
+  constexpr bool kI8 = kPlanes == 4 || kPlanes == 5;
   constexpr int kOperandVectors = S::kTileRows * (kI8 ? 4 : 16);
   constexpr int kStageVectors = kOperandVectors + kWVectors;
   constexpr int kCopies = (kStageVectors + kThreads - 1) / kThreads;
@@ -1533,7 +1642,7 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
     switch ((rows + 7) >> 3) {
 #define EXL3_GROUPS_I8(G)                                          \
   case G:                                                          \
-    run_tile_i8<G, S>(p, smem, load, rows, tile.y, pi, cb);        \
+    run_tile_i8<G, S, kPlanes == 5>(p, smem, load, rows, tile.y, pi, cb); \
     break;
       EXL3_GROUPS_I8(1)
       EXL3_GROUPS_I8(2) EXL3_GROUPS_I8(3) EXL3_GROUPS_I8(4) EXL3_GROUPS_I8(5)
@@ -1773,9 +1882,12 @@ int prefill_one_plane() {
       const std::string s(v == nullptr ? "" : v);
       if (s.empty() || s == "fp16") return 1;
       if (s == "acc") return 3;
-      TORCH_CHECK(s == "i8", "VLLM_EXL3_Q4N_PREFILL must be fp16, acc or i8");
-      TORCH_CHECK(F::kCodebook == 4, "VLLM_EXL3_Q4N_PREFILL=i8 serves Q4N-X (codebook 4) only");
-      return 4;
+      TORCH_CHECK(s == "i8" || s == "i8b" || s == "i8bg",
+                  "VLLM_EXL3_Q4N_PREFILL must be fp16, acc, i8, i8b or i8bg");
+      TORCH_CHECK(F::kCodebook == 4, "VLLM_EXL3_Q4N_PREFILL=i8* serves Q4N-X (codebook 4) only");
+      // i8: per-row INT8 scales; i8b: per-128-k block scales; i8bg: i8b for
+      // gate/up, the FP16 one-plane GEMM for down (which projection errs).
+      return s == "i8" ? 4 : s == "i8b" ? 5 : 6;
     }();
     return mode;
   } else if constexpr (F::kTileRows <= 8) {
@@ -1922,6 +2034,16 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
               launch_gemm<GateUp, 4>(p, items, stream);
             }
             break;
+          case 5:
+          case 6:
+            if constexpr (F::kCodebook == 4) {
+              i8_operand<kHidden, true>
+                  <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
+                      table, operand, unscale, 2, 0);
+              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              launch_gemm<GateUp, 5>(p, items, stream);
+            }
+            break;
           default: launch_gemm<GateUp>(p, items, stream); break;
         }
       }
@@ -1961,6 +2083,16 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
             launch_gemm<Down, 4>(p, items, stream);
           }
           break;
+        case 5:
+          if constexpr (F::kCodebook == 4) {
+            i8_operand<kIntermediate, true>
+                <<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
+                    table, operand, unscale, 1, 2);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            launch_gemm<Down, 5>(p, items, stream);
+          }
+          break;
+        case 6: launch_gemm<Down, 1>(p, items, stream); break;
         default: launch_gemm<Down>(p, items, stream); break;
       }
     }
