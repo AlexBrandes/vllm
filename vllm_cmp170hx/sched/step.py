@@ -51,6 +51,7 @@ class Sm80Step:
         "prefill_chunk_limit",
         "decode_only",
         "prefill_only",
+        "decode_turn",
     )
 
     def __init__(
@@ -86,6 +87,11 @@ class Sm80Step:
         self.decode_only = self.prefill_only = False
         if scheduler.pp_homogeneous_steps:
             self.decode_only, self.prefill_only = scheduler._homogeneous_step_phase()
+        # A capped decode-only step takes the streams whose turn it is, not
+        # the oldest ones every time (see Sm80SchedulerMixin._pp_decode_turn).
+        self.decode_turn: frozenset[str] | None = None
+        if self.decode_only and self.pp_decode_cap is not None:
+            self.decode_turn = scheduler._pp_decode_turn(self.pp_decode_cap)
 
     def skip(self, request: Any) -> bool:
         """Running loop: whether the request waits for a later step: a decode
@@ -95,6 +101,8 @@ class Sm80Step:
         if self.prefill_only and not request.is_prefill_chunk:
             return True
         if self.decode_only and request.is_prefill_chunk:
+            return True
+        if self.decode_turn is not None and request.request_id not in self.decode_turn:
             return True
         return (
             self.pp_decode_cap is not None
@@ -182,8 +190,13 @@ class Sm80Step:
 
     def charge(self, request: Any, num_new_tokens: int) -> None:
         """The request was scheduled with ``num_new_tokens`` tokens."""
-        if self.pp_decode_cap is not None and not request.is_prefill_chunk:
-            self.num_pp_decodes += 1
+        if not request.is_prefill_chunk:
+            if self.pp_decode_cap is not None:
+                self.num_pp_decodes += 1
+            if self.scheduler.pp_spread_decodes:
+                self.scheduler._pp_decode_served[request.request_id] = (
+                    self.scheduler.current_step
+                )
         if request is not self.request:
             return
         if self.is_prefill:

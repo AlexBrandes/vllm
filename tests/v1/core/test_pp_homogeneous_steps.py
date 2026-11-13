@@ -144,3 +144,35 @@ def test_a_blocked_prefill_cannot_hold_decodes_off():
 def test_inert_without_pp():
     scheduler = create_scheduler(max_model_len=MAX_LEN)
     assert not scheduler.pp_homogeneous_steps
+
+
+def test_with_decode_spreading_every_stream_advances_during_a_prefill():
+    # Both flags on (the GLM unit): the capped decode-only steps of the
+    # alternation rotate through the streams. Taking the oldest ceil(3 / 2) = 2
+    # every time left dec2 with no step until the prompt finished.
+    scheduler = _pp_scheduler(homogeneous=True)
+    scheduler.pp_spread_decodes = True
+    streams, long_req = _decoding_with_long_prompt(scheduler)
+    steps = {request.request_id: 0 for request in streams}
+    while long_req.is_prefill_chunk or long_req.num_computed_tokens == 0:
+        decodes, prefills = _step(scheduler)
+        assert not (decodes and prefills), (decodes, prefills)
+        assert len(decodes) <= 2, decodes
+        for req_id in decodes:
+            steps[req_id] += 1
+    assert max(steps.values()) - min(steps.values()) <= 1, steps
+    assert min(steps.values()) > 0, steps
+
+
+def test_decode_spreading_still_caps_steps_without_prefill():
+    scheduler = _pp_scheduler(homogeneous=True)
+    scheduler.pp_spread_decodes = True
+    streams = create_requests(
+        num_requests=4, num_tokens=8, max_tokens=512, ignore_eos=True
+    )
+    for request in streams:
+        scheduler.add_request(request)
+    _step(scheduler)
+    for _ in range(4):
+        decodes, prefills = _step(scheduler)
+        assert len(decodes) == 2 and not prefills

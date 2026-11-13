@@ -100,6 +100,10 @@ class Sm80SchedulerMixin:
         # different in-flight micro-batches instead.
         self.pp_homogeneous_steps = self.use_pp and envs.VLLM_PP_HOMOGENEOUS_STEPS
         self._last_step_was_decode = False
+        # Step at which each decode request was last scheduled, so the capped
+        # decode-only steps of the alternation rotate through the streams.
+        self._pp_decode_served: dict[str, int] = {}
+        self._pp_decode_rr = 0
         if self.pp_homogeneous_steps:
             logger.info("PP homogeneous steps on: no step mixes prefill and decode")
 
@@ -345,6 +349,37 @@ class Sm80SchedulerMixin:
             return None
         num_decoding = sum(1 for r in self.running if not r.is_prefill_chunk)
         return max(1, cdiv(num_decoding, self.parallel_config.pipeline_parallel_size))
+
+    def _pp_decode_turn(self, cap: int) -> frozenset[str]:
+        """Request ids a capped decode-only step takes: the ``cap`` ready
+        decodes served longest ago (never-served first); ties go to a running
+        position that rotates by ``cap`` each step, so with an odd stream count
+        no stream wins every tie.
+
+        In a decode-only step of the alternation every decoder is ready at
+        once, and the running loop alone would take the same oldest ``cap``
+        streams each time while the rest got no step until the prompt
+        finished prefilling. Rotating keeps the step the size spreading
+        gives it and serves every stream in turn."""
+        ready = [
+            r
+            for r in self.running
+            if not r.is_prefill_chunk
+            and r.num_tokens_with_spec + r.num_output_placeholders
+            > r.num_computed_tokens
+            and self.current_step >= r.next_decode_eligible_step
+        ]
+        served = self._pp_decode_served
+        live = {r.request_id for r in self.running}
+        for req_id in [k for k in served if k not in live]:
+            del served[req_id]
+        n, start = len(ready), self._pp_decode_rr
+        self._pp_decode_rr += cap
+        order = sorted(
+            range(n),
+            key=lambda i: (served.get(ready[i].request_id, -1), (i - start) % n),
+        )
+        return frozenset(ready[i].request_id for i in order[:cap])
 
     def _homogeneous_step_phase(self) -> tuple[bool, bool]:
         """(decode_only, prefill_only) for this step under homogeneous PP
