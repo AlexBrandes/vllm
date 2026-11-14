@@ -1305,6 +1305,24 @@ struct Staged : S {
   static constexpr int kSmemBytes = Stages * S::kStageBytes;
   static_assert(Stages >= 2 && S::kChunks >= Stages - 1, "pipeline depth");
 };
+// Lab INT8 GEMM variants (VLLM_EXL3_Q4N_I8_GEMM): the per-row INT8 path with
+// TPW n-tiles per warp and a compact stage (64 INT8 bytes per operand row and
+// chunk instead of the FP16 split's 256) Stages deep. INT8 MMAs accumulate in
+// s32 exactly and every output element's epilogue is unchanged, so any tiling
+// or depth is bitwise the base shape's result.
+template <class S, int TPW, int Stages>
+struct I8Shape : S {
+  static constexpr int kTPW = TPW;
+  static constexpr int kBlockTiles = kWarps * TPW;
+  static constexpr int kColBlocks = S::kN / (16 * kBlockTiles);
+  static constexpr uint32_t kStageW = S::kTileRows * kKC;
+  static constexpr uint32_t kStageBytes = kStageW + kSteps * kBlockTiles * S::kTileBytes;
+  static constexpr int kStages = Stages;
+  static constexpr int kSmemBytes = Stages * kStageBytes;
+  static_assert(S::kN % (16 * kBlockTiles) == 0 && S::kChunks >= Stages - 1,
+                "INT8 variant shape");
+  static_assert(kStageBytes % 16 == 0, "16-byte aligned stages");
+};
 // One served family: the MoE shape, the expert weight format (always the
 // mul1 codebook) and the integer SwiGLU limit the family ships with (0: none;
 // the GLM family's fixed model limit 10, used as the exact FP32 constant, so
@@ -2012,6 +2030,43 @@ void launch_gemm(const Gemm& p, int64_t max_items, cudaStream_t stream) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// VLLM_EXL3_Q4N_I8_GEMM: base (default: the family shapes), c3 / c4 / c5
+// (compact stages, 3 / 4 / 5 deep), t2c3 / t2c4 / t2c5 (gate/up TPW 2 too).
+inline int q4n_i8_gemm_variant() {
+  static const int v = [] {
+    const char* e = std::getenv("VLLM_EXL3_Q4N_I8_GEMM");
+    const std::string s = e ? e : "base";
+    if (s == "base") return 0;
+    if (s == "c3") return 1;
+    if (s == "c4") return 2;
+    if (s == "c5") return 3;
+    if (s == "t2c3") return 4;
+    if (s == "t2c4") return 5;
+    if (s == "t2c5") return 6;
+    TORCH_CHECK(false, "VLLM_EXL3_Q4N_I8_GEMM must be base, c3, c4, c5, t2c3, t2c4 or t2c5");
+    return 0;
+  }();
+  return v;
+}
+template <class S>
+void launch_gemm_items(const Gemm& p, int64_t max_tiles, cudaStream_t stream) {
+  launch_gemm<S, 4>(p, max_tiles * S::kProjections * S::kColBlocks, stream);
+}
+// gate/up (kGateUp) or down with the selected INT8 variant.
+template <class S, bool kGateUp>
+void launch_i8_gemm(const Gemm& p, int64_t max_tiles, cudaStream_t stream) {
+  constexpr int kBaseTpw = S::kTPW;
+  switch (q4n_i8_gemm_variant()) {
+    case 1: launch_gemm_items<I8Shape<S, kBaseTpw, 3>>(p, max_tiles, stream); return;
+    case 2: launch_gemm_items<I8Shape<S, kBaseTpw, 4>>(p, max_tiles, stream); return;
+    case 3: launch_gemm_items<I8Shape<S, kBaseTpw, 5>>(p, max_tiles, stream); return;
+    case 4: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 3>>(p, max_tiles, stream); return;
+    case 5: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>>(p, max_tiles, stream); return;
+    case 6: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 5>>(p, max_tiles, stream); return;
+    default: launch_gemm_items<S>(p, max_tiles, stream); return;
+  }
+}
+
 }  // namespace
 
 bool served_shape(int64_t hidden, int64_t intermediate) {
@@ -2288,7 +2343,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
               }
               timer.mark("gu_i8");
-              launch_gemm<GateUp, 4>(p, items, stream);
+              launch_i8_gemm<GateUp, true>(p, max_tiles, stream);
             }
             break;
           case 5:
@@ -2352,7 +2407,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
               C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
             timer.mark("down_i8");
-            launch_gemm<Down, 4>(p, items, stream);
+            launch_i8_gemm<Down, false>(p, max_tiles, stream);
           }
           break;
         case 5:
