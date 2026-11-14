@@ -2797,8 +2797,15 @@ void moe_out_prefill(const torch::Tensor& x, const torch::Tensor& topk_ids,
   TORCH_CHECK(experts > 0 && experts <= kMoePrefillMaxExperts,
               "EXL3 MoE prefill needs 1..", kMoePrefillMaxExperts,
               " local experts");
-  TORCH_CHECK(rows == 0 || rows >= kMoePrefillMinRows,
-              "EXL3 MoE prefill serves calls of at least ", kMoePrefillMinRows,
+  // Lab: VLLM_EXL3_MOE_PREFILL_MIN_ROWS lowers the call floor (default
+  // kMoePrefillMinRows) to measure mid-row (9..64-row) calls on this
+  // schedule; the kernels have no lower row bound of their own.
+  static const int64_t min_rows = [] {
+    const char* v = std::getenv("VLLM_EXL3_MOE_PREFILL_MIN_ROWS");
+    return v && *v ? std::max<int64_t>(1, std::atoll(v)) : kMoePrefillMinRows;
+  }();
+  TORCH_CHECK(rows == 0 || rows >= min_rows,
+              "EXL3 MoE prefill serves calls of at least ", min_rows,
               " rows");
   const int64_t required = moe_workspace_size_prefill(
       rows, hidden, intermediate_size, topk, experts);

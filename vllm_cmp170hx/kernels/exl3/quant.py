@@ -1267,7 +1267,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         MOE_PREFILL_MIN_ROWS - 1 rows on moe_out_decode_tc in decode_tc_rows
         slices (each token's routed output depends only on its own routes, and
         the slice count is fixed by the row count, so capture is safe); larger
-        calls on moe_out_prefill within its workspace bound."""
+        calls on moe_out_prefill, in chunks of at most its workspace bound."""
         from vllm_cmp170hx.kernels.exl3.ops import (
             MOE_PREFILL_MIN_ROWS,
             moe_out_decode_tc,
@@ -1277,15 +1277,22 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         if rows == 0:
             return
         if rows >= MOE_PREFILL_MIN_ROWS:
-            if rows > self.prefill_max_rows:
-                raise ValueError(
-                    f"EXL3 Q4N MoE call of {rows} rows exceeds the tensor-core "
-                    f"prefill bound {self.prefill_max_rows}"
+            # Calls above the workspace bound run as consecutive chunks of at
+            # most prefill_max_rows rows (a token's routed output depends only
+            # on its own routes, so chunking leaves every row's result as it
+            # is); the last chunk is widened backwards to the kernel's row
+            # floor when it would fall below it.
+            step = self.prefill_max_rows
+            lo = 0
+            while lo < rows:
+                hi = min(rows, lo + step)
+                if hi - lo < MOE_PREFILL_MIN_ROWS:
+                    lo = max(0, hi - MOE_PREFILL_MIN_ROWS)
+                moe_out_prefill(
+                    x[lo:hi], ids[lo:hi], weights[lo:hi], ptrs, meta, expert_map,
+                    self.intermediate_size, self.prefill_bits_x2, out[lo:hi], ws,
                 )
-            moe_out_prefill(
-                x, ids, weights, ptrs, meta, expert_map,
-                self.intermediate_size, self.prefill_bits_x2, out, ws,
-            )
+                lo = hi
             return
         step = self.decode_tc_rows
         for lo in range(0, rows, step):
