@@ -2212,6 +2212,25 @@ struct StageTimer {
 // operand kernels write the INT8 rows directly (gate_up_operand<F, true>,
 // down_operand<F, true>) instead of FP16 split rows re-read by i8_operand.
 // Bitwise the same INT8 rows, sums and scales; 0 restores the two-kernel path.
+// VLLM_EXL3_Q4N_DECODE_GEMM (with VLLM_EXL3_Q4N_DECODE=i8): base (the decode
+// shapes and VLLM_EXL3_MOE_DECODE_TC_STAGES), c3 / c4 (compact INT8 stages),
+// t2c3 / t2c4 (gate/up TPW 2 too), d1c3 / d1c4 (down TPW 1). Bitwise equal.
+inline int q4n_decode_gemm_variant() {
+  static const int v = [] {
+    const char* e = std::getenv("VLLM_EXL3_Q4N_DECODE_GEMM");
+    const std::string s = e ? e : "base";
+    if (s == "base") return 0;
+    if (s == "c3") return 1;
+    if (s == "c4") return 2;
+    if (s == "t2c3") return 3;
+    if (s == "t2c4") return 4;
+    if (s == "d1c3") return 5;
+    if (s == "d1c4") return 6;
+    TORCH_CHECK(false, "VLLM_EXL3_Q4N_DECODE_GEMM: base, c3, c4, t2c3, t2c4, d1c3, d1c4");
+    return 0;
+  }();
+  return v;
+}
 // Lab (VLLM_EXL3_Q4N_DECODE=i8, Q4N-X decode families): per-row INT8
 // activations on the u8 x s8 IMMA path in the 8-row decode GEMMs too, with the
 // fused INT8 operand blocks. Changes decode numerics (as prefill i8 does).
@@ -2272,6 +2291,20 @@ void launch_decode_gemm(const Gemm& p, int64_t items, cudaStream_t stream) {
     case 6: launch_gemm<Staged<S, 6>, kPlanes>(p, items, stream); break;
     case 8: launch_gemm<Staged<S, 8>, kPlanes>(p, items, stream); break;
     default: launch_gemm<S, kPlanes>(p, items, stream); break;
+  }
+}
+template <class S, bool kGateUp>
+void launch_i8_decode_gemm(const Gemm& p, int64_t max_tiles, int64_t items,
+                           cudaStream_t stream) {
+  constexpr int kBaseTpw = S::kTPW;
+  switch (q4n_decode_gemm_variant()) {
+    case 1: launch_gemm_items<I8Shape<S, kBaseTpw, 3>>(p, max_tiles, stream); return;
+    case 2: launch_gemm_items<I8Shape<S, kBaseTpw, 4>>(p, max_tiles, stream); return;
+    case 3: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 3>>(p, max_tiles, stream); return;
+    case 4: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>>(p, max_tiles, stream); return;
+    case 5: launch_gemm_items<I8Shape<S, kGateUp ? kBaseTpw : 1, 3>>(p, max_tiles, stream); return;
+    case 6: launch_gemm_items<I8Shape<S, kGateUp ? kBaseTpw : 1, 4>>(p, max_tiles, stream); return;
+    default: launch_decode_gemm<S, 4>(p, items, stream); return;
   }
 }
 // Q4N families (a new format with no bitwise contract to keep) run one FP16 activation plane: the activation's
@@ -2367,7 +2400,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
       const int64_t items = max_tiles * GateUp::kProjections * GateUp::kColBlocks;
       if constexpr (kTileRows == 8) {
         if constexpr (F::kCodebook == 4) {
-          if (i8_decode) launch_decode_gemm<GateUp, 4>(p, items, stream);
+          if (i8_decode) launch_i8_decode_gemm<GateUp, true>(p, max_tiles, items, stream);
           else launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
         } else {
           launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
@@ -2441,7 +2474,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     const int64_t items = max_tiles * Down::kProjections * Down::kColBlocks;
     if constexpr (kTileRows == 8) {
       if constexpr (F::kCodebook == 4) {
-        if (i8_decode) launch_decode_gemm<Down, 4>(p, items, stream);
+        if (i8_decode) launch_i8_decode_gemm<Down, false>(p, max_tiles, items, stream);
         else launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
       } else {
         launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
