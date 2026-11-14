@@ -1291,6 +1291,7 @@ struct Shape {
       kStageW + kSteps * kBlockTiles * kTileBytes;
   static constexpr int kStages = kShippedStages;
   static constexpr int kSmemBytes = kStages * kStageBytes;
+  static constexpr int kMinBlocks = 2;  // __launch_bounds__ of gemm
   static_assert(K % kKC == 0 && N % (16 * kBlockTiles) == 0 &&
                     kChunks >= kStages - 1,
                 "served shape");
@@ -1310,8 +1311,9 @@ struct Staged : S {
 // chunk instead of the FP16 split's 256) Stages deep. INT8 MMAs accumulate in
 // s32 exactly and every output element's epilogue is unchanged, so any tiling
 // or depth is bitwise the base shape's result.
-template <class S, int TPW, int Stages>
+template <class S, int TPW, int Stages, int MinBlocks = 2>
 struct I8Shape : S {
+  static constexpr int kMinBlocks = MinBlocks;
   static constexpr int kTPW = TPW;
   static constexpr int kBlockTiles = kWarps * TPW;
   static constexpr int kColBlocks = S::kN / (16 * kBlockTiles);
@@ -1729,7 +1731,7 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
 // blocks fastest so concurrently running blocks share the tile's operand rows
 // in L2.
 template <class S, int kPlanes = 0>
-__global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
+__global__ void __launch_bounds__(kThreads, S::kMinBlocks) gemm(Gemm p) {
   extern __shared__ __align__(16) unsigned char gemm_shared[];
   const uint32_t smem = smem_address(gemm_shared);
   const int64_t items = int64_t(p.table[1]) * S::kProjections * S::kColBlocks;
@@ -2043,7 +2045,11 @@ inline int q4n_i8_gemm_variant() {
     if (s == "t2c3") return 4;
     if (s == "t2c4") return 5;
     if (s == "t2c5") return 6;
-    TORCH_CHECK(false, "VLLM_EXL3_Q4N_I8_GEMM must be base, c3, c4, c5, t2c3, t2c4 or t2c5");
+    if (s == "t4c4") return 7;      // gate/up TPW 4 (1 block/SM), down base TPW c4
+    if (s == "t2d4c4") return 8;    // gate/up TPW 2, down TPW 4 (1 block/SM)
+    if (s == "t4d4c4") return 9;    // both TPW 4
+    if (s == "t2d4c3") return 10;
+    TORCH_CHECK(false, "VLLM_EXL3_Q4N_I8_GEMM: base, c3, c4, c5, t2c3, t2c4, t2c5, t4c4, t2d4c4, t4d4c4, t2d4c3");
     return 0;
   }();
   return v;
@@ -2063,6 +2069,19 @@ void launch_i8_gemm(const Gemm& p, int64_t max_tiles, cudaStream_t stream) {
     case 4: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 3>>(p, max_tiles, stream); return;
     case 5: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>>(p, max_tiles, stream); return;
     case 6: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 5>>(p, max_tiles, stream); return;
+    case 7:
+      if constexpr (kGateUp) launch_gemm_items<I8Shape<S, 4, 4, 1>>(p, max_tiles, stream);
+      else launch_gemm_items<I8Shape<S, kBaseTpw, 4>>(p, max_tiles, stream);
+      return;
+    case 8:
+      if constexpr (kGateUp) launch_gemm_items<I8Shape<S, 2, 4>>(p, max_tiles, stream);
+      else launch_gemm_items<I8Shape<S, 4, 4, 1>>(p, max_tiles, stream);
+      return;
+    case 9: launch_gemm_items<I8Shape<S, 4, 4, 1>>(p, max_tiles, stream); return;
+    case 10:
+      if constexpr (kGateUp) launch_gemm_items<I8Shape<S, 2, 4>>(p, max_tiles, stream);
+      else launch_gemm_items<I8Shape<S, 4, 3, 1>>(p, max_tiles, stream);
+      return;
     default: launch_gemm_items<S>(p, max_tiles, stream); return;
   }
 }
