@@ -16,6 +16,13 @@ kernel (cmp_i8mm.scaled_mm_out) above. The LM head runs Marlin W8A16 (uint8b128,
 scales, FP16 activations) so the logits take no activation rounding
 (VLLM_EXL3_DENSE_W8_LM_HEAD=0 keeps the EXL3 head). Matrices absent from the sidecar keep EXL3.
 Lab libraries come from VLLM_EXL3_ONCE_LIB_DIR (default /opt/exl3-once), as for dense_prefill_once.
+
+Lab (default off): VLLM_EXL3_DENSE_W4=<W4 sidecar> adds a 4-bit copy of the rotated matrices it covers
+(<prefix>.q4 int32 [K/8, N] GPTQ-packed uint4b8, <prefix>.s4 fp16 [K/128, N]; convert_dense_w4.py) for
+decode-sized calls: <= VLLM_EXL3_DENSE_W4_MAX_M rows (default 32) run H128(x * suh) in FP16
+(exl3_i8_lab.act_fp16) and Marlin W4A16 g128; larger calls keep the W8A8 path, so both copies stay
+resident. Matrices under VLLM_EXL3_DENSE_W4_MIN_WEIGHTS (default 12M: shared experts, q_a, kv_a,
+indexer wq_b) stay W8.
 """
 
 import os
@@ -30,9 +37,15 @@ PATH = os.environ.get("VLLM_EXL3_DENSE_W8", "").strip()
 LM_HEAD = os.environ.get("VLLM_EXL3_DENSE_W8_LM_HEAD", "1") == "1"
 SMALL_M = int(os.environ.get("VLLM_EXL3_DENSE_W8_SMALL_M", "128"))
 LIB_DIR = os.environ.get("VLLM_EXL3_ONCE_LIB_DIR", "/opt/exl3-once")
+W4_PATH = os.environ.get("VLLM_EXL3_DENSE_W4", "").strip()
+W4_MAX_M = int(os.environ.get("VLLM_EXL3_DENSE_W4_MAX_M", "32"))
+# Matrices below this many weights stay W8 (Marlin W4 is no faster on the 2048-wide shared experts).
+W4_MIN_WEIGHTS = int(os.environ.get("VLLM_EXL3_DENSE_W4_MIN_WEIGHTS", "12000000"))
 
 _file = None
 _keys: frozenset[str] = frozenset()
+_w4_file = None
+_w4_keys: frozenset[str] = frozenset()
 _libs = False
 _workspaces: dict[int, torch.Tensor] = {}
 _registered = False
@@ -69,6 +82,47 @@ def covers(prefix: str) -> bool:
 
 def tensor(prefix: str, suffix: str) -> torch.Tensor:
     return _open().get_tensor(f"{prefix}.{suffix}")
+
+
+def _open_w4():
+    global _w4_file, _w4_keys
+    if _w4_file is None:
+        from safetensors import safe_open
+
+        _w4_file = safe_open(W4_PATH, "pt", device="cpu")
+        _w4_keys = frozenset(_w4_file.keys())
+        logger.info_once(
+            "EXL3 dense W4 sidecar %s: %d matrices, W4A16 up to %d rows",
+            W4_PATH, sum(1 for k in _w4_keys if k.endswith(".q4")), W4_MAX_M,
+            scope="process",
+        )
+    return _w4_file
+
+
+def w4_covers(prefix: str) -> bool:
+    if not W4_PATH or prefix == "lm_head" or not covers(prefix):
+        return False
+    f = _open_w4()
+    if f"{prefix}.q4" not in _w4_keys:
+        return False
+    k8, n = f.get_slice(f"{prefix}.q4").get_shape()
+    return k8 * 8 * n >= W4_MIN_WEIGHTS
+
+
+def w4_tensor(prefix: str, suffix: str) -> torch.Tensor:
+    return _open_w4().get_tensor(f"{prefix}.{suffix}")
+
+
+def marlin_pack_w4(q4: torch.Tensor, s4: torch.Tensor):
+    """GPTQ uint4b8 [K/8, N] + fp16 group-128 scales [K/128, N] -> Marlin weight and permuted scales."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_permute_scales,
+    )
+
+    k, n = q4.shape[0] * 8, q4.shape[1]
+    return (ops.gptq_marlin_repack(q4.contiguous(), k, n, 4),
+            marlin_permute_scales(s4.contiguous(), k, n, 128))
 
 
 def load_libs() -> None:
@@ -135,6 +189,30 @@ def _w8_linear_fake(x, w8, sw, suh):
     return x.new_empty((x.shape[0], w8.shape[0]))
 
 
+def _w4_linear(x: torch.Tensor, q4: torch.Tensor, s4: torch.Tensor, suh: torch.Tensor,
+               w8: torch.Tensor, sw: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    m = x.shape[0]
+    if m == 0:
+        return x.new_empty((0, n))
+    if m > W4_MAX_M:
+        return _w8_linear(x, w8, sw, suh)
+    from vllm import _custom_ops as ops
+    from vllm.scalar_type import scalar_types
+
+    xr = torch.empty((m, k), dtype=torch.float16, device=x.device)
+    torch.ops.exl3_i8_lab.act_fp16(x, suh, xr)
+    _log(f"w4 decode k={k} n={n}", m)
+    out = ops.marlin_gemm(
+        xr, None, q4, None, s4, None, None, None, _workspace(x.device),
+        scalar_types.uint4b8, m, n, k, False, True, False,
+    )
+    return out.to(torch.bfloat16)
+
+
+def _w4_linear_fake(x, q4, s4, suh, w8, sw, n, k):
+    return x.new_empty((x.shape[0], n))
+
+
 def _w8_lm_head(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, n: int,
                 k: int) -> torch.Tensor:
     from vllm import _custom_ops as ops
@@ -165,6 +243,8 @@ def register_ops() -> None:
                               mutates_args=[], fake_impl=_w8_linear_fake)
     direct_register_custom_op(op_name="exl3_w8_lm_head", op_func=_w8_lm_head,
                               mutates_args=[], fake_impl=_w8_lm_head_fake)
+    direct_register_custom_op(op_name="exl3_w4_linear", op_func=_w4_linear,
+                              mutates_args=[], fake_impl=_w4_linear_fake)
     _registered = True
 
 

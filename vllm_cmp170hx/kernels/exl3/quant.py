@@ -360,8 +360,20 @@ class Exl3PackedWeight(nn.Module):
                 ),
                 requires_grad=False,
             )
+            # Lab: a 4-bit copy for decode-sized calls (VLLM_EXL3_DENSE_W4).
+            self.w4_mode = dense_w8.w4_covers(matrix.prefix)
+            if self.w4_mode:
+                self.q4 = nn.Parameter(
+                    torch.empty(self.padded_in // 8, n, dtype=torch.int32),
+                    requires_grad=False,
+                )
+                self.s4 = nn.Parameter(
+                    torch.empty(self.padded_in // 128, n, dtype=torch.float16),
+                    requires_grad=False,
+                )
             self.loaded = False
             return
+        self.w4_mode = False
         self.trellis = nn.Parameter(
             torch.empty(
                 self.padded_in // 16,
@@ -395,6 +407,16 @@ class Exl3PackedWeight(nn.Module):
             self.sw.data.copy_(dense_w8.tensor(prefix, "sw"))
             if self.suh.numel():
                 self.suh.data.copy_(dense_w8.tensor(prefix, "suh"))
+            if self.w4_mode:
+                q4 = dense_w8.w4_tensor(prefix, "q4")
+                s4 = dense_w8.w4_tensor(prefix, "s4")
+                if tuple(q4.shape) != tuple(self.q4.shape) or tuple(s4.shape) != tuple(self.s4.shape):
+                    raise ValueError(
+                        f"EXL3 dense W4 sidecar shapes {tuple(q4.shape)} / {tuple(s4.shape)} != "
+                        f"{tuple(self.q4.shape)} / {tuple(self.s4.shape)} for {prefix}"
+                    )
+                self.q4.data.copy_(q4)
+                self.s4.data.copy_(s4)
             for key in self.matrix.keys:
                 ledger.mark(key, "consumed", prefix)
             self.loaded = True
@@ -518,6 +540,10 @@ class Exl3LinearMethod(LinearMethodBase):
                         torch.empty(0, dtype=torch.int8, device=q.device),
                         requires_grad=False,
                     )
+                if weight.w4_mode:
+                    q, s = dense_w8.marlin_pack_w4(weight.q4.data, weight.s4.data)
+                    weight.q4 = nn.Parameter(q, requires_grad=False)
+                    weight.s4 = nn.Parameter(s, requires_grad=False)
                 self.row_chunks.append(0)
                 continue
             self.row_chunks.append(
@@ -534,6 +560,11 @@ class Exl3LinearMethod(LinearMethodBase):
                     weight.padded_in,
                 )
                 if weight.w8_mode and weight.matrix.prefix == "lm_head"
+                else torch.ops.vllm.exl3_w4_linear(
+                    x, weight.q4, weight.s4, weight.suh, weight.w8, weight.sw,
+                    weight.logical_out, weight.padded_in,
+                )
+                if weight.w4_mode
                 else torch.ops.vllm.exl3_w8_linear(x, weight.w8, weight.sw, weight.suh)
                 if weight.w8_mode
                 else torch.ops.vllm.exl3_linear(
