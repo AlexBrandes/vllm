@@ -394,11 +394,42 @@ __device__ __forceinline__ void store8_split(const float* v, float scale,
   *reinterpret_cast<uint4*>(lo) = make_uint4(l[0], l[1], l[2], l[3]);
 }
 
+// Fused per-row INT8 (VLLM_EXL3_Q4N_PREFILL=i8 with VLLM_EXL3_Q4N_I8_FUSE on):
+// the value i8_operand would read back, (hi + lo) of the FP16 split of v 2^e,
+// computed in the same FP32 operations and kept in registers.
+__device__ __forceinline__ float split_sum(float v, float scale) {
+  const float y = __fmul_rn(v, scale);
+  const __half h = __float2half_rn(y);
+  const __half l = __float2half_rn(__fsub_rn(y, __half2float(h)));
+  return __half2float(h) + __half2float(l);
+}
+// i8_operand's byte position of value k inside the INT8 row (pairs of the two
+// 8-value halves of each 16-value block interleaved, Q4N lane order).
+__device__ __forceinline__ int i8_byte(int k) {
+  const int m = k & 15;
+  return (k & ~15) + 4 * ((m & 7) >> 1) + 2 * (m >> 3) + (m & 1);
+}
+__device__ __forceinline__ int i8_quant(float y, float qs) {
+  return max(-127, min(127, __float2int_rn(y * qs)));
+}
+// Eight consecutive values k0..k0+7 (k0 % 8 == 0) as i8_operand stores them.
+__device__ __forceinline__ void store8_i8(unsigned char* q8, int k0, const int* q) {
+  unsigned char* blk = q8 + (k0 & ~15);
+  const int half8 = (k0 >> 3) & 1;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint16_t v = uint16_t(uint8_t(int8_t(q[2 * j]))) |
+                       uint16_t(uint16_t(uint8_t(int8_t(q[2 * j + 1]))) << 8);
+    *reinterpret_cast<uint16_t*>(blk + 4 * j + 2 * half8) = v;
+  }
+}
+
 // One warp per (sorted position, gate/up projection): x * suh and H128 (the
 // shipped FP32 operations), then the split operand row (K halves high, then
 // K halves low) and its 2^-e. Lane group g of iteration it holds 128-block
-// 4 it + g.
-template <class F>
+// 4 it + g. kI8: the per-row INT8 row, its row sum and its scale instead,
+// bitwise what gate_up_operand followed by i8_operand<kHidden> writes.
+template <class F, bool kI8 = false>
 __global__ void __launch_bounds__(32 * kOperandWarps)
     gate_up_operand(const __nv_bfloat16* x, Routing routing, const int* table,
                     __half* operand, float* unscale) {
@@ -439,6 +470,44 @@ __global__ void __launch_bounds__(32 * kOperandWarps)
     const int e = split_exponent(peak);
     const float scale = pow2(e);
     __half* out = operand + task * 2 * kHidden;
+    if constexpr (kI8) {
+      float ypeak = 0.0f;
+#pragma unroll
+      for (int it = 0; it < kIters; ++it)
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          v[it][j] = split_sum(v[it][j], scale);
+          ypeak = fmaxf(ypeak, fabsf(v[it][j]));
+        }
+#pragma unroll
+      for (int d = 16; d >= 1; d >>= 1)
+        ypeak = fmaxf(ypeak, __shfl_xor_sync(0xffffffffu, ypeak, d));
+      const float qs = ypeak > 0.0f ? 127.0f / ypeak : 0.0f;
+      unsigned char* q8 = reinterpret_cast<unsigned char*>(out + kHidden);
+      int rsum = 0;
+#pragma unroll
+      for (int it = 0; it < kIters; ++it) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          int q[8];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            q[j] = i8_quant(v[it][8 * h + j], qs);
+            rsum += q[j];
+          }
+          store8_i8(q8, 512 * it + 64 * h + lane_col, q);
+        }
+      }
+#pragma unroll
+      for (int d = 16; d >= 1; d >>= 1) rsum += __shfl_xor_sync(0xffffffffu, rsum, d);
+      if (lane == 0) {
+        *reinterpret_cast<float*>(q8 + kHidden) = static_cast<float>(rsum);
+        float u = pow2(-e);
+        u *= ypeak / 127.0f;
+        unscale[pos * 3 + projection] = u;
+      }
+      continue;
+    }
 #pragma unroll
     for (int it = 0; it < kIters; ++it) {
 #pragma unroll
@@ -576,12 +645,13 @@ __device__ __forceinline__ float down_input(float g, float u, float gate_svh,
 // layout of hadamard128_warp (lane holds k = 512 + lane + 32 i). A wider
 // intermediate keeps every block in the hadamard128_warp layout (the same
 // H128 bitwise, the group layout's shuffles at warp distance).
-template <class F>
+template <class F, bool kI8 = false>
 __global__ void __launch_bounds__(32 * kOperandWarps)
     down_operand(Routing routing, const int* table, const float* gate_up,
                  __half* operand, float* unscale) {
   constexpr int kIntermediate = F::kIntermediate;
   constexpr int kTail = 512;
+  static_assert(!kI8 || kIntermediate != 5 * 128, "fused INT8: wide intermediate only");
   const int lane = threadIdx.x & 31;
   const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
   const int* sorted = table + Layout::sorted_offset();
@@ -704,6 +774,42 @@ __global__ void __launch_bounds__(32 * kOperandWarps)
       const int e = split_exponent(peak);
       const float scale = pow2(e);
       __half* out = operand + pos * 2 * kIntermediate;
+      if constexpr (kI8) {
+        // As i8_operand<kIntermediate> after the split rows: same values,
+        // same byte layout (value k at i8_byte(k)), row sum, scale.
+        float ypeak = 0.0f;
+#pragma unroll
+        for (int b = 0; b < kBlocks; ++b)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            v[b][i] = split_sum(v[b][i], scale);
+            ypeak = fmaxf(ypeak, fabsf(v[b][i]));
+          }
+#pragma unroll
+        for (int d = 16; d >= 1; d >>= 1)
+          ypeak = fmaxf(ypeak, __shfl_xor_sync(0xffffffffu, ypeak, d));
+        const float qs = ypeak > 0.0f ? 127.0f / ypeak : 0.0f;
+        unsigned char* q8 = reinterpret_cast<unsigned char*>(out + kIntermediate);
+        int rsum = 0;
+#pragma unroll
+        for (int b = 0; b < kBlocks; ++b)
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const int k = 128 * b + lane + 32 * i;
+            const int q = i8_quant(v[b][i], qs);
+            rsum += q;
+            q8[i8_byte(k)] = uint8_t(int8_t(q));
+          }
+#pragma unroll
+        for (int d = 16; d >= 1; d >>= 1) rsum += __shfl_xor_sync(0xffffffffu, rsum, d);
+        if (lane == 0) {
+          *reinterpret_cast<float*>(q8 + kIntermediate) = static_cast<float>(rsum);
+          float u = pow2(-e);
+          u *= ypeak / 127.0f;
+          unscale[pos * 3 + 2] = u;
+        }
+        continue;
+      }
 #pragma unroll
       for (int b = 0; b < kBlocks; ++b) {
 #pragma unroll
@@ -1960,6 +2066,18 @@ struct StageTimer {
   }
 };
 
+// VLLM_EXL3_Q4N_I8_FUSE (default on): with VLLM_EXL3_Q4N_PREFILL=i8, the
+// operand kernels write the INT8 rows directly (gate_up_operand<F, true>,
+// down_operand<F, true>) instead of FP16 split rows re-read by i8_operand.
+// Bitwise the same INT8 rows, sums and scales; 0 restores the two-kernel path.
+inline bool q4n_i8_fuse_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_Q4N_I8_FUSE");
+    return v == nullptr || v[0] != '0';
+  }();
+  return on;
+}
+
 inline bool decode_glue_enabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("VLLM_EXL3_MOE_DECODE_GLUE");
@@ -2022,6 +2140,10 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   float* unscale = gate_up + assignments * 2 * kIntermediate;
   int* table = reinterpret_cast<int*>(unscale + (assignments * 3 + 3) / 4 * 4);
   StageTimer timer(stream, kTileRows != 8);
+  // Fused INT8 operands: Q4N-X prefill families in per-row INT8 mode (4).
+  bool fused_i8 = false;
+  if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128)
+    fused_i8 = prefill_one_plane<F>() == 4 && q4n_i8_fuse_enabled();
   route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
       routing, assignments, table);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2054,6 +2176,11 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
             <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
                 x, routing, table, operand, unscale);
       }
+    } else if (fused_i8) {
+      if constexpr (F::kCodebook == 4 && F::kTileRows != 8)
+        gate_up_operand<F, true>
+            <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
+                x, routing, table, operand, unscale);
     } else {
       gate_up_operand<F>
           <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
@@ -2072,10 +2199,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
           case 4:
             if constexpr (F::kCodebook == 4) {
               timer.mark("gu_operand");
-              i8_operand<kHidden>
-                  <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
-                      table, operand, unscale, 2, 0);
-              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              if (!fused_i8) {
+                i8_operand<kHidden>
+                    <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
+                        table, operand, unscale, 2, 0);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+              }
               timer.mark("gu_i8");
               launch_gemm<GateUp, 4>(p, items, stream);
             }
@@ -2105,6 +2234,10 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
             <<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
                 routing, table, gate_up, operand, unscale);
       }
+    } else if (fused_i8) {
+      if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128)
+        down_operand<F, true><<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
+            routing, table, gate_up, operand, unscale);
     } else {
       down_operand<F><<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
           routing, table, gate_up, operand, unscale);
@@ -2124,10 +2257,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
         case 4:
           if constexpr (F::kCodebook == 4) {
             timer.mark("down_operand");
-            i8_operand<kIntermediate>
-                <<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
-                    table, operand, unscale, 1, 2);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            if (!fused_i8) {
+              i8_operand<kIntermediate>
+                  <<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
+                      table, operand, unscale, 1, 2);
+              C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
             timer.mark("down_i8");
             launch_gemm<Down, 4>(p, items, stream);
           }
