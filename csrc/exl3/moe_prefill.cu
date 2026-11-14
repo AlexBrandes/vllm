@@ -176,7 +176,7 @@ __device__ __forceinline__ void block_scan2(int a, int b, int& a_before,
 // shapes; formats and trellis alignment live in device metadata).
 template <class F>
 __global__ void __launch_bounds__(kRouteThreads)
-    route(Routing routing, int64_t assignments, int* table) {
+    route(Routing routing, int64_t assignments, int* table, bool check = true) {
   extern __shared__ int route_shared[];
   constexpr int kHidden = F::kHidden;
   constexpr int kIntermediate = F::kIntermediate;
@@ -189,6 +189,7 @@ __global__ void __launch_bounds__(kRouteThreads)
   int* tile_begin = row_begin + experts;  // experts + 1 entries
   for (int e = threadIdx.x; e < experts; e += blockDim.x) {
     cursor[e] = 0;
+    if (!check) continue;
     for (int q = 0; q < 3; ++q) {
       const int64_t* meta = routing.metadata + int64_t(e) * 12 + q * 4;
       const int64_t in = q < 2 ? kHidden : kIntermediate;
@@ -2195,7 +2196,15 @@ struct StageTimer {
   static bool enabled() {
     static const bool on = [] {
       const char* v = std::getenv("VLLM_EXL3_PREFILL_STAGE_TIMING");
-      return v != nullptr && v[0] == '1';
+      return v != nullptr && (v[0] == '1' || v[0] == '2');
+    }();
+    return on;
+  }
+  // =2: the decode families too (8-row tiles).
+  static bool decode_enabled() {
+    static const bool on = [] {
+      const char* v = std::getenv("VLLM_EXL3_PREFILL_STAGE_TIMING");
+      return v != nullptr && v[0] == '2';
     }();
     return on;
   }
@@ -2268,6 +2277,16 @@ inline bool q4n_i8_fuse_warp() {
   static const bool on = [] {
     const char* v = std::getenv("VLLM_EXL3_Q4N_I8_FUSE");
     return v != nullptr && std::string(v) == "warp";
+  }();
+  return on;
+}
+// Lab (VLLM_EXL3_ROUTE_CHECK=0): skip route's per-call re-validation of every
+// local expert's metadata and trellis alignment (checked at load); the table
+// it builds is unchanged.
+inline bool route_check_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_ROUTE_CHECK");
+    return v == nullptr || v[0] != '0';
   }();
   return on;
 }
@@ -2354,7 +2373,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   float* gate_up = workspace + assignments * 2 * kHidden;
   float* unscale = gate_up + assignments * 2 * kIntermediate;
   int* table = reinterpret_cast<int*>(unscale + (assignments * 3 + 3) / 4 * 4);
-  StageTimer timer(stream, kTileRows != 8);
+  StageTimer timer(stream, kTileRows != 8 || StageTimer::decode_enabled());
   // Fused INT8 operands: Q4N-X prefill families in per-row INT8 mode (4).
   bool fused_i8 = false;
   if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128)
@@ -2364,7 +2383,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   if constexpr (F::kCodebook == 4 && F::kTileRows == 8 && decode_glue_blocks<F>())
     i8_decode = q4n_decode_i8_enabled();
   route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
-      routing, assignments, table);
+      routing, assignments, table, route_check_enabled());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   timer.mark("route");
   const int64_t max_tiles = std::min<int64_t>(
@@ -2420,6 +2439,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     {
       const int64_t items = max_tiles * GateUp::kProjections * GateUp::kColBlocks;
       if constexpr (kTileRows == 8) {
+        timer.mark("gu_operand");
         if constexpr (F::kCodebook == 4) {
           if (i8_decode) launch_i8_decode_gemm<GateUp, true>(p, max_tiles, items, stream);
           else launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
@@ -2494,6 +2514,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   {
     const int64_t items = max_tiles * Down::kProjections * Down::kColBlocks;
     if constexpr (kTileRows == 8) {
+      timer.mark("down_operand");
       if constexpr (F::kCodebook == 4) {
         if (i8_decode) launch_i8_decode_gemm<Down, false>(p, max_tiles, items, stream);
         else launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
@@ -2541,6 +2562,8 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
              32 * kOperandWarps, 0, stream>>>(down_result, weights, routing,
                                               table, assignments, rows, out);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
+      timer.mark("combine");
+      timer.report(rows);
       return;
     }
   }
