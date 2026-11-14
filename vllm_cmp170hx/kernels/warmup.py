@@ -35,6 +35,34 @@ def _log_prefill_switches() -> None:
             "and sparse_mla_min_ctx rows on sm_80.")
 
 
+def _warmup_mhc_prefill(worker) -> None:
+    """Compile the sm_80 mHC prefill pre-norm kernels (VLLM_SM80_MHC_PREFILL) before serving.
+
+    Triton specialises them per (BLOCK_M, SPLIT_K, reduce BLOCK_M), all pure functions of the row
+    count; over the prefill range (>= the mhc/prefill_min_rows row, 512) they take two configurations
+    (split 32 up to ~1,184 rows, split 16 up to ~2,368), so one call at 512 and one at 2,048 rows
+    compiles both. Without this the first long prefill of a process JIT-compiles them (jit_monitor
+    latency warning). A no-op unless the switch is on and the model has mHC layers."""
+    if not envs.VLLM_SM80_MHC_PREFILL:
+        return
+    import torch
+
+    from vllm_cmp170hx.kernels.mhc.prenorm import hc_prenorm_gemm
+    from vllm_cmp170hx.kernels.warmup_utils import find_module
+
+    layer = find_module(worker.get_model(), "mhc_fused_post_pre_op")
+    if layer is None:
+        return
+    hidden, hc = int(layer.hidden_size), int(layer.n)
+    k, n = hc * hidden, hc * 2 + hc * hc
+    fn = torch.zeros(n, k, dtype=torch.float32, device=worker.device)
+    for rows in (512, 2048):
+        x = torch.zeros(rows, k, dtype=torch.bfloat16, device=worker.device)
+        hc_prenorm_gemm(x, fn)
+    torch.cuda.synchronize(worker.device)
+    logger.info("Warmed up the sm_80 mHC prefill pre-norm kernels (rows 512, 2048; K=%d, N=%d).", k, n)
+
+
 def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
     # The compiled Marlin decode (its own switch, on TP and PP workers alike):
     # its persistent scratch must exist before profiling/capture use the ops.
@@ -100,6 +128,7 @@ def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
 
     warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
     _log_prefill_switches()
+    _warmup_mhc_prefill(worker)
     if envs.VLLM_SM80_SPARSE_MLA_PREFILL or hot_swap.listed("sparse_mla_prefill"):
         # The 64-head sparse-MLA prefill kernel (sparse_prefill_mla_pp.py).
         # Prefill runs eagerly, but compiling here keeps the Gluon JIT off the
