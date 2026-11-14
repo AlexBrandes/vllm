@@ -856,9 +856,25 @@ __device__ __forceinline__ float block_peak(float peak, int lane, int warp) {
   return row;
 }
 
+// Row sum of a block's INT8 values (integer, so order-independent). Every
+// thread of the block must call it once.
+template <int kBlockWarps>
+__device__ __forceinline__ int block_isum(int v, int lane, int warp) {
+  __shared__ int warp_sums[kBlockWarps];
+#pragma unroll
+  for (int d = 16; d >= 1; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+  if (lane == 0) warp_sums[warp] = v;
+  __syncthreads();
+  int row = 0;
+#pragma unroll
+  for (int w = 0; w < kBlockWarps; ++w) row += warp_sums[w];
+  return row;
+}
+
 // gate_up_operand with one block per (sorted position, projection) task:
 // warp w holds iteration w's 512 columns (lane group g: 128-block 4 w + g).
-template <class F>
+// kI8: the fused per-row INT8 epilogue of gate_up_operand<F, true> (bitwise).
+template <class F, bool kI8 = false>
 __global__ void __launch_bounds__(32 * (F::kHidden / 512))
     gate_up_operand_block(const __nv_bfloat16* x, Routing routing,
                           const int* table, __half* operand, float* unscale) {
@@ -893,6 +909,33 @@ __global__ void __launch_bounds__(32 * (F::kHidden / 512))
   const int e = split_exponent(peak);
   const float scale = pow2(e);
   __half* out = operand + task * 2 * kHidden;
+  if constexpr (kI8) {
+#pragma unroll
+    for (int j = 0; j < 16; ++j) v[j] = split_sum(v[j], scale);
+    __syncthreads();  // block_peak's shared slots are reused below
+    const float ypeak = block_peak<kBlockWarps>(lane_peak(v), lane, it);
+    const float qs = ypeak > 0.0f ? 127.0f / ypeak : 0.0f;
+    unsigned char* q8 = reinterpret_cast<unsigned char*>(out + kHidden);
+    int rsum = 0;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      int q[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        q[j] = i8_quant(v[8 * h + j], qs);
+        rsum += q[j];
+      }
+      store8_i8(q8, 512 * it + 64 * h + lane_col, q);
+    }
+    rsum = block_isum<kBlockWarps>(rsum, lane, it);
+    if (threadIdx.x == 0) {
+      *reinterpret_cast<float*>(q8 + kHidden) = static_cast<float>(rsum);
+      float u = pow2(-e);
+      u *= ypeak / 127.0f;
+      unscale[pos * 3 + projection] = u;
+    }
+    return;
+  }
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
     const int col = 512 * it + 64 * h + lane_col;
@@ -904,7 +947,8 @@ __global__ void __launch_bounds__(32 * (F::kHidden / 512))
 // down_operand's wide branch with one block per sorted position: warp b holds
 // 128-block b in the hadamard128_warp layout (lane holds k = 128 b + lane +
 // 32 i), exactly the wide branch's per-block operations.
-template <class F>
+// kI8: the fused per-row INT8 epilogue of down_operand<F, true> (bitwise).
+template <class F, bool kI8 = false>
 __global__ void __launch_bounds__(32 * (F::kIntermediate / 128))
     down_operand_block(Routing routing, const int* table, const float* gate_up,
                        __half* operand, float* unscale) {
@@ -946,6 +990,29 @@ __global__ void __launch_bounds__(32 * (F::kIntermediate / 128))
   const int e = split_exponent(peak);
   const float scale = pow2(e);
   __half* out = operand + pos * 2 * kIntermediate;
+  if constexpr (kI8) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = split_sum(v[i], scale);
+    __syncthreads();  // block_peak's shared slots are reused below
+    const float ypeak = block_peak<kBlockWarps>(lane_peak(v), lane, b);
+    const float qs = ypeak > 0.0f ? 127.0f / ypeak : 0.0f;
+    unsigned char* q8 = reinterpret_cast<unsigned char*>(out + kIntermediate);
+    int rsum = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int q = i8_quant(v[i], qs);
+      rsum += q;
+      q8[i8_byte(128 * b + lane + 32 * i)] = uint8_t(int8_t(q));
+    }
+    rsum = block_isum<kBlockWarps>(rsum, lane, b);
+    if (threadIdx.x == 0) {
+      *reinterpret_cast<float*>(q8 + kIntermediate) = static_cast<float>(rsum);
+      float u = pow2(-e);
+      u *= ypeak / 127.0f;
+      unscale[pos * 3 + 2] = u;
+    }
+    return;
+  }
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const int k = 128 * b + lane + 32 * i;
@@ -2070,6 +2137,15 @@ struct StageTimer {
 // operand kernels write the INT8 rows directly (gate_up_operand<F, true>,
 // down_operand<F, true>) instead of FP16 split rows re-read by i8_operand.
 // Bitwise the same INT8 rows, sums and scales; 0 restores the two-kernel path.
+// VLLM_EXL3_Q4N_I8_FUSE=warp: the warp-per-task fused kernels (254 / 125
+// registers) instead of the default block-per-task ones.
+inline bool q4n_i8_fuse_warp() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_Q4N_I8_FUSE");
+    return v != nullptr && std::string(v) == "warp";
+  }();
+  return on;
+}
 inline bool q4n_i8_fuse_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("VLLM_EXL3_Q4N_I8_FUSE");
@@ -2177,10 +2253,16 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
                 x, routing, table, operand, unscale);
       }
     } else if (fused_i8) {
-      if constexpr (F::kCodebook == 4 && F::kTileRows != 8)
-        gate_up_operand<F, true>
-            <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
-                x, routing, table, operand, unscale);
+      if constexpr (F::kCodebook == 4 && F::kTileRows != 8) {
+        if (q4n_i8_fuse_warp())
+          gate_up_operand<F, true>
+              <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
+                  x, routing, table, operand, unscale);
+        else
+          gate_up_operand_block<F, true>
+              <<<static_cast<unsigned int>(2 * assignments), 32 * (kHidden / 512),
+                 0, stream>>>(x, routing, table, operand, unscale);
+      }
     } else {
       gate_up_operand<F>
           <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
@@ -2235,9 +2317,15 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
                 routing, table, gate_up, operand, unscale);
       }
     } else if (fused_i8) {
-      if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128)
-        down_operand<F, true><<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
-            routing, table, gate_up, operand, unscale);
+      if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128) {
+        if (q4n_i8_fuse_warp())
+          down_operand<F, true><<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
+              routing, table, gate_up, operand, unscale);
+        else
+          down_operand_block<F, true>
+              <<<static_cast<unsigned int>(assignments), 32 * (kIntermediate / 128),
+                 0, stream>>>(routing, table, gate_up, operand, unscale);
+      }
     } else {
       down_operand<F><<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
           routing, table, gate_up, operand, unscale);
