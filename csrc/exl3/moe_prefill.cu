@@ -1200,9 +1200,15 @@ __device__ __forceinline__ void ldmatrix2_at(uint32_t address, uint32_t (&r)[2])
 }
 // The four nibble-sum codebook values (0..30, before the -15 offset) of a
 // Q4N state as the u8 bytes of one A register (byte c = value c).
+// Per byte b = 16 hi + lo: hi + lo = b - 15 hi, so the sums are p - 15 H with H = the high nibbles; no byte borrows
+// (b - 15 hi >= 0) and 15 hi < 256 carries into nothing, so this is exactly ((p >> 4) & m) + (p & m) with one
+// IMAD (FMA pipe) in place of an AND and an ADD on the integer ALU pipe, which bounds the INT8 decode GEMM.
 __device__ __forceinline__ uint32_t q4n_nibble_sums(uint32_t state) {
   const uint32_t p = state * 0x83DCD12Du;
-  return ((p >> 4) & 0x0f0f0f0fu) + (p & 0x0f0f0f0fu);
+  const uint32_t h = (p >> 4) & 0x0f0f0f0fu;
+  uint32_t r;
+  asm("mad.lo.u32 %0, %1, 0xFFFFFFF1, %2;" : "=r"(r) : "r"(h), "r"(p));
+  return r;
 }
 
 // Two mul1 codebook values as an FP16 pair (low half = s0): exactly
