@@ -1935,7 +1935,7 @@ struct StageTimer {
   int n = 0;
   cudaStream_t stream;
   bool active;
-  explicit StageTimer(cudaStream_t s) : stream(s), active(enabled() && s != nullptr) {
+  StageTimer(cudaStream_t s, bool on) : stream(s), active(on && enabled()) {
     if (!active) return;
     for (auto& e : ev) cudaEventCreate(&e);
     cudaEventRecord(ev[n], stream);
@@ -2021,7 +2021,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   float* gate_up = workspace + assignments * 2 * kHidden;
   float* unscale = gate_up + assignments * 2 * kIntermediate;
   int* table = reinterpret_cast<int*>(unscale + (assignments * 3 + 3) / 4 * 4);
-  StageTimer timer(kTileRows == 8 ? nullptr : stream);
+  StageTimer timer(stream, kTileRows != 8);
   route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
       routing, assignments, table);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
