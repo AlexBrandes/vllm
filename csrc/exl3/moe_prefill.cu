@@ -2041,6 +2041,73 @@ __global__ void __launch_bounds__(32 * kOperandWarps)
   for (int i = 0; i < 4; ++i) dst[32 * i] = __float2bfloat16_rn(sum[i]);
 }
 
+// combine_route (lab, VLLM_EXL3_MOE_COMBINE_WIDE=1): combine_block with the routes spread over warps. One block per
+// (token, 128-block) task, warp r = route r: each warp loads its route's down row and svh, runs the same H128 and the
+// same FP32 multiply into shared memory; warp 0 then accumulates the live routes in route order with the same FMA, so
+// each output is bitwise combine_block's. At decode widths (4 rows: 128 tasks) the single-warp version left the
+// dependent position -> expert -> svh / down loads of 8 routes serial in each of only 128 warps.
+template <typename Out, class F, int kTopk>
+__global__ void __launch_bounds__(32 * kTopk)
+    combine_route(const float* down, const float* weights, Routing routing,
+                  const int* table, int64_t assignments, int64_t rows,
+                  Out* out) {
+  static_assert(F::kTileRows == 8, "the FP32 decode combine");
+  constexpr int kHidden = F::kHidden;
+  constexpr int kBlocks = kHidden / 128;
+  __shared__ float value[kTopk][4][32];
+  __shared__ float wts[kTopk];
+  __shared__ int alive[kTopk];
+  const int lane = threadIdx.x & 31;
+  const int route = threadIdx.x >> 5;
+  const int64_t task = blockIdx.x;
+  if (task >= rows * kBlocks) return;  // block-uniform
+  const int64_t row = task / kBlocks;
+  const int base = static_cast<int>(task % kBlocks) * 128 + lane;
+  const int* position = table + Layout::position_offset(assignments);
+  const int64_t assignment = row * kTopk + route;
+  const int pos = position[assignment];
+  const bool live = pos >= 0;
+  float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float sc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (live) {
+    const half* svh = expert_part(routing, local_expert(routing, assignment), 2, 2);
+    const float* src = down + int64_t(pos) * kHidden + base;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      v[i] = src[32 * i];
+      sc[i] = __half2float(svh[base + 32 * i]);
+    }
+  }
+  hadamard128_warp(v, lane);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) value[route][i][lane] = __fmul_rn(v[i], sc[i]);
+  if (lane == 0) {
+    alive[route] = live;
+    wts[route] = live ? weights[assignment] : 0.0f;
+  }
+  __syncthreads();
+  if (route != 0) return;
+  float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int r = 0; r < kTopk; ++r) {
+    if (alive[r]) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) sum[i] = __fmaf_rn(value[r][i][lane], wts[r], sum[i]);
+    }
+  }
+  Out* dst = out + row * kHidden + base;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) dst[32 * i] = __float2bfloat16_rn(sum[i]);
+}
+
+inline bool combine_wide_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_MOE_COMBINE_WIDE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+
 unsigned int warp_grid(int64_t tasks) {
   return static_cast<unsigned int>(
       std::min<int64_t>((tasks + kOperandWarps - 1) / kOperandWarps, 65535));
@@ -2562,6 +2629,15 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   if constexpr (decode_glue_blocks<F>()) {
     if (topk == kDecodeGlueTopk && decode_glue_enabled()) {
       const int64_t tasks = rows * (kHidden / 128);
+      if (combine_wide_enabled()) {
+        combine_route<__nv_bfloat16, F, kDecodeGlueTopk>
+            <<<static_cast<unsigned int>(tasks), 32 * kDecodeGlueTopk, 0, stream>>>(
+                down_result, weights, routing, table, assignments, rows, out);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        timer.mark("combine");
+        timer.report(rows);
+        return;
+      }
       combine_block<__nv_bfloat16, F, kDecodeGlueTopk>
           <<<static_cast<unsigned int>((tasks + kOperandWarps - 1) /
                                        kOperandWarps),
