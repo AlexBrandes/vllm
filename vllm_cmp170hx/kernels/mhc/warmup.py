@@ -4,17 +4,19 @@
 ``vllm_cmp170hx/kernels/warmup_utils.py`` for why it must run before capture)."""
 
 from vllm.logger import init_logger
-from vllm_cmp170hx.kernels.mhc import decode_v2_max_rows, use_ampere_mhc_decode_v3
+from vllm_cmp170hx.kernels.mhc import (
+    decode_v2_max_rows,
+    decode_v3_enabled,
+    use_ampere_mhc_decode_v3,
+)
 from vllm_cmp170hx.kernels.warmup_utils import find_module, token_sizes
 
 logger = init_logger(__name__)
 
 
 def warmup_from_worker(worker, capture_sizes) -> None:
-    """No-op unless VLLM_AMPERE_DECODE_KERNELS and VLLM_GLM5_DECODE_MHC_V2."""
-    from vllm import envs
-
-    if not envs.VLLM_AMPERE_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_MHC_V2:
+    """No-op unless mHC decode v3 is requested (``decode_v3_enabled``)."""
+    if not decode_v3_enabled():
         return
     _warmup_mhc_v3(
         worker.get_model(), worker.device, capture_sizes, use_ampere_mhc_decode_v3

@@ -26,6 +26,7 @@ from vllm_cmp170hx.kernels._platform import _is_sm80
 __all__ = [
     "ampere_prenorm_offsets_fit",
     "decode_v2_max_rows",
+    "decode_v3_enabled",
     "use_ampere_mhc_decode_v3",
     "use_ampere_prefill_prenorm",
 ]
@@ -34,6 +35,15 @@ __all__ = [
 # to know whether it is None, and the artifact-link script calls the gate with
 # three positional arguments, so the parameter cannot be required.
 _PRESENT = object()
+
+
+def decode_v3_enabled() -> bool:
+    """mHC decode v3 requested: VLLM_SM80_MHC_DECODE alone, or the older pair
+    VLLM_AMPERE_DECODE_KERNELS + VLLM_GLM5_DECODE_MHC_V2."""
+    from vllm import envs
+
+    return bool(envs.VLLM_SM80_MHC_DECODE or (
+        envs.VLLM_AMPERE_DECODE_KERNELS and envs.VLLM_GLM5_DECODE_MHC_V2))
 
 
 def decode_v2_max_rows(hc_mult: int, hidden_size: int) -> int:
@@ -71,9 +81,7 @@ def use_ampere_mhc_decode_v3(
     (the kernel fuses the input RMSNorm, so a call without it falls through to
     TileLang).
     """
-    from vllm import envs
-
-    if not envs.VLLM_AMPERE_DECODE_KERNELS or not envs.VLLM_GLM5_DECODE_MHC_V2:
+    if not decode_v3_enabled():
         return False
     if norm_weight is None:
         return False

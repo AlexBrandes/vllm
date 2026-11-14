@@ -74,6 +74,13 @@ def warmup_from_worker(worker, cudagraph_capture_sizes) -> None:
         if kda_decode is not None:
             kda_decode.warmup_from_worker(worker, cudagraph_capture_sizes)
         warmup_route_from_worker(worker, cudagraph_capture_sizes)
+    elif envs.VLLM_SM80_MHC_DECODE:
+        # mHC decode v3 alone (no other sm_80 decode kernel is on).
+        from vllm_cmp170hx.kernels.mhc.warmup import (
+            warmup_from_worker as warmup_mhc_decode,
+        )
+
+        warmup_mhc_decode(worker, cudagraph_capture_sizes)
     # The sm_80 KDA chunked prefill at 64, 32 or 16 heads
     # (vllm_cmp170hx/models/glm5next/ops/kda_prefill.py): compile its kernels
     # before the first prefill. Prefill runs eagerly, so this is about

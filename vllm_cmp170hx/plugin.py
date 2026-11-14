@@ -213,9 +213,9 @@ def register_mhc_decode_op() -> None:
     runs the sm_80 mHC decode kernel (``vllm_cmp170hx/kernels/mhc/fused_op.py``),
     while VLLM_AMPERE_DECODE_KERNELS and VLLM_GLM5_DECODE_MHC_V2 are set; with
     either off the op stays upstream's. Idempotent."""
-    import vllm.envs as envs
+    from vllm_cmp170hx.kernels.mhc import decode_v3_enabled
 
-    if not (envs.VLLM_AMPERE_DECODE_KERNELS and envs.VLLM_GLM5_DECODE_MHC_V2):
+    if not decode_v3_enabled():
         return
     from vllm_cmp170hx.kernels.mhc import fused_op
 
