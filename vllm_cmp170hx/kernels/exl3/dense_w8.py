@@ -15,6 +15,10 @@ vLLM's cutlass_scaled_mm for <= VLLM_EXL3_DENSE_W8_SMALL_M rows (default 128) or
 kernel (cmp_i8mm.scaled_mm_out) above. The LM head runs Marlin W8A16 (uint8b128, per-channel FP16
 scales, FP16 activations) so the logits take no activation rounding
 (VLLM_EXL3_DENSE_W8_LM_HEAD=0 keeps the EXL3 head). Matrices absent from the sidecar keep EXL3.
+Lab (default off): VLLM_EXL3_DENSE_W8_DECODE=1 runs calls of <= 16 rows (N % 16, K % 128) through
+exl3_i8_lab.act_int8_dec (the same quantisation with a wider block) and exl3_i8_lab.w8_decode_mm, a skinny
+W8A8 GEMM that streams the row-major sidecar in contiguous runs; both equal the default path bit for bit
+(card 4, 8 GLM shapes, 1..16 rows) at 1.17-1.40x its speed per call.
 Lab libraries come from VLLM_EXL3_ONCE_LIB_DIR (default /opt/exl3-once), as for dense_prefill_once.
 
 Lab (default off): VLLM_EXL3_DENSE_W4=<W4 sidecar> adds a 4-bit copy of the rotated matrices it covers
@@ -36,6 +40,7 @@ logger = init_logger(__name__)
 PATH = os.environ.get("VLLM_EXL3_DENSE_W8", "").strip()
 LM_HEAD = os.environ.get("VLLM_EXL3_DENSE_W8_LM_HEAD", "1") == "1"
 SMALL_M = int(os.environ.get("VLLM_EXL3_DENSE_W8_SMALL_M", "128"))
+DECODE = os.environ.get("VLLM_EXL3_DENSE_W8_DECODE", "0") == "1"
 LIB_DIR = os.environ.get("VLLM_EXL3_ONCE_LIB_DIR", "/opt/exl3-once")
 W4_PATH = os.environ.get("VLLM_EXL3_DENSE_W4", "").strip()
 W4_MAX_M = int(os.environ.get("VLLM_EXL3_DENSE_W4_MAX_M", "32"))
@@ -172,6 +177,12 @@ def _w8_linear(x: torch.Tensor, w8: torch.Tensor, sw: torch.Tensor,
         return x.new_empty((0, n))
     xq = torch.empty((m, k), dtype=torch.int8, device=x.device)
     sx = torch.empty((m,), dtype=torch.float32, device=x.device)
+    if DECODE and m <= 16 and n % 16 == 0 and k % 128 == 0 and w8.is_contiguous():
+        torch.ops.exl3_i8_lab.act_int8_dec(x, suh, xq, sx)
+        _log(f"decode-w8d k={k} n={n}", m)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        torch.ops.exl3_i8_lab.w8_decode_mm(out, xq, w8, sx, sw)
+        return out
     torch.ops.exl3_i8_lab.act_int8(x, suh, xq, sx)
     _log(f"{'decode' if m <= SMALL_M else 'prefill'} k={k} n={n}", m)
     if m <= SMALL_M:

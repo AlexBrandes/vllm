@@ -17,6 +17,8 @@
 //   rebuild_fp16(trellis, svh, bits_x2, codebook, w16[N, K] fp16)
 //   act_int8(x bf16[M, logical_in], suh, xq int8[M, padded_in], sx float[M])
 //   act_fp16(x bf16[M, logical_in], suh, xr fp16[M, padded_in])
+//   act_int8_dec(...)  act_int8 with a 512/1024-thread block per row (decode-sized calls; same results)
+//   w8_decode_mm(out bf16[M, N], xq, w8[N, K], sx, sw)  1..16 rows; equals cutlass_scaled_mm bit for bit
 #include <torch/library.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -137,17 +139,17 @@ __global__ void __launch_bounds__(kThreads) rebuild_kernel(
   }
 }
 
-template <bool kInt8>
-__global__ void __launch_bounds__(kThreads) act_kernel(
+template <bool kInt8, int kT = kThreads>
+__global__ void __launch_bounds__(kT) act_kernel(
     const __nv_bfloat16* __restrict__ x, const half* __restrict__ suh, int64_t logical_in,
     int64_t padded_in, int8_t* __restrict__ xq, float* __restrict__ sx, half* __restrict__ xr) {
   extern __shared__ float row_buf[];
-  __shared__ float wmax[kThreads / 32];
+  __shared__ float wmax[kT / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int64_t r = blockIdx.x;
   float m = 0.0f;
-  for (int64_t b = warp; b < padded_in / 128; b += kThreads / 32) {
+  for (int64_t b = warp; b < padded_in / 128; b += kT / 32) {
     float v[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -175,14 +177,127 @@ __global__ void __launch_bounds__(kThreads) act_kernel(
   __syncthreads();
   m = 0.0f;
 #pragma unroll
-  for (int w = 0; w < kThreads / 32; ++w) m = fmaxf(m, wmax[w]);
+  for (int w = 0; w < kT / 32; ++w) m = fmaxf(m, wmax[w]);
   const float inv = m > 0.0f ? 127.0f / m : 0.0f;
-  for (int64_t col = threadIdx.x; col < padded_in; col += kThreads) {
+  for (int64_t col = threadIdx.x; col < padded_in; col += kT) {
     int q = __float2int_rn(__fmul_rn(row_buf[col], inv));
     q = min(max(q, -127), 127);
     xq[r * padded_in + col] = static_cast<int8_t>(q);
   }
   if (threadIdx.x == 0) sx[r] = m > 0.0f ? m / 127.0f : 1.0f;
+}
+
+
+// Decode-sized W8A8 GEMM (VLLM_EXL3_DENSE_W8_DECODE): out[m, n] = bf16(sx[m] * (sw[n] * float(sum_k xq[m, k] *
+// w8[n, k]))), m <= 16, w8 row-major [N, K] (the sidecar as stored), N % 16 == 0, K % 128 == 0. Bitwise equal to
+// vLLM cutlass_scaled_mm (exact int32 dot product, ScaledEpilogue order scale_a * (scale_b * acc) in FP32).
+// One CTA per 16 output rows, kDecWarps warps interleave 128-byte K chunks (chunk c = warp + kDecWarps * j) with
+// kDecUnroll chunks in flight, so a CTA streams 16 rows x 1 KiB contiguous runs; lane (g, t) loads bytes
+// [16t, 16t + 16) and [64 + 16t, 64 + 16t + 16) of each chunk of rows g and g + 8 (whole 32-byte sectors per load)
+// straight into s8 m16n8k32 A fragments (MMA step s takes words 2s / 2s + 1), and the token's same bytes as B.
+// Card 4, CUDA-graph back to back, 4 rows: 1.06-1.13x a same-size streaming read (cutlass_scaled_mm 1.21-1.56x).
+constexpr int kDecWarps = 4;
+constexpr int kDecUnroll = 2;
+
+__device__ __forceinline__ void mma_s8s8(const uint4& a, uint32_t b0, uint32_t b1, int (&d)[4]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
+  uint4 v;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+
+template <int kTiles>  // 1: m <= 8, 2: m <= 16
+__global__ void __launch_bounds__(32 * kDecWarps)
+    w8_decode_kernel(const int8_t* __restrict__ xq, const int8_t* __restrict__ w8,
+                     const float* __restrict__ sx, const float* __restrict__ sw,
+                     __nv_bfloat16* __restrict__ out, int m, int n, int k) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int row0 = blockIdx.x * 16;
+  const int chunks = k >> 7;
+  const uint4* wa = reinterpret_cast<const uint4*>(w8 + int64_t(row0 + g) * k) + t;
+  const uint4* wb = reinterpret_cast<const uint4*>(w8 + int64_t(row0 + g + 8) * k) + t;
+  const uint4* xa[kTiles];
+  bool live[kTiles];
+#pragma unroll
+  for (int i = 0; i < kTiles; ++i) {
+    const int tok = 8 * i + g;
+    live[i] = tok < m;
+    xa[i] = reinterpret_cast<const uint4*>(xq + int64_t(live[i] ? tok : 0) * k) + t;
+  }
+  int acc[kTiles][4];
+#pragma unroll
+  for (int i = 0; i < kTiles; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j] = 0;
+  for (int c0 = warp; c0 < chunks; c0 += kDecWarps * kDecUnroll) {
+    uint4 ra[kDecUnroll][2], rb[kDecUnroll][2];
+#pragma unroll
+    for (int u = 0; u < kDecUnroll; ++u) {
+      const int c = c0 + u * kDecWarps;
+      if (c < chunks) {
+        ra[u][0] = ldg_stream(wa + 8 * c); ra[u][1] = ldg_stream(wa + 8 * c + 4);
+        rb[u][0] = ldg_stream(wb + 8 * c); rb[u][1] = ldg_stream(wb + 8 * c + 4);
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kDecUnroll; ++u) {
+      const int c = c0 + u * kDecWarps;
+      if (c < chunks) {
+        const uint32_t A[8] = {ra[u][0].x, ra[u][0].y, ra[u][0].z, ra[u][0].w,
+                               ra[u][1].x, ra[u][1].y, ra[u][1].z, ra[u][1].w};
+        const uint32_t B[8] = {rb[u][0].x, rb[u][0].y, rb[u][0].z, rb[u][0].w,
+                               rb[u][1].x, rb[u][1].y, rb[u][1].z, rb[u][1].w};
+#pragma unroll
+        for (int i = 0; i < kTiles; ++i) {
+          uint32_t X[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+          if (live[i]) {
+            const uint4 x0 = __ldg(xa[i] + 8 * c), x1 = __ldg(xa[i] + 8 * c + 4);
+            X[0] = x0.x; X[1] = x0.y; X[2] = x0.z; X[3] = x0.w;
+            X[4] = x1.x; X[5] = x1.y; X[6] = x1.z; X[7] = x1.w;
+          }
+#pragma unroll
+          for (int s = 0; s < 4; ++s)
+            mma_s8s8(make_uint4(A[2 * s], B[2 * s], A[2 * s + 1], B[2 * s + 1]), X[2 * s],
+                     X[2 * s + 1], acc[i]);
+        }
+      }
+    }
+  }
+  __shared__ int red[kDecWarps][kTiles][4][32];
+#pragma unroll
+  for (int i = 0; i < kTiles; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) red[warp][i][j][lane] = acc[i][j];
+  __syncthreads();
+  if (warp != 0) return;
+#pragma unroll
+  for (int i = 0; i < kTiles; ++i) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      int sum = 0;
+#pragma unroll
+      for (int w = 0; w < kDecWarps; ++w) sum += red[w][i][j][lane];
+      // c0: (row g, token 2t), c1: (row g, token 2t + 1), c2 / c3: row g + 8.
+      const int tok = 8 * i + 2 * t + (j & 1);
+      const int row = row0 + g + (j >> 1) * 8;
+      if (tok < m) {
+        const float v = __fmul_rn(sx[tok], __fmul_rn(sw[row], static_cast<float>(sum)));
+        out[int64_t(tok) * n + row] = __float2bfloat16_rn(v);
+      }
+    }
+  }
 }
 
 #define LAB_FORMATS(X) X(10, 2) X(12, 2) X(14, 2) X(12, 1)
@@ -273,6 +388,54 @@ void act_int8(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xq, at::Te
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void act_int8_dec(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xq, at::Tensor& sx) {
+  check_act(x, suh);
+  const int64_t M = x.size(0), P = suh.numel();
+  TORCH_CHECK(xq.scalar_type() == at::kChar && xq.is_contiguous() && xq.size(0) == M &&
+                  xq.size(1) == P, "xq int8 [M, padded_in]");
+  TORCH_CHECK(sx.scalar_type() == at::kFloat && sx.numel() == M, "sx float [M]");
+  if (M == 0) return;
+  const c10::cuda::CUDAGuard guard(x.device());
+  const size_t smem = P * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  // Card 4, graph replay, 4 rows: 512 threads fastest below K 8192, 1024 at or above (act_int8: 256).
+  auto k = P >= 8192 ? act_kernel<true, 1024> : act_kernel<true, 512>;
+  const int threads = P >= 8192 ? 1024 : 512;
+  if (smem > 40 * 1024)
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
+  k<<<M, threads, smem, stream>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                                  reinterpret_cast<const half*>(suh.data_ptr()), x.size(1), P,
+                                  reinterpret_cast<int8_t*>(xq.data_ptr()), sx.data_ptr<float>(),
+                                  nullptr);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void w8_decode_mm(at::Tensor& out, const at::Tensor& xq, const at::Tensor& w8, const at::Tensor& sx,
+                  const at::Tensor& sw) {
+  TORCH_CHECK(xq.is_cuda() && xq.scalar_type() == at::kChar && xq.dim() == 2 && xq.is_contiguous(),
+              "xq int8 [M, K]");
+  TORCH_CHECK(w8.scalar_type() == at::kChar && w8.dim() == 2 && w8.is_contiguous(), "w8 int8 [N, K]");
+  const int64_t m = xq.size(0), k = xq.size(1), n = w8.size(0);
+  TORCH_CHECK(w8.size(1) == k && m >= 1 && m <= 16 && n % 16 == 0 && k % 128 == 0,
+              "w8_decode_mm: 1..16 rows, N % 16, K % 128");
+  TORCH_CHECK(sx.scalar_type() == at::kFloat && sx.numel() == m && sw.scalar_type() == at::kFloat &&
+                  sw.numel() == n, "scales");
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous() && out.size(0) == m &&
+                  out.size(1) == n, "out bf16 [M, N]");
+  const c10::cuda::CUDAGuard guard(xq.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto* o = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  if (m <= 8)
+    w8_decode_kernel<1><<<n / 16, 32 * kDecWarps, 0, stream>>>(
+        xq.data_ptr<int8_t>(), w8.data_ptr<int8_t>(), sx.data_ptr<float>(), sw.data_ptr<float>(), o,
+        int(m), int(n), int(k));
+  else
+    w8_decode_kernel<2><<<n / 16, 32 * kDecWarps, 0, stream>>>(
+        xq.data_ptr<int8_t>(), w8.data_ptr<int8_t>(), sx.data_ptr<float>(), sw.data_ptr<float>(), o,
+        int(m), int(n), int(k));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void act_fp16(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xr) {
   check_act(x, suh);
   const int64_t M = x.size(0), P = suh.numel();
@@ -298,6 +461,8 @@ TORCH_LIBRARY(exl3_i8_lab, m) {
         "Tensor(a!) w16) -> ()");
   m.def("act_int8(Tensor x, Tensor suh, Tensor(a!) xq, Tensor(b!) sx) -> ()");
   m.def("act_fp16(Tensor x, Tensor suh, Tensor(a!) xr) -> ()");
+  m.def("act_int8_dec(Tensor x, Tensor suh, Tensor(a!) xq, Tensor(b!) sx) -> ()");
+  m.def("w8_decode_mm(Tensor(a!) out, Tensor xq, Tensor w8, Tensor sx, Tensor sw) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(exl3_i8_lab, CUDA, m) {
@@ -306,4 +471,6 @@ TORCH_LIBRARY_IMPL(exl3_i8_lab, CUDA, m) {
   m.impl("rebuild_fp16", &exl3_i8_lab::rebuild_fp16);
   m.impl("act_int8", &exl3_i8_lab::act_int8);
   m.impl("act_fp16", &exl3_i8_lab::act_fp16);
+  m.impl("act_int8_dec", &exl3_i8_lab::act_int8_dec);
+  m.impl("w8_decode_mm", &exl3_i8_lab::w8_decode_mm);
 }
