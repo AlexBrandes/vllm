@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Bindings for the shipped BF16 EXL3 extension."""
 
+import os
 import importlib
 from functools import cache
 
@@ -67,7 +68,10 @@ def split_moe_key(key: int) -> tuple[int, int]:
 # moe_out_decode_tc (csrc/exl3/moe_prefill.cu, the small-row schedule) covers
 # decode-step calls of 1..MOE_DECODE_TC_MAX_ROWS rows of the exact GLM family
 # above: the same shape, uniform expert format and SwiGLU limit gate.
-MOE_DECODE_TC_MAX_ROWS = 8
+# Lab: VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS (read by the extension too) raises the per-call cap, so a
+# 9..N-row decode call runs as one moe_out_decode_tc call (8-row route tiles per expert, each routed
+# expert decoded once per 8 of its rows) instead of 8-row slices. Bitwise the slices' results.
+MOE_DECODE_TC_MAX_ROWS = max(8, int(os.environ.get("VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS", "8") or 8))
 
 
 def _linear_fake(

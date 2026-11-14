@@ -2639,6 +2639,18 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64,
 // arithmetic, the kernels and the workspace layout are run_family's; only the
 // Family (hence the GEMM shapes' rows per tile and the route tile size)
 // differs from the prefill entry.
+// Lab: VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS raises the per-call row cap of the
+// decode schedule (default kMoeDecodeTcMaxRows). The schedule keeps 8-row
+// route tiles per expert, so a wider call decodes each routed expert once per
+// 8 of its rows instead of once per 8-row slice of the call (T1 probe).
+inline int64_t decode_tc_max_rows() {
+  static const int64_t v = [] {
+    const char* e = std::getenv("VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS");
+    return e && *e ? std::max<int64_t>(kMoeDecodeTcMaxRows, std::atoll(e)) : kMoeDecodeTcMaxRows;
+  }();
+  return v;
+}
+
 template <bool kDownOnly = false>
 void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
                 const float* weights, const void* expert_map, bool map64,
@@ -2650,9 +2662,9 @@ void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
   TORCH_CHECK(
       hidden == GlmFamily::kHidden && intermediate == GlmFamily::kIntermediate,
       "EXL3 MoE decode tensor-core run of an unserved shape");
-  TORCH_CHECK(rows <= kMoeDecodeTcMaxRows,
+  TORCH_CHECK(rows <= decode_tc_max_rows(),
               "EXL3 MoE decode tensor-core schedule serves at most ",
-              kMoeDecodeTcMaxRows, " rows, not ", rows);
+              decode_tc_max_rows(), " rows, not ", rows);
   if (bits_x2 == GlmFamily::kBitsX2) {
     run_family<GlmDecodeFamily, kDownOnly>(
         x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
@@ -2935,9 +2947,9 @@ void moe_out_decode_tc(const torch::Tensor& x, const torch::Tensor& topk_ids,
   TORCH_CHECK(experts > 0 && experts <= kMoeDecodeTcMaxExperts,
               "EXL3 MoE decode needs 1..", kMoeDecodeTcMaxExperts,
               " local experts");
-  TORCH_CHECK(rows == 0 || rows <= kMoeDecodeTcMaxRows,
+  TORCH_CHECK(rows == 0 || rows <= moe_prefill::decode_tc_max_rows(),
               "EXL3 MoE decode tensor-core serves calls of at most ",
-              kMoeDecodeTcMaxRows, " rows");
+              moe_prefill::decode_tc_max_rows(), " rows");
   const int64_t required = moe_workspace_size_decode_tc(
       rows, hidden, intermediate_size, topk, experts);
   TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
