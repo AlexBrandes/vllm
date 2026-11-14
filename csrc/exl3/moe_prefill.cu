@@ -1831,7 +1831,8 @@ __global__ void __launch_bounds__(kThreads, S::kMinBlocks) gemm(Gemm p) {
   };
 
   if constexpr (kI8) {
-    static_assert(S::kTileRows == 64, "INT8 path: prefill families");
+    static_assert(S::kTileRows == 64 || S::kTileRows == 8,
+                  "INT8 path: prefill (64-row) and decode (8-row) tiles");
     switch ((rows + 7) >> 3) {
 #define EXL3_GROUPS_I8(G)                                          \
   case G:                                                          \
@@ -2211,6 +2212,16 @@ struct StageTimer {
 // operand kernels write the INT8 rows directly (gate_up_operand<F, true>,
 // down_operand<F, true>) instead of FP16 split rows re-read by i8_operand.
 // Bitwise the same INT8 rows, sums and scales; 0 restores the two-kernel path.
+// Lab (VLLM_EXL3_Q4N_DECODE=i8, Q4N-X decode families): per-row INT8
+// activations on the u8 x s8 IMMA path in the 8-row decode GEMMs too, with the
+// fused INT8 operand blocks. Changes decode numerics (as prefill i8 does).
+inline bool q4n_decode_i8_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_Q4N_DECODE");
+    return v != nullptr && std::string(v) == "i8";
+  }();
+  return on;
+}
 // VLLM_EXL3_Q4N_I8_FUSE=warp: the warp-per-task fused kernels (254 / 125
 // registers) instead of the default block-per-task ones.
 inline bool q4n_i8_fuse_warp() {
@@ -2294,6 +2305,10 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   bool fused_i8 = false;
   if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128)
     fused_i8 = prefill_one_plane<F>() == 4 && q4n_i8_fuse_enabled();
+  // INT8 decode: Q4N-X decode families with the block operand kernels.
+  bool i8_decode = false;
+  if constexpr (F::kCodebook == 4 && F::kTileRows == 8 && decode_glue_blocks<F>())
+    i8_decode = q4n_decode_i8_enabled();
   route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
       routing, assignments, table);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2317,7 +2332,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     if constexpr (decode_glue_blocks<F>()) {
-      if (decode_glue_enabled()) {
+      if (i8_decode) {
+        if constexpr (F::kCodebook == 4)
+          gate_up_operand_block<F, true>
+              <<<static_cast<unsigned int>(2 * assignments), 32 * (kHidden / 512),
+                 0, stream>>>(x, routing, table, operand, unscale);
+      } else if (decode_glue_enabled()) {
         gate_up_operand_block<F>
             <<<static_cast<unsigned int>(2 * assignments), 32 * (kHidden / 512),
                0, stream>>>(x, routing, table, operand, unscale);
@@ -2346,7 +2366,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     {
       const int64_t items = max_tiles * GateUp::kProjections * GateUp::kColBlocks;
       if constexpr (kTileRows == 8) {
-        launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
+        if constexpr (F::kCodebook == 4) {
+          if (i8_decode) launch_decode_gemm<GateUp, 4>(p, items, stream);
+          else launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
+        } else {
+          launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
+        }
       } else {
         switch (prefill_one_plane<F>()) {
           case 1: launch_gemm<GateUp, 1>(p, items, stream); break;
@@ -2381,7 +2406,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     }
     timer.mark("gu_gemm");
     if constexpr (decode_glue_blocks<F>()) {
-      if (decode_glue_enabled()) {
+      if (i8_decode) {
+        if constexpr (F::kCodebook == 4)
+          down_operand_block<F, true>
+              <<<static_cast<unsigned int>(assignments), 32 * (kIntermediate / 128),
+                 0, stream>>>(routing, table, gate_up, operand, unscale);
+      } else if (decode_glue_enabled()) {
         down_operand_block<F>
             <<<static_cast<unsigned int>(assignments), 32 * (kIntermediate / 128),
                0, stream>>>(routing, table, gate_up, operand, unscale);
@@ -2410,7 +2440,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   {
     const int64_t items = max_tiles * Down::kProjections * Down::kColBlocks;
     if constexpr (kTileRows == 8) {
-      launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
+      if constexpr (F::kCodebook == 4) {
+        if (i8_decode) launch_decode_gemm<Down, 4>(p, items, stream);
+        else launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
+      } else {
+        launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
+      }
     } else {
       switch (prefill_one_plane<F>()) {
         case 1: launch_gemm<Down, 1>(p, items, stream); break;
