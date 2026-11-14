@@ -1661,12 +1661,33 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
         }
       }
       const uint32_t vec = static_cast<uint32_t>(((2 * s + lv) ^ b_swz) * 16);
+      if constexpr (kG >= 2) {
+        // Two 8-row groups per ldmatrix.x4 (lanes 16..31 address group g + 1):
+        // the same B bytes as two x2 loads, half the instructions.
 #pragma unroll
-      for (int g = 0; g < kG; ++g) {
-        uint32_t b[2];
-        ldmatrix2_at(b_row + read + g * 8 * 64 + vec, b);
+        for (int g = 0; g + 1 < kG; g += 2) {
+          uint32_t b[4];
+          ldmatrix4_at(b_row + read + (g + (lane >> 4)) * 8 * 64 + vec, b);
 #pragma unroll
-        for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][g]);
+          for (int j = 0; j < TPW; ++j) {
+            mma_u8s8(a[j], b[0], b[1], acc[j][g]);
+            mma_u8s8(a[j], b[2], b[3], acc[j][g + 1]);
+          }
+        }
+        if constexpr (kG % 2 == 1) {
+          uint32_t b[2];
+          ldmatrix2_at(b_row + read + (kG - 1) * 8 * 64 + vec, b);
+#pragma unroll
+          for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][kG - 1]);
+        }
+      } else {
+#pragma unroll
+        for (int g = 0; g < kG; ++g) {
+          uint32_t b[2];
+          ldmatrix2_at(b_row + read + g * 8 * 64 + vec, b);
+#pragma unroll
+          for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][g]);
+        }
       }
     }
     if constexpr (kBlock) {
