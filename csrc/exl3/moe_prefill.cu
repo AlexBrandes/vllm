@@ -1918,6 +1918,48 @@ constexpr bool decode_glue_blocks() {
   return F::kTileRows == 8 && F::kIntermediate != 5 * 128 &&
          F::kHidden / 512 <= 32 && F::kIntermediate / 128 <= 32;
 }
+// Lab diagnostic (VLLM_EXL3_PREFILL_STAGE_TIMING=1, prefill families only):
+// CUDA events between the stages of one routed prefill call, printed to stderr
+// as "EXL3_STAGES rows=<r> <name>=<ms> ..." after the call. Serialises the call;
+// never set in serving.
+struct StageTimer {
+  static bool enabled() {
+    static const bool on = [] {
+      const char* v = std::getenv("VLLM_EXL3_PREFILL_STAGE_TIMING");
+      return v != nullptr && v[0] == '1';
+    }();
+    return on;
+  }
+  cudaEvent_t ev[12];
+  const char* names[12];
+  int n = 0;
+  cudaStream_t stream;
+  bool active;
+  explicit StageTimer(cudaStream_t s) : stream(s), active(enabled() && s != nullptr) {
+    if (!active) return;
+    for (auto& e : ev) cudaEventCreate(&e);
+    cudaEventRecord(ev[n], stream);
+    names[n++] = "start";
+  }
+  void mark(const char* name) {
+    if (!active || n >= 12) return;
+    cudaEventRecord(ev[n], stream);
+    names[n++] = name;
+  }
+  void report(int64_t rows) {
+    if (!active) return;
+    cudaEventSynchronize(ev[n - 1]);
+    std::string line = "EXL3_STAGES rows=" + std::to_string(rows);
+    for (int i = 1; i < n; ++i) {
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, ev[i - 1], ev[i]);
+      line += std::string(" ") + names[i] + "=" + std::to_string(ms);
+    }
+    fprintf(stderr, "%s\n", line.c_str());
+    for (auto& e : ev) cudaEventDestroy(e);
+  }
+};
+
 inline bool decode_glue_enabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("VLLM_EXL3_MOE_DECODE_GLUE");
@@ -1979,9 +2021,11 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   float* gate_up = workspace + assignments * 2 * kHidden;
   float* unscale = gate_up + assignments * 2 * kIntermediate;
   int* table = reinterpret_cast<int*>(unscale + (assignments * 3 + 3) / 4 * 4);
+  StageTimer timer(kTileRows == 8 ? nullptr : stream);
   route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
       routing, assignments, table);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  timer.mark("route");
   const int64_t max_tiles = std::min<int64_t>(
       assignments, assignments / kTileRows +
                        std::min<int64_t>(local_experts, assignments) + 1);
@@ -2027,10 +2071,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
           case 3: launch_gemm<GateUp, 3>(p, items, stream); break;
           case 4:
             if constexpr (F::kCodebook == 4) {
+              timer.mark("gu_operand");
               i8_operand<kHidden>
                   <<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
                       table, operand, unscale, 2, 0);
               C10_CUDA_KERNEL_LAUNCH_CHECK();
+              timer.mark("gu_i8");
               launch_gemm<GateUp, 4>(p, items, stream);
             }
             break;
@@ -2048,6 +2094,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
         }
       }
     }
+    timer.mark("gu_gemm");
     if constexpr (decode_glue_blocks<F>()) {
       if (decode_glue_enabled()) {
         down_operand_block<F>
@@ -2076,10 +2123,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
         case 3: launch_gemm<Down, 3>(p, items, stream); break;
         case 4:
           if constexpr (F::kCodebook == 4) {
+            timer.mark("down_operand");
             i8_operand<kIntermediate>
                 <<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
                     table, operand, unscale, 1, 2);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
+            timer.mark("down_i8");
             launch_gemm<Down, 4>(p, items, stream);
           }
           break;
@@ -2109,6 +2158,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
       return;
     }
   }
+  timer.mark("down_gemm");
   // combine: one warp per task, no grid cap.
   const int64_t combine_blocks =
       (rows * (kHidden / 512) + kOperandWarps - 1) / kOperandWarps;
@@ -2118,6 +2168,8 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   combine<__nv_bfloat16, F><<<grid, 32 * kOperandWarps, 0, stream>>>(
       down_result, weights, routing, table, assignments, rows, out);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  timer.mark("combine");
+  timer.report(rows);
 }
 
 void run(const __nv_bfloat16* x, const void* ids, bool ids64,
