@@ -37,6 +37,38 @@ from vllm_cmp170hx.kernels.exl3.utils import (
 
 logger = init_logger(__name__)
 
+
+# Lab (default off): VLLM_EXL3_ROUTE_HIST_DIR=<dir> counts routed assignments per (MoE layer, global expert) on
+# eager calls (CUDA-graph captures are skipped) and writes <dir>/route-hist-<pid>.pt every 64 calls: {layer_name:
+# int64[global_experts]}. For calibration-coverage studies (tokens per expert of a calibration set); no effect on
+# outputs.
+import os as _os
+
+_ROUTE_HIST_DIR = _os.environ.get("VLLM_EXL3_ROUTE_HIST_DIR", "").strip()
+_route_hist: dict = {}
+_route_calls = [0]
+
+
+def _record_routes(layer, topk_ids) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        return
+    n = int(getattr(layer, "global_num_experts", 0) or 0)
+    if n <= 0:
+        return
+    name = str(getattr(layer, "layer_name", None) or getattr(layer, "prefix", None) or id(layer))
+    ids = topk_ids.reshape(-1).to(torch.int64)
+    ids = ids[(ids >= 0) & (ids < n)]
+    h = _route_hist.get(name)
+    if h is None:
+        h = _route_hist[name] = torch.zeros(n, dtype=torch.int64, device=topk_ids.device)
+    h += torch.bincount(ids, minlength=n)
+    _route_calls[0] += 1
+    if _route_calls[0] % 64 == 0:
+        _os.makedirs(_ROUTE_HIST_DIR, exist_ok=True)
+        tmp = _os.path.join(_ROUTE_HIST_DIR, f".route-hist-{_os.getpid()}.pt")
+        torch.save({k: v.cpu() for k, v in _route_hist.items()}, tmp)
+        _os.replace(tmp, _os.path.join(_ROUTE_HIST_DIR, f"route-hist-{_os.getpid()}.pt"))
+
 # Qwen4Exp QSA projects Q/gate, K, V and the replicated indexer Q/K in one
 # layer. It first builds a three-output QKV layer, then replaces it with the
 # four-output fused one, and the target, MTP and LoRA packed mappings disagree
@@ -1040,6 +1072,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     ):
         assert self.moe_kernel is not None
+        if _ROUTE_HIST_DIR:
+            _record_routes(layer, topk_ids)
         return self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.exl3_ptrs,
