@@ -56,7 +56,7 @@ MOE_PREFILL_GLM_SHAPE = (4096, 2048, 8, 288, 288)
 MOE_PREFILL_GLM_EXPERT_BITS = (5, 7)
 # Q4N (codebook 3, lab): the layer key passed as bits_x2 is the stored bits_x2 + Q4N_KEY_OFFSET.
 Q4N_KEY_OFFSET = 64
-MOE_GLM_Q4N_EXPERT_BITS = (5, 6)
+MOE_GLM_Q4N_EXPERT_BITS = (4, 5, 6, 7)  # 4 / 7: E5 allocation families (Q4N-X only, lab)
 
 
 def split_moe_key(key: int) -> tuple[int, int]:

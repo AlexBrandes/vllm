@@ -1382,6 +1382,14 @@ using GlmQ4NX6Family = Family<4096, 2048, 6, 10, 64, 4>;
 using GlmQ4NX6DecodeFamily = Family<4096, 2048, 6, 10, 8, 4>;
 constexpr int kGlmQ4NXKey = 5 + kQ4NXFormatOffset;
 constexpr int kGlmQ4NX6Key = 6 + kQ4NXFormatOffset;
+// E5 allocation families (lab): Q4N-X at 2.0 bpw (bits_x2 4: KV 8, L 24, 16 ring words per tile) and 3.5 bpw
+// (bits_x2 7: KV 14, L 18, 28 words). Same schedules and arithmetic; only the trellis width differs.
+using GlmQ4NX4Family = Family<4096, 2048, 4, 10, 64, 4>;
+using GlmQ4NX4DecodeFamily = Family<4096, 2048, 4, 10, 8, 4>;
+using GlmQ4NX7Family = Family<4096, 2048, 7, 10, 64, 4>;
+using GlmQ4NX7DecodeFamily = Family<4096, 2048, 7, 10, 8, 4>;
+constexpr int kGlmQ4NX4Key = 4 + kQ4NXFormatOffset;
+constexpr int kGlmQ4NX7Key = 7 + kQ4NXFormatOffset;
 
 template <class S>
 __device__ __forceinline__ uint32_t next_stage(uint32_t offset) {
@@ -2699,6 +2707,16 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64,
                                  local_experts, rows, topk, out, workspace, stream);
       return;
     }
+    if (bits_x2 == kGlmQ4NX4Key) {
+      run_family<GlmQ4NX4Family>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                 local_experts, rows, topk, out, workspace, stream);
+      return;
+    }
+    if (bits_x2 == kGlmQ4NX7Key) {
+      run_family<GlmQ4NX7Family>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                 local_experts, rows, topk, out, workspace, stream);
+      return;
+    }
     TORCH_CHECK(
         bits_x2 == Glm35Family::kBitsX2,
         "EXL3 MoE prefill runs the GLM 5-bit or 3.5-bit family, not bits_x2 ",
@@ -2771,14 +2789,20 @@ void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
         metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
     return;
   }
-  if (bits_x2 == kGlmQ4NXKey || bits_x2 == kGlmQ4NX6Key) {
+  if (bits_x2 == kGlmQ4NXKey || bits_x2 == kGlmQ4NX6Key || bits_x2 == kGlmQ4NX4Key || bits_x2 == kGlmQ4NX7Key) {
     TORCH_CHECK(!kDownOnly && activated_down == nullptr,
                 "EXL3 Q4N MoE decode serves the full tensor-core mode only");
     if (bits_x2 == kGlmQ4NXKey)
       run_family<GlmQ4NXDecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
                                              metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
-    else
+    else if (bits_x2 == kGlmQ4NX6Key)
       run_family<GlmQ4NX6DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                              metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    else if (bits_x2 == kGlmQ4NX4Key)
+      run_family<GlmQ4NX4DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                              metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    else
+      run_family<GlmQ4NX7DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
                                               metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
     return;
   }
