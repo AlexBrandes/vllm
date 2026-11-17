@@ -197,6 +197,15 @@ def register() -> None:
     register_light_timing()
     register_fork_parsers()
     register_mhc_decode_op()
+    register_lab_hidden_capture()
+
+
+def register_lab_hidden_capture() -> None:
+    """Lab: final-norm hidden-state dump for fidelity replay, with
+    VLLM_SM80_CAPTURE_HIDDEN_DIR (vllm_cmp170hx/lab_hidden_capture.py)."""
+    from vllm_cmp170hx import lab_hidden_capture
+
+    lab_hidden_capture.install()
 
 
 def register_fork_parsers() -> None:
