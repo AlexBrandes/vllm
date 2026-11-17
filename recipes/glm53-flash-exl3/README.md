@@ -21,7 +21,7 @@ This page pins that release rather than duplicating its scripts.
 ```bash
 git clone https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3.git
 cd cmp170hx-glm53-flash-exl3
-git checkout --detach 0294590212713617fdfa5d5be46385f30c657f6a
+git checkout --detach a1dcd7b84350e39558d781eb32ecfc04a90eff37
 ./download.sh
 ./start.sh
 ```
@@ -44,17 +44,17 @@ curl --fail http://127.0.0.1:8000/v1/chat/completions \
 
 Stop only the recipe's container with `./stop.sh` from that checkout.
 For settings, reasoning, tool calls, and the chat template, use the
-[pinned recipe README](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/README.md).
+[pinned recipe README](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/a1dcd7b84350e39558d781eb32ecfc04a90eff37/README.md).
 
 ## Release identity
 
 | Component | Pin |
 | --- | --- |
-| Recipe | `0294590212713617fdfa5d5be46385f30c657f6a` |
+| Recipe | `a1dcd7b84350e39558d781eb32ecfc04a90eff37` |
 | Upstream vLLM | wheel for `a0d7356b98e929c17051bac44f5a086e4117974d` |
 | vLLM branch | `vllm/a0d7356b98` at `ea2ef399a614ea72b65b15804000342f629a850f` |
-| Plugin | `plugin` at `0c79bc78fdc30708f1995d5759828d2a08e39f04` |
-| Image | `ghcr.io/alexbrandes/cmp170hx-glm53-flash-exl3@sha256:daa037541ed91b304c5f4168b6dad4820362ef25c1e6ba3193bf5aef562ed076` |
+| Plugin | `plugin` at `7129837ee1ed5d4ae6d6bfed0ffe0d26bd06d9f9` |
+| Image | `ghcr.io/alexbrandes/cmp170hx-glm53-flash-exl3@sha256:1112f996472f364b3d7ebc44ef2719ab1e3db64b5f3240472a127482b8dfb0ec` |
 | Checkpoint | `turboderp/GLM-5.3-Flash-exl3` `sc_2.60bpw` at `24781209f2862a939cc21e01d256c943bd1a58a3` |
 | Dense weights | INT8 copy built by `download.sh` from `zai-org/GLM-5.3-Flash` at `46a050bec13002ad29ee795c16e61cf4fa3c4a9c` |
 | Drafter | `incoai/GLM-5.3-Flash-DFlash2` at `bf582e4eacc1810f76656d1811693ff6c6737d2a` |
@@ -65,12 +65,15 @@ For settings, reasoning, tool calls, and the chat template, use the
 The [public results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/results/2026-11-11.json)
 and [benchmark tables](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/tree/0294590212713617fdfa5d5be46385f30c657f6a#benchmarks)
 cover three public-v1 runs, plus correctness, image and video
-input, needle, context window, HumanEval, GSM8K and GPQA Diamond.
+input, needle, context window, HumanEval, GSM8K and GPQA Diamond, measured on the
+2026-11-11 release (recipe `0294590`, image `daa03754`). The current release changes only
+the scheduler (round-robin decode turn, full prefill budget beside decodes) and was not
+re-measured.
 
 ## Credits and licenses
 
 The engine is Apache-2.0; the standalone recipe is MIT, and the checkpoint and
-drafter have their own licenses. Its [NOTICE](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/NOTICE)
+drafter have their own licenses. Its [NOTICE](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/a1dcd7b84350e39558d781eb32ecfc04a90eff37/NOTICE)
 credits turboderp's ExLlamaV3, Morrowmake's vllm-sm80, Z.AI, incoai and the
 benchmark authors. See the [fork credits](../../README.md#credits) for CMPUnlocker,
 Morrowmake, PixelML, and the wider CMP community.
