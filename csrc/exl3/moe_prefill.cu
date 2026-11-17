@@ -176,7 +176,7 @@ __device__ __forceinline__ void block_scan2(int a, int b, int& a_before,
 // shapes; formats and trellis alignment live in device metadata).
 template <class F>
 __global__ void __launch_bounds__(kRouteThreads)
-    route(Routing routing, int64_t assignments, int* table) {
+    route(Routing routing, int64_t assignments, int* table, bool check = true) {
   extern __shared__ int route_shared[];
   constexpr int kHidden = F::kHidden;
   constexpr int kIntermediate = F::kIntermediate;
@@ -189,6 +189,7 @@ __global__ void __launch_bounds__(kRouteThreads)
   int* tile_begin = row_begin + experts;  // experts + 1 entries
   for (int e = threadIdx.x; e < experts; e += blockDim.x) {
     cursor[e] = 0;
+    if (!check) continue;
     for (int q = 0; q < 3; ++q) {
       const int64_t* meta = routing.metadata + int64_t(e) * 12 + q * 4;
       const int64_t in = q < 2 ? kHidden : kIntermediate;
@@ -1856,7 +1857,8 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
   };
 
   if constexpr (kI8) {
-    static_assert(S::kTileRows == 64, "INT8 path: prefill families");
+    static_assert(S::kTileRows == 64 || S::kTileRows == 8,
+                  "INT8 path: prefill (64-row) and decode (8-row) tiles");
     switch ((rows + 7) >> 3) {
 #define EXL3_GROUPS_I8(G)                                          \
   case G:                                                          \
@@ -2037,6 +2039,73 @@ __global__ void __launch_bounds__(32 * kOperandWarps)
   for (int i = 0; i < 4; ++i) dst[32 * i] = __float2bfloat16_rn(sum[i]);
 }
 
+// combine_route (lab, VLLM_EXL3_MOE_COMBINE_WIDE=1): combine_block with the routes spread over warps. One block per
+// (token, 128-block) task, warp r = route r: each warp loads its route's down row and svh, runs the same H128 and the
+// same FP32 multiply into shared memory; warp 0 then accumulates the live routes in route order with the same FMA, so
+// each output is bitwise combine_block's. At decode widths (4 rows: 128 tasks) the single-warp version left the
+// dependent position -> expert -> svh / down loads of 8 routes serial in each of only 128 warps.
+template <typename Out, class F, int kTopk>
+__global__ void __launch_bounds__(32 * kTopk)
+    combine_route(const float* down, const float* weights, Routing routing,
+                  const int* table, int64_t assignments, int64_t rows,
+                  Out* out) {
+  static_assert(F::kTileRows == 8, "the FP32 decode combine");
+  constexpr int kHidden = F::kHidden;
+  constexpr int kBlocks = kHidden / 128;
+  __shared__ float value[kTopk][4][32];
+  __shared__ float wts[kTopk];
+  __shared__ int alive[kTopk];
+  const int lane = threadIdx.x & 31;
+  const int route = threadIdx.x >> 5;
+  const int64_t task = blockIdx.x;
+  if (task >= rows * kBlocks) return;  // block-uniform
+  const int64_t row = task / kBlocks;
+  const int base = static_cast<int>(task % kBlocks) * 128 + lane;
+  const int* position = table + Layout::position_offset(assignments);
+  const int64_t assignment = row * kTopk + route;
+  const int pos = position[assignment];
+  const bool live = pos >= 0;
+  float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float sc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (live) {
+    const half* svh = expert_part(routing, local_expert(routing, assignment), 2, 2);
+    const float* src = down + int64_t(pos) * kHidden + base;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      v[i] = src[32 * i];
+      sc[i] = __half2float(svh[base + 32 * i]);
+    }
+  }
+  hadamard128_warp(v, lane);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) value[route][i][lane] = __fmul_rn(v[i], sc[i]);
+  if (lane == 0) {
+    alive[route] = live;
+    wts[route] = live ? weights[assignment] : 0.0f;
+  }
+  __syncthreads();
+  if (route != 0) return;
+  float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int r = 0; r < kTopk; ++r) {
+    if (alive[r]) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) sum[i] = __fmaf_rn(value[r][i][lane], wts[r], sum[i]);
+    }
+  }
+  Out* dst = out + row * kHidden + base;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) dst[32 * i] = __float2bfloat16_rn(sum[i]);
+}
+
+inline bool combine_wide_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_MOE_COMBINE_WIDE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+
 unsigned int warp_grid(int64_t tasks) {
   return static_cast<unsigned int>(
       std::min<int64_t>((tasks + kOperandWarps - 1) / kOperandWarps, 65535));
@@ -2171,7 +2240,15 @@ struct StageTimer {
   static bool enabled() {
     static const bool on = [] {
       const char* v = std::getenv("VLLM_EXL3_PREFILL_STAGE_TIMING");
-      return v != nullptr && v[0] == '1';
+      return v != nullptr && (v[0] == '1' || v[0] == '2');
+    }();
+    return on;
+  }
+  // =2: the decode families too (8-row tiles).
+  static bool decode_enabled() {
+    static const bool on = [] {
+      const char* v = std::getenv("VLLM_EXL3_PREFILL_STAGE_TIMING");
+      return v != nullptr && v[0] == '2';
     }();
     return on;
   }
@@ -2209,12 +2286,46 @@ struct StageTimer {
 // operand kernels write the INT8 rows directly (gate_up_operand<F, true>,
 // down_operand<F, true>) instead of FP16 split rows re-read by i8_operand.
 // Bitwise the same INT8 rows, sums and scales; 0 restores the two-kernel path.
+// VLLM_EXL3_Q4N_DECODE_GEMM (with VLLM_EXL3_Q4N_DECODE=i8): base (the decode
+// shapes and VLLM_EXL3_MOE_DECODE_TC_STAGES) or t2c4 (compact INT8 stages 4
+// deep, gate/up TPW 2; the served choice). Bitwise equal.
+inline int q4n_decode_gemm_variant() {
+  static const int v = [] {
+    const char* e = std::getenv("VLLM_EXL3_Q4N_DECODE_GEMM");
+    const std::string s = e ? e : "base";
+    if (s == "base") return 0;
+    if (s == "t2c4") return 4;
+    TORCH_CHECK(false, "VLLM_EXL3_Q4N_DECODE_GEMM must be base or t2c4");
+    return 0;
+  }();
+  return v;
+}
+// Lab (VLLM_EXL3_Q4N_DECODE=i8, Q4N-X decode families): per-row INT8
+// activations on the u8 x s8 IMMA path in the 8-row decode GEMMs too, with the
+// fused INT8 operand blocks. Changes decode numerics (as prefill i8 does).
+inline bool q4n_decode_i8_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_Q4N_DECODE");
+    return v != nullptr && std::string(v) == "i8";
+  }();
+  return on;
+}
 // VLLM_EXL3_Q4N_I8_FUSE=warp: the warp-per-task fused kernels (254 / 125
 // registers) instead of the default block-per-task ones.
 inline bool q4n_i8_fuse_warp() {
   static const bool on = [] {
     const char* v = std::getenv("VLLM_EXL3_Q4N_I8_FUSE");
     return v != nullptr && std::string(v) == "warp";
+  }();
+  return on;
+}
+// Lab (VLLM_EXL3_ROUTE_CHECK=0): skip route's per-call re-validation of every
+// local expert's metadata and trellis alignment (checked at load); the table
+// it builds is unchanged.
+inline bool route_check_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_ROUTE_CHECK");
+    return v == nullptr || v[0] != '0';
   }();
   return on;
 }
@@ -2261,6 +2372,15 @@ void launch_decode_gemm(const Gemm& p, int64_t items, cudaStream_t stream) {
     default: launch_gemm<S, kPlanes>(p, items, stream); break;
   }
 }
+template <class S, bool kGateUp>
+void launch_i8_decode_gemm(const Gemm& p, int64_t max_tiles, int64_t items,
+                           cudaStream_t stream) {
+  constexpr int kBaseTpw = S::kTPW;
+  switch (q4n_decode_gemm_variant()) {
+    case 4: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>>(p, max_tiles, stream); return;
+    default: launch_decode_gemm<S, 4>(p, items, stream); return;
+  }
+}
 // Q4N families (a new format with no bitwise contract to keep) run one FP16 activation plane: the activation's
 // FP16 rounding (~2^-11 relative) is far below the 2.5-bit weight error, and it halves the MMAs.
 template <class F>
@@ -2287,13 +2407,17 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   float* gate_up = workspace + assignments * 2 * kHidden;
   float* unscale = gate_up + assignments * 2 * kIntermediate;
   int* table = reinterpret_cast<int*>(unscale + (assignments * 3 + 3) / 4 * 4);
-  StageTimer timer(stream, kTileRows != 8);
+  StageTimer timer(stream, kTileRows != 8 || StageTimer::decode_enabled());
   // Fused INT8 operands: Q4N-X prefill families in per-row INT8 mode (4).
   bool fused_i8 = false;
   if constexpr (F::kCodebook == 4 && F::kTileRows != 8 && F::kIntermediate != 5 * 128)
     fused_i8 = prefill_one_plane<F>() == 4 && q4n_i8_fuse_enabled();
+  // INT8 decode: Q4N-X decode families with the block operand kernels.
+  bool i8_decode = false;
+  if constexpr (F::kCodebook == 4 && F::kTileRows == 8 && decode_glue_blocks<F>())
+    i8_decode = q4n_decode_i8_enabled();
   route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
-      routing, assignments, table);
+      routing, assignments, table, route_check_enabled());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   timer.mark("route");
   const int64_t max_tiles = std::min<int64_t>(
@@ -2315,7 +2439,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     if constexpr (decode_glue_blocks<F>()) {
-      if (decode_glue_enabled()) {
+      if (i8_decode) {
+        if constexpr (F::kCodebook == 4)
+          gate_up_operand_block<F, true>
+              <<<static_cast<unsigned int>(2 * assignments), 32 * (kHidden / 512),
+                 0, stream>>>(x, routing, table, operand, unscale);
+      } else if (decode_glue_enabled()) {
         gate_up_operand_block<F>
             <<<static_cast<unsigned int>(2 * assignments), 32 * (kHidden / 512),
                0, stream>>>(x, routing, table, operand, unscale);
@@ -2344,7 +2473,13 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     {
       const int64_t items = max_tiles * GateUp::kProjections * GateUp::kColBlocks;
       if constexpr (kTileRows == 8) {
-        launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
+        timer.mark("gu_operand");
+        if constexpr (F::kCodebook == 4) {
+          if (i8_decode) launch_i8_decode_gemm<GateUp, true>(p, max_tiles, items, stream);
+          else launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
+        } else {
+          launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
+        }
       } else {
         switch (prefill_one_plane<F>()) {
           case 1: launch_gemm<GateUp, 1>(p, items, stream); break;
@@ -2379,7 +2514,12 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     }
     timer.mark("gu_gemm");
     if constexpr (decode_glue_blocks<F>()) {
-      if (decode_glue_enabled()) {
+      if (i8_decode) {
+        if constexpr (F::kCodebook == 4)
+          down_operand_block<F, true>
+              <<<static_cast<unsigned int>(assignments), 32 * (kIntermediate / 128),
+                 0, stream>>>(routing, table, gate_up, operand, unscale);
+      } else if (decode_glue_enabled()) {
         down_operand_block<F>
             <<<static_cast<unsigned int>(assignments), 32 * (kIntermediate / 128),
                0, stream>>>(routing, table, gate_up, operand, unscale);
@@ -2408,7 +2548,13 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   {
     const int64_t items = max_tiles * Down::kProjections * Down::kColBlocks;
     if constexpr (kTileRows == 8) {
-      launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
+      timer.mark("down_operand");
+      if constexpr (F::kCodebook == 4) {
+        if (i8_decode) launch_i8_decode_gemm<Down, false>(p, max_tiles, items, stream);
+        else launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
+      } else {
+        launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
+      }
     } else {
       switch (prefill_one_plane<F>()) {
         case 1: launch_gemm<Down, 1>(p, items, stream); break;
@@ -2444,12 +2590,23 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   if constexpr (decode_glue_blocks<F>()) {
     if (topk == kDecodeGlueTopk && decode_glue_enabled()) {
       const int64_t tasks = rows * (kHidden / 128);
+      if (combine_wide_enabled()) {
+        combine_route<__nv_bfloat16, F, kDecodeGlueTopk>
+            <<<static_cast<unsigned int>(tasks), 32 * kDecodeGlueTopk, 0, stream>>>(
+                down_result, weights, routing, table, assignments, rows, out);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        timer.mark("combine");
+        timer.report(rows);
+        return;
+      }
       combine_block<__nv_bfloat16, F, kDecodeGlueTopk>
           <<<static_cast<unsigned int>((tasks + kOperandWarps - 1) /
                                        kOperandWarps),
              32 * kOperandWarps, 0, stream>>>(down_result, weights, routing,
                                               table, assignments, rows, out);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
+      timer.mark("combine");
+      timer.report(rows);
       return;
     }
   }
@@ -2525,6 +2682,18 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64,
 // arithmetic, the kernels and the workspace layout are run_family's; only the
 // Family (hence the GEMM shapes' rows per tile and the route tile size)
 // differs from the prefill entry.
+// Lab: VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS raises the per-call row cap of the
+// decode schedule (default kMoeDecodeTcMaxRows). The schedule keeps 8-row
+// route tiles per expert, so a wider call decodes each routed expert once per
+// 8 of its rows instead of once per 8-row slice of the call (T1 probe).
+inline int64_t decode_tc_max_rows() {
+  static const int64_t v = [] {
+    const char* e = std::getenv("VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS");
+    return e && *e ? std::max<int64_t>(kMoeDecodeTcMaxRows, std::atoll(e)) : kMoeDecodeTcMaxRows;
+  }();
+  return v;
+}
+
 template <bool kDownOnly = false>
 void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
                 const float* weights, const void* expert_map, bool map64,
@@ -2536,9 +2705,9 @@ void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
   TORCH_CHECK(
       hidden == GlmFamily::kHidden && intermediate == GlmFamily::kIntermediate,
       "EXL3 MoE decode tensor-core run of an unserved shape");
-  TORCH_CHECK(rows <= kMoeDecodeTcMaxRows,
+  TORCH_CHECK(rows <= decode_tc_max_rows(),
               "EXL3 MoE decode tensor-core schedule serves at most ",
-              kMoeDecodeTcMaxRows, " rows, not ", rows);
+              decode_tc_max_rows(), " rows, not ", rows);
   if (bits_x2 == GlmFamily::kBitsX2) {
     run_family<GlmDecodeFamily, kDownOnly>(
         x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
@@ -2821,9 +2990,9 @@ void moe_out_decode_tc(const torch::Tensor& x, const torch::Tensor& topk_ids,
   TORCH_CHECK(experts > 0 && experts <= kMoeDecodeTcMaxExperts,
               "EXL3 MoE decode needs 1..", kMoeDecodeTcMaxExperts,
               " local experts");
-  TORCH_CHECK(rows == 0 || rows <= kMoeDecodeTcMaxRows,
+  TORCH_CHECK(rows == 0 || rows <= moe_prefill::decode_tc_max_rows(),
               "EXL3 MoE decode tensor-core serves calls of at most ",
-              kMoeDecodeTcMaxRows, " rows");
+              moe_prefill::decode_tc_max_rows(), " rows");
   const int64_t required = moe_workspace_size_decode_tc(
       rows, hidden, intermediate_size, topk, experts);
   TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
