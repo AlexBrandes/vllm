@@ -96,6 +96,30 @@ upstream commit, which a source tree does not have.
 For an installed engine, build vLLM from the vLLM branch and install the
 plugin beside it with `pip install --no-deps .` from this branch.
 
+### Scheduler tests in an installed image, without a GPU
+
+The `tests/v1/core` scheduler tests are CPU tests. They run against the image's
+installed vLLM, as long as three conditions hold:
+
+- **Use the vLLM branch's test tree.** Run `git archive vllm/<base10> tests`, then
+  copy this branch's `tests/` over it. The plugin tests import upstream's
+  `tests/v1/core/utils.py` and `tests/v1/kv_connector/unit/utils.py`. A test
+  tree from another vLLM line fails with `SchedulerConfig` validation errors.
+- **Set `VLLM_TARGET_DEVICE=cpu`.** Without a visible GPU, platform detection
+  otherwise fails with "Failed to infer device type".
+- **Allow the Hugging Face config fetch.** The upstream helper builds its
+  config from `facebook/opt-125m`, so allow the network or a warm `HF_HOME`.
+
+```bash
+docker run --rm --entrypoint '' -e VLLM_TARGET_DEVICE=cpu -e HF_HOME=/hf \
+    -v "$PWD/hf:/hf" -v "$PWD/tests:/t/tests:ro" -w /t <image> bash -c \
+    'pip install -q --target /tmp/pt pytest tblib && PYTHONPATH=/tmp/pt \
+     python -m pytest -q tests/v1/core'
+```
+
+To test a patched scheduler without rebuilding, mount the changed files over
+`site-packages/vllm_cmp170hx/sched/`.
+
 ## Code shared with vllm-sm80
 
 The plugin's sm_80 code for GLM-5.3-Flash (model, layer and op overrides, the
