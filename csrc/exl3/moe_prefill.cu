@@ -31,6 +31,7 @@
 #include "moe_prefill.h"
 #include "common.h"
 #include "codec.cuh"
+#include "codec_q4n.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -945,8 +946,9 @@ struct Gemm {
 // offset 0, then the block's kBlockTiles adjacent trellis tiles of each k16
 // step at kStageW.
 template <int K, int N, int Projections, int First, int TPW, int BitsX2,
-          int TileRows>
+          int TileRows, int Codebook = 2>
 struct Shape {
+  static constexpr int kCodebook = Codebook;
   static constexpr int kTileRows = TileRows;
   static constexpr int kK = K;
   static constexpr int kN = N;
@@ -987,22 +989,22 @@ struct Staged : S {
 // family selects every kernel template instantiation; the tensor-core
 // algorithm and the arithmetic are shared.
 template <int Hidden, int Intermediate, int BitsX2, int SwigluLimit,
-          int TileRows>
+          int TileRows, int Codebook = 2>
 struct Family {
   static constexpr int kTileRows = TileRows;
   static constexpr int kHidden = Hidden;
   static constexpr int kIntermediate = Intermediate;
   static constexpr int kBitsX2 = BitsX2;
-  static constexpr int kCodebook = 2;
+  static constexpr int kCodebook = Codebook;
   static constexpr float kSwigluLimit = static_cast<float>(SwigluLimit);
-  using GateUpShape = Shape<Hidden, Intermediate, 2, 0, 1, BitsX2, TileRows>;
+  using GateUpShape = Shape<Hidden, Intermediate, 2, 0, 1, BitsX2, TileRows, Codebook>;
   // The mixed role modes compute one gate/up projection on the tensor cores in
   // its own launch (Projections 1); the MMA arithmetic per projection is the
   // GateUpShape's, so a tensor-core gate/up here is bit-for-bit the full
   // mode's.
-  using TcGateShape = Shape<Hidden, Intermediate, 1, 0, 1, BitsX2, TileRows>;
-  using TcUpShape = Shape<Hidden, Intermediate, 1, 1, 1, BitsX2, TileRows>;
-  using DownShape = Shape<Intermediate, Hidden, 1, 2, 2, BitsX2, TileRows>;
+  using TcGateShape = Shape<Hidden, Intermediate, 1, 0, 1, BitsX2, TileRows, Codebook>;
+  using TcUpShape = Shape<Hidden, Intermediate, 1, 1, 1, BitsX2, TileRows, Codebook>;
+  using DownShape = Shape<Intermediate, Hidden, 1, 2, 2, BitsX2, TileRows, Codebook>;
   static_assert(Hidden % 512 == 0, "operand and combine spans");
   static_assert(Intermediate % 128 == 0, "one H128 per 128-block");
   static_assert(Intermediate <= Hidden, "the down rows fit the operand region");
@@ -1014,6 +1016,22 @@ using Glm35Family = Family<4096, 2048, 7, 10, 64>;
 // GLM prefill families, on the small-row schedule of 8-row route tiles.
 using GlmDecodeFamily = Family<4096, 2048, 5, 10, 8>;
 using Glm35DecodeFamily = Family<4096, 2048, 7, 10, 8>;
+// Q4N (codebook 3) GLM families: the same shapes, schedules and arithmetic; only the trellis decode differs.
+using GlmQ4NFamily = Family<4096, 2048, 5, 10, 64, 3>;
+using GlmQ4NDecodeFamily = Family<4096, 2048, 5, 10, 8, 3>;
+constexpr int kGlmQ4NKey = 5 + kQ4NFormatOffset;
+// Q4N at 3.0 bpw (bits_x2 6: 12-bit steps, 24 ring words per tile).
+using GlmQ4N6Family = Family<4096, 2048, 6, 10, 64, 3>;
+using GlmQ4N6DecodeFamily = Family<4096, 2048, 6, 10, 8, 3>;
+constexpr int kGlmQ4N6Key = 6 + kQ4NFormatOffset;
+// Q4N-X (codebook 4): keys bits_x2 + 128.
+constexpr int kQ4NXFormatOffset = 128;
+using GlmQ4NXFamily = Family<4096, 2048, 5, 10, 64, 4>;
+using GlmQ4NXDecodeFamily = Family<4096, 2048, 5, 10, 8, 4>;
+using GlmQ4NX6Family = Family<4096, 2048, 6, 10, 64, 4>;
+using GlmQ4NX6DecodeFamily = Family<4096, 2048, 6, 10, 8, 4>;
+constexpr int kGlmQ4NXKey = 5 + kQ4NXFormatOffset;
+constexpr int kGlmQ4NX6Key = 6 + kQ4NXFormatOffset;
 
 template <class S>
 __device__ __forceinline__ uint32_t next_stage(uint32_t offset) {
@@ -1068,7 +1086,26 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
   // Trellis words of this lane's window in the warp's first tile of step 0.
   uint32_t w_lane[Ring::kLoadWords];
   int shift;
-  {
+  bool q4n_zero_hi = false;
+  if constexpr (S::kCodebook == 3 || S::kCodebook == 4) {
+    // Q4N: hi/lo ring words around the window start; lane 0 starts before the tile (zero prefix).
+    const int start = Q4NRing<S::kBitsX2, S::kCodebook>::start(lane);
+    const uint32_t base = smem + S::kStageW + TPW * warp * S::kTileBytes;
+    if (start < 0) {
+      q4n_zero_hi = true;
+      shift = start + 32;
+      w_lane[0] = base;
+      w_lane[1] = base;
+    } else {
+      const int w0 = start >> 5;
+      const int w1 = w0 + 1 < Q4NRing<S::kBitsX2, S::kCodebook>::kWords ? w0 + 1 : w0;
+      shift = start & 31;
+      w_lane[0] = base + 4 * w0;
+      w_lane[1] = base + 4 * w1;
+    }
+#pragma unroll
+    for (int i = 2; i < Ring::kLoadWords; ++i) w_lane[i] = w_lane[1];
+  } else {
     const LaneWindow<S::kBitsX2> window(lane);
     shift = window.shift;
 #pragma unroll
@@ -1094,14 +1131,20 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
       uint32_t a[TPW][4];
 #pragma unroll
       for (int j = 0; j < TPW; ++j) {
-        uint32_t words[Ring::kLoadWords];
+        const uint32_t tile_off =
+            read + step * (S::kBlockTiles * S::kTileBytes) + j * S::kTileBytes;
+        if constexpr (S::kCodebook == 3 || S::kCodebook == 4) {
+          const uint32_t lo = lds32(w_lane[1] + tile_off);
+          const uint32_t hi = q4n_zero_hi ? 0u : lds32(w_lane[0] + tile_off);
+          q4n_fragment<S::kBitsX2, S::kCodebook>(hi, lo, shift, a[j]);
+        } else {
+          uint32_t words[Ring::kLoadWords];
 #pragma unroll
-        for (int i = 0; i < Ring::kLoadWords; ++i) {
-          words[i] =
-              lds32(w_lane[i] + read + step * (S::kBlockTiles * S::kTileBytes) +
-                    j * S::kTileBytes);
+          for (int i = 0; i < Ring::kLoadWords; ++i) {
+            words[i] = lds32(w_lane[i] + tile_off);
+          }
+          decode_fragment<S::kBitsX2>(words, shift, a[j]);
         }
-        decode_fragment<S::kBitsX2>(words, shift, a[j]);
       }
       const uint32_t bsrc = b_lane + read + ((x ^ (2 * step)) * 16);
       uint32_t b[2][4];
@@ -1155,7 +1198,8 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
         const int r = 8 * g + 2 * t + c;
         if (r < rows) {
           const int64_t pos = first + r;
-          const float scale = p.unscale[pos * 3 + S::kFirst + pi];
+          float scale = p.unscale[pos * 3 + S::kFirst + pi];
+          if constexpr (S::kCodebook >= 3) scale = __fmul_rn(scale, kQ4NAlpha);
           int64_t row = pos;
           if constexpr (S::kProjections == 1 && S::kFirst < 2)
             row = p.row_map[pos];
@@ -1478,7 +1522,9 @@ int64_t workspace_elements(int64_t assignments, int64_t hidden,
 // "1": one plane; "pair": both planes as independent MMAs. Returns kPlanes.
 template <class F>
 int prefill_one_plane() {
-  if constexpr (F::kTileRows <= 8) {
+  if constexpr (F::kCodebook >= 3) {
+    return 1;
+  } else if constexpr (F::kTileRows <= 8) {
     return 0;
   } else {
     static const int mode = [] {
@@ -1531,15 +1577,19 @@ inline int decode_gemm_stages() {
   }();
   return stages;
 }
-template <class S>
+template <class S, int kPlanes = 0>
 void launch_decode_gemm(const Gemm& p, int64_t items, cudaStream_t stream) {
   switch (decode_gemm_stages()) {
-    case 4: launch_gemm<Staged<S, 4>>(p, items, stream); break;
-    case 6: launch_gemm<Staged<S, 6>>(p, items, stream); break;
-    case 8: launch_gemm<Staged<S, 8>>(p, items, stream); break;
-    default: launch_gemm<S>(p, items, stream); break;
+    case 4: launch_gemm<Staged<S, 4>, kPlanes>(p, items, stream); break;
+    case 6: launch_gemm<Staged<S, 6>, kPlanes>(p, items, stream); break;
+    case 8: launch_gemm<Staged<S, 8>, kPlanes>(p, items, stream); break;
+    default: launch_gemm<S, kPlanes>(p, items, stream); break;
   }
 }
+// Q4N families (a new format with no bitwise contract to keep) run one FP16 activation plane: the activation's
+// FP16 rounding (~2^-11 relative) is far below the 2.5-bit weight error, and it halves the MMAs.
+template <class F>
+constexpr int q4n_planes() { return F::kCodebook >= 3 ? 1 : 0; }
 
 template <class F, bool kDownOnly = false>
 void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
@@ -1602,7 +1652,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     {
       const int64_t items = max_tiles * GateUp::kProjections * GateUp::kColBlocks;
       if constexpr (kTileRows == 8) {
-        launch_decode_gemm<GateUp>(p, items, stream);
+        launch_decode_gemm<GateUp, q4n_planes<F>()>(p, items, stream);
       } else {
         switch (prefill_one_plane<F>()) {
           case 1: launch_gemm<GateUp, 1>(p, items, stream); break;
@@ -1631,7 +1681,7 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   {
     const int64_t items = max_tiles * Down::kProjections * Down::kColBlocks;
     if constexpr (kTileRows == 8) {
-      launch_decode_gemm<Down>(p, items, stream);
+      launch_decode_gemm<Down, q4n_planes<F>()>(p, items, stream);
     } else {
       switch (prefill_one_plane<F>()) {
         case 1: launch_gemm<Down, 1>(p, items, stream); break;
@@ -1677,6 +1727,28 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64,
                             rows, topk, out, workspace, stream);
       return;
     }
+    if (bits_x2 == kGlmQ4NKey) {
+      run_family<GlmQ4NFamily>(x, ids, ids64, weights, expert_map, map64,
+                               global_experts, pointers, metadata, local_experts,
+                               rows, topk, out, workspace, stream);
+      return;
+    }
+    if (bits_x2 == kGlmQ4N6Key) {
+      run_family<GlmQ4N6Family>(x, ids, ids64, weights, expert_map, map64,
+                                global_experts, pointers, metadata, local_experts,
+                                rows, topk, out, workspace, stream);
+      return;
+    }
+    if (bits_x2 == kGlmQ4NXKey) {
+      run_family<GlmQ4NXFamily>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                local_experts, rows, topk, out, workspace, stream);
+      return;
+    }
+    if (bits_x2 == kGlmQ4NX6Key) {
+      run_family<GlmQ4NX6Family>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                 local_experts, rows, topk, out, workspace, stream);
+      return;
+    }
     TORCH_CHECK(
         bits_x2 == Glm35Family::kBitsX2,
         "EXL3 MoE prefill runs the GLM 5-bit or 3.5-bit family, not bits_x2 ",
@@ -1718,6 +1790,34 @@ void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
         x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
         metadata, local_experts, rows, topk, out, workspace, stream,
         activated_down);
+    return;
+  }
+  if (bits_x2 == kGlmQ4NKey) {
+    // Q4N serves the full tensor-core mode only: the mixed role modes run a scalar mul1 decode.
+    TORCH_CHECK(!kDownOnly && activated_down == nullptr,
+                "EXL3 Q4N MoE decode serves the full tensor-core mode only");
+    run_family<GlmQ4NDecodeFamily, false>(
+        x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+        metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    return;
+  }
+  if (bits_x2 == kGlmQ4N6Key) {
+    TORCH_CHECK(!kDownOnly && activated_down == nullptr,
+                "EXL3 Q4N MoE decode serves the full tensor-core mode only");
+    run_family<GlmQ4N6DecodeFamily, false>(
+        x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+        metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    return;
+  }
+  if (bits_x2 == kGlmQ4NXKey || bits_x2 == kGlmQ4NX6Key) {
+    TORCH_CHECK(!kDownOnly && activated_down == nullptr,
+                "EXL3 Q4N MoE decode serves the full tensor-core mode only");
+    if (bits_x2 == kGlmQ4NXKey)
+      run_family<GlmQ4NXDecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                             metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    else
+      run_family<GlmQ4NX6DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                              metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
     return;
   }
   TORCH_CHECK(
