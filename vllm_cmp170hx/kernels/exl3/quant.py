@@ -501,6 +501,7 @@ class Exl3LinearMethod(LinearMethodBase):
         from vllm_cmp170hx.kernels.exl3 import ops as exl3_ops
 
         self.row_chunks = []
+        self._fuse_w8(layer)
         for weight in layer.exl3_weights:
             if not weight.loaded:
                 raise ValueError(f"Unloaded EXL3 matrix: {weight.matrix.prefix}")
@@ -523,6 +524,36 @@ class Exl3LinearMethod(LinearMethodBase):
             self.row_chunks.append(
                 exl3_ops.linear_row_chunk(weight.padded_in, weight.padded_out)
             )
+
+    @staticmethod
+    def _fuse_w8(layer):
+        """Lab: merge a layer's sidecar matrices that share one input rotation (same suh, same K) into
+        one matrix, so a merged layer (gate/up, q_a/kv_a) runs one H128 + quant and one GEMM. The
+        output is the concatenation apply() would build. Only sidecars built with --share-suh have
+        equal sign vectors; with per-matrix EXL3 signs nothing is merged (VLLM_EXL3_DENSE_W8_FUSE=0
+        disables it)."""
+        import os
+
+        weights = list(layer.exl3_weights)
+        if (
+            os.environ.get("VLLM_EXL3_DENSE_W8_FUSE", "1") != "1"
+            or len(weights) < 2
+            or not all(w.loaded and w.w8_mode and w.matrix.prefix != "lm_head" for w in weights)
+            or len({w.padded_in for w in weights}) != 1
+            or not all(torch.equal(w.suh.data, weights[0].suh.data) for w in weights[1:])
+        ):
+            return
+        first = weights[0]
+        first.w8 = nn.Parameter(torch.cat([w.w8.data for w in weights], 0), requires_grad=False)
+        first.sw = nn.Parameter(torch.cat([w.sw.data for w in weights], 0), requires_grad=False)
+        first.logical_out = sum(w.logical_out for w in weights)
+        first.padded_out = first.logical_out
+        layer.exl3_weights = nn.ModuleList([first])
+        logger.info_once(
+            "EXL3 dense sidecar: fusing shared-input matrices (e.g. %s)",
+            " + ".join(w.matrix.prefix for w in weights),
+            scope="process",
+        )
 
     def apply(self, layer, x, bias=None):
         shape = x.shape[:-1]
