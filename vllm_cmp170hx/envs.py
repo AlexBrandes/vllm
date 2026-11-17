@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_AMPERE_DECODE_KERNELS: bool = False
     VLLM_GLM5_DECODE_MOE_ROUTING: bool = True
     VLLM_GLM5_DECODE_MHC_V2: bool = False
+    VLLM_SM80_MHC_DECODE: bool = False
     VLLM_MOE_DECODE_ROUTE_V2: bool = False
     VLLM_AMPERE_KDA_FOLD: bool = False
     VLLM_AMPERE_KDA_RECOVER_OFF: bool = False
@@ -348,6 +349,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # VLLM_AMPERE_DECODE_KERNELS=1 as well.
     "VLLM_GLM5_DECODE_MHC_V2": lambda: bool(
         int(os.getenv("VLLM_GLM5_DECODE_MHC_V2", "0"))
+    ),
+    # Lab: mHC decode v3 on its own, without VLLM_AMPERE_DECODE_KERNELS (which
+    # also switches the KDA decode and MoE routing kernels). v3 takes the mixes
+    # and the squared sum from the stored bf16 stream, as the serving TileLang
+    # path does (round_mix; vllm_cmp170hx/kernels/mhc/decode.py).
+    "VLLM_SM80_MHC_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM80_MHC_DECODE", "0"))
     ),
     # Opt in to vllm_cmp170hx/kernels/moe/route.py: the MoE router GEMV, the
     # sigmoid/bias top-k and the Marlin block alignment as one op (one launch

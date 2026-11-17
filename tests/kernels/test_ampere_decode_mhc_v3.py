@@ -13,8 +13,10 @@ every kernel
 specialisation compiles for sm_80.
 GPU (sm_80, skipped otherwise): error against an FP64 recomputation no worse
 than TileLang's (summed mean <= 1.2x, max <= 1.25x on post_mix and comb_mix;
-layer_input max within one bf16 ulp or 1.25x of TileLang's) with residual_cur
-bitwise equal to TileLang's; bitwise run-to-run; a closed gate never reaches
+layer_input max within one bf16 ulp or 1.25x of TileLang's), with the mixes
+taken from the stored bf16 stream as the serving TileLang path does, and
+residual_cur within 2 bf16 ulps of TileLang's on <= 1e-4 of the elements (the
+2026-11 serving TileLang forms it in a different FMA order); bitwise run-to-run; a closed gate never reaches
 v3; CUDA-graph replay == eager with zero allocation growth.
 Inputs are generated on the CPU (CUDA randn depends on the SM count).
 """
@@ -42,6 +44,7 @@ def clean(monkeypatch):
     from vllm_cmp170hx.kernels import _platform
 
     monkeypatch.delenv("VLLM_GLM5_DECODE_MHC_V2", raising=False)
+    monkeypatch.delenv("VLLM_SM80_MHC_DECODE", raising=False)
     use_rows(monkeypatch)
     monkeypatch.setattr(_platform, "_SM80_CACHE", True)
 
@@ -67,6 +70,13 @@ def test_gate_needs_master_flag(monkeypatch):
     _on(monkeypatch)
     monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "0")
     assert _gate(4) is False
+
+
+def test_standalone_switch_opens_the_gate_alone(monkeypatch):
+    monkeypatch.setenv("VLLM_AMPERE_DECODE_KERNELS", "0")
+    monkeypatch.setenv("VLLM_SM80_MHC_DECODE", "1")
+    assert _gate(4) is True
+    assert _gate(33) is False
 
 
 def test_gate_range_is_1_to_32(monkeypatch):
@@ -265,8 +275,9 @@ def _kw(c):
 
 
 def _ref64(c):
-    """FP64 op with the two bf16 rounding points (mixes from fp32 rc, collapse
-    from bf16 rc; RMSNorm sumsq of fp32 o, scale on bf16(o))."""
+    """FP64 op with the bf16 rounding points of the serving path (mixes and
+    their squared sum from bf16 rc, collapse from bf16 rc; RMSNorm sumsq of fp32
+    o, scale on bf16(o))."""
     d = torch.float64
     x, res = c["x"].to(d), c["residual"].to(d)
     post = c["post_layer_mix"].reshape(-1, HC).to(d)
@@ -275,7 +286,7 @@ def _ref64(c):
     M = x.shape[0]
     rc = torch.einsum("mkj,mkh->mjh", comb, res) + post[:, :, None] * x[:, None, :]
     rcb = rc.to(torch.bfloat16)
-    flat = rc.reshape(M, -1)
+    flat = rcb.to(d).reshape(M, -1)
     mixes = (flat @ fn.t()) * torch.rsqrt(flat.square().sum(-1, keepdim=True)
                                           / flat.shape[1] + RMS_EPS)
     pre = torch.sigmoid(mixes[:, :HC] * sc[0] + base[:HC]) + EPS
@@ -328,7 +339,8 @@ def test_gpu_accuracy_vs_tilelang_no_floor(monkeypatch):
                 b = tlmod.mhc_fused_post_pre_tilelang(**kw)
                 torch.cuda.synchronize()
                 assert all(torch.equal(p, q) for p, q in zip(a, a2)), (M, "run-to-run")
-                assert torch.equal(a[0], b[0]), (M, "residual_cur")
+                assert _bf16_ulps(a[0], b[0]) <= 2.0, (M, "residual_cur ulps")
+                assert float((a[0] != b[0]).float().mean()) <= 1e-4, (M, "residual_cur")
                 ref = _ref64(c)
                 for i in (1, 2, 3):
                     g_max, g_mean = _err(a[i], ref[i])

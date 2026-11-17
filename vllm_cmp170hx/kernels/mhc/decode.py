@@ -38,7 +38,9 @@ the faster of the v1 kernel and TileLang at each M:
 NO PRECISION REDUCTION. bf16 in / fp32 accumulate / bf16 out, fp32 `fn`. On
 real activations every output is as close to an FP64 recomputation as the
 TileLang kernel's (mean and max error within ~1.05x of it at M = 4..25), and
-`residual_cur` is bitwise equal to TileLang's. Three things make that true:
+`residual_cur` was bitwise equal to the TileLang kernel it was written against (against the
+TileLang in the 2026-11 serving image: within 2 bf16 ulps on 0.002 % of elements, equally close
+to FP64). Three things make that true:
   * the prenorm GEMM on the tensor cores is split into three TF32 terms
     (hi*hi + hi*lo + lo*hi), and the big hi*hi term is accumulated OUTSIDE the
     tensor core, one fresh mma per 8-wide k block added into fp32 registers.
@@ -54,17 +56,24 @@ TileLang kernel's (mean and max error within ~1.05x of it at M = 4..25), and
     last one's are not), and the sigmoids use a Newton-refined reciprocal.
 Gated as before on bitwise determinism and CUDA-graph capture. The two bf16
 rounding points of the op are kept exactly:
-  * `mixes` and `sqrsum` are accumulated from the pre-rounding fp32
-    `residual_cur`, while the collapse reads the stored bf16 `residual_cur`;
+  * `mixes` and `sqrsum` are accumulated from the stored bf16
+    `residual_cur` (round_mix, default since 2026-11-14 to match the serving
+    TileLang path; VLLM_SM80_MHC_DECODE_ROUND_MIX=0 gives the original
+    pre-rounding fp32 statistics), and the collapse reads the stored bf16
+    `residual_cur`;
   * the RMSNorm squared sum is taken from the fp32 collapse and the scale is
     applied to its bf16 rounding.
 """
+
+import os
 
 import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
+
+_ROUND_MIX = os.environ.get("VLLM_SM80_MHC_DECODE_ROUND_MIX", "1") == "1"
 
 
 # --------------------------------------------------------------------------
@@ -920,7 +929,11 @@ def mhc_fused_post_pre(
     comb_out = torch.empty(M, hc * hc, dtype=torch.float32, device=dev)
     li = torch.empty(M, hidden, dtype=torch.bfloat16, device=dev)
 
-    post_prenorm(xf, res, pf, cf, fnf, rc, mix, sqr)
+    # The mixes and the squared sum come from the stored bf16 stream, as in the
+    # serving TileLang path (whose statistics read the rounded residual since
+    # the stored-residual fix); VLLM_SM80_MHC_DECODE_ROUND_MIX=0 restores v3's
+    # original fp32-stream statistics.
+    post_prenorm(xf, res, pf, cf, fnf, rc, mix, sqr, round_mix=_ROUND_MIX)
     _glu_finish_kernel[(M, 2)](
         mix, sqr, hc_scale, hc_base, rc, nw, post_out, comb_out, li, M,
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, norm_eps,
