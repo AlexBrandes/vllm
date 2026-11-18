@@ -1055,6 +1055,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_v2_rows, workspace = self._moe_v2(layer, metadata, max_rows, workspace)
         prefill_decode_len = 0
         prefill_max_rows = None
+        prefill_bits_x2 = 0
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace, prefill_bits_x2 = self._moe_prefill(
                 layer, metadata, max_rows, workspace
