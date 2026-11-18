@@ -1,6 +1,6 @@
 # GLM-5.3-Flash EXL3 on two CMP 170HX cards
 
-GLM-5.3-Flash as a 2.6 bpw EXL3 checkpoint whose routed experts use the Q4N-X
+GLM-5.3-Flash as a 2.6 bpw EXL3 checkpoint whose routed experts use the Q4NX
 codebook, with INT8 dense weights, pipeline parallelism across two cards, the
 DFlash2 drafter at three draft tokens, and text, image and video input. The
 runnable recipe lives in
@@ -20,7 +20,7 @@ This page pins that release rather than duplicating its scripts.
 ```bash
 git clone https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3.git
 cd cmp170hx-glm53-flash-exl3
-git checkout --detach ecdcaa550e61195f00e04ddacb29cfe82d7759a3
+git checkout --detach c6590e105e0a62f033ccc6808b549af6d022eba3
 ./download.sh
 ./start.sh
 ```
@@ -42,13 +42,13 @@ curl --fail http://127.0.0.1:8000/v1/chat/completions \
 
 Stop only the recipe's container with `./stop.sh` from that checkout.
 For settings, reasoning, tool calls, and the chat template, use the
-[pinned recipe README](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/ecdcaa550e61195f00e04ddacb29cfe82d7759a3/README.md).
+[pinned recipe README](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/c6590e105e0a62f033ccc6808b549af6d022eba3/README.md).
 
 ## Release identity
 
 | Component | Pin |
 | --- | --- |
-| Recipe | `ecdcaa550e61195f00e04ddacb29cfe82d7759a3` |
+| Recipe | `c6590e105e0a62f033ccc6808b549af6d022eba3` |
 | Upstream vLLM | wheel for `a0d7356b98e929c17051bac44f5a086e4117974d` |
 | vLLM branch | `vllm/a0d7356b98` at `ea2ef399a614ea72b65b15804000342f629a850f` |
 | Plugin | `plugin` at `ff413b2df19718342e02d9763f161d69afce7b4a` |
@@ -59,8 +59,8 @@ For settings, reasoning, tool calls, and the chat template, use the
 | Context / concurrency | 225,280 tokens / up to 4 sequences |
 | Speculation / graphs | DFlash, 3 draft tokens / FULL_DECODE_ONLY |
 
-The [public results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/ecdcaa550e61195f00e04ddacb29cfe82d7759a3/results/q4nx-2.6bpw.json)
-and [benchmark tables](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/tree/ecdcaa550e61195f00e04ddacb29cfe82d7759a3#benchmarks)
+The [public results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/c6590e105e0a62f033ccc6808b549af6d022eba3/results/q4nx-2.6bpw.json)
+and [benchmark tables](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/tree/c6590e105e0a62f033ccc6808b549af6d022eba3#benchmarks)
 cover one public-v1 run, KL divergence and perplexity against the BF16 and FP8
 releases, GSM8K, IFEval, and image and video input, each beside the previous
 release (turboderp's EXL3 checkpoint).
@@ -68,7 +68,7 @@ release (turboderp's EXL3 checkpoint).
 ## Credits and licenses
 
 The engine is Apache-2.0; the standalone recipe is MIT, and the checkpoint and
-drafter have their own licenses. Its [NOTICE](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/ecdcaa550e61195f00e04ddacb29cfe82d7759a3/NOTICE)
+drafter have their own licenses. Its [NOTICE](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/c6590e105e0a62f033ccc6808b549af6d022eba3/NOTICE)
 credits turboderp's ExLlamaV3, Morrowmake's vllm-sm80, Z.AI, incoai and the
 benchmark authors. See the [fork credits](../../README.md#credits) for CMPUnlocker,
 Morrowmake, PixelML, and the wider CMP community.
