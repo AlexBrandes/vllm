@@ -147,3 +147,29 @@ def test_cmp_pp3_plan_for_the_real_config(monkeypatch):
     # A partition on the group boundaries needs no shadow at all.
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "14,6,20")
     assert all(not p.shadows for p in stage_plans(config, 3))
+
+
+def test_shadow_inputs_are_relayed_through_middle_stages(monkeypatch):
+    """A source two stages before its last consumer travels through the
+    middle stage, which relays it (and here also shadows it itself)."""
+    from types import SimpleNamespace
+
+    from vllm_cmp170hx.models.deepseek_v41.sm80_pp_shadow import stage_plans
+
+    config = SimpleNamespace(
+        num_hidden_layers=40,
+        compress_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0],
+        kv_source_layer_ids=[2, 8, 14, 20],
+        index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+        candidate_source_layer_id=20,
+    )
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "21,1,1,17")
+    plans = stage_plans(config, 4)
+    assert [p.shadows for p in plans] == [(), (20,), (20,), (20,)]
+    assert [p.capture for p in plans] == [(20,), (), (), ()]
+    assert [p.send for p in plans] == [(20,), (20,), (20,), ()]
+    assert [p.receive for p in plans] == [(), (20,), (20,), (20,)]
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,10,10,10")
+    plans = stage_plans(config, 4)
+    assert [p.shadows for p in plans] == [(), (8,), (), (20, 28)]
+    assert [p.send for p in plans] == [(8,), (), (20, 28), ()]
