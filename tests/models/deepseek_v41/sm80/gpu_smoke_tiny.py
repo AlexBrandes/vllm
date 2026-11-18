@@ -33,6 +33,12 @@ def build(out: Path, tokenizer_dir: Path) -> None:
     # The real vocabulary (embedding 129280 x 512): chat prompts and image
     # sentinels from the real tokenizer stay in range.
     config["text_config"]["vocab_size"] = 129280
+    # The served attention geometry per GPU at TP=1 (pipeline stages): 64 query
+    # heads in 8 output groups and the 32-head indexer, not the fixture's
+    # TP4-sized 16 heads (the sm_80 fused decode is validated for 16 local
+    # heads only; TP=1 takes the generic kernels).
+    config["text_config"]["num_attention_heads"] = 64
+    config["text_config"]["index_n_heads"] = 32
     tables = out / "engram-tables"
     config["engram_table_dir"] = str(tables)
     if out.exists():
