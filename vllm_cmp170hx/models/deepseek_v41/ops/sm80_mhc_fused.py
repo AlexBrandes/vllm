@@ -87,7 +87,13 @@ from vllm_cmp170hx.plugin import register_fork_env_vars
 
 register_fork_env_vars()  # read at import below
 
-__all__ = ["mhc_fused_post_pre_delayed", "mhc_post", "mhc_pre_delayed", "supports"]
+__all__ = [
+    "mhc_fused_post_pre_delayed",
+    "mhc_post",
+    "mhc_post_streams",
+    "mhc_pre_delayed",
+    "supports",
+]
 
 HC = 4
 NOUT = (2 + HC) * HC
@@ -507,6 +513,57 @@ def _delayed(
     else:
         finish(PART_BOTH)
     return streams, post, comb, layer_input, next_pre
+
+
+_ZERO_FN: dict = {}
+
+
+def mhc_post_streams(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Kernel A's post alone: the BF16 streams :func:`mhc_fused_post_pre_delayed`
+    hands the next layer, bit for bit. For a pipeline stage's last layer,
+    whose successor's fused post+pre runs on the next stage: the next stage
+    then starts from the same streams as one stage holding both layers (the
+    torch ``mhc_post`` rounds differently). The projection partials kernel A
+    also computes are discarded (zero ``fn``)."""
+    if residual.dim() != 3:
+        raise ValueError(f"streams must be [tokens, hc, hidden], got {tuple(residual.shape)}")
+    T, hc, hidden = residual.shape
+    reason = supports(hc, hidden)
+    if reason is not None:
+        raise ValueError(f"fused mHC post: {reason}")
+    assert x.dtype == torch.bfloat16 and x.shape == (T, hidden), (x.dtype, x.shape)
+    assert post_layer_mix.dtype == torch.float32 and comb_res_mix.dtype == torch.float32
+    # deferred coefficients of the previous call, before kernel A reads them
+    sm80_mhc_side.flush()
+    res = residual.contiguous()
+    rc = torch.empty_like(res)
+    if T == 0:
+        return rc
+    key = (hc * hidden, res.device)
+    fn = _ZERO_FN.get(key)
+    if fn is None:
+        fn = _ZERO_FN[key] = torch.zeros(NOUT, hc * hidden, dtype=torch.float32, device=res.device)
+    ksb = hidden // HB_GLU
+    mix = torch.empty(ksb, T, NOUT, dtype=torch.float32, device=res.device)
+    sqr = torch.empty(ksb, T, dtype=torch.float32, device=res.device)
+    post_prenorm(
+        x.contiguous(),
+        res,
+        post_layer_mix.reshape(T, hc).contiguous(),
+        comb_res_mix.reshape(T, hc, hc).contiguous(),
+        fn,
+        rc,
+        mix,
+        sqr,
+        round_mix=True,
+        fp64_acc=True,
+    )
+    return rc
 
 
 def mhc_pre_delayed(

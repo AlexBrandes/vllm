@@ -49,6 +49,7 @@ from itertools import islice
 import torch
 
 import vllm.envs as envs
+from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -493,7 +494,14 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
         full_num_tokens: int,
     ) -> torch.Tensor:
         assert isinstance(hidden_states, torch.Tensor)
-        hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
+        ops = getattr(self.layers[self.end_layer - 1], "_mhc_ops", None)
+        if hasattr(ops, "mhc_post_streams") and not get_pp_group().is_last_rank:
+            # A pipeline stage's end: the next stage's first layer would have
+            # run this post inside its fused post+pre; kernel A's post gives
+            # the streams that call computes (bitwise PP == PP1).
+            hidden_states = ops.mhc_post_streams(hidden_states, residual, post_mix, res_mix)
+        else:
+            hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_by_layer[self.end_layer] = hidden_states.mean(dim=1)
         return hidden_states
