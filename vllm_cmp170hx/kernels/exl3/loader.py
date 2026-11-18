@@ -46,7 +46,12 @@ def _verify_pipeline_parallel(
     ) and (multimodal is None or multimodal.language_model_only)
     glm5_next = model_type in ("glm5_next", "glm5_next_text", "glm5_next_mtp")
     text_type = getattr(model_config.hf_text_config, "model_type", "")
-    if model_type == "deepseek_v41" or text_type in ("deepseek_v41", "deepseek_v41_text"):
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    if (
+        model_type == "deepseek_v41"
+        or text_type in ("deepseek_v41", "deepseek_v41_text")
+        or "DSparkV41DraftModel" in architectures
+    ):
         # DeepSeek-V4.1: pipeline stages of whole decoder layers at TP=1
         # (VLLM_PP_LAYER_PARTITION, e.g. 16,9,15 on cards 1, 4, 2).
         if parallel_config.tensor_parallel_size != 1:
