@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     LinearBase,
     LinearMethodBase,
     QKVParallelLinear,
@@ -346,6 +347,13 @@ class Exl3Config(QuantizationConfig):
             groups = self.grouped_constituents(prefix)
             if groups and isinstance(layer, LinearBase):
                 return Exl3GroupedLinearMethod(groups)
+            if (
+                self.is_dsv41
+                and isinstance(layer, (ReplicatedLinear, ColumnParallelLinear))
+                and _tp_world_size() == 1
+                and _dense_w8_covers(self.source_prefix(prefix))
+            ):
+                return W8SidecarLinearMethod(self.source_prefix(prefix))
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
         return None
@@ -693,6 +701,73 @@ class Exl3LinearMethod(LinearMethodBase):
             weight.logical_out,
             row_chunk,
         )
+
+
+def _tp_world_size() -> int:
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    return get_tensor_model_parallel_world_size()
+
+
+def _dense_w8_covers(prefix: str) -> bool:
+    from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+    return dense_w8.covers(prefix)
+
+
+class W8SidecarLinearMethod(LinearMethodBase):
+    """An unsharded linear the EXL3 checkpoint keeps unquantized (DeepSeek-V4.1
+    ``layers.{1,14}.engram.wkv``: the converter builds the Engram projection
+    without a quantization map) but the dense W8 sidecar covers: it runs
+    W8A8 from the sidecar like the EXL3-covered matrices
+    (``torch.ops.vllm.exl3_w8_linear``). The checkpoint's BF16 ``.weight``
+    is left unused (EXL3 loader), so the layer holds only the INT8 copy."""
+
+    def __init__(self, source: str):
+        self.source = source
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+        n, k = sum(output_partition_sizes), input_size_per_partition
+        shape = tuple(dense_w8._open().get_slice(f"{self.source}.w8").get_shape())
+        if shape != (n, k):
+            raise ValueError(
+                f"EXL3 dense W8 sidecar shape {shape} != {(n, k)} for {self.source}"
+            )
+        layer.w8 = nn.Parameter(torch.empty(n, k, dtype=torch.int8), requires_grad=False)
+        layer.sw = nn.Parameter(torch.empty(n, dtype=torch.float32), requires_grad=False)
+        layer.suh = nn.Parameter(torch.empty(k, dtype=torch.float16), requires_grad=False)
+        layer.w8_sidecar_source = self.source
+
+    def load_sidecar(self, layer) -> None:
+        from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+        layer.w8.data.copy_(dense_w8.tensor(self.source, "w8"))
+        layer.sw.data.copy_(dense_w8.tensor(self.source, "sw"))
+        layer.suh.data.copy_(dense_w8.tensor(self.source, "suh"))
+
+    def process_weights_after_loading(self, layer):
+        from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+        dense_w8.load_libs()
+
+    def apply(self, layer, x, bias=None):
+        shape = x.shape[:-1]
+        x = x.reshape(-1, x.shape[-1]).contiguous()
+        out = torch.ops.vllm.exl3_w8_linear(x, layer.w8, layer.sw, layer.suh)
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*shape, out.shape[-1])
 
 
 def _dense_w8_head(prefix: str) -> bool:

@@ -166,3 +166,55 @@ def test_drafter_stages_write_their_own_context_kv(
     assert len(stores) == len(model.layers)
     for (attn, slot), layer, expected in zip(stores, model.layers, slots):
         assert attn is layer.attn and slot is expected
+
+
+def test_plain_engram_wkv_served_from_the_w8_sidecar(
+    monkeypatch, meta_platform, tmp_path  # noqa: F811
+):
+    """Our converter keeps ``engram.wkv`` unquantized (BF16 ``.weight``).
+    With a dense W8 sidecar that covers it, the layer takes
+    W8SidecarLinearMethod: the INT8 matrix loads from the sidecar and the
+    checkpoint's BF16 copy is left unused."""
+    from safetensors.torch import save_file
+
+    from vllm_cmp170hx import plugin
+    from vllm_cmp170hx.kernels.exl3 import dense_w8
+    from vllm_cmp170hx.kernels.exl3.quant import W8SidecarLinearMethod
+
+    plugin._register_exl3()
+    config = fixture.tiny_config()
+    text = config["text_config"]
+    hc = text["hc_mult"]
+    n, k = text["hidden_size"] * (hc + 1), (
+        (text["engram_max_ngram_size"] - 1) * text["engram_n_heads"] * text["engram_head_dim"]
+    )
+    checkpoint = tmp_path / "ckpt"
+    real = fixture.checkpoint_tensors
+
+    def plain_engram(cfg):
+        tensors = {n_: v for n_, v in real(cfg).items() if ".engram.wkv." not in n_}
+        for layer in cfg["text_config"]["engram_layer_ids"]:
+            tensors[f"layers.{layer}.engram.wkv.weight"] = ("BF16", (n, k))
+        return tensors
+
+    monkeypatch.setattr(fixture, "checkpoint_tensors", plain_engram)
+    fixture.write_checkpoint(checkpoint, config)
+    sidecar = {}
+    for layer in text["engram_layer_ids"]:
+        p = f"layers.{layer}.engram.wkv"
+        sidecar[f"{p}.w8"] = torch.full((n, k), 3, dtype=torch.int8)
+        sidecar[f"{p}.sw"] = torch.full((n,), 0.5, dtype=torch.float32)
+        sidecar[f"{p}.suh"] = torch.ones(k, dtype=torch.float16)
+    save_file(sidecar, str(tmp_path / "dense.safetensors"))
+    monkeypatch.setattr(dense_w8, "PATH", str(tmp_path / "dense.safetensors"))
+    monkeypatch.setattr(dense_w8, "_file", None)
+    construct.set_groups(monkeypatch, 1, 0)
+    construct.stub_engram_tables(monkeypatch, 1)
+    target_config, _ = construct.vllm_configs(str(checkpoint), 1)
+    target = construct.build_model(target_config)
+    wkv = [m for name, m in target.named_modules() if name.endswith("engram.wkv")]
+    assert wkv and all(isinstance(m.quant_method, W8SidecarLinearMethod) for m in wkv)
+    entries = _load(monkeypatch, target, target_config)
+    for layer in text["engram_layer_ids"]:
+        assert entries[f"layers.{layer}.engram.wkv.weight"][0] == "unused"
+    assert all(int(m.w8[0, 0]) == 3 and float(m.sw[0]) == 0.5 for m in wkv)

@@ -19,6 +19,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm_cmp170hx.kernels.exl3.quant import (
+    W8SidecarLinearMethod,
     Exl3Config,
     Exl3LinearMethod,
     Exl3MoEMethod,
@@ -319,6 +320,15 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
                         loaded.add(f"{name}.bias")
                     elif getattr(module, "bias", None) is not None:
                         raise ValueError(f"Missing EXL3 bias: {bias_key}")
+                loaded.update(f"{name}.{key}" for key, _ in module.named_parameters())
+            elif isinstance(method, W8SidecarLinearMethod):
+                # The checkpoint's unquantized copy stays unused; the layer
+                # serves the dense W8 sidecar's INT8 matrix.
+                method.load_sidecar(module)
+                source = method.source
+                for key in (f"{source}.weight",):
+                    if key in manifest.tensors and key not in ledger.entries:
+                        ledger.mark(key, "unused", "served by the dense W8 sidecar")
                 loaded.update(f"{name}.{key}" for key, _ in module.named_parameters())
             elif isinstance(method, Exl3MoEMethod):
                 for key in method.nonlocal_keys:

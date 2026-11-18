@@ -48,6 +48,18 @@ def _write_sparse(directory: Path, config: dict, routed_25: set[int]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(config))
     tensors = fixture.checkpoint_tensors(config)
+    # Our exllamav3 fork keeps the Engram projection unquantized (no qmap):
+    # a BF16 ``engram.wkv.weight`` instead of an EXL3 matrix.
+    for name in [n for n in tensors if ".engram.wkv." in n]:
+        del tensors[name]
+    text = config["text_config"]
+    hc = text["hc_mult"]
+    n_hash = (text["engram_max_ngram_size"] - 1) * text["engram_n_heads"]
+    for layer in text["engram_layer_ids"]:
+        tensors[f"layers.{layer}.engram.wkv.weight"] = (
+            "BF16",
+            (text["hidden_size"] * (hc + 1), n_hash * text["engram_head_dim"]),
+        )
     header, offset = {}, 0
     for name, (dtype, shape) in sorted(tensors.items()):
         if ".ffn.experts." in name and name.endswith(".trellis"):
@@ -158,6 +170,13 @@ def test_real_shape_stage_bytes(monkeypatch, meta_platform):  # noqa: F811
                         / 1e9, 3,
                     ),
                     "by_kind_gb": _by_kind(target),
+                    "engram_wkv": sorted(
+                        {
+                            type(m.quant_method).__name__
+                            for n, m in target.named_modules()
+                            if n.endswith("engram.wkv")
+                        }
+                    ),
                 }
             ),
             flush=True,
