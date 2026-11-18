@@ -116,11 +116,22 @@ def run(
     t0 = time.time()
     outs = llm.generate(prompts, params)
     gen = time.time() - t0
+    # The same requests again, and the long prompt alone (another batch
+    # composition): greedy tokens must repeat.
+    again = llm.generate(prompts, params)
+    alone = llm.generate([prompts[-1]], params)
+    repeat_equal = [
+        list(a.outputs[0].token_ids) == list(b.outputs[0].token_ids)
+        for a, b in zip(outs, again)
+    ]
+    alone_equal = list(alone[0].outputs[0].token_ids) == list(outs[-1].outputs[0].token_ids)
     image_tokens = None
     if image:
         chat = llm.chat(_image_request(), params)
         image_tokens = list(chat[0].outputs[0].token_ids)
     result = {
+        "repeat_equal": repeat_equal,
+        "alone_equal": alone_equal,
         "image_tokens": image_tokens,
         "graphs": graphs,
         "dspark": dspark,
