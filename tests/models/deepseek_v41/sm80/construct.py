@@ -56,8 +56,11 @@ class _NoStream:
 
 
 
-def set_groups(monkeypatch, tp_size: int, tp_rank: int) -> None:
-    """TP ranks with whole-expert EP over the same ranks (DP 1, PP 1)."""
+def set_groups(
+    monkeypatch, tp_size: int, tp_rank: int, pp_size: int = 1, pp_rank: int = 0
+) -> None:
+    """TP ranks with whole-expert EP over the same ranks (DP 1), on pipeline
+    stage ``pp_rank`` of ``pp_size``."""
     import vllm.distributed.parallel_state as ps
 
     tp = _Group(tp_size, tp_rank)
@@ -66,7 +69,7 @@ def set_groups(monkeypatch, tp_size: int, tp_rank: int) -> None:
         "_TP": tp,
         "_ETP": tp,
         "_EP": tp,
-        "_PP": single,
+        "_PP": _Group(pp_size, pp_rank),
         "_DP": single,
         "_DCP": single,
         "_PCP": single,
@@ -108,7 +111,9 @@ def _quant_config(directory: str, hf_config):
     return quant
 
 
-def vllm_configs(directory: str, tp_size: int) -> tuple[VllmConfig, VllmConfig]:
+def vllm_configs(
+    directory: str, tp_size: int, pp_size: int = 1
+) -> tuple[VllmConfig, VllmConfig]:
     """The target's config and the DSpark drafter's (its own EXL3 config,
     as load_dspark_model gives it)."""
     hf_config = get_config(directory, trust_remote_code=False)
@@ -119,7 +124,7 @@ def vllm_configs(directory: str, tp_size: int) -> tuple[VllmConfig, VllmConfig]:
     parallel = _runtime_defaults(
         ParallelConfig,
         tensor_parallel_size=tp_size,
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=pp_size,
         enable_expert_parallel=True,
         distributed_executor_backend="mp",
     )

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Load EXL3 constituents without materializing unassigned packed tensors."""
 
+import functools
 import time
 from collections import Counter
 from contextlib import ExitStack
@@ -15,6 +16,7 @@ from vllm.config import ModelConfig, ParallelConfig, VllmConfig, get_current_vll
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm_cmp170hx.kernels.exl3.quant import (
     Exl3Config,
@@ -195,10 +197,33 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             prefixes += ("model.language_model.embed_tokens.",)
         shared = {name for name in manifest.tensors if name.startswith(prefixes)}
     mapper = getattr(model, "hf_to_vllm_mapper", None)
+    # DeepSeek-V4.1 pipeline stages that shadow a source layer's attention
+    # (models/deepseek_v41/sm80_pp_shadow.py) load that attention's tensors
+    # although its decoder layer belongs to another stage.
+    shadow_owner = None
+    if quant.is_dsv41 and not is_draft:
+        from vllm_cmp170hx.models.deepseek_v41 import sm80_pp_shadow
+
+        backbone = getattr(getattr(model, "language_model", model), "model", None)
+        if backbone is not None and getattr(backbone, "pp_shadow_sources", None):
+            shadow_owner = functools.partial(sm80_pp_shadow.owner_of, backbone)
+    param_names = {id(p): n for n, p in model.named_parameters()}
     for name in manifest.tensors:
         if name in ledger.entries:
             continue
+        if shadow_owner is not None and shadow_owner(name) is not None:
+            continue
         mapped_name = mapper.map_name(name) if mapper is not None else name
+        if (
+            quant.is_dsv41
+            and not is_draft
+            and name.startswith("head.")
+            and not get_pp_group().is_last_rank
+        ):
+            # The packed head's tensors (head.trellis, .suh, ...) are not
+            # named like the mapped head weight; only the last stage owns it.
+            ledger.mark(name, "unused", "head assigned to the last pipeline stage")
+            continue
         if mapped_name is not None and is_pp_missing_parameter(mapped_name, model):
             ledger.mark(
                 name, "unused", "module assigned to another pipeline/model stage"
@@ -211,6 +236,14 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             ledger.mark(name, "unused", "native MTP model owner")
         elif is_draft and not draft_source:
             if name.startswith(("lm_head.", "model.language_model.embed_tokens.")):
+                continue
+            if (
+                quant.is_dsv41
+                and name.startswith("embed.")
+                and getattr(model, "has_own_embed_tokens", False)
+            ):
+                # The DSpark drafter on the last PP stage keeps its own copy of
+                # the input embedding (sm80_model.DSparkDeepseekV4ForCausalLM).
                 continue
             ledger.mark(name, "unused", "target model owner")
 
@@ -296,6 +329,17 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             if name.endswith((".trellis", ".suh", ".svh", ".mcg", ".mul1", ".q4n", ".q4nx")):
                 raise ValueError(f"EXL3 packed tensor has no runtime owner: {name}")
             tensor = files[header.path].get_tensor(name)
+            owner = shadow_owner(name) if shadow_owner is not None else None
+            if owner is not None:
+                module, leaf = owner
+                params = dict(module.named_parameters())
+                if leaf not in params:
+                    raise ValueError(f"EXL3 shadow tensor has no parameter: {name}")
+                param = params[leaf]
+                getattr(param, "weight_loader", default_weight_loader)(param, tensor)
+                loaded.add(param_names[id(param)])
+                ledger.mark(name, "consumed", f"pp shadow {leaf}")
+                continue
             consumed = model.load_weights(iter([(name, tensor)]))
             if not consumed:
                 raise ValueError(f"EXL3 plain tensor has no runtime owner: {name}")
@@ -305,7 +349,8 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     missing = {
         name
         for name, _ in model.named_parameters()
-        if name not in loaded and name not in file_backed_parameters
+        if name not in loaded
+        and name not in file_backed_parameters
     }
     if missing:
         raise ValueError(f"Unloaded EXL3 runtime parameters: {sorted(missing)[:16]}")

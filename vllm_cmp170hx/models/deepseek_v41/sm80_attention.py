@@ -46,6 +46,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -322,6 +323,23 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
     ) -> None:
+        # A pipeline stage that cuts inside a KV-sharing group builds its
+        # shadow source layers first, so this layer finds their caches
+        # (sm80_pp_shadow.py).
+        from vllm_cmp170hx.models.deepseek_v41 import sm80_pp_shadow
+
+        sm80_pp_shadow.ensure_shadows(
+            type(self),
+            vllm_config,
+            prefix,
+            extract_layer_index(prefix),
+            topk_indices_buffer=topk_indices_buffer,
+            aux_stream_list=aux_stream_list,
+            candidate_block_buffer=candidate_block_buffer,
+        )
+        # Set by sm80_pp_shadow.attach_shadows when a later stage shadows this
+        # layer: attend() keeps its input there for the pipeline hop.
+        self.pp_capture_buffer: torch.Tensor | None = None
         super().__init__(
             vllm_config,
             prefix,
@@ -704,6 +722,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
     ) -> torch.Tensor:
         """The input projections and the attention region of :meth:`forward`:
         the ``wo_a`` input (see :meth:`forward_mqa`), one row per token."""
+        if self.pp_capture_buffer is not None:
+            self.pp_capture_buffer[: hidden_states.shape[0]].copy_(hidden_states)
         attn_out = torch.empty(
             (hidden_states.shape[0], self.n_local_heads, self.head_dim),
             dtype=hidden_states.dtype,

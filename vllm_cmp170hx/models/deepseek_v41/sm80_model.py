@@ -55,10 +55,12 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.deepseek_v41.nvidia import dspark as upstream_dspark
 from vllm.models.deepseek_v41.nvidia import model as upstream_model
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
+from vllm.sequence import IntermediateTensors
 from vllm_cmp170hx.models.deepseek_v41.ops import sm80_mhc
 from vllm_cmp170hx.models.deepseek_v41.ops import sm80_mhc_side
 from vllm_cmp170hx import capture
 from vllm_cmp170hx.models.deepseek_v41.ops.sm80_mhc import mhc_post
+from vllm_cmp170hx.models.deepseek_v41 import sm80_pp_shadow
 from vllm_cmp170hx.models.deepseek_v41 import sm80_split_reduce
 from vllm_cmp170hx.models.deepseek_v41.sm80_attention import DeepseekV41Sm80Attention
 from vllm_cmp170hx.models.deepseek_v41.sm80_moe import adopt_moe, adopt_row_mask
@@ -392,6 +394,40 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             # Upstream bound the replay's KV write to the layer before its
             # adoption: that write_kv runs the TileLang mHC.
             replay.write_batch_kv = model.layers[model.decoder_replay_start].write_kv
+        # Pipeline stages cut inside KV-sharing groups (sm80_pp_shadow.py).
+        from vllm.config import get_current_vllm_config
+
+        sm80_pp_shadow.attach_shadows(model, get_current_vllm_config())
+
+    def make_empty_intermediate_tensors(self, batch_size, dtype, device):
+        tensors = super().make_empty_intermediate_tensors(batch_size, dtype, device)
+        for key, width in sm80_pp_shadow.receive_shapes(self).items():
+            tensors[key] = torch.zeros((batch_size, width), dtype=dtype, device=device)
+        return tensors
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors,
+        inputs_embeds=None,
+        lookback_token_ids=None,
+        decode_step=None,
+    ):
+        sm80_pp_shadow.run_shadows(self, positions, intermediate_tensors)
+        out = super().forward(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            lookback_token_ids=lookback_token_ids,
+            decode_step=decode_step,
+        )
+        if isinstance(out, IntermediateTensors):
+            out = sm80_pp_shadow.add_shipments(
+                self, out, intermediate_tensors, positions.shape[0]
+            )
+        return out
 
     def _collapse(
         self,
@@ -460,16 +496,34 @@ class DeepseekV41ForCausalLM(
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         DeepseekV4Model.adopt(self.language_model.model)
+        # The wrappers bound the upstream method before the adoption; the
+        # pipeline receive buffers include the shadow source inputs.
+        self.language_model.make_empty_intermediate_tensors = (
+            self.language_model.model.make_empty_intermediate_tensors
+        )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
         # Upstream builds the head unquantized (the base checkpoint's is
         # BF16); the EXL3 checkpoint's head is packed, so it is built with
         # the model's quantization config.
         config = self.language_model.config
-        self.language_model.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=vllm_config.quant_config,
-            prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
-        )
+        from vllm.distributed import get_pp_group
+
+        if not get_pp_group().is_first_rank:
+            # Images are encoded on the first pipeline stage only; later
+            # stages keep no vision tower or aligner (about 1 GB each).
+            self.vision = PPMissingLayer()
+            self.aligner = PPMissingLayer()
+
+        # Only the last pipeline stage holds the head (PPMissingLayer elsewhere).
+        if get_pp_group().is_last_rank:
+            self.language_model.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=f"{maybe_prefix(prefix, 'language_model')}.lm_head",
+            )
         Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
 
 
@@ -487,7 +541,9 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
     layers write their context window rows themselves."""
 
     @classmethod
-    def adopt(cls, model: upstream_dspark.DSparkDeepseekV4Model) -> None:
+    def adopt(
+        cls, model: upstream_dspark.DSparkDeepseekV4Model, keep_embed: bool = False
+    ) -> None:
         assert type(model) is upstream_dspark.DSparkDeepseekV4Model, type(model)
         if model.use_sequence_parallel or model.use_native_mega_moe:
             raise ValueError(
@@ -496,8 +552,9 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
             )
         model.__class__ = cls
         _adopt_layers(model.layers, model.config)
-        # Aliased from the target by the DSpark loader (load_dspark_model).
-        model.embed_tokens = PPMissingLayer()
+        if not keep_embed:
+            # Aliased from the target by the DSpark loader (load_dspark_model).
+            model.embed_tokens = PPMissingLayer()
         if sm80_writes_context_kv(model) and hasattr(model, "context_wkv_proj"):
             # The sm_80 stages write their context KV from their own wkv
             # (precompute_and_store_context_kv), so the stacked context
@@ -558,7 +615,14 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
 
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        DSparkDeepseekV4Model.adopt(self.model)
+        from vllm.distributed import get_pp_group
+
+        # Under pipeline parallelism the drafter runs on the last stage, which
+        # holds the target's head but not its input embedding: the drafter
+        # keeps its own embedding there and loads it from the checkpoint's
+        # ``embed`` (load_dspark_model then leaves it alone).
+        self.has_own_embed_tokens = get_pp_group().world_size > 1
+        DSparkDeepseekV4Model.adopt(self.model, keep_embed=self.has_own_embed_tokens)
         # Aliased from the target by the DSpark loader (load_dspark_model).
         self.lm_head = PPMissingLayer()
         # Base logits through the target's EXL3 head; the Markov bias through
@@ -581,6 +645,8 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
             self.model, "context_wkv_proj"
         ):
             return None
+        if name.startswith("embed.") and self.has_own_embed_tokens:
+            return "model.embed_tokens." + name.removeprefix("embed.")
         return super()._remap_dspark_name(name)
 
     def load_weights(self, weights) -> set[str]:
