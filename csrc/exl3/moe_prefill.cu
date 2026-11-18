@@ -3,7 +3,8 @@
 // Qwen (hidden 2560, intermediate 640, every expert matrix bits_x2 10 with
 // the mul1 codebook, codebook 2) and GLM (hidden 4096, intermediate 2048,
 // every expert matrix bits_x2 5 with the mul1 codebook, SwiGLU clamped to
-// the family's fixed limit 10.0). The caller
+// the family's fixed limit 10.0); DeepSeek-V4.1 (hidden 5120, intermediate
+// 2304, Q4N-X bits_x2 4 / 5, limit 10.0) runs the same templates. The caller
 // (vllm_cmp170hx/kernels/exl3/quant.py) takes this operator only for those
 // configurations, in prefill steps, for calls of more than 64 rows; every
 // other call stays on moe_out (moe.cu) or moe_out_v2 (moe_v2.cu), which this
@@ -1357,6 +1358,17 @@ struct Family {
   static_assert(Intermediate % 128 == 0, "one H128 per 128-block");
   static_assert(Intermediate <= Hidden, "the down rows fit the operand region");
 };
+// DeepSeek-V4.1-Flash routed experts (lab): hidden 5120 (10 operand / combine spans of 512, 40 H128 blocks),
+// intermediate 2304 (18 H128 blocks; not a multiple of 512, so down staging takes the wide-intermediate layouts),
+// SwiGLU limit 10 (config swiglu_limit; the same gate <= 10, |up| <= 10 clamp as GLM), Q4N-X only at 2.0 bpw
+// (bits_x2 4) and 2.5 bpw (bits_x2 5). Top-k and expert counts are runtime arguments, so the target's top-6 of 384
+// and the DSpark drafter's top-3 of 128 (same hidden / intermediate) run the same families; routed_scaling_factor
+// (1.5) is in the routing weights. GEMM tiling: gate/up N 2304 = 18 x 128 (TPW 1) = 9 x 256 (TPW 2), down N 5120 =
+// 20 x 256; K 5120 / 2304 = 80 / 36 chunks of 64.
+constexpr int kDsv41Hidden = 5120;
+constexpr int kDsv41Intermediate = 2304;
+constexpr int kDsv41Topk = 6;       // target layers: 6 of 384 routed experts
+constexpr int kDsv41DraftTopk = 3;  // DSpark drafter (mtp.0-2): 3 of 128
 using QwenFamily = Family<2560, 640, 10, 0, 64>;
 using GlmFamily = Family<4096, 2048, 5, 10, 64>;
 using Glm35Family = Family<4096, 2048, 7, 10, 64>;
@@ -1380,6 +1392,14 @@ using GlmQ4NX6Family = Family<4096, 2048, 6, 10, 64, 4>;
 using GlmQ4NX6DecodeFamily = Family<4096, 2048, 6, 10, 8, 4>;
 constexpr int kGlmQ4NXKey = 5 + kQ4NXFormatOffset;
 constexpr int kGlmQ4NX6Key = 6 + kQ4NXFormatOffset;
+
+// The DeepSeek-V4.1 Q4N-X families (prefill: 64-row route tiles; decode: 8-row) and their layer keys.
+using Dsv41Q4NX4Family = Family<kDsv41Hidden, kDsv41Intermediate, 4, 10, 64, 4>;
+using Dsv41Q4NX4DecodeFamily = Family<kDsv41Hidden, kDsv41Intermediate, 4, 10, 8, 4>;
+using Dsv41Q4NX5Family = Family<kDsv41Hidden, kDsv41Intermediate, 5, 10, 64, 4>;
+using Dsv41Q4NX5DecodeFamily = Family<kDsv41Hidden, kDsv41Intermediate, 5, 10, 8, 4>;
+constexpr int kDsv41Q4NX4Key = 4 + kQ4NXFormatOffset;
+constexpr int kDsv41Q4NX5Key = 5 + kQ4NXFormatOffset;
 
 template <class S>
 __device__ __forceinline__ uint32_t next_stage(uint32_t offset) {
@@ -2155,18 +2175,24 @@ void launch_i8_gemm(const Gemm& p, int64_t max_tiles, cudaStream_t stream) {
 
 }  // namespace
 
+bool dsv41_shape(int64_t hidden, int64_t intermediate) {
+  return hidden == kDsv41Hidden && intermediate == kDsv41Intermediate;
+}
+
 bool served_shape(int64_t hidden, int64_t intermediate) {
   return (hidden == QwenFamily::kHidden &&
           intermediate == QwenFamily::kIntermediate) ||
          (hidden == GlmFamily::kHidden &&
-          intermediate == GlmFamily::kIntermediate);
+          intermediate == GlmFamily::kIntermediate) ||
+         dsv41_shape(hidden, intermediate);
 }
 
-// The shapes moe_out_decode_tc serves (the GLM families; the bits_x2 check
-// lives in run_decode).
+// The shapes moe_out_decode_tc serves (the GLM and DeepSeek-V4.1 families;
+// the bits_x2 check lives in run_decode).
 bool served_decode_shape(int64_t hidden, int64_t intermediate) {
-  return hidden == GlmFamily::kHidden &&
-         intermediate == GlmFamily::kIntermediate;
+  return (hidden == GlmFamily::kHidden &&
+          intermediate == GlmFamily::kIntermediate) ||
+         dsv41_shape(hidden, intermediate);
 }
 
 int64_t workspace_elements(int64_t assignments, int64_t hidden,
@@ -2231,6 +2257,23 @@ template <class F>
 constexpr bool decode_glue_blocks() {
   return F::kTileRows == 8 && F::kIntermediate != 5 * 128 &&
          F::kHidden / 512 <= 32 && F::kIntermediate / 128 <= 32;
+}
+// The decode combine of a top-kTopk call: combine_route (VLLM_EXL3_MOE_COMBINE_WIDE=1) or combine_block, one task
+// per (token, 128-block); both are bitwise the generic FP32 combine.
+template <class F, int kTopk>
+bool launch_decode_combine(const float* down, const float* weights, const Routing& routing, const int* table,
+                           int64_t assignments, int64_t rows, __nv_bfloat16* out, cudaStream_t stream) {
+  const int64_t tasks = rows * (F::kHidden / 128);
+  if (combine_wide_enabled()) {
+    combine_route<__nv_bfloat16, F, kTopk><<<static_cast<unsigned int>(tasks), 32 * kTopk, 0, stream>>>(
+        down, weights, routing, table, assignments, rows, out);
+  } else {
+    combine_block<__nv_bfloat16, F, kTopk>
+        <<<static_cast<unsigned int>((tasks + kOperandWarps - 1) / kOperandWarps), 32 * kOperandWarps, 0, stream>>>(
+            down, weights, routing, table, assignments, rows, out);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return true;
 }
 // Lab diagnostic (VLLM_EXL3_PREFILL_STAGE_TIMING=1, prefill families only):
 // CUDA events between the stages of one routed prefill call, printed to stderr
@@ -2588,23 +2631,24 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     }
   }
   if constexpr (decode_glue_blocks<F>()) {
-    if (topk == kDecodeGlueTopk && decode_glue_enabled()) {
-      const int64_t tasks = rows * (kHidden / 128);
-      if (combine_wide_enabled()) {
-        combine_route<__nv_bfloat16, F, kDecodeGlueTopk>
-            <<<static_cast<unsigned int>(tasks), 32 * kDecodeGlueTopk, 0, stream>>>(
-                down_result, weights, routing, table, assignments, rows, out);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        timer.mark("combine");
-        timer.report(rows);
-        return;
+    // The per-128-block decode combines are compiled per served top-k (GLM 8; DeepSeek-V4.1 6 and the drafter's 3);
+    // any other top-k takes the generic FP32 combine below (same per-route FP32 FMAs in route order, so the same
+    // bits).
+    bool combined = false;
+    if (decode_glue_enabled()) {
+      if (topk == kDecodeGlueTopk) {
+        combined = launch_decode_combine<F, kDecodeGlueTopk>(down_result, weights, routing, table, assignments,
+                                                             rows, out, stream);
+      } else if constexpr (F::kHidden == kDsv41Hidden && F::kIntermediate == kDsv41Intermediate) {
+        if (topk == kDsv41Topk)
+          combined = launch_decode_combine<F, kDsv41Topk>(down_result, weights, routing, table, assignments, rows,
+                                                          out, stream);
+        else if (topk == kDsv41DraftTopk)
+          combined = launch_decode_combine<F, kDsv41DraftTopk>(down_result, weights, routing, table, assignments,
+                                                               rows, out, stream);
       }
-      combine_block<__nv_bfloat16, F, kDecodeGlueTopk>
-          <<<static_cast<unsigned int>((tasks + kOperandWarps - 1) /
-                                       kOperandWarps),
-             32 * kOperandWarps, 0, stream>>>(down_result, weights, routing,
-                                              table, assignments, rows, out);
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    if (combined) {
       timer.mark("combine");
       timer.report(rows);
       return;
@@ -2630,6 +2674,18 @@ void run(const __nv_bfloat16* x, const void* ids, bool ids64,
          int64_t bits_x2, const int64_t* pointers, const int64_t* metadata,
          int64_t local_experts, int64_t rows, int64_t topk, __nv_bfloat16* out,
          float* workspace, cudaStream_t stream) {
+  if (dsv41_shape(hidden, intermediate)) {
+    TORCH_CHECK(bits_x2 == kDsv41Q4NX4Key || bits_x2 == kDsv41Q4NX5Key,
+                "EXL3 MoE prefill runs the DeepSeek-V4.1 Q4N-X 2.0- or 2.5-bit family (key 132 or 133), not key ",
+                bits_x2);
+    if (bits_x2 == kDsv41Q4NX4Key)
+      run_family<Dsv41Q4NX4Family>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                   local_experts, rows, topk, out, workspace, stream);
+    else
+      run_family<Dsv41Q4NX5Family>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers, metadata,
+                                   local_experts, rows, topk, out, workspace, stream);
+    return;
+  }
   if (hidden == GlmFamily::kHidden &&
       intermediate == GlmFamily::kIntermediate) {
     if (bits_x2 == GlmFamily::kBitsX2) {
@@ -2702,6 +2758,22 @@ void run_decode(const __nv_bfloat16* x, const void* ids, bool ids64,
                 const int64_t* metadata, int64_t local_experts, int64_t rows,
                 int64_t topk, __nv_bfloat16* out, float* workspace,
                 cudaStream_t stream, const float* activated_down = nullptr) {
+  if (dsv41_shape(hidden, intermediate)) {
+    TORCH_CHECK(rows <= decode_tc_max_rows(), "EXL3 MoE decode tensor-core schedule serves at most ",
+                decode_tc_max_rows(), " rows, not ", rows);
+    TORCH_CHECK(bits_x2 == kDsv41Q4NX4Key || bits_x2 == kDsv41Q4NX5Key,
+                "EXL3 MoE decode runs the DeepSeek-V4.1 Q4N-X 2.0- or 2.5-bit family (key 132 or 133), not key ",
+                bits_x2);
+    TORCH_CHECK(!kDownOnly && activated_down == nullptr,
+                "EXL3 Q4N MoE decode serves the full tensor-core mode only");
+    if (bits_x2 == kDsv41Q4NX4Key)
+      run_family<Dsv41Q4NX4DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                                metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    else
+      run_family<Dsv41Q4NX5DecodeFamily, false>(x, ids, ids64, weights, expert_map, map64, global_experts, pointers,
+                                                metadata, local_experts, rows, topk, out, workspace, stream, nullptr);
+    return;
+  }
   TORCH_CHECK(
       hidden == GlmFamily::kHidden && intermediate == GlmFamily::kIntermediate,
       "EXL3 MoE decode tensor-core run of an unserved shape");
@@ -2806,9 +2878,9 @@ int64_t moe_workspace_size_prefill(int64_t max_rows, int64_t hidden_size,
   TORCH_CHECK(max_rows >= 0 && topk >= 0 && local_experts >= 0,
               "EXL3 rows/topk/local_experts must be nonnegative");
   TORCH_CHECK(moe_prefill::served_shape(hidden_size, intermediate_size),
-              "EXL3 MoE prefill covers hidden 2560 and intermediate 640, or "
-              "hidden 4096 and ",
-              "intermediate 2048");
+              "EXL3 MoE prefill covers hidden 2560 and intermediate 640, "
+              "hidden 4096 and intermediate 2048, or hidden 5120 and ",
+              "intermediate 2304");
   if (local_experts == 0) return 0;
   const int64_t assignments = checked_mul(max_rows, topk);
   TORCH_CHECK(assignments <= std::numeric_limits<int>::max(),
@@ -2891,7 +2963,8 @@ int64_t moe_workspace_size_decode_tc(int64_t max_rows, int64_t hidden_size,
   TORCH_CHECK(max_rows >= 0 && topk >= 0 && local_experts >= 0,
               "EXL3 rows/topk/local_experts must be nonnegative");
   TORCH_CHECK(moe_prefill::served_decode_shape(hidden_size, intermediate_size),
-              "EXL3 MoE decode covers hidden 4096 and intermediate 2048");
+              "EXL3 MoE decode covers hidden 4096 and intermediate 2048, or "
+              "hidden 5120 and intermediate 2304");
   if (local_experts == 0) return 0;
   const int64_t assignments = checked_mul(max_rows, topk);
   TORCH_CHECK(assignments <= std::numeric_limits<int>::max(),

@@ -15,6 +15,11 @@ namespace exl3 {
 // caller passes the layer's uniform bits_x2; the family selection is by
 // (shape, bits_x2). Results differ from moe_out in the last bits (hi/lo FP16
 // MMAs, FP64 route sums).
+//
+// DeepSeek-V4.1-Flash (lab): hidden 5120 / intermediate 2304 with every routed
+// matrix Q4N-X (codebook 4) at bits_x2 4 or 5 (keys 132 / 133), SwiGLU fixed
+// limit 10.0, any top-k (served: 6 of 384, the DSpark drafter's 3 of 128);
+// both moe_out_prefill and moe_out_decode_tc.
 constexpr int64_t kMoePrefillMinRows = 65;
 constexpr int64_t kMoePrefillMaxExperts = 4096;
 
