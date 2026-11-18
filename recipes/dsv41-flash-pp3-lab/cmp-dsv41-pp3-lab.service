@@ -38,7 +38,8 @@ StartLimitBurst=10
 # Candidate speed switches from vllm-sm80 left OFF for the first correctness boot (enable one at a
 # time with benchlib): VLLM_DEEPSEEK_V41_ROUTER_MMA,
 # VLLM_DEEPSEEK_V41_GATE_GEMV, VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH, VLLM_DEEPSEEK_V41_SWA_META_BATCH,
-# VLLM_DEEPSEEK_V41_ATTN_PIPELINE, VLLM_DEEPSEEK_V41_SPLITKV_DECODE, VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE.
+# VLLM_DEEPSEEK_V41_ATTN_PIPELINE, VLLM_DEEPSEEK_V41_SPLITKV_DECODE. (VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE is
+# validated for 16 local heads, i.e. TP4; at TP=1 its gate stays closed.)
 [Service]
 Type=simple
 Restart=no
