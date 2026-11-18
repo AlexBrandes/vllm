@@ -67,11 +67,12 @@ def build(qtensors: Path, layers: int, src: Path, out: Path) -> None:
         "head.suh": ("F16", [hidden]),
         "head.svh": ("F16", [vocab]),
         "head.mul1": ("I32", []),
-        # The image sentinels come with the vision tower (converted last).
-        "image_start": ("BF16", [hidden]),
-        "image_end": ("BF16", [hidden]),
-        "image_newline": ("BF16", [hidden]),
     }
+    # The vision tower, aligner and image sentinels are converted last: zero
+    # stand-ins at their real shapes (text prompts never reach them).
+    for name, (dtype, shape) in fixture.checkpoint_tensors(config).items():
+        if name.startswith(("vision.", "aligner.", "image_")):
+            tensors[name] = (dtype, list(shape))
     header, offset = {}, 0
     for name, (dtype, shape) in tensors.items():
         size = fixture.tensor_bytes(dtype, tuple(shape))
@@ -107,8 +108,6 @@ def run(out: Path, w8: Path | None, graphs: bool) -> dict:
         max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=2048,
         gpu_memory_utilization=0.85, mm_encoder_tp_mode="data",
         tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
-        # The vision tower is converted last; this cut has none (text only).
-        limit_mm_per_prompt={"image": 0},
     )
     if graphs:
         kwargs["compilation_config"] = {"cudagraph_mode": "FULL_DECODE_ONLY"}
