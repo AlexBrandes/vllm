@@ -923,7 +923,10 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
         output], group by group in this rank's group order."""
         if x.dim() != 3 or x.shape[1] != len(layer.exl3_weights):
             raise ValueError("Grouped EXL3 input must be [tokens, groups, input]")
-        if getattr(self, "w8_grouped", False):
+        # Card 4, wo_a geometry: one quantisation is 17-25 % faster up to 512
+        # rows and 10 % slower at 2048 (the transpose copy), so prefill-sized
+        # calls keep one call per group; both are the same bits.
+        if getattr(self, "w8_grouped", False) and x.shape[0] <= 512:
             weights = layer.exl3_weights
             output = torch.ops.vllm.exl3_w8_grouped(
                 x.contiguous(),
