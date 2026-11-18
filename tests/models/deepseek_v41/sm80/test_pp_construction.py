@@ -173,3 +173,54 @@ def test_shadow_inputs_are_relayed_through_middle_stages(monkeypatch):
     plans = stage_plans(config, 4)
     assert [p.shadows for p in plans] == [(), (8,), (), (20, 28)]
     assert [p.send for p in plans] == [(8,), (), (20, 28), ()]
+
+
+def test_shadow_forward_plumbing():
+    """Stage 1 of 16,9,15: replays shadow 14 on the received input before
+    its layers, and ships its own captured 20/24 inputs (sliced to the
+    step's tokens); a relaying stage forwards what it received."""
+    from types import SimpleNamespace
+
+    import torch
+    from torch import nn
+
+    from vllm.sequence import IntermediateTensors
+    from vllm_cmp170hx.models.deepseek_v41 import sm80_pp_shadow as shadow
+
+    calls = []
+
+    class FakeAttn(nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+        def attend(self, positions, x):
+            calls.append((self.layer, x.shape[0], float(x[0, 0])))
+
+    model = SimpleNamespace(
+        pp_plan=shadow.StagePlan(16, 25, (14,), (14,), (20, 24), (20, 24)),
+        pp_shadow_sources=nn.ModuleDict({"14": FakeAttn(14)}),
+        pp_capture_buffers={20: torch.full((8, 4), 20.0), 24: torch.full((8, 4), 24.0)},
+        config=SimpleNamespace(hidden_size=4),
+    )
+    received = IntermediateTensors(
+        {"hidden_states": torch.zeros(8, 4, 4), shadow.SHIP_KEY.format(14): torch.full((8, 4), 14.0)}
+    )
+    shadow.run_shadows(model, torch.arange(5), received)
+    assert calls == [(14, 5, 14.0)]
+    out = shadow.add_shipments(
+        model, IntermediateTensors({"hidden_states": torch.zeros(5, 4, 4)}), received, 5
+    )
+    assert set(out.tensors) == {"hidden_states", "pp_shadow_x.20", "pp_shadow_x.24"}
+    assert out["pp_shadow_x.20"].shape == (5, 4) and float(out["pp_shadow_x.24"][0, 0]) == 24.0
+    assert shadow.receive_shapes(model) == {"pp_shadow_x.14": 4}
+    # A relaying stage (21,1,1,17: stage 1) forwards the received input.
+    relay = SimpleNamespace(
+        pp_plan=shadow.StagePlan(21, 22, (20,), (20,), (20,), ()),
+        pp_shadow_sources=nn.ModuleDict({"20": FakeAttn(20)}),
+        pp_capture_buffers={},
+        config=SimpleNamespace(hidden_size=4),
+    )
+    got = IntermediateTensors({"pp_shadow_x.20": torch.full((8, 4), 7.0)})
+    out = shadow.add_shipments(relay, IntermediateTensors({}), got, 3)
+    assert float(out["pp_shadow_x.20"][2, 0]) == 7.0 and out["pp_shadow_x.20"].shape[0] == 3
