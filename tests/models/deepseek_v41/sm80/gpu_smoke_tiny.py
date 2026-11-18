@@ -30,6 +30,9 @@ def build(out: Path, tokenizer_dir: Path) -> None:
     from tests.models.deepseek_v41.sm80.test_engram_storage import _write_table
 
     config = fixture.tiny_config()
+    # The real vocabulary (embedding 129280 x 512): chat prompts and image
+    # sentinels from the real tokenizer stay in range.
+    config["text_config"]["vocab_size"] = 129280
     tables = out / "engram-tables"
     config["engram_table_dir"] = str(tables)
     if out.exists():
@@ -47,7 +50,33 @@ def build(out: Path, tokenizer_dir: Path) -> None:
             shutil.copytree(tokenizer_dir / extra, out / extra)
 
 
-def run(out: Path, graphs: bool, dspark: bool, prompt_lens: list[int]) -> dict:
+def _image_request():
+    import base64
+    import io
+
+    from PIL import Image
+
+    image = Image.new("RGB", (336, 224))
+    for x in range(336):
+        for y in range(224):
+            image.putpixel((x, y), ((x * 7) % 256, (y * 5) % 256, (x + y) % 256))
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": "Describe the picture."},
+            ],
+        }
+    ]
+
+
+def run(
+    out: Path, graphs: bool, dspark: bool, prompt_lens: list[int], image: bool = False
+) -> dict:
     from vllm import LLM, SamplingParams
 
     kwargs = dict(
@@ -74,14 +103,19 @@ def run(out: Path, graphs: bool, dspark: bool, prompt_lens: list[int]) -> dict:
     llm = LLM(**kwargs)
     boot = time.time() - t0
     prompts = [
-        {"prompt_token_ids": [(7 * i + 13 * n) % 1300 + 3 for i in range(n)]}
+        {"prompt_token_ids": [(7 * i + 13 * n) % 100000 + 3 for i in range(n)]}
         for n in prompt_lens
     ]
     params = SamplingParams(max_tokens=24, temperature=0.0, logprobs=3, ignore_eos=True)
     t0 = time.time()
     outs = llm.generate(prompts, params)
     gen = time.time() - t0
+    image_tokens = None
+    if image:
+        chat = llm.chat(_image_request(), params)
+        image_tokens = list(chat[0].outputs[0].token_ids)
     result = {
+        "image_tokens": image_tokens,
         "graphs": graphs,
         "dspark": dspark,
         "boot_s": round(boot, 1),
@@ -107,6 +141,7 @@ def main() -> None:
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--image", action="store_true")
     parser.add_argument("--prompt-lens", default="12,300,900")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
@@ -115,7 +150,10 @@ def main() -> None:
     if args.build_only:
         return
     lens = [int(x) for x in args.prompt_lens.split(",")]
-    print(json.dumps(run(args.out, args.graphs, args.dspark, lens)), flush=True)
+    print(
+        json.dumps(run(args.out, args.graphs, args.dspark, lens, image=args.image)),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
