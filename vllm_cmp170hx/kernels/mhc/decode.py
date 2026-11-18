@@ -819,6 +819,12 @@ def _glu_finish_kernel(mix_ptr, sqr_ptr, scale_ptr, base_ptr, rc_ptr, nw_ptr,
 # 8 warps and k_width 2 worse, plain register fn loads +0.3 us, unswizzled
 # cp.async buffers +1.1 us (bank conflicts).
 HB_GLU = 32
+# VLLM_SM80_MHC_UNIFORM_KERNEL_A=1: calls of <= BT_T rows also take the
+# non-transposed kernel, whose per-row sums do not depend on the call's row
+# count, so a token's mHC coefficients are the same bits in decode-sized and
+# prefill-sized calls (the transposed small-M kernel differs by ~1 FP32 ulp in
+# comb; DeepSeek-V4.1 batch-invariance check 2026-11-17). Costs ~1 us a call.
+_UNIFORM_KERNEL_A = os.environ.get("VLLM_SM80_MHC_UNIFORM_KERNEL_A", "0") == "1"
 BT_T = 8            # token block of the transposed M <= 8 kernel (the mma's n8)
 WARPS_GLU = 4
 BM_A = 16           # bf16/tf32 mma is m16n8k16: 16 rows is the minimum unit
@@ -856,7 +862,7 @@ def post_prenorm(x, res, post, comb, fn, rc, mix, sqr, *, has_post=True, round_m
     nout = fn.shape[0]
     ksb = hidden // HB_GLU
     assert hidden % HB_GLU == 0 and mix.shape == (ksb, M, nout), (hidden, mix.shape)
-    if M <= BT_T:
+    if M <= BT_T and not _UNIFORM_KERNEL_A:
         _glu_post_prenorm_tb_kernel[(triton.cdiv(M, BT_T), ksb)](
             x, res, post, comb, fn, rc, mix, sqr, M,
             HIDDEN=hidden, NOUT=nout, HB=HB_GLU, BT=BT_T,
