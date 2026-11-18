@@ -48,6 +48,9 @@ def test_pp3_stages_own_disjoint_tensors(
 
     plugin._register_exl3()
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    # The served runner: vLLM's V2 runner builds the multimodal tower on the
+    # meta device on every stage but the first (its image_* parameters too).
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     sizes = [int(x) for x in partition.split(",")]
     bounds, start = [], 0
     for size in sizes:
