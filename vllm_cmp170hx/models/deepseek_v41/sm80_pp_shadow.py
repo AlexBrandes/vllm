@@ -34,8 +34,9 @@ The design follows the "PP shadow KV" approach of zebgop-ops/dsv41reap-pp
 
 Cost per shadow: one attention input projection set and attention region per
 step (no output projection), one more layer's KV cache on the stage, the
-source's attention weights resident twice, and ``hidden * 2`` bytes per
-token on each pipeline hop between the source and its last consumer.
+source's attention input weights resident twice (its ``wo_a``/``wo_b`` are
+dropped from the shadow), and ``hidden * 2`` bytes per token on each
+pipeline hop between the source and its last consumer.
 """
 
 from __future__ import annotations
@@ -227,9 +228,15 @@ def attach_shadows(model: nn.Module, vllm_config) -> None:
     config = model.config
     plan = current_plan(config)
     model.pp_plan = plan
-    model.pp_shadow_sources = nn.ModuleDict(
-        {str(s): m for s, m in _BUILT.pop(id(vllm_config), {}).items()}
-    )
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    built = _BUILT.pop(id(vllm_config), {})
+    for shadow in built.values():
+        # A shadow's output is dropped: its output projections never run
+        # here, so they hold no weights (their tensors stay unused).
+        shadow.wo_a = PPMissingLayer()
+        shadow.wo_b = PPMissingLayer()
+    model.pp_shadow_sources = nn.ModuleDict({str(s): m for s, m in built.items()})
     if plan is None:
         return
     missing = [s for s in plan.shadows if str(s) not in model.pp_shadow_sources]
@@ -258,6 +265,8 @@ def owner_of(model: nn.Module, checkpoint_name: str):
         return None
     match = re.match(r"layers\.(\d+)\.attn\.(.*)", checkpoint_name)
     if match is None or match[1] not in shadows:
+        return None
+    if match[2].startswith(("wo_a.", "wo_b.")):
         return None
     return shadows[match[1]], match[2]
 

@@ -96,9 +96,14 @@ def test_pp3_stages_own_disjoint_tensors(
             continue
         stages = consumed.get(name, [])
         layer = _layer(name)
-        if layer is not None and ".attn." in name and layer in shadowed:
-            # A shadowed source's attention loads on its own stage and on
-            # every stage that shadows it.
+        if (
+            layer is not None
+            and ".attn." in name
+            and layer in shadowed
+            and not re.search(r"\.attn\.wo_[ab]\.", name)
+        ):
+            # A shadowed source's attention (but its output projections)
+            # loads on its own stage and on every stage that shadows it.
             assert stages == sorted({stage_of[layer], *shadowed[layer]}), (name, stages)
         elif layer is not None:
             assert stages == [stage_of[layer]], (name, stages)
