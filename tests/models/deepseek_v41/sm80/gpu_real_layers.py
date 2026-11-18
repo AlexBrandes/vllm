@@ -67,6 +67,10 @@ def build(qtensors: Path, layers: int, src: Path, out: Path) -> None:
         "head.suh": ("F16", [hidden]),
         "head.svh": ("F16", [vocab]),
         "head.mul1": ("I32", []),
+        # The image sentinels come with the vision tower (converted last).
+        "image_start": ("BF16", [hidden]),
+        "image_end": ("BF16", [hidden]),
+        "image_newline": ("BF16", [hidden]),
     }
     header, offset = {}, 0
     for name, (dtype, shape) in tensors.items():
