@@ -363,7 +363,19 @@ def _adopt_layers(layers, config) -> None:
 class DeepseekV4Model(upstream_model.DeepseekV4Model):
     """Backbone whose final post runs ``ops/sm80_mhc.py``; the last collapse
     stays ``hc_collapse_triton`` (the reference ``hc_pre`` order: FP32
-    products summed per stream, one BF16 rounding)."""
+    products summed per stream, one BF16 rounding).
+
+    DSpark under pipeline parallelism: the drafter on the last stage reads
+    the entry streams of its target layers. Upstream's V4.1 backbone drops
+    the ones an earlier stage computes, and does not declare
+    ``supports_aux_hidden_states_over_pp``, so vLLM refused DSpark at PP > 1.
+    Here an earlier stage ships its target-layer streams as
+    ``aux_hidden_states_<slot>`` (the ``EagleModelMixin`` slot layout; the
+    runner relays them through middle stages) and the last stage puts them in
+    front of its own. With the real partitions the targets (37-39) all sit on
+    the last stage and nothing is shipped."""
+
+    supports_aux_hidden_states_over_pp = True
 
     @classmethod
     def adopt(cls, model: upstream_model.DeepseekV4Model) -> None:
@@ -421,6 +433,7 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
         decode_step=None,
     ):
         sm80_pp_shadow.run_shadows(self, positions, intermediate_tensors)
+        self._pp_aux_by_layer = None
         out = super().forward(
             input_ids,
             positions,
@@ -433,7 +446,42 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             out = sm80_pp_shadow.add_shipments(
                 self, out, intermediate_tensors, positions.shape[0]
             )
+            local = self._local_aux_layers()
+            if local:
+                captured = self._pp_aux_by_layer or {}
+                missing = [layer for layer in local if layer not in captured]
+                if missing:
+                    raise RuntimeError(
+                        f"DSpark target-layer streams {missing} were not captured "
+                        "on this pipeline stage"
+                    )
+                out.tensors.update(
+                    self.pack_local_aux_hidden_states([captured[l] for l in local])
+                )
+            return out
+        remote = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        if remote:
+            if isinstance(out, tuple):
+                hidden_states, aux = out
+                return hidden_states, remote + list(aux)
+            return out, remote
         return out
+
+    def _local_aux_layers(self) -> list[int]:
+        """Target layers whose entry stream this stage computes: layer ``L``'s
+        stream comes out of layer ``L - 1``'s post, i.e. the stages holding
+        ``start_layer < L <= end_layer`` (``L == end_layer`` is the
+        collapse at the stage's end)."""
+        return [
+            layer
+            for layer in self.aux_hidden_state_layers
+            if self.start_layer < layer <= self.end_layer
+        ]
+
+    def _run_layers(self, *args, **kwargs):
+        # The capture dict of this forward (upstream keeps it local).
+        self._pp_aux_by_layer = kwargs.get("aux_hidden_by_layer", args[8] if len(args) > 8 else None)
+        return super()._run_layers(*args, **kwargs)
 
     def _collapse(
         self,

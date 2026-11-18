@@ -70,6 +70,7 @@ def test_pp3_stages_own_disjoint_tensors(
             shadowed[source].add(stage)
     consumed = defaultdict(list)
     why = defaultdict(list)
+    aux_owner: list[int] = []
     tensors = None
     draft_result = None
     for stage in range(len(sizes)):
@@ -79,6 +80,11 @@ def test_pp3_stages_own_disjoint_tensors(
             str(checkpoint), 1, pp_size=len(sizes)
         )
         target = construct.build_model(target_config)
+        # DSpark target-layer streams: each computed on exactly one stage.
+        backbone = target.language_model.model
+        assert backbone.supports_aux_hidden_states_over_pp
+        backbone.aux_hidden_state_layers = (5, 6, 7)
+        aux_owner.extend(backbone._local_aux_layers())
         tensors = set(target_config.quant_config.manifest.tensors)
         result = _load(monkeypatch, target, target_config)
         assert set(result) == tensors
@@ -92,6 +98,7 @@ def test_pp3_stages_own_disjoint_tensors(
             draft_result = _load(monkeypatch, draft, draft_config)
             assert set(draft_result) == tensors
     assert tensors is not None and draft_result is not None
+    assert sorted(aux_owner) == [5, 6, 7], aux_owner
     for name in tensors:
         if name.startswith("mtp."):
             assert name not in consumed, name
