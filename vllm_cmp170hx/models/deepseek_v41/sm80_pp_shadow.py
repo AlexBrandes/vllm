@@ -32,8 +32,9 @@ and the stage's own layers see the last published top-k.
 The design follows the "PP shadow KV" approach of zebgop-ops/dsv41reap-pp
 (Apache-2.0), reimplemented for this plugin's attention and EXL3 loader.
 
-Cost per shadow: one attention input projection set and attention region per
-step (no output projection), one more layer's KV cache on the stage, the
+Cost per shadow: one attention input projection set and the attention
+preparation per step (KV writes, query, top-k; no attention and no output
+projection), one more layer's KV cache on the stage, the
 source's attention input weights resident twice (its ``wo_a``/``wo_b`` are
 dropped from the shadow), and ``hidden * 2`` bytes per token on each
 pipeline hop between the source and its last consumer.
@@ -236,6 +237,8 @@ def attach_shadows(model: nn.Module, vllm_config) -> None:
         # here, so they hold no weights (their tensors stay unused).
         shadow.wo_a = PPMissingLayer()
         shadow.wo_b = PPMissingLayer()
+        # Only the source's cache writes and published buffers matter here.
+        shadow.pp_shadow_prepare_only = True
     model.pp_shadow_sources = nn.ModuleDict({str(s): m for s, m in built.items()})
     if plan is None:
         return

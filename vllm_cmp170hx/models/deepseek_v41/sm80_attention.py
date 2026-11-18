@@ -340,6 +340,10 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         # Set by sm80_pp_shadow.attach_shadows when a later stage shadows this
         # layer: attend() keeps its input there for the pipeline hop.
         self.pp_capture_buffer: torch.Tensor | None = None
+        # Set on a pipeline stage's shadow source (sm80_pp_shadow.py): its
+        # attention output is discarded, so after prepare_layer (every KV
+        # write, top-k and candidate buffer of the step) it stops.
+        self.pp_shadow_prepare_only = False
         super().__init__(
             vllm_config,
             prefix,
@@ -780,6 +784,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             self._sm80_chunk_bytes,
             fused=fused, pipeline=pipeline, workspace=workspace,
         )
+        if self.pp_shadow_prepare_only:
+            return
         self._sm80_attend(batch, q, out, fused=fused, pipeline=pipeline, workspace=workspace)
         if record is not None:
             _capture_attention_outputs(record, self.sm80_cfg, batch, caches, out)
