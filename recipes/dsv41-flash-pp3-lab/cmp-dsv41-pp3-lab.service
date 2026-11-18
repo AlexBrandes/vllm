@@ -1,0 +1,50 @@
+[Unit]
+Description=LAB (not installed): DeepSeek-V4.1-Flash-1017 Q4N-X EXL3 pipeline-parallel (PP3) on CMP 170HX cards 1, 4, 2
+Documentation=file:/home/alex/llm-gateway/gateway/README.md
+After=docker.service
+Requires=docker.service
+StartLimitIntervalSec=1800
+StartLimitBurst=10
+
+# LAB UNIT, committed for review only. Do NOT install or enable it: it takes cards 1, 2 and 4,
+# i.e. it replaces the GLM-5.3-Flash default placement (glm53-exl3-pp2 on cards 1-2) and the
+# lab card 4. Card 3 (qwen38-c) is never touched: the container sees only the three UUIDs below.
+#
+# Stage order (CUDA_VISIBLE_DEVICES order = PP rank): rank 0 = card 1 (GPU-bd10e096, 64 GB, layers 0-15,
+# embedding, vision tower, both Engram layers 1 and 14), rank 1 = card 4 (GPU-ee1699e3, 40 GB, layers
+# 16-24, shadow of source layer 14), rank 2 = card 2 (GPU-348909a8, 64 GB, layers 25-39, shadows of
+# source layers 20 and 24, final norm, head, DSpark drafter). VLLM_PP_LAYER_PARTITION=16,9,15 cuts inside
+# the KV-sharing groups 14-19 and 20-39; the plugin's shadow sources (models/deepseek_v41/sm80_pp_shadow.py)
+# make that legal: stage 0 ships layer 14's attention input, stage 1 ships 20's and 24's (10 KB/token each).
+# Rebalance by measured memory at first boot (valid stage sizes are any; shadows are planned automatically).
+#
+# Image: lab-dsv41-pp3:<plugin sha> built by recipes/dsv41-flash-pp3-lab/build.sh (dsv41/plugin + dsv41/vllm
+# on lab-glm53-q4nx-kf:6734e9fe03). Weights:
+#   /model  /home/alex/models/DeepSeek-V4.1-Flash-1017-Q4NX-c1   Q4N-X EXL3 conversion (routed 2.0/2.5 bpw)
+#   /w8     /home/alex/models/DeepSeek-V4.1-Flash-1017-dense-w8-v1 dense INT8 sidecar (runtime/dsv41/dense-w8,
+#           build_dense_w8.py, 8.10 GB, 664 matrices; copy with MANIFEST before first boot)
+#   /engram /home/alex/models/DeepSeek-V4.1-Flash-1017-src        official shards 47-48 (Engram tables, SSD
+#           placement, read through model.safetensors.index.json; config field engram_table_dir)
+# Flags carried from the GLM production unit (see gateway/cmp-glm53-exl3-pp2.service for evidence):
+#   Q4N-X INT8 routed prefill/decode (t2c4), wide decode calls (64 rows), combine_route wide, no route
+#   re-check; dense W8A8 sidecar incl. skinny decode GEMM; homogeneous PP steps, spread decodes,
+#   2048-token prefill chunk beside decodes (sched round-robin is in the plugin); expandable segments.
+# DeepSeek-V4.1 specific: Engram SSD rows with an 8 GiB host row cache on rank 0; FP32 head (plugin
+# default head_dtype=float32); deterministic index top-k is the sm_80 stable radix select (no flag);
+# no hash routing (the 1017 checkpoint has no gate.tid2eid; every layer is noaux_tc sqrtsoftplus).
+# Candidate speed switches from vllm-sm80 left OFF for the first correctness boot (enable one at a
+# time with benchlib): VLLM_DEEPSEEK_V41_FUSED_MHC(+_FINISH_V2), VLLM_DEEPSEEK_V41_ROUTER_MMA,
+# VLLM_DEEPSEEK_V41_GATE_GEMV, VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH, VLLM_DEEPSEEK_V41_SWA_META_BATCH,
+# VLLM_DEEPSEEK_V41_ATTN_PIPELINE, VLLM_DEEPSEEK_V41_SPLITKV_DECODE, VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE.
+[Service]
+Type=simple
+Restart=no
+TimeoutStartSec=600
+TimeoutStopSec=90
+ExecStartPre=-/usr/bin/docker rm -f dsv41-pp3-lab
+ExecStart=/usr/bin/docker run --entrypoint '' -e PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --name dsv41-pp3-lab --gpus '"device=GPU-bd10e096-f7db-16a4-557b-06ea1b258c2e,GPU-ee1699e3-cb4f-7f81-abe8-5329516228e6,GPU-348909a8-87b2-f694-f624-59fcaa7a9255"' -e CUDA_VISIBLE_DEVICES=GPU-bd10e096-f7db-16a4-557b-06ea1b258c2e,GPU-ee1699e3-cb4f-7f81-abe8-5329516228e6,GPU-348909a8-87b2-f694-f624-59fcaa7a9255 --network host --shm-size 16g -e HF_HUB_OFFLINE=1 -v /home/alex/models/DeepSeek-V4.1-Flash-1017-Q4NX-c1:/model:ro -v /home/alex/models/DeepSeek-V4.1-Flash-1017-dense-w8-v1:/w8:ro -v /home/alex/models/DeepSeek-V4.1-Flash-1017-src:/engram:ro -e VLLM_PP_LAYER_PARTITION=16,9,15 -e VLLM_PP_HOMOGENEOUS_STEPS=1 -e VLLM_PP_SPREAD_DECODES=1 -e VLLM_EXL3_MOE_PREFILL_TC=1 -e VLLM_EXL3_MOE_DECODE_TC=1 -e VLLM_EXL3_MOE_DECODE_TC_MODE=full -e VLLM_EXL3_Q4N_PREFILL=i8 -e VLLM_EXL3_Q4N_I8_GEMM=t2c4 -e VLLM_EXL3_Q4N_DECODE=i8 -e VLLM_EXL3_Q4N_DECODE_GEMM=t2c4 -e VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS=64 -e VLLM_EXL3_MOE_COMBINE_WIDE=1 -e VLLM_EXL3_ROUTE_CHECK=0 -e VLLM_EXL3_DENSE_PREFILL_TC=1 -e VLLM_EXL3_DENSE_DECODE_TC=1 -e VLLM_EXL3_DENSE_DECODE_TC_FAMILIES=all -e VLLM_EXL3_DENSE_DECODE_SPLITK=1 -e VLLM_EXL3_DECODE_VARIANT=off -e VLLM_EXL3_DENSE_W8=/w8/dense.safetensors -e VLLM_EXL3_DENSE_W8_DECODE=1 -e VLLM_ENGRAM_PLACEMENT=ssd -e VLLM_ENGRAM_ROW_CACHE_GIB=8 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lab-dsv41-pp3:PLUGIN_SHA vllm serve /model --host 127.0.0.1 --port 18560 --served-model-name deepseek-v4.1-flash-q4nx-lab --quantization exl3 --load-format exl3 --dtype bfloat16 --tokenizer-mode deepseek_v41 --pipeline-parallel-size 3 --tensor-parallel-size 1 --mm-encoder-tp-mode data --max-model-len 131072 --max-num-seqs 4 --max-num-batched-tokens 2048 --prefill-chunk-with-decodes 2048 --gpu-memory-utilization 0.96 --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-prompt-tokens-details --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' --speculative-config '{"method": "dspark"}' --hf-overrides '{"engram_table_dir": "/engram"}'
+ExecStop=-/usr/bin/docker stop -t 45 dsv41-pp3-lab
+ExecStopPost=-/usr/bin/docker rm -f dsv41-pp3-lab
+
+[Install]
+WantedBy=multi-user.target
