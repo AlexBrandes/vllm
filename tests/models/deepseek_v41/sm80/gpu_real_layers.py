@@ -103,6 +103,8 @@ def run(out: Path, w8: Path | None, graphs: bool) -> dict:
         max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=2048,
         gpu_memory_utilization=0.85, mm_encoder_tp_mode="data",
         tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
+        # The vision tower is converted last; this cut has none (text only).
+        limit_mm_per_prompt={"image": 0},
     )
     if graphs:
         kwargs["compilation_config"] = {"cudagraph_mode": "FULL_DECODE_ONLY"}
