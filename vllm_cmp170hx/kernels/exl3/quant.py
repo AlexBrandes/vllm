@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm_cmp170hx.kernels.exl3.utils import (
@@ -142,6 +143,10 @@ class Exl3Config(QuantizationConfig):
         self.mapped_prefixes: dict[str, str] = {}
         self.is_qwen = False
         self.is_glm = False
+        # DeepSeek-V4.1: checkpoint names follow DeepSeek's own modules
+        # (models/deepseek_v41/sm80_exl3.py, DeepseekV41Exl3Layout).
+        self.is_dsv41 = False
+        self.layout = None
 
     @classmethod
     def get_name(cls) -> Literal["exl3"]:
@@ -202,6 +207,15 @@ class Exl3Config(QuantizationConfig):
             or getattr(text, "model_type", "") == "glm5_next_text"
         )
         self.mtp_start_layer_idx = getattr(text, "num_hidden_layers", 0)
+        self.is_dsv41 = model_type == "deepseek_v41" or getattr(
+            text, "model_type", ""
+        ) in ("deepseek_v41", "deepseek_v41_text")
+        if self.is_dsv41:
+            from vllm_cmp170hx.models.deepseek_v41.sm80_exl3 import (
+                DeepseekV41Exl3Layout,
+            )
+
+            self.layout = DeepseekV41Exl3Layout(hf_config)
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper):
         if self.manifest is None:
@@ -242,7 +256,7 @@ class Exl3Config(QuantizationConfig):
 
     def is_draft_source(self, name: str) -> bool:
         """Whether a checkpoint tensor belongs to the native draft model."""
-        if self.is_qwen:
+        if self.is_qwen or self.is_dsv41:
             return name.startswith("mtp.")
         if self.is_glm:
             match = re.match(r"model\.language_model\.layers\.(\d+)\.", name)
@@ -261,6 +275,8 @@ class Exl3Config(QuantizationConfig):
         )
         if prefix in self.mapped_prefixes:
             return self.mapped_prefixes[prefix]
+        if self.layout is not None:
+            return self.layout.source_prefix(self, prefix)
         if not self.is_qwen:
             return prefix
         if prefix.startswith("model.language_model.model."):
@@ -292,7 +308,11 @@ class Exl3Config(QuantizationConfig):
         if source in self.manifest.matrices:
             return [self.manifest.matrices[source]]
         parent, _, leaf = source.rpartition(".")
-        members = self.packed_modules_mapping.get(leaf, [leaf])
+        members = None
+        if self.layout is not None:
+            members = self.layout.members(self, leaf, source, outputs)
+        if members is None:
+            members = self.packed_modules_mapping.get(leaf, [leaf])
         if leaf == "qkv" and ".visual." in source:
             members = ["q_proj", "k_proj", "v_proj"]
         elif leaf == "qkv_proj" and self.is_qwen and outputs:
@@ -321,9 +341,25 @@ class Exl3Config(QuantizationConfig):
             )
             if matrices:
                 return Exl3LinearMethod(matrices)
+            groups = self.grouped_constituents(prefix)
+            if groups and isinstance(layer, LinearBase):
+                return Exl3GroupedLinearMethod(groups)
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
         return None
+
+    def grouped_constituents(self, prefix: str) -> list[PackedMatrix]:
+        """Per-group matrices of a block-diagonal projection stored as one
+        EXL3 matrix per group (DeepSeek-V4.1 ``wo_a.slice.<g>``), in group
+        order; empty for every other projection."""
+        if self.layout is None:
+            return []
+        assert self.manifest is not None
+        names = self.layout.grouped_members(self, self.source_prefix(prefix))
+        missing = [n for n in names if n not in self.manifest.matrices]
+        if missing:
+            raise ValueError(f"Missing EXL3 group matrices: {missing[:4]}")
+        return [self.manifest.matrices[n] for n in names]
 
 
 class Exl3PackedWeight(nn.Module):
@@ -387,7 +423,7 @@ class Exl3PackedWeight(nn.Module):
             )
             self.suh = nn.Parameter(
                 torch.empty(
-                    0 if matrix.prefix == "lm_head" else self.padded_in,
+                    0 if _dense_w8_head(matrix.prefix) else self.padded_in,
                     dtype=torch.float16,
                 ),
                 requires_grad=False,
@@ -459,6 +495,13 @@ class Exl3PackedWeight(nn.Module):
 class Exl3LinearMethod(LinearMethodBase):
     def __init__(self, matrices: list[PackedMatrix]):
         self.matrices = matrices
+        # Output dtype: BF16, or FP32 for a layer whose output the model keeps
+        # in FP32 (set_output_dtype; an LM head takes ModelConfig.head_dtype).
+        # The kernels here return BF16; an FP32 output is that result widened
+        # (not the FP32 accumulator as vllm-sm80's EXL3 kernels store it).
+        self.out_dtype = torch.bfloat16
+        # Keys of the matrices other ranks hold (grouped projections).
+        self.nonlocal_keys: list[str] = []
 
     def create_weights(
         self,
@@ -472,6 +515,14 @@ class Exl3LinearMethod(LinearMethodBase):
     ):
         if params_dtype != torch.bfloat16:
             raise ValueError("EXL3 requires BF16 activations")
+        if isinstance(layer, ParallelLMHead):
+            from vllm.config import get_current_vllm_config_or_none
+
+            vllm_config = get_current_vllm_config_or_none()
+            model_config = getattr(vllm_config, "model_config", None)
+            head_dtype = getattr(model_config, "head_dtype", None)
+            if head_dtype is not None:
+                self.out_dtype = _linear_out_dtype(head_dtype)
         rank, size = layer.tp_rank, layer.tp_size
         if isinstance(layer, ReplicatedLinear):
             rank, size = 0, 1
@@ -543,7 +594,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 from vllm_cmp170hx.kernels.exl3 import dense_w8
 
                 dense_w8.load_libs()
-                if weight.matrix.prefix == "lm_head":
+                if _dense_w8_head(weight.matrix.prefix):
                     q, s = dense_w8.marlin_pack_lm_head(weight.w8.data, weight.sw.data)
                     weight.marlin_q = nn.Parameter(q, requires_grad=False)
                     weight.marlin_s = nn.Parameter(s, requires_grad=False)
@@ -570,7 +621,7 @@ class Exl3LinearMethod(LinearMethodBase):
         if (
             os.environ.get("VLLM_EXL3_DENSE_W8_FUSE", "1") != "1"
             or len(weights) < 2
-            or not all(w.loaded and w.w8_mode and w.matrix.prefix != "lm_head" for w in weights)
+            or not all(w.loaded and w.w8_mode and not _dense_w8_head(w.matrix.prefix) for w in weights)
             or len({w.padded_in for w in weights}) != 1
             or not all(torch.equal(w.suh.data, weights[0].suh.data) for w in weights[1:])
         ):
@@ -596,7 +647,7 @@ class Exl3LinearMethod(LinearMethodBase):
                     x, weight.marlin_q, weight.marlin_s, weight.logical_out,
                     weight.padded_in,
                 )
-                if weight.w8_mode and weight.matrix.prefix == "lm_head"
+                if weight.w8_mode and _dense_w8_head(weight.matrix.prefix)
                 else torch.ops.vllm.exl3_w8_linear(x, weight.w8, weight.sw, weight.suh)
                 if weight.w8_mode
                 else torch.ops.vllm.exl3_linear(
@@ -613,9 +664,184 @@ class Exl3LinearMethod(LinearMethodBase):
             for weight, row_chunk in zip(layer.exl3_weights, self.row_chunks)
         ]
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+        if output.dtype != self.out_dtype:
+            output = output.to(self.out_dtype)
         if bias is not None:
             output.add_(bias)
         return output.reshape(*shape, output.shape[-1])
+
+    @staticmethod
+    def _run(weight, row_chunk: int, x: torch.Tensor) -> torch.Tensor:
+        """One packed matrix: the sidecar's W8A16 head or W8A8 GEMM, else the
+        EXL3 trellis kernel (the per-matrix dispatch of :meth:`apply`)."""
+        if weight.w8_mode and _dense_w8_head(weight.matrix.prefix):
+            return torch.ops.vllm.exl3_w8_lm_head(
+                x, weight.marlin_q, weight.marlin_s, weight.logical_out,
+                weight.padded_in,
+            )
+        if weight.w8_mode:
+            return torch.ops.vllm.exl3_w8_linear(x, weight.w8, weight.sw, weight.suh)
+        return torch.ops.vllm.exl3_linear(
+            x,
+            weight.trellis,
+            weight.suh,
+            weight.svh,
+            weight.matrix.bits_x2,
+            weight.matrix.codebook,
+            weight.logical_out,
+            row_chunk,
+        )
+
+
+def _dense_w8_head(prefix: str) -> bool:
+    from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+    return dense_w8.is_head(prefix)
+
+
+def _linear_out_dtype(dtype) -> torch.dtype:
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype)
+    if dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(f"EXL3 linear outputs are BF16 or FP32, not {dtype}")
+    return dtype
+
+
+class OutDtypeLinearMethod(UnquantizedLinearMethod):
+    """An unquantized linear that returns its FP32-accumulated product in
+    ``out_dtype``: FP32 keeps the sum of the exact BF16 products unrounded,
+    as an FP32 linear of the same BF16 input and weight computes it."""
+
+    def __init__(self, out_dtype: torch.dtype):
+        super().__init__()
+        self.out_dtype = out_dtype
+
+    def apply(self, layer, x, bias=None):
+        shape = x.shape
+        output = torch.mm(
+            x.reshape(-1, shape[-1]), layer.weight.t(), out_dtype=self.out_dtype
+        )
+        if bias is not None:
+            output = output + bias.to(self.out_dtype)
+        return output.reshape(*shape[:-1], output.shape[-1])
+
+
+def set_output_dtype(layer: nn.Module, dtype: torch.dtype) -> None:
+    """Have the EXL3 or unquantized linear ``layer`` return ``dtype`` (BF16
+    or FP32); an unquantized layer takes OutDtypeLinearMethod."""
+    method = getattr(layer, "quant_method", None)
+    if isinstance(method, Exl3LinearMethod):
+        method.out_dtype = _linear_out_dtype(dtype)
+    elif type(method) in (UnquantizedLinearMethod, OutDtypeLinearMethod):
+        layer.quant_method = OutDtypeLinearMethod(_linear_out_dtype(dtype))
+    else:
+        raise TypeError(
+            f"{type(layer).__name__} has no EXL3 or unquantized linear method "
+            f"({type(method).__name__}) to set an output dtype on"
+        )
+
+
+def set_moe_prefill_v2(layer: nn.Module) -> str | None:
+    """vllm-sm80's moe_out_prefill_v2 is not carried: this plugin's routed
+    prefill is the Q4N-X INT8 operator (VLLM_EXL3_Q4N_PREFILL). Returns why."""
+    return (
+        "moe_out_prefill_v2 is not in this plugin; routed prefill takes the "
+        "Q4N-X operators (VLLM_EXL3_Q4N_PREFILL)"
+    )
+
+
+class Exl3HeadLogitsProcessor(LogitsProcessor):
+    """LogitsProcessor that also serves a head_dtype different from the
+    model dtype with an EXL3 LM head: the head stores its logits in the head
+    dtype (Exl3LinearMethod.create_weights), so it runs as it is. Every
+    other head takes the upstream path."""
+
+    @classmethod
+    def adopt(cls, processor: LogitsProcessor) -> None:
+        assert type(processor) is LogitsProcessor, type(processor)
+        processor.__class__ = cls
+
+    def _apply_head(self, lm_head, hidden_states, embedding_bias):
+        method = lm_head.quant_method
+        if not isinstance(method, Exl3LinearMethod):
+            return super()._apply_head(lm_head, hidden_states, embedding_bias)
+        head_dtype = self.head_dtype or hidden_states.dtype
+        if method.out_dtype != head_dtype:
+            raise ValueError(
+                f"The EXL3 LM head stores {method.out_dtype}, the head dtype is "
+                f"{head_dtype}"
+            )
+        return method.apply(lm_head, hidden_states, bias=embedding_bias)
+
+
+class Exl3GroupedLinearMethod(Exl3LinearMethod):
+    """A block-diagonal projection stored as one EXL3 matrix per group:
+    output group g is input group g times W_g^T. TP ranks own whole groups in
+    order. The layer has no dense weight; callers project through
+    :meth:`apply_grouped` (DeepSeek-V4.1 attention ``wo_a``)."""
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if params_dtype != torch.bfloat16:
+            raise ValueError("EXL3 requires BF16 activations")
+        groups, size = len(self.matrices), layer.tp_size
+        if groups % size or output_size % groups:
+            raise ValueError(f"EXL3 cannot split {groups} groups over {size} ranks")
+        local, group_out = groups // size, output_size // groups
+        mine = range(layer.tp_rank * local, (layer.tp_rank + 1) * local)
+        self.nonlocal_keys = [
+            key
+            for group, matrix in enumerate(self.matrices)
+            if group not in mine
+            for key in matrix.keys
+        ]
+        if sum(output_partition_sizes) != local * group_out:
+            raise ValueError("EXL3 group widths do not match the layer partition")
+        weights = []
+        for matrix in self.matrices[layer.tp_rank * local : (layer.tp_rank + 1) * local]:
+            matrix.validate_logical(input_size, group_out)
+            weights.append(
+                Exl3PackedWeight(
+                    matrix,
+                    input_size,
+                    group_out,
+                    slice(0, matrix.padded_in),
+                    [slice(0, matrix.padded_out)],
+                )
+            )
+        layer.exl3_weights = nn.ModuleList(weights)
+
+    @staticmethod
+    def _fuse_w8(layer):
+        # Groups have distinct inputs: never merge them.
+        return
+
+    def apply(self, layer, x, bias=None):
+        raise ValueError("Grouped EXL3 projections run through apply_grouped")
+
+    def apply_grouped(self, layer, x: torch.Tensor) -> torch.Tensor:
+        """``x`` [tokens, local groups, input] -> [tokens, local groups *
+        output], group by group in this rank's group order."""
+        if x.dim() != 3 or x.shape[1] != len(layer.exl3_weights):
+            raise ValueError("Grouped EXL3 input must be [tokens, groups, input]")
+        outputs = [
+            self._run(weight, row_chunk, x[:, group].contiguous())
+            for group, (weight, row_chunk) in enumerate(
+                zip(layer.exl3_weights, self.row_chunks)
+            )
+        ]
+        output = torch.cat(outputs, dim=-1)
+        if output.dtype != self.out_dtype:
+            output = output.to(self.out_dtype)
+        return output
 
 
 class Exl3MoEMethod(FusedMoEMethodBase):
@@ -656,6 +882,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             local = layer._map_global_expert_id_to_local_expert_id(expert)
             for role in ("gate_proj", "up_proj", "down_proj"):
                 prefix = f"{self.prefix}.{expert}.{role}"
+                if self.config.layout is not None:
+                    prefix = self.config.layout.expert_matrix(
+                        self.config, self.prefix, expert, role
+                    )
                 matrix = self.config.manifest.matrices.get(prefix)
                 if matrix is None:
                     raise ValueError(f"Missing EXL3 expert matrix: {prefix}")

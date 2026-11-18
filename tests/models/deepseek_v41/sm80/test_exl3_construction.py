@@ -80,7 +80,9 @@ def _load(monkeypatch, model, config) -> dict[str, tuple[str, str]]:
     return entries
 
 
-@pytest.mark.parametrize("tp", [1, 4])
+# This plugin serves DeepSeek-V4.1 at TP=1 (pipeline stages); TP4 uneven
+# shared-expert shards are not carried.
+@pytest.mark.parametrize("tp", [1])
 def test_every_checkpoint_tensor_has_one_owner(
     monkeypatch,
     meta_platform,  # noqa: F811

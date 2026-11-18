@@ -43,6 +43,13 @@ def _verify_pipeline_parallel(
         "qwen4_exp_mtp",
     ) and (multimodal is None or multimodal.language_model_only)
     glm5_next = model_type in ("glm5_next", "glm5_next_text", "glm5_next_mtp")
+    text_type = getattr(model_config.hf_text_config, "model_type", "")
+    if model_type == "deepseek_v41" or text_type in ("deepseek_v41", "deepseek_v41_text"):
+        # DeepSeek-V4.1: pipeline stages of whole decoder layers at TP=1
+        # (VLLM_PP_LAYER_PARTITION, e.g. 16,9,15 on cards 1, 4, 2).
+        if parallel_config.tensor_parallel_size != 1:
+            raise ValueError("EXL3 DeepSeek-V4.1 pipeline parallelism requires TP=1")
+        return
     if (
         not (qwen_text_only or glm5_next)
         or parallel_config.tensor_parallel_size != 1
@@ -93,6 +100,13 @@ class Exl3ModelLoader(DefaultModelLoader):
         self.counter_before_loading_weights = time.perf_counter()
         load_exl3_weights(model, model_config)
         self.counter_after_loading_weights = time.perf_counter()
+
+
+def require_cuda_parameters(model: torch.nn.Module) -> None:
+    """Refuse a loaded EXL3 model with a parameter off the GPU."""
+    for name, parameter in model.named_parameters():
+        if not parameter.is_cuda:
+            raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
 
 
 def manifest_still_needed(vllm_config, is_draft: bool) -> bool:
@@ -157,6 +171,14 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     is_draft = model_config.runner_type == "draft"
     loaded = set()
     file_backed_parameters = set()
+    if quant.is_dsv41:
+        # The Engram tables are read from the base checkpoint by the sm_80
+        # Engram storage (models/deepseek_v41/sm80_engram.py), not from here.
+        file_backed_parameters = {
+            name
+            for name, _ in model.named_parameters()
+            if ".engram.embed_tokens." in name
+        }
     modules = dict(model.named_modules())
     shared: set[str] = set()
     if is_draft and (
@@ -219,6 +241,8 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
         for name, module in modules.items():
             method = getattr(module, "quant_method", None)
             if isinstance(method, Exl3LinearMethod):
+                for key in method.nonlocal_keys:
+                    ledger.mark(key, "unused", "group assigned to another TP rank")
                 bias_offset = 0
                 for weight in module.exl3_weights:
                     weight.load(files, ledger)
@@ -285,9 +309,7 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
     }
     if missing:
         raise ValueError(f"Unloaded EXL3 runtime parameters: {sorted(missing)[:16]}")
-    for name, parameter in model.named_parameters():
-        if not parameter.is_cuda:
-            raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
+    require_cuda_parameters(model)
     counts = Counter(disposition for disposition, _ in ledger.entries.values())
     logger.info(
         "EXL3 packed format, BF16 activations; %s model; PLE placement=%s; "

@@ -123,6 +123,9 @@ def vllm_configs(directory: str, tp_size: int) -> tuple[VllmConfig, VllmConfig]:
         enable_expert_parallel=True,
         distributed_executor_backend="mp",
     )
+    # Upstream a0d7356b98 resolves this at post-init, which construction skips.
+    if parallel.eplb_config.num_redundant_experts is None:
+        parallel.eplb_config.num_redundant_experts = 0
     scheduler = SchedulerConfig(
         max_model_len=2048,
         max_num_batched_tokens=256,

@@ -9,7 +9,7 @@ holds, per EXL3 matrix prefix:
                             (x W^T = H128(x * suh) W_r^T), one scale per output row
   <prefix>.sw  fp32 [N]
   <prefix>.suh fp16 [K]     (rotated matrices only)
-  lm_head.w8 / lm_head.sw   unrotated (no suh)
+  lm_head.w8 / lm_head.sw   unrotated (no suh); DeepSeek-V4.1: head.w8 / head.sw
 Rotated matrices run W8A8: a fused H128(x * suh) + per-token int8 quant (exl3_i8_lab.act_int8), then
 vLLM's cutlass_scaled_mm for <= VLLM_EXL3_DENSE_W8_SMALL_M rows (default 128) or the 128x256 CUTLASS
 kernel (cmp_i8mm.scaled_mm_out) above. The LM head runs Marlin W8A16 (uint8b128, per-channel FP16
@@ -48,6 +48,15 @@ def enabled() -> bool:
     return bool(PATH)
 
 
+# EXL3 matrix prefixes of the LM head: GLM/Qwen checkpoints keep "lm_head",
+# DeepSeek-V4.1's keep DeepSeek's own name "head".
+HEAD_PREFIXES = ("lm_head", "head")
+
+
+def is_head(prefix: str) -> bool:
+    return prefix in HEAD_PREFIXES
+
+
 def _open():
     global _file, _keys
     if _file is None:
@@ -66,7 +75,7 @@ def _open():
 
 
 def covers(prefix: str) -> bool:
-    if not enabled() or (prefix == "lm_head" and not LM_HEAD):
+    if not enabled() or (is_head(prefix) and not LM_HEAD):
         return False
     _open()
     return f"{prefix}.w8" in _keys
