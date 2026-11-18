@@ -437,6 +437,8 @@ def adopt_moe(ffn: nn.Module, config) -> None:
                 "gate GEMM, not this kernel; capture with the flag off"
             )
         gate.gemv = True
+        # Read before the first call: the GEMV's scratch is sized by it.
+        sm80_gate_gemv.MAX_ROWS = max(1, envs.VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS)
         logger.info_once(
             "DeepSeek-V4.1 sm_80: MoE gate calls of at most %d rows compute the "
             "logits in FP64 in one kernel (VLLM_DEEPSEEK_V41_GATE_GEMV=1)",

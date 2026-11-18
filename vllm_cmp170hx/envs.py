@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
+    VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS: int = 64
     VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
@@ -1072,6 +1073,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # OFF. Read in vllm_sm80/models/deepseek_v41/sm80_moe.py.
     "VLLM_DEEPSEEK_V41_GATE_GEMV": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80, with VLLM_DEEPSEEK_V41_GATE_GEMV: the largest gate
+    # call the FP64 GEMV takes (default 64: decode and verify). The GEMV's rows
+    # are independent of each other, the FP32 GEMM's are not (its tiling follows
+    # the row count), and a near-tie in the router logits then picks other
+    # experts: a value above the prefill step (e.g. 8192) makes routing, and the
+    # served tokens with it, independent of batch composition. Card 4, real
+    # layers 0-5: first-token logprobs alone vs batched moved by up to 3 nats
+    # with the GEMM, 0 with the GEMV on every call.
+    "VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS", "64")
     ),
     # DeepSeek-V4.1 on sm_80: the grouped MXFP8 wo_a (one Marlin GEMM per
     # group and a concat) as one grouped Triton W8A16 GEMM over all groups
