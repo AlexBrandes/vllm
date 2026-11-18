@@ -231,7 +231,7 @@ def profile(
 
 
 def measure(out: Path, w8: Path | None, dspark: bool, max_len: int, util: float,
-            spec_tokens: int) -> dict:
+            spec_tokens: int, images: int | None = None) -> dict:
     """Boot as a serving rank would (FULL_DECODE_ONLY, 4 sequences, 2048-token
     steps, the given max-model-len and utilization, optional DSpark) and run
     one short request; the memory accounting is in vLLM's own log lines
@@ -249,6 +249,8 @@ def measure(out: Path, w8: Path | None, dspark: bool, max_len: int, util: float,
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
         swa_bounded_replay=False,
     )
+    if images is not None:
+        kwargs["limit_mm_per_prompt"] = {"image": images}
     if dspark:
         spec = {"method": "dspark"}
         if spec_tokens:
@@ -325,6 +327,7 @@ def main() -> None:
     parser.add_argument("--measure", action="store_true")
     parser.add_argument("--util", type=float, default=0.97)
     parser.add_argument("--spec-tokens", type=int, default=0)
+    parser.add_argument("--images", type=int)
     parser.add_argument("--profile-mode", default="decode", choices=("decode", "prefill"))
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
@@ -341,7 +344,7 @@ def main() -> None:
         return
     if args.measure:
         print(json.dumps(measure(args.out, w8, args.dspark, args.max_len, args.util,
-                                 args.spec_tokens)), flush=True)
+                                 args.spec_tokens, args.images)), flush=True)
         return
     if args.profile_dir is not None:
         print(
