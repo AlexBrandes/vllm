@@ -112,6 +112,17 @@ def main() -> None:
             else:
                 reference[op] = full
             result[f"{name}/{op}"] = entry
+        if hasattr(module, "mhc_post_streams"):
+            # A pipeline stage's end (sm80_model._collapse): kernel A's post
+            # alone must give the streams of the fused post+pre, bit for bit.
+            residual, x, fn, scale, base, pre_mix, post, comb, norm = data
+            bad = []
+            for rows in SIZES:
+                fused = _run(module, "post_pre", data, rows)[0]
+                alone = module.mhc_post_streams(x[:rows], residual[:rows], post[:rows], comb[:rows])
+                if not torch.equal(fused, alone):
+                    bad.append([rows, (fused.float() - alone.float()).abs().max().item()])
+            result[f"{name}/post_streams_equal_fused"] = {"equal": not bad, "mismatches": bad[:8]}
     print(json.dumps(result), flush=True)
 
 
