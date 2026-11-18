@@ -847,7 +847,7 @@ def _evict(path):
 
 
 def _file_residency(path):
-    from vllm_cmp170hx.models.qwen4_exp.exl3_ple import page_cache_residency
+    from vllm_cmp170hx.kernels.exl3.host_read import page_cache_residency
 
     fd = os.open(path, os.O_RDONLY)
     try:

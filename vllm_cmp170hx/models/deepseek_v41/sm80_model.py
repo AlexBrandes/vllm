@@ -396,10 +396,14 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
             # adoption: that write_kv runs the TileLang mHC.
             replay.write_batch_kv = model.layers[model.decoder_replay_start].write_kv
         # Pipeline stages cut inside KV-sharing groups (sm80_pp_shadow.py).
-        from vllm.config import get_current_vllm_config
+        from vllm.config import get_current_vllm_config_or_none
 
-        sm80_pp_shadow.attach_shadows(model, get_current_vllm_config())
-        trim_rope_caches(model, get_current_vllm_config())
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            sm80_pp_shadow.attach_shadows(model, vllm_config)
+            trim_rope_caches(model, vllm_config)
+        else:
+            model.pp_plan = None
 
     def make_empty_intermediate_tensors(self, batch_size, dtype, device):
         tensors = super().make_empty_intermediate_tensors(batch_size, dtype, device)
@@ -603,9 +607,11 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
         if not keep_embed:
             # Aliased from the target by the DSpark loader (load_dspark_model).
             model.embed_tokens = PPMissingLayer()
-        from vllm.config import get_current_vllm_config
+        from vllm.config import get_current_vllm_config_or_none
 
-        trim_rope_caches(model, get_current_vllm_config())
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            trim_rope_caches(model, vllm_config)
         if sm80_writes_context_kv(model) and hasattr(model, "context_wkv_proj"):
             # The sm_80 stages write their context KV from their own wkv
             # (precompute_and_store_context_kv), so the stacked context

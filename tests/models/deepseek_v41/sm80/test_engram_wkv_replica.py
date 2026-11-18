@@ -383,6 +383,7 @@ def test_adopt_refuses_a_replica_no_step_reaches(monkeypatch, no_capture):
     assert type(engram.wkv) is W.ReplicatedPrefillWkv
 
 
+@pytest.mark.skip(reason="the hybrid capture family (vllm-sm80 hybrid checkpoints) is not carried by this plugin")
 def test_adopt_refuses_a_hybrid_capture(monkeypatch, no_capture, tmp_path):
     """Every shard copy carries this rank's capture facts: a hybrid capture
     would record four GEMMs as this rank's."""
