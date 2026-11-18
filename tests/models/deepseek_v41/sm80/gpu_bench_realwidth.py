@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Real-width, few-layer DeepSeek-V4.1 engine run on one GPU: the served
+kernels at the served shapes, without the converted checkpoint.
+
+Builds a header-only (sparse, all-zero data) EXL3 checkpoint with the real
+config cut to ``--layers`` decoder layers (hidden 5120, 384 routed experts as
+Q4N-X at 2.0 / 2.5 bpw, the real attention, indexer, compressor, mHC, Engram
+on layer 1, the three DSpark stages with 128 Q4N-X experts at 2.5 bpw) and a
+header-only dense W8 sidecar copied from the real one's header, then serves
+it through vLLM with the lab unit's kernel switches and times prefill and
+decode. All weights are zero, so the tokens are meaningless; the point is
+that the Q4N-X V4.1 families, the W8 sidecar paths, Engram, mHC and DSpark
+load and run at the served geometry, and what a layer costs (Interpretation
+only; serving numbers come from benchlib).
+
+    python tests/models/deepseek_v41/sm80/gpu_bench_realwidth.py --out DIR \
+        --tokenizer-dir SRC --w8-header W8HDR [--layers 4] [--dspark]
+"""
+
+import argparse
+import json
+import os
+import shutil
+import struct
+import sys
+import time
+from pathlib import Path
+
+LAB_ENV = {
+    "VLLM_EXL3_MOE_PREFILL_TC": "1",
+    "VLLM_EXL3_MOE_DECODE_TC": "1",
+    "VLLM_EXL3_MOE_DECODE_TC_MODE": "full",
+    "VLLM_EXL3_Q4N_PREFILL": "i8",
+    "VLLM_EXL3_Q4N_I8_GEMM": "t2c4",
+    "VLLM_EXL3_Q4N_DECODE": "i8",
+    "VLLM_EXL3_Q4N_DECODE_GEMM": "t2c4",
+    "VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS": "64",
+    "VLLM_EXL3_MOE_COMBINE_WIDE": "1",
+    "VLLM_EXL3_ROUTE_CHECK": "0",
+    "VLLM_EXL3_DENSE_PREFILL_TC": "1",
+    "VLLM_EXL3_DENSE_DECODE_TC": "1",
+    "VLLM_EXL3_DENSE_DECODE_TC_FAMILIES": "all",
+    "VLLM_EXL3_DENSE_DECODE_SPLITK": "1",
+    "VLLM_EXL3_DECODE_VARIANT": "off",
+    "VLLM_EXL3_DENSE_W8_DECODE": "1",
+    "VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8": "1",
+    "VLLM_DEEPSEEK_V41_TRIM_ROPE": "1",
+    "VLLM_DEEPSEEK_V41_FUSED_MHC": "1",
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": "1",
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
+
+
+def build(out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int]) -> None:
+    from tests.models.deepseek_v41.sm80 import exl3_fixture as fixture
+    from tests.models.deepseek_v41.sm80.test_engram_storage import _write_table
+
+    config = json.loads((fixture.FIXTURES / "config.json").read_text())
+    text = config["text_config"]
+    ratios = text["compress_ratios"]
+    text["compress_ratios"] = ratios[:layers] + ratios[-text["num_nextn_predict_layers"]:]
+    text["num_hidden_layers"] = layers
+    text["kv_source_layer_ids"] = [s for s in text["kv_source_layer_ids"] if s < layers]
+    text["index_source_layer_ids"] = [s for s in text["index_source_layer_ids"] if s < layers]
+    text["candidate_source_layer_id"] = max(text["kv_source_layer_ids"])
+    keep = [i for i, l in enumerate(text["engram_layer_ids"]) if l < layers]
+    text["engram_layer_ids"] = [text["engram_layer_ids"][i] for i in keep]
+    text["engram_num_embeddings"] = [text["engram_num_embeddings"][i] for i in keep]
+    text["dspark_target_layer_ids"] = list(range(layers - 3, layers))
+    tables = out / "engram-tables"
+    config["engram_table_dir"] = str(tables)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    (out / "config.json").write_text(json.dumps(config))
+    tensors = fixture.checkpoint_tensors(config)
+    # Our converter: Engram wkv BF16; routed experts Q4N-X (marker q4nx).
+    for name in [n for n in tensors if ".engram.wkv." in n]:
+        del tensors[name]
+    hc = text["hc_mult"]
+    n_hash = (text["engram_max_ngram_size"] - 1) * text["engram_n_heads"]
+    for layer in text["engram_layer_ids"]:
+        tensors[f"layers.{layer}.engram.wkv.weight"] = (
+            "BF16", (text["hidden_size"] * (hc + 1), n_hash * text["engram_head_dim"])
+        )
+    for name in [n for n in tensors if ".ffn.experts." in n and n.endswith(".mul1")]:
+        del tensors[name]
+        tensors[name[: -len(".mul1")] + ".q4nx"] = ("I32", ())
+    for name, (dtype, shape) in list(tensors.items()):
+        if ".ffn.experts." in name and name.endswith(".trellis"):
+            draft = name.startswith("mtp.")
+            layer = int(name.split(".")[1])
+            bits_x2 = 5 if draft or layer in routed_25 else 4
+            tensors[name] = (dtype, (*shape[:-1], 8 * bits_x2))
+    header, offset = {}, 0
+    for name, (dtype, shape) in sorted(tensors.items()):
+        size = fixture.tensor_bytes(dtype, tuple(shape))
+        header[name] = {"dtype": dtype, "shape": list(shape),
+                        "data_offsets": [offset, offset + size]}
+        offset += size
+    raw = json.dumps(header).encode()
+    raw += b" " * (-len(raw) % 8)
+    markers = {"mul1": fixture.MUL1, "q4nx": fixture.MUL1}
+    with open(out / "model-00001-of-00001.safetensors", "wb") as f:
+        f.write(struct.pack("<Q", len(raw)) + raw)
+        f.truncate(8 + len(raw) + offset)
+        for name, entry in header.items():
+            marker = name.rsplit(".", 1)[-1]
+            if marker in markers:
+                os.pwrite(f.fileno(), struct.pack("<I", markers[marker]),
+                          8 + len(raw) + entry["data_offsets"][0])
+    tables.mkdir()
+    for layer, rows in zip(text["engram_layer_ids"], text["engram_num_embeddings"]):
+        _write_table(tables, layer, rows, [0], f"engram-{layer}.safetensors")
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        if (tokenizer_dir / name).exists():
+            shutil.copyfile(tokenizer_dir / name, out / name)
+
+
+def sparse_sidecar(header_file: Path, out: Path, size: int) -> Path:
+    path = out / "w8" / "dense.safetensors"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(header_file.read_bytes())
+        f.truncate(size)
+    return path
+
+
+def run(out: Path, w8: Path | None, dspark: bool, max_len: int) -> dict:
+    os.environ.update(LAB_ENV)
+    if w8 is not None:
+        os.environ["VLLM_EXL3_DENSE_W8"] = str(w8)
+    from vllm import LLM, SamplingParams
+
+    kwargs = dict(
+        model=str(out), quantization="exl3", load_format="exl3", dtype="bfloat16",
+        max_model_len=max_len, max_num_seqs=4, max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.85, mm_encoder_tp_mode="data",
+        tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
+        compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
+    )
+    if dspark:
+        kwargs["speculative_config"] = {"method": "dspark"}
+    t0 = time.time()
+    llm = LLM(**kwargs)
+    boot = time.time() - t0
+    result = {"boot_s": round(boot, 1), "dspark": dspark}
+    for batch, prompt_len, out_len in ((1, 2048, 1), (1, 2048, 129), (4, 2048, 129)):
+        prompts = [
+            {"prompt_token_ids": [(13 * i + 7 * b) % 100000 + 3 for i in range(prompt_len)]}
+            for b in range(batch)
+        ]
+        params = SamplingParams(max_tokens=out_len, temperature=0.0, ignore_eos=True)
+        llm.generate(prompts, params)  # warm
+        t0 = time.time()
+        llm.generate(prompts, params)
+        result[f"b{batch}_p{prompt_len}_o{out_len}_s"] = round(time.time() - t0, 3)
+    p1 = result["b1_p2048_o1_s"]
+    result["decode_ms_per_step_b1"] = round(
+        (result["b1_p2048_o129_s"] - p1) / 128 * 1000, 2
+    )
+    result["decode_ms_per_step_b4"] = round(
+        (result["b4_p2048_o129_s"] - result["b1_p2048_o1_s"] * 4) / 128 * 1000, 2
+    )
+    del llm
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--tokenizer-dir", type=Path, required=True)
+    parser.add_argument("--w8-header", type=Path)
+    parser.add_argument("--w8-size", type=int, default=8098376784)
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--routed-25", default="0")
+    parser.add_argument("--dspark", action="store_true")
+    parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--max-len", type=int, default=16384)
+    args = parser.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    routed_25 = {int(x) for x in args.routed_25.split(",") if x}
+    if not args.skip_build:
+        build(args.out, args.tokenizer_dir, args.layers, routed_25)
+    w8 = None
+    if args.w8_header is not None:
+        w8 = sparse_sidecar(args.w8_header, args.out, args.w8_size)
+    if args.build_only:
+        return
+    print(json.dumps(run(args.out, w8, args.dspark, args.max_len)), flush=True)
+
+
+if __name__ == "__main__":
+    main()
