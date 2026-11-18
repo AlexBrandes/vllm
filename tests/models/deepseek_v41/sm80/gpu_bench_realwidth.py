@@ -244,9 +244,14 @@ def run(out: Path, w8: Path | None, dspark: bool, max_len: int) -> dict:
         ]
         params = SamplingParams(max_tokens=out_len, temperature=0.0, ignore_eos=True)
         llm.generate(prompts, params)  # warm
-        t0 = time.time()
-        llm.generate(prompts, params)
-        result[f"b{batch}_p{prompt_len}_o{out_len}_s"] = round(time.time() - t0, 3)
+        times = []
+        for _ in range(int(os.environ.get("DSV41_BENCH_REPEATS", "3"))):
+            t0 = time.time()
+            llm.generate(prompts, params)
+            times.append(time.time() - t0)
+        times.sort()
+        result[f"b{batch}_p{prompt_len}_o{out_len}_s"] = round(times[len(times) // 2], 4)
+        result[f"b{batch}_p{prompt_len}_o{out_len}_spread"] = round(times[-1] - times[0], 4)
     p1 = result["b1_p2048_o1_s"]
     result["decode_ms_per_step_b1"] = round(
         (result["b1_p2048_o129_s"] - p1) / 128 * 1000, 2
