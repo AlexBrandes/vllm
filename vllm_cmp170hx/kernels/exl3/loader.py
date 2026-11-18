@@ -344,6 +344,14 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
             if name.endswith((".trellis", ".suh", ".svh", ".mcg", ".mul1", ".q4n", ".q4nx")):
                 raise ValueError(f"EXL3 packed tensor has no runtime owner: {name}")
             tensor = files[header.path].get_tensor(name)
+            if quant.is_dsv41 and name.endswith(".attn.compressor.ape"):
+                # exllamav3's DeepSeek-V4 compressor module writes an absolute
+                # position embedding; DeepSeek-V4.1 has none (the official
+                # checkpoint carries no ``ape``) and the conversion stores zeros.
+                if torch.count_nonzero(tensor):
+                    raise ValueError(f"Nonzero {name}: DeepSeek-V4.1 compressors have no APE")
+                ledger.mark(name, "unused", "zero APE (DeepSeek-V4.1 has none)")
+                continue
             owner = shadow_owner(name) if shadow_owner is not None else None
             if owner is not None:
                 module, leaf = owner
