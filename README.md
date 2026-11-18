@@ -44,7 +44,7 @@ Each recipe pins the exact engine it was validated with.
 | --- | --- | --- | --- |
 | Qwen3.8-Flash-Next | W4A16 AutoRound | PP2 / TP1 | [W4A16 recipe](recipes/qwen-flash-next-w4a16/README.md) — pinned container on the plugin layout, image and video input, download and launch scripts |
 | Qwen3.8-Flash-Next | EXL3 5.05 bpw | PP2 / TP1 | [EXL3 recipe](recipes/qwen-flash-next-exl3/README.md) — source-built container and the validated serving configuration |
-| GLM-5.3-Flash | EXL3 2.60 bpw | PP2 / TP1 | [EXL3 recipe](recipes/glm53-flash-exl3/README.md) — pinned container, image and video input, DFlash2 drafter, download and launch scripts |
+| GLM-5.3-Flash | EXL3 2.6 bpw, Q4N-X routed experts | PP2 / TP1 | [EXL3 recipe](recipes/glm53-flash-exl3/README.md) — pinned container, INT8 dense weights, image and video input, DFlash2 drafter, download and launch scripts |
 | Qwen3.8-27B | W4A16 AutoRound | one card | [W4A16 recipe](recipes/qwen38-27b/README.md) — pinned container for one 64 GB or 40 GB card, image and video input, DFlash2 drafter, download and launch scripts |
 
 Each recipe lists its hardware, storage and software requirements, its engine
@@ -55,7 +55,7 @@ pins, and its launch settings.
 These are our measurements at **170 W/card on PCIe Gen2 ×4 links**: two 64 GiB
 cards for the PP2 recipes, one 40 GB card for Qwen3.8-27B.
 Decode uses the SparkDash `3e6d4ef` protocol: greedy sampling, thinking off,
-400 output tokens. Values are medians of three complete runs. C4 and C8 mean
+400 output tokens. Values are medians of three complete runs (GLM-5.3-Flash: one run). C4 and C8 mean
 total throughput across four or eight simultaneous requests, not the speed of
 each request.
 
@@ -63,12 +63,12 @@ each request.
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3.8-Flash-Next W4A16 | 234.4 tok/s | 581.9 tok/s | 827.3 tok/s | 7,426 tok/s |
 | Qwen3.8-Flash-Next EXL3 | 163.1 tok/s | 355.5 tok/s | 499.8 tok/s | 4,000 tok/s |
-| GLM-5.3-Flash EXL3 | 88.3 tok/s | 170.5 tok/s | N/A | 2,501 tok/s |
+| GLM-5.3-Flash EXL3 (Q4N-X) | 161.9 tok/s | 287.2 tok/s | N/A | 4,605 tok/s |
 | Qwen3.8-27B W4A16 (one card) | 343.5 tok/s | 868.3 tok/s | 1,233.8 tok/s | 3,629 tok/s |
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
 and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), the
-[GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/0294590212713617fdfa5d5be46385f30c657f6a/results/2026-11-11.json), and the
+[GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/ecdcaa550e61195f00e04ddacb29cfe82d7759a3/results/q4nx-2.6bpw.json), and the
 [Qwen3.8-27B results](https://github.com/AlexBrandes/cmp170hx-qwen38-27b/blob/6587a76a6fdccd1c355536cedf57564e6f0c800b/results/2026-11-11.json) identify their engine,
 configuration, and measurement runs. Each row measures a **whole recipe**: engine
 version, quantization, speculative depth and runtime settings differ between
