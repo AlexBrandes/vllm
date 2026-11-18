@@ -263,7 +263,12 @@ class Exl3Manifest:
             raise ValueError(f"Unsupported EXL3 codebook multiplier: {prefix}")
         bits_x2 = stride // 8
         if codebook >= 3:
-            if bits_x2 not in (5, 6):
+            # Q4N (codebook 3): 2.5 / 3.0 bpw. Q4N-X (codebook 4): 2.0 / 2.5 /
+            # 3.0 / 3.5 bpw, the widths the routed tensor-core families
+            # instantiate (GLM-5.3 mixed allocations, DeepSeek-V4.1 2.0 / 2.5);
+            # the MoE gates check the (shape, width) family per layer.
+            allowed = (5, 6) if codebook == 3 else (4, 5, 6, 7)
+            if bits_x2 not in allowed:
                 raise ValueError(f"Unsupported Q4N bitrate: {prefix}")
         elif not (bits_x2 in range(2, 17, 2) or (codebook == 2 and bits_x2 in (3, 5, 7))):
             raise ValueError(f"Unsupported EXL3 bitrate/codebook: {prefix}")
