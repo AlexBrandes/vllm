@@ -901,6 +901,20 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
         # Groups have distinct inputs: never merge them.
         return
 
+    def process_weights_after_loading(self, layer):
+        super().process_weights_after_loading(layer)
+        from vllm_cmp170hx.kernels.exl3 import dense_w8
+
+        weights = list(layer.exl3_weights)
+        # One activation quantisation for every group (dense_w8._w8_grouped)
+        # when all groups are sidecar matrices with the same input signs.
+        self.w8_grouped = (
+            dense_w8.GROUPED
+            and len(weights) > 1
+            and all(w.w8_mode for w in weights)
+            and all(torch.equal(w.suh.data, weights[0].suh.data) for w in weights[1:])
+        )
+
     def apply(self, layer, x, bias=None):
         raise ValueError("Grouped EXL3 projections run through apply_grouped")
 
@@ -909,6 +923,17 @@ class Exl3GroupedLinearMethod(Exl3LinearMethod):
         output], group by group in this rank's group order."""
         if x.dim() != 3 or x.shape[1] != len(layer.exl3_weights):
             raise ValueError("Grouped EXL3 input must be [tokens, groups, input]")
+        if getattr(self, "w8_grouped", False):
+            weights = layer.exl3_weights
+            output = torch.ops.vllm.exl3_w8_grouped(
+                x.contiguous(),
+                [w.w8 for w in weights],
+                [w.sw for w in weights],
+                weights[0].suh,
+            )
+            if output.dtype != self.out_dtype:
+                output = output.to(self.out_dtype)
+            return output
         outputs = [
             self._run(weight, row_chunk, x[:, group].contiguous())
             for group, (weight, row_chunk) in enumerate(

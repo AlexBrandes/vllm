@@ -34,6 +34,9 @@ PATH = os.environ.get("VLLM_EXL3_DENSE_W8", "").strip()
 LM_HEAD = os.environ.get("VLLM_EXL3_DENSE_W8_LM_HEAD", "1") == "1"
 SMALL_M = int(os.environ.get("VLLM_EXL3_DENSE_W8_SMALL_M", "128"))
 DECODE = os.environ.get("VLLM_EXL3_DENSE_W8_DECODE", "0") == "1"
+# Grouped projections whose groups share one suh run one activation
+# quantisation for all groups (_w8_grouped); 0 keeps one call per group.
+GROUPED = os.environ.get("VLLM_EXL3_DENSE_W8_GROUPED", "1") == "1"
 LIB_DIR = os.environ.get("VLLM_EXL3_ONCE_LIB_DIR", "/opt/exl3-once")
 
 _file = None
@@ -151,6 +154,52 @@ def _w8_linear(x: torch.Tensor, w8: torch.Tensor, sw: torch.Tensor,
     return out
 
 
+def _w8_grouped(x: torch.Tensor, w8s: list[torch.Tensor], sws: list[torch.Tensor],
+                suh: torch.Tensor) -> torch.Tensor:
+    """A block-diagonal projection whose groups share one input sign vector
+    (DeepSeek-V4.1 ``wo_a``: 8 groups, sidecar built with share-suh): ``x``
+    [T, G, K] -> [T, G * N]. One activation quantisation covers every group's
+    rows (group-major, so each group's rows stay contiguous), then each group
+    takes the GEMM :func:`_w8_linear` would pick for T rows. The quantisation
+    is per row, so every group's operand equals its separate call's bit for
+    bit (as do act_int8 and act_int8_dec)."""
+    t, g, k = x.shape
+    n = w8s[0].shape[0]
+    if t == 0:
+        return x.new_empty((0, g * n))
+    m = g * t
+    xs = x.transpose(0, 1).reshape(m, k).contiguous()
+    xq = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    sx = torch.empty((m,), dtype=torch.float32, device=x.device)
+    if DECODE and m <= 16 and k % 128 == 0:
+        torch.ops.exl3_i8_lab.act_int8_dec(xs, suh, xq, sx)
+    else:
+        torch.ops.exl3_i8_lab.act_int8(xs, suh, xq, sx)
+    out = torch.empty((t, g * n), dtype=torch.bfloat16, device=x.device)
+    for i in range(g):
+        xq_i, sx_i = xq[i * t : (i + 1) * t], sx[i * t : (i + 1) * t]
+        w8, sw = w8s[i], sws[i]
+        if DECODE and t <= 16 and n % 16 == 0 and k % 128 == 0 and w8.is_contiguous():
+            o = torch.empty((t, n), dtype=torch.bfloat16, device=x.device)
+            torch.ops.exl3_i8_lab.w8_decode_mm(o, xq_i, w8, sx_i, sw)
+        elif t <= SMALL_M:
+            from vllm import _custom_ops as ops
+
+            o = ops.cutlass_scaled_mm(
+                xq_i, w8.t(), sx_i.view(-1, 1), sw.view(1, -1), torch.bfloat16
+            )
+        else:
+            o = torch.empty((t, n), dtype=torch.bfloat16, device=x.device)
+            torch.ops.cmp_i8mm.scaled_mm_out(o, xq_i, w8, sx_i, sw)
+        out[:, i * n : (i + 1) * n].copy_(o)
+    _log(f"grouped g={g} k={k} n={n}", t)
+    return out
+
+
+def _w8_grouped_fake(x, w8s, sws, suh):
+    return x.new_empty((x.shape[0], x.shape[1] * w8s[0].shape[0]))
+
+
 def _w8_linear_fake(x, w8, sw, suh):
     return x.new_empty((x.shape[0], w8.shape[0]))
 
@@ -185,6 +234,8 @@ def register_ops() -> None:
                               mutates_args=[], fake_impl=_w8_linear_fake)
     direct_register_custom_op(op_name="exl3_w8_lm_head", op_func=_w8_lm_head,
                               mutates_args=[], fake_impl=_w8_lm_head_fake)
+    direct_register_custom_op(op_name="exl3_w8_grouped", op_func=_w8_grouped,
+                              mutates_args=[], fake_impl=_w8_grouped_fake)
     _registered = True
 
 
