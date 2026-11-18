@@ -167,6 +167,46 @@ def sparse_sidecar(header_file: Path, out: Path, size: int) -> Path:
     return path
 
 
+def profile(out: Path, w8: Path | None, max_len: int, profile_dir: Path) -> dict:
+    """Eager decode under the torch profiler: CUDA time per kernel name over
+    64 decode steps at batch 1 (kernel durations; launch gaps excluded)."""
+    import glob
+    import gzip
+
+    os.environ.update(LAB_ENV)
+    if w8 is not None:
+        os.environ["VLLM_EXL3_DENSE_W8"] = str(w8)
+    os.environ["VLLM_TORCH_PROFILER_DIR"] = str(profile_dir)
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=str(out), quantization="exl3", load_format="exl3", dtype="bfloat16",
+        max_model_len=max_len, max_num_seqs=4, max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.85, mm_encoder_tp_mode="data",
+        tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
+        enforce_eager=True,
+    )
+    prompt = [{"prompt_token_ids": [(13 * i) % 100000 + 3 for i in range(512)]}]
+    params = SamplingParams(max_tokens=65, temperature=0.0, ignore_eos=True)
+    llm.generate(prompt, params)
+    llm.start_profile()
+    llm.generate(prompt, params)
+    llm.stop_profile()
+    del llm
+    totals: dict[str, float] = {}
+    for path in glob.glob(str(profile_dir / "**" / "*.json*"), recursive=True):
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt") as f:
+            trace = json.load(f)
+        for event in trace.get("traceEvents", []):
+            if event.get("cat") == "kernel":
+                name = event.get("name", "?")[:90]
+                totals[name] = totals.get(name, 0.0) + float(event.get("dur", 0.0))
+    total = sum(totals.values())
+    top = sorted(totals.items(), key=lambda kv: -kv[1])[:25]
+    return {"kernel_us_total": round(total), "top": [[n, round(us)] for n, us in top]}
+
+
 def run(out: Path, w8: Path | None, dspark: bool, max_len: int) -> dict:
     os.environ.update(LAB_ENV)
     if w8 is not None:
@@ -217,6 +257,7 @@ def main() -> None:
     parser.add_argument("--routed-25", default="0")
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--realistic", action="store_true")
+    parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--max-len", type=int, default=16384)
@@ -229,6 +270,9 @@ def main() -> None:
     if args.w8_header is not None:
         w8 = sparse_sidecar(args.w8_header, args.out, args.w8_size)
     if args.build_only:
+        return
+    if args.profile_dir is not None:
+        print(json.dumps(profile(args.out, w8, args.max_len, args.profile_dir)), flush=True)
         return
     print(json.dumps(run(args.out, w8, args.dspark, args.max_len)), flush=True)
 
