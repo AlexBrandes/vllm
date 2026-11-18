@@ -53,7 +53,9 @@ LAB_ENV = {
 }
 
 
-def build(out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int]) -> None:
+def build(
+    out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int], realistic: bool = False
+) -> None:
     from tests.models.deepseek_v41.sm80 import exl3_fixture as fixture
     from tests.models.deepseek_v41.sm80.test_engram_storage import _write_table
 
@@ -120,12 +122,40 @@ def build(out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int]) -> N
             if marker in markers:
                 os.pwrite(f.fileno(), struct.pack("<I", markers[marker]),
                           8 + len(raw) + entry["data_offsets"][0])
+        if realistic:
+            _realistic_values(f.fileno(), 8 + len(raw), header)
     tables.mkdir()
     for layer, rows in zip(text["engram_layer_ids"], text["engram_num_embeddings"]):
         _write_table(tables, layer, rows, [0], f"engram-{layer}.safetensors")
     for name in ("tokenizer.json", "tokenizer_config.json"):
         if (tokenizer_dir / name).exists():
             shutil.copyfile(tokenizer_dir / name, out / name)
+
+
+def _realistic_values(fd: int, base: int, header: dict) -> None:
+    """Values that make the routing realistic in an otherwise all-zero
+    checkpoint: a random embedding, unit norm weights and random router
+    gates (logit spread ~1.4), so tokens spread over the experts as served
+    tokens do (an all-zero model routes every token to the same experts)."""
+    import torch
+
+    generator = torch.Generator().manual_seed(0)
+    for name, entry in header.items():
+        lo, hi = entry["data_offsets"]
+        shape = entry["shape"]
+        if name == "embed.weight":
+            rows_per_chunk = 4096
+            for start in range(0, shape[0], rows_per_chunk):
+                rows = min(rows_per_chunk, shape[0] - start)
+                chunk = torch.randn(rows, shape[1], generator=generator).to(torch.bfloat16)
+                os.pwrite(fd, chunk.view(torch.int16).numpy().tobytes(),
+                          base + lo + start * shape[1] * 2)
+        elif "norm" in name and name.endswith(".weight") and entry["dtype"] == "BF16":
+            ones = torch.ones(shape, dtype=torch.bfloat16)
+            os.pwrite(fd, ones.view(torch.int16).numpy().tobytes(), base + lo)
+        elif name.endswith(".ffn.gate.weight"):
+            gate = (torch.randn(shape, generator=generator) * 0.02).to(torch.float16)
+            os.pwrite(fd, gate.view(torch.int16).numpy().tobytes(), base + lo)
 
 
 def sparse_sidecar(header_file: Path, out: Path, size: int) -> Path:
@@ -186,6 +216,7 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--routed-25", default="0")
     parser.add_argument("--dspark", action="store_true")
+    parser.add_argument("--realistic", action="store_true")
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--max-len", type=int, default=16384)
@@ -193,7 +224,7 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     routed_25 = {int(x) for x in args.routed_25.split(",") if x}
     if not args.skip_build:
-        build(args.out, args.tokenizer_dir, args.layers, routed_25)
+        build(args.out, args.tokenizer_dir, args.layers, routed_25, args.realistic)
     w8 = None
     if args.w8_header is not None:
         w8 = sparse_sidecar(args.w8_header, args.out, args.w8_size)
