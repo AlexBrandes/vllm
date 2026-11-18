@@ -977,10 +977,14 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if envs.VLLM_EXL3_MOE_V2:
             moe_v2_rows, workspace = self._moe_v2(layer, metadata, max_rows, workspace)
         prefill_decode_len = 0
+        prefill_max_rows = None
         if envs.VLLM_EXL3_MOE_PREFILL_TC:
             prefill_decode_len, workspace, prefill_bits_x2 = self._moe_prefill(
                 layer, metadata, max_rows, workspace
             )
+            family = exl3_ops.moe_tc_family(self.hidden_size, self.intermediate_size)
+            if family is not None and prefill_decode_len:
+                prefill_max_rows = family.prefill_max_rows
         decode_tc_rows = 0
         decode_tc_bits_x2 = 0
         decode_query_len = 0
@@ -1024,9 +1028,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             moe_v2_rows,
             prefill_decode_len,
             prefill_requires_explicit=(
-                bool(prefill_decode_len) and self.hidden_size == 4096
+                bool(prefill_decode_len)
+                and exl3_ops.moe_tc_family(self.hidden_size, self.intermediate_size)
+                is not None
             ),
             prefill_bits_x2=prefill_bits_x2,
+            prefill_max_rows=prefill_max_rows,
             decode_tc_rows=decode_tc_rows,
             decode_tc_bits_x2=decode_tc_bits_x2,
             decode_query_len=decode_query_len,
@@ -1088,16 +1095,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         """The decode query bound, workspace and family bits for a covered
         prefill family.
 
-        GLM additionally requires explicit pure-prefill metadata at dispatch
-        and a uniform 5-bit or 3.5-bit expert format. A zero bound means the
-        gate is closed.
+        The MOE_TC_FAMILIES shapes (GLM, DeepSeek-V4.1) additionally require
+        explicit pure-prefill metadata at dispatch, a uniform admitted expert
+        format, 74 SMs, the family's SwiGLU limit and its model layout. A
+        zero bound means the gate is closed.
         """
         from vllm.config import get_current_vllm_config
         from vllm_cmp170hx.kernels.exl3 import ops as exl3_ops
         from vllm_cmp170hx.kernels.exl3.step_phase import max_decode_query_len
 
         device = layer.exl3_ptrs.device
-        glm = self.hidden_size == 4096 and self.intermediate_size == 2048
+        family = exl3_ops.moe_tc_family(self.hidden_size, self.intermediate_size)
         bits_x2 = _layer_bits_x2(metadata)
         reason = exl3_ops.moe_prefill_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
@@ -1110,12 +1118,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             metadata,
             bits_x2 if bits_x2 is not None else 0,
         )
-        if reason is None and glm:
-            sms = torch.cuda.get_device_properties(device).multi_processor_count
-            if sms != 74:
-                reason = f"GLM prefill device has {sms} SMs, not 74"
-            elif self.moe.swiglu_limit != 10.0:
-                reason = "GLM tensor-core prefill requires SwiGLU clipping at 10.0"
+        if reason is None and family is not None:
+            reason = _family_device_closed_reason(family, "prefill", device, self.moe)
         if reason is None and max_rows < exl3_ops.MOE_PREFILL_MIN_ROWS:
             reason = f"MoE calls have at most {max_rows} rows"
         if reason is None:
@@ -1123,7 +1127,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
         vllm_config = get_current_vllm_config()
         if reason is None:
-            reason = _prefill_layout_closed_reason(vllm_config, glm=glm)
+            reason = _prefill_layout_closed_reason(vllm_config, family=family)
         if reason is not None:
             logger.info_once(
                 "VLLM_EXL3_MOE_PREFILL_TC is set but the gate is closed: %s; "
@@ -1133,7 +1137,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return 0, workspace, 0
         rows = min(
             max_rows,
-            exl3_ops.MOE_PREFILL_GLM_MAX_ROWS if glm else exl3_ops.MOE_PREFILL_MAX_ROWS,
+            family.prefill_max_rows if family is not None else exl3_ops.MOE_PREFILL_MAX_ROWS,
         )
         workspace = max(
             workspace,
@@ -1163,7 +1167,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "calls keep their kernels.",
             exl3_ops.MOE_PREFILL_MIN_ROWS,
             rows,
-            glm,
+            family is not None,
         )
         compilation = getattr(vllm_config, "compilation_config", None)
         graph_max = getattr(compilation, "max_cudagraph_capture_size", None) or 0
@@ -1177,18 +1181,21 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     def _moe_decode_tc(self, layer, metadata, max_rows: int, workspace: int):
         """The row bound, expert format, decode phase bound and workspace for
-        the GLM small-row tensor-core decode family (0 rows: the gate closed).
+        a small-row tensor-core decode family (GLM, DeepSeek-V4.1; 0 rows: the
+        gate closed).
 
-        The same family checks as the GLM prefill gate: the exact PP2
-        DFlash-k3/k5/k7 layout, 74 SMs, SwiGLU limit 10.0, a uniform 5-bit or
-        3.5-bit expert format with codebook 2 and 16-byte-aligned trellis
-        bases. The row range is 1..8 rows in decode steps.
+        The same family checks as the prefill gate: the family's model layout
+        (GLM: the exact PP2 DFlash-k3/k5/k7 layout), 74 SMs, the family's
+        SwiGLU limit, a uniform admitted expert format and 16-byte-aligned
+        trellis bases. The row range is 1..MOE_DECODE_TC_MAX_ROWS rows in
+        decode steps.
         """
         from vllm.config import get_current_vllm_config
         from vllm_cmp170hx.kernels.exl3 import ops as exl3_ops
         from vllm_cmp170hx.kernels.exl3.step_phase import max_decode_query_len
 
         device = layer.exl3_ptrs.device
+        family = exl3_ops.moe_tc_family(self.hidden_size, self.intermediate_size)
         bits_x2 = _layer_bits_x2(metadata)
         reason = exl3_ops.moe_decode_tc_closed_reason(
             tuple(torch.cuda.get_device_capability(device)),
@@ -1202,11 +1209,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             bits_x2 if bits_x2 is not None else 0,
         )
         if reason is None:
-            sms = torch.cuda.get_device_properties(device).multi_processor_count
-            if sms != 74:
-                reason = f"GLM decode device has {sms} SMs, not 74"
-            elif self.moe.swiglu_limit != 10.0:
-                reason = "GLM tensor-core decode requires SwiGLU clipping at 10.0"
+            reason = _family_device_closed_reason(family, "decode", device, self.moe)
         if reason is None and max_rows < 1:
             reason = f"MoE calls have at most {max_rows} rows"
         if reason is None:
@@ -1214,7 +1217,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             reason = _unaligned_trellis_reason(layer.exl3_ptrs.tolist())
         vllm_config = get_current_vllm_config()
         if reason is None:
-            reason = _prefill_layout_closed_reason(vllm_config, glm=True)
+            reason = _prefill_layout_closed_reason(vllm_config, family=family)
         if reason is not None:
             logger.info_once(
                 "VLLM_EXL3_MOE_DECODE_TC is set but the gate is closed: %s; "
@@ -1302,6 +1305,7 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         decode_tc_bits_x2=0,
         decode_query_len=0,
         q4n_tc_only=False,
+        prefill_max_rows=None,
     ):
         super().__init__(moe, quant)
         self.intermediate_size = intermediate_size
@@ -1331,8 +1335,12 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
             MOE_PREFILL_MAX_ROWS,
         )
 
+        # The family's prefill chunk bound (MOE_TC_FAMILIES), else the former
+        # rule (GLM's bound for the explicit-metadata family, Qwen's otherwise).
         self.prefill_max_rows = (
-            MOE_PREFILL_GLM_MAX_ROWS
+            prefill_max_rows
+            if prefill_max_rows is not None
+            else MOE_PREFILL_GLM_MAX_ROWS
             if prefill_requires_explicit
             else MOE_PREFILL_MAX_ROWS
         )
@@ -1570,8 +1578,49 @@ class Exl3Experts(mk.FusedMoEExpertsModular):
         return moe_out_decode_tc
 
 
-def _prefill_layout_closed_reason(vllm_config, *, glm: bool = False) -> str | None:
-    """Keep Qwen's existing layout and bound GLM PP2 drafts to 4/6/8 rows."""
+def _family_device_closed_reason(family, phase: str, device, moe) -> str | None:
+    """A MOE_TC_FAMILIES family's device and model checks: the 74-SM CMP 170HX
+    the schedules were sized on, and the SwiGLU limit the family hard-codes."""
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if sms != 74:
+        return f"{family.name} {phase} device has {sms} SMs, not 74"
+    if moe.swiglu_limit != family.swiglu_limit:
+        return (
+            f"{family.name} tensor-core {phase} requires SwiGLU clipping at "
+            f"{family.swiglu_limit}"
+        )
+    return None
+
+
+# DeepSeek-V4.1 text configs (target and DSpark drafter) the family serves.
+_DSV41_MODEL_TYPES = ("deepseek_v41_text", "deepseek_v41")
+
+
+def _dsv41_layout_closed_reason(vllm_config) -> str | None:
+    """DeepSeek-V4.1: a BF16 model of this hidden size. Its routed experts are
+    Q4N-X only, which run every call on the tensor-core kernels by row count
+    (Exl3Experts._apply_q4n), so no parallel or drafting layout is required."""
+    model = getattr(vllm_config, "model_config", None)
+    text = getattr(model, "hf_text_config", None)
+    if (
+        getattr(text, "model_type", None) not in _DSV41_MODEL_TYPES
+        or getattr(text, "hidden_size", None) != 5120
+        or getattr(model, "dtype", None) != torch.bfloat16
+    ):
+        return "DeepSeek-V4.1 tensor-core MoE requires a BF16 DeepSeek-V4.1 model"
+    return None
+
+
+def _prefill_layout_closed_reason(
+    vllm_config, *, glm: bool = False, family=None
+) -> str | None:
+    """Keep Qwen's existing layout, bound GLM PP2 drafts to 4/6/8 rows, and
+    keep DeepSeek-V4.1's family to its model (``family``: the layer's
+    MOE_TC_FAMILIES entry, None for Qwen)."""
+    if family is not None:
+        if family.name == "DeepSeek-V4.1":
+            return _dsv41_layout_closed_reason(vllm_config)
+        glm = True
     parallel = vllm_config.parallel_config
     layout = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size)
     spec = vllm_config.speculative_config

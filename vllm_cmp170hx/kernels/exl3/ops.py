@@ -4,6 +4,7 @@
 
 import os
 import importlib
+from dataclasses import dataclass
 from functools import cache
 
 import torch
@@ -57,6 +58,73 @@ MOE_PREFILL_GLM_EXPERT_BITS = (5, 7)
 # Q4N (codebook 3, lab): the layer key passed as bits_x2 is the stored bits_x2 + Q4N_KEY_OFFSET.
 Q4N_KEY_OFFSET = 64
 MOE_GLM_Q4N_EXPERT_BITS = (5, 6)
+
+
+# DeepSeek-V4.1-Flash routed experts (lab): Q4N-X only, 2.0 or 2.5 bpw per layer.
+MOE_DSV41_Q4NX_EXPERT_BITS = (4, 5)
+MOE_PREFILL_DSV41_MAX_ROWS = 2312
+
+
+@dataclass(frozen=True)
+class MoeTcFamily:
+    """One routed-expert configuration of the tensor-core MoE operators
+    (moe_out_prefill, moe_out_decode_tc; csrc/exl3/moe_prefill.cu), keyed by
+    (hidden, intermediate): the device families are selected by that shape and
+    the layer key (stored bits_x2 + codebook offset)."""
+
+    name: str
+    hidden: int
+    intermediate: int
+    # Exact (top_k, local experts, global experts) layouts the gate admits.
+    routes: tuple[tuple[int, int, int], ...]
+    # The model's SwiGLU limit the device family hard-codes (gate <= limit,
+    # |up| <= limit); a layer with another limit keeps the base kernels.
+    swiglu_limit: float
+    # Stored bits_x2 admitted per codebook (2: mul1, 3: Q4N, 4: Q4N-X).
+    bits: tuple[tuple[int, tuple[int, ...]], ...]
+    # How the closed-gate message names the admitted formats.
+    bits_text: str
+    # Most rows one moe_out_prefill call is sized for (larger calls chunk).
+    prefill_max_rows: int
+
+    def allowed_bits(self, codebook: int) -> tuple[int, ...]:
+        return dict(self.bits).get(codebook, ())
+
+
+# The served tensor-core families. GLM's entry is exactly the former GLM-only
+# gate; DeepSeek-V4.1's target layers (top-6 of 384) and its DSpark drafter
+# (mtp.0-2: top-3 of 128) share one device family per format.
+MOE_TC_FAMILIES = {
+    (4096, 2048): MoeTcFamily(
+        name="GLM",
+        hidden=4096,
+        intermediate=2048,
+        routes=(MOE_PREFILL_GLM_SHAPE[2:],),
+        swiglu_limit=10.0,
+        bits=(
+            (2, MOE_PREFILL_GLM_EXPERT_BITS),
+            (3, MOE_GLM_Q4N_EXPERT_BITS),
+            (4, MOE_GLM_Q4N_EXPERT_BITS),
+        ),
+        bits_text="the 5-bit or 3.5-bit family (Q4N: 2.5 or 3-bit)",
+        prefill_max_rows=MOE_PREFILL_GLM_MAX_ROWS,
+    ),
+    (5120, 2304): MoeTcFamily(
+        name="DeepSeek-V4.1",
+        hidden=5120,
+        intermediate=2304,
+        routes=((6, 384, 384), (3, 128, 128)),
+        swiglu_limit=10.0,
+        bits=((4, MOE_DSV41_Q4NX_EXPERT_BITS),),
+        bits_text="the Q4N-X 2.0- or 2.5-bpw family (keys 132 / 133)",
+        prefill_max_rows=MOE_PREFILL_DSV41_MAX_ROWS,
+    ),
+}
+
+
+def moe_tc_family(hidden_size: int, intermediate_size: int) -> MoeTcFamily | None:
+    """The tensor-core MoE family of this expert shape, or None."""
+    return MOE_TC_FAMILIES.get((hidden_size, intermediate_size))
 
 
 def split_moe_key(key: int) -> tuple[int, int]:
@@ -341,12 +409,15 @@ def moe_prefill_closed_reason(
     metadata: list[list[list[int]]],
     bits_x2: int,
 ) -> str | None:
-    """Select only the exact Qwen or GLM prefill family from host metadata.
+    """Select only the exact Qwen prefill family or a MOE_TC_FAMILIES entry
+    (GLM, DeepSeek-V4.1) from host metadata.
 
-    ``bits_x2`` is the layer's uniform expert format (GLM: 5 or 7); the
-    device family is selected by (shape, bits_x2).
+    ``bits_x2`` is the layer's uniform expert format key (GLM: 5 or 7, Q4N /
+    Q4N-X keys; DeepSeek-V4.1: Q4N-X keys 132 / 133); the device family is
+    selected by (shape, bits_x2).
     """
-    if (hidden_size, intermediate_size) != MOE_PREFILL_GLM_SHAPE[:2]:
+    family = moe_tc_family(hidden_size, intermediate_size)
+    if family is None:
         return moe_v2_closed_reason(
             capability,
             dtype,
@@ -357,16 +428,9 @@ def moe_prefill_closed_reason(
             global_experts,
             metadata,
         )
-    stored, codebook = split_moe_key(bits_x2)
-    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook >= 3 else MOE_PREFILL_GLM_EXPERT_BITS
-    if stored not in allowed:
-        return f"GLM prefill runs the 5-bit or 3.5-bit family (Q4N: 2.5 or 3-bit), not key {bits_x2}"
-    expected_meta = [
-        [4096, 2048, stored, codebook],
-        [4096, 2048, stored, codebook],
-        [2048, 4096, stored, codebook],
-    ]
-    return _moe_family_closed_reason(
+    return _moe_tc_family_closed_reason(
+        family,
+        "prefill",
         capability,
         dtype,
         hidden_size,
@@ -375,8 +439,7 @@ def moe_prefill_closed_reason(
         local_experts,
         global_experts,
         metadata,
-        MOE_PREFILL_GLM_SHAPE,
-        expected_meta,
+        bits_x2,
     )
 
 
@@ -393,28 +456,60 @@ def moe_decode_tc_closed_reason(
 ) -> str | None:
     """Why moe_out_decode_tc must not serve this layer, or None when it may.
 
-    The GLM decode family is the GLM prefill family on the small-row
+    A decode family is its prefill family (MOE_TC_FAMILIES) on the small-row
     schedule: the same (hidden, intermediate, top_k, experts) shape, the same
-    uniform 5-bit or 3.5-bit expert format with codebook 2, and the same
-    capability and dtype checks. The caller keeps the family to the exact GLM
-    layout and its SwiGLU limit 10.0, to 16-byte-aligned trellis bases, and
-    to calls of 1..MOE_DECODE_TC_MAX_ROWS rows in decode steps.
+    uniform expert format, and the same capability and dtype checks. The
+    caller keeps the family to its model layout and SwiGLU limit, to
+    16-byte-aligned trellis bases, and to calls of 1..MOE_DECODE_TC_MAX_ROWS
+    rows in decode steps.
     """
-    if (hidden_size, intermediate_size) != MOE_PREFILL_GLM_SHAPE[:2]:
+    family = moe_tc_family(hidden_size, intermediate_size)
+    if family is None:
         return (
             f"(hidden, intermediate) = {(hidden_size, intermediate_size)}, not "
-            f"{MOE_PREFILL_GLM_SHAPE[:2]} (the small-row decode schedule "
-            "serves the GLM family; other decode calls keep their kernels)"
+            f"one of {sorted(MOE_TC_FAMILIES)} (the small-row decode schedule "
+            "serves the GLM and DeepSeek-V4.1 families; other decode calls "
+            "keep their kernels)"
         )
+    return _moe_tc_family_closed_reason(
+        family,
+        "decode",
+        capability,
+        dtype,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        local_experts,
+        global_experts,
+        metadata,
+        bits_x2,
+    )
+
+
+def _moe_tc_family_closed_reason(
+    family: MoeTcFamily,
+    phase: str,
+    capability,
+    dtype,
+    hidden_size,
+    intermediate_size,
+    top_k,
+    local_experts,
+    global_experts,
+    metadata,
+    bits_x2,
+) -> str | None:
     stored, codebook = split_moe_key(bits_x2)
-    allowed = MOE_GLM_Q4N_EXPERT_BITS if codebook >= 3 else MOE_PREFILL_GLM_EXPERT_BITS
-    if stored not in allowed:
-        return f"GLM decode runs the 5-bit or 3.5-bit family (Q4N: 2.5 or 3-bit), not key {bits_x2}"
+    if stored not in family.allowed_bits(codebook):
+        return f"{family.name} {phase} runs {family.bits_text}, not key {bits_x2}"
+    h, i = family.hidden, family.intermediate
     expected_meta = [
-        [4096, 2048, stored, codebook],
-        [4096, 2048, stored, codebook],
-        [2048, 4096, stored, codebook],
+        [h, i, stored, codebook],
+        [h, i, stored, codebook],
+        [i, h, stored, codebook],
     ]
+    route = (top_k, local_experts, global_experts)
+    expected_route = route if route in family.routes else family.routes[0]
     return _moe_family_closed_reason(
         capability,
         dtype,
@@ -424,7 +519,7 @@ def moe_decode_tc_closed_reason(
         local_experts,
         global_experts,
         metadata,
-        MOE_PREFILL_GLM_SHAPE,
+        (h, i, *expected_route),
         expected_meta,
     )
 
@@ -763,7 +858,8 @@ def moe_out_decode_tc(
     out,
     workspace,
 ) -> None:
-    """The GLM 5-bit or 3.5-bit family on the small-row schedule (1..8 rows).
+    """A MOE_TC_FAMILIES family (GLM 5-bit / 3.5-bit / Q4N / Q4N-X, DeepSeek-V4.1
+    Q4N-X) on the small-row schedule (1..MOE_DECODE_TC_MAX_ROWS rows).
 
     The same tensor-core arithmetic as moe_out_prefill with 8-row route
     tiles and one 8-row MMA group per GEMM block; the caller keeps the
@@ -785,7 +881,7 @@ def moe_out_decode_tc(
     )
 
 
-_moe_decode_tc_warm_devices: set[tuple[torch.device, int, int, int]] = set()
+_moe_decode_tc_warm_devices: set[tuple[torch.device, int, int, int, int]] = set()
 
 
 def warmup_moe_decode_tc(
@@ -808,7 +904,9 @@ def warmup_moe_decode_tc(
     temporary buffers are freed again.
     """
     device = packed_ptrs.device
-    key = (device, hidden_size, intermediate_size, bits_x2)
+    # top_k is part of the key: the decode combine kernels are per top-k
+    # (DeepSeek-V4.1's target top-6 and drafter top-3 share a format).
+    key = (device, hidden_size, intermediate_size, bits_x2, top_k)
     if key in _moe_decode_tc_warm_devices:
         return
     rows = MOE_DECODE_TC_MAX_ROWS
