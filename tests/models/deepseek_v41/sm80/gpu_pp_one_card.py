@@ -80,6 +80,14 @@ def register():
 
     gpu_worker.init_worker_distributed_environment = init_dist
 
+    rows = os.environ.get("DSV41_GATE_GEMV_MAX_ROWS")
+    if rows:
+        # Diagnosis only: the FP64 gate GEMV (row-independent) for prefill-sized
+        # calls too (VLLM_DEEPSEEK_V41_GATE_GEMV=1 must be set).
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_gate_gemv
+
+        sm80_gate_gemv.MAX_ROWS = int(rows)
+
     dump = os.environ.get("DSV41_PP_DRAFT_DUMP")
     if dump:
         import json
