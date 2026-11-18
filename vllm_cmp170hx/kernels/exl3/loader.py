@@ -111,8 +111,13 @@ class Exl3ModelLoader(DefaultModelLoader):
 
 
 def require_cuda_parameters(model: torch.nn.Module) -> None:
-    """Refuse a loaded EXL3 model with a parameter off the GPU."""
+    """Refuse a loaded EXL3 model with a parameter off the GPU. Meta
+    parameters are stubs of components this rank does not run (vLLM builds a
+    multimodal tower on the meta device on later pipeline stages of the V2
+    runner, or with --limit-mm-per-prompt 0), never served."""
     for name, parameter in model.named_parameters():
+        if parameter.is_meta:
+            continue
         if not parameter.is_cuda:
             raise ValueError(f"EXL3 parameter must remain CUDA-owned: {name}")
 
@@ -371,9 +376,10 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
         ledger.finish()
     missing = {
         name
-        for name, _ in model.named_parameters()
+        for name, parameter in model.named_parameters()
         if name not in loaded
         and name not in file_backed_parameters
+        and not parameter.is_meta
     }
     if missing:
         raise ValueError(f"Unloaded EXL3 runtime parameters: {sorted(missing)[:16]}")
