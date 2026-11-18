@@ -21,9 +21,9 @@ StartLimitBurst=10
 # routed 2.0; real-shape meta build): weights 15,10,15 = 62.4 / 36.0 / 58.0 GB + DSpark drafter 4.8 GB on rank 2
 # (INT8 drafter-embedding copy). Non-weight measured on card 4 (engine log 2026-11-18 01:47 and 03:35): first stage
 # 2.82 GiB, last stage with DSpark 2.31 GiB, KV 2.07 / 1.49 KB per token on the first / last stage. At 0.97 the KV
-# room is ~0.7 GiB on rank 0 (with VLLM_DEEPSEEK_V41_EMBED_INT8=1; ~0.1 GiB without), ~2.1 on rank 1, ~0.25 on
-# rank 2 (after the gate GEMV's 0.12 GiB scratch): a pool of ~180k tokens, so max-model-len 131072 (engine log
-# 03:36 and 04:15, ATTENTION coordinator; margins ±0.2 GiB). Fallbacks if
+# room is ~0.7 GiB on rank 0 (with VLLM_DEEPSEEK_V41_EMBED_INT8=1; ~0.1 GiB without), ~2.1 on rank 1, ~0.3 on
+# rank 2: a pool of ~200k tokens, so max-model-len 131072 (engine log 03:36-04:35, ATTENTION coordinator;
+# margins ±0.2 GiB). Fallbacks if
 # a rank's KV line at boot is short: --max-num-batched-tokens 1024 instead of the INT8 embedding (rank 0 +0.57 GiB,
 # no numerics change), 1536 (rank 2 +0.13 GiB), or a smaller max-model-len; run-lab.sh takes them as overrides.
 # DSpark under PP: the plugin backbone ships target-layer streams over PP (here targets 37-39 are all on rank 2);
@@ -52,8 +52,9 @@ StartLimitBurst=10
 # Router gate in FP64 on every call up to 2048 rows (VLLM_DEEPSEEK_V41_GATE_GEMV + _MAX_ROWS=2048): the GEMV's rows
 # are independent of each other, the FP32 GEMM's tiling follows the row count and near-ties then pick other experts.
 # Card 4, real converter layers 0-5: first-token logprobs alone vs batched moved by up to 3 nats with the GEMM, 0 with
-# the GEMV, and 1024- vs 256-token prefill steps agree; prefill time +0.6 % (in the noise), decode unchanged; cost
-# 0.12 GiB of FP64 scratch per rank (engine log 2026-11-18 04:15). run-lab.sh GATE_GEMV_ROWS=64 restores the GEMM.
+# the GEMV, and 1024- vs 256-token prefill steps agree; prefill time +0.6 % (in the noise), decode unchanged; calls
+# above 256 rows run as 256-row launches (16 MB FP64 scratch per rank; engine log 2026-11-18 04:15 and 04:35).
+# run-lab.sh GATE_GEMV_ROWS=64 restores the GEMM.
 # Candidate speed switches from vllm-sm80 left OFF for the first correctness boot (enable one at a
 # time with benchlib): VLLM_DEEPSEEK_V41_ROUTER_MMA (its decode gate replaces the GEMV's),
 # VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH, VLLM_DEEPSEEK_V41_SWA_META_BATCH,

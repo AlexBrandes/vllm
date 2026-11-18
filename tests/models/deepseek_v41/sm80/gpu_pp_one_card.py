@@ -136,7 +136,7 @@ def write_shim(directory: Path) -> None:
 
 def run_arm(
     out: Path, partition: str, dspark: bool, prompt_lens: list[int], lab: bool,
-    swa_replay: bool = True, batched_tokens: int = 1024,
+    swa_replay: bool = True, batched_tokens: int = 1024, image: bool = False,
 ) -> dict:
     stages = len(partition.split(","))
     if stages > 1:
@@ -168,6 +168,17 @@ def run_arm(
     ]
     alone = [llm.generate([p], params)[0] for p in prompts]
     batched = llm.generate(prompts, params)
+    image_out = None
+    if image:
+        # Vision on the first stage (the tower is a meta stub on later ones).
+        from tests.models.deepseek_v41.sm80.gpu_smoke_tiny import _image_request
+
+        chat = llm.chat(_image_request(), params)[0].outputs[0]
+        image_out = {
+            "tokens": list(chat.token_ids),
+            "logprobs": [sorted((t, lp.logprob) for t, lp in step.items())
+                         for step in chat.logprobs],
+        }
     result = {
         "partition": partition,
         "dspark": dspark,
@@ -178,6 +189,7 @@ def run_arm(
             for o in alone
         ],
         "batched_tokens": [list(o.outputs[0].token_ids) for o in batched],
+        "image": image_out,
         "batched_first_logprobs": [
             sorted((t, lp.logprob) for t, lp in o.outputs[0].logprobs[0].items())
             for o in batched
@@ -193,6 +205,7 @@ def main() -> None:
     parser.add_argument("--arms", default="8,4:4,4:3:1,3:1:4")
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--lab", action="store_true")
+    parser.add_argument("--image", action="store_true", help="also one image chat per arm")
     parser.add_argument("--batched-tokens", type=int, default=1024,
                         help="max-num-batched-tokens (smaller: prompts prefill in chunks)")
     parser.add_argument("--no-swa-replay", action="store_true",
@@ -213,7 +226,7 @@ def main() -> None:
     if args.arm:
         sys.path.insert(0, str(root))
         res = run_arm(args.out, args.arm.replace(":", ","), args.dspark, lens, args.lab,
-                      not args.no_swa_replay, args.batched_tokens)
+                      not args.no_swa_replay, args.batched_tokens, args.image)
         Path(args.result).write_text(json.dumps(res))
         return
     shim = Path(tempfile.mkdtemp(prefix="dsv41-pp-one-card-"))
@@ -246,7 +259,7 @@ def main() -> None:
                "--result", str(result), "--prompt-lens", args.prompt_lens]
         cmd += ["--dspark"] * args.dspark + ["--lab"] * args.lab
         cmd += ["--no-swa-replay"] * args.no_swa_replay
-        cmd += ["--batched-tokens", str(args.batched_tokens)]
+        cmd += ["--batched-tokens", str(args.batched_tokens)] + ["--image"] * args.image
         drafts = shim / f"{arm.replace(':', '-')}.drafts.jsonl"
         arm_env = dict(env, DSV41_PP_DRAFT_DUMP=str(drafts)) if args.dspark else env
         proc = subprocess.run(cmd, env=arm_env, capture_output=True, text=True, timeout=1500)
@@ -293,6 +306,8 @@ def main() -> None:
             ]
             entry["batched_tokens_equal"] = res["batched_tokens"] == reference["batched_tokens"]
         entry["batched_equals_alone"] = res["batched_tokens"] == res["tokens"]
+        if res.get("image") is not None and reference is not None and arm != first:
+            entry["image_equal"] = res["image"] == reference.get("image")
         # This arm's own batch sensitivity: first-step logprob change between
         # a prompt alone and the same prompt batched with the others.
         entry["batched_vs_alone_first_step_max_diff"] = max(

@@ -3,7 +3,8 @@
 """Batch invariance of the DeepSeek-V4.1 router logits on sm_80 (the GLM
 32/33-token lesson applied to expert selection): the logits of the same rows
 in calls of 1..2048 rows, bitwise, for the served FP32 gate GEMM (cuBLAS,
-the default), the FP64 gate GEMV (VLLM_DEEPSEEK_V41_GATE_GEMV, decode sizes)
+the default), the FP64 gate GEMV (VLLM_DEEPSEEK_V41_GATE_GEMV, decode sizes, all
+sizes with VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS=2048)
 and the tensor-core gate (VLLM_DEEPSEEK_V41_ROUTER_MMA, 1..2047 rows); plus
 how often the top-6 selection of a row differs from the 2048-row call.
 
@@ -35,6 +36,10 @@ def main() -> None:
     paths = {"fp32_gemm": fp32_gemm}
     try:
         from vllm_cmp170hx.models.deepseek_v41.ops import sm80_gate_gemv
+
+        # VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS=2048: prefill-sized calls too
+        # (run as launches of CHUNK_ROWS rows).
+        sm80_gate_gemv.MAX_ROWS = int(os.environ.get("VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS", "64"))
 
         def gemv(rows):
             if not sm80_gate_gemv.serves(x[:rows], w32):

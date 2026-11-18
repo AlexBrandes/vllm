@@ -1081,7 +1081,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # experts: a value above the prefill step (e.g. 8192) makes routing, and the
     # served tokens with it, independent of batch composition. Card 4, real
     # layers 0-5: first-token logprobs alone vs batched moved by up to 3 nats
-    # with the GEMM, 0 with the GEMV on every call.
+    # with the GEMM, 0 with the GEMV on every call. Calls above 256 rows run as
+    # consecutive 256-row launches (16 MB of FP64 scratch per rank).
     "VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS", "64")
     ),

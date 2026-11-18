@@ -56,6 +56,11 @@ from vllm.triton_utils import tl, triton
 __all__ = ["MAX_ROWS", "gate_gemv", "serves", "supports"]
 
 MAX_ROWS = 64
+# Calls above this many rows run as consecutive launches of at most this many
+# rows each (the rows are independent: the same bits), so the FP64 partial
+# scratch stays split x blocks x 64 x CHUNK_ROWS (16 MB) when MAX_ROWS is
+# raised to the prefill step (VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS).
+CHUNK_ROWS = 256
 BLOCK_E = 64
 BLOCK_K = 64
 # Larger token tiles than this run as more token blocks (registers: the
@@ -222,7 +227,7 @@ def token_tile(rows: int) -> tuple[int, int]:
 
 def _scratch(device: torch.device, num_experts: int, split: int):
     """(FP64 partials, zeroed int32 counters), once per (device, N, SPLIT),
-    large enough for :data:`MAX_ROWS` rows."""
+    large enough for one launch: min(:data:`MAX_ROWS`, :data:`CHUNK_ROWS`) rows."""
     key = (str(device), num_experts, split)
     if key not in _SCRATCH:
         if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -231,10 +236,11 @@ def _scratch(device: torch.device, num_experts: int, split: int):
                 "must run outside a CUDA graph capture"
             )
         blocks = triton.cdiv(num_experts, BLOCK_E)
+        rows = min(MAX_ROWS, CHUNK_ROWS)
         _SCRATCH[key] = (
-            torch.empty(split * blocks * BLOCK_E * MAX_ROWS, dtype=torch.float64,
+            torch.empty(split * blocks * BLOCK_E * rows, dtype=torch.float64,
                         device=device),
-            torch.zeros(blocks * triton.cdiv(MAX_ROWS, MAX_BLOCK_T),
+            torch.zeros(blocks * triton.cdiv(rows, MAX_BLOCK_T),
                         dtype=torch.int32, device=device),
         )
     return _SCRATCH[key]
@@ -256,26 +262,30 @@ def gate_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return out
     split = split_for(N, K, _sm_count(x.device))
     part, count = _scratch(x.device, N, split)
-    block_t, token_blocks = token_tile(M)
     w_pairs = weight.dtype == torch.bfloat16
-    _gate_gemv_kernel[(triton.cdiv(N, BLOCK_E), split, token_blocks)](
-        x.view(torch.int32),
-        weight.view(torch.int32) if w_pairs else weight,
-        out,
-        part,
-        count,
-        M,
-        x.stride(0) // 2,
-        weight.stride(0) // 2 if w_pairs else weight.stride(0),
-        out.stride(0),
-        N=N,
-        K=K,
-        SPLIT=split,
-        BLOCK_T=block_t,
-        BLOCK_E=BLOCK_E,
-        BLOCK_K=BLOCK_K,
-        W_PAIRS=w_pairs,
-        num_warps=4,
-        num_stages=3,
-    )
+    w = weight.view(torch.int32) if w_pairs else weight
+    for start in range(0, M, CHUNK_ROWS):
+        rows = min(CHUNK_ROWS, M - start)
+        block_t, token_blocks = token_tile(rows)
+        xs = x[start : start + rows]
+        _gate_gemv_kernel[(triton.cdiv(N, BLOCK_E), split, token_blocks)](
+            xs.view(torch.int32),
+            w,
+            out[start : start + rows],
+            part,
+            count,
+            rows,
+            x.stride(0) // 2,
+            weight.stride(0) // 2 if w_pairs else weight.stride(0),
+            out.stride(0),
+            N=N,
+            K=K,
+            SPLIT=split,
+            BLOCK_T=block_t,
+            BLOCK_E=BLOCK_E,
+            BLOCK_K=BLOCK_K,
+            W_PAIRS=w_pairs,
+            num_warps=4,
+            num_stages=3,
+        )
     return out
