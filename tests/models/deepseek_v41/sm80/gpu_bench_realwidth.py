@@ -154,7 +154,8 @@ def _realistic_values(fd: int, base: int, header: dict) -> None:
             ones = torch.ones(shape, dtype=torch.bfloat16)
             os.pwrite(fd, ones.view(torch.int16).numpy().tobytes(), base + lo)
         elif name.endswith(".ffn.gate.weight"):
-            gate = (torch.randn(shape, generator=generator) * 0.02).to(torch.float16)
+            # BF16-valued (as the official gates are), stored F16 as our converter does.
+            gate = (torch.randn(shape, generator=generator) * 0.02).to(torch.bfloat16).to(torch.float16)
             os.pwrite(fd, gate.view(torch.int16).numpy().tobytes(), base + lo)
 
 
