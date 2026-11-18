@@ -13,11 +13,20 @@ PP), and the attention of every shadow source the stage replays
 (models/deepseek_v41/sm80_pp_shadow.py). Engram tables stay on SSD.
 
     python3 tools/dsv41_pp_plan.py --model DIR [--w8 dense.safetensors] \
-        --budgets-gb 63.5,37.5,63.5 [--top 10]
+        --budgets-gb 62.5,38.3,63.1 [--no-dspark] [--top 10]
 
-``--budgets-gb`` is the weight budget per stage in card order (visible memory
-minus activations, graphs, KV and the Q4N-X startup allocation, measured at
-the first boot). Prints the feasible partitions by smallest worst slack.
+``--budgets-gb`` is the weight budget per stage in card order: the vLLM
+budget (``--gpu-memory-utilization`` x the card's torch-visible memory) minus
+the stage's non-weight memory and its KV for the planned context. Measured on
+card 4 (engine log 2026-11-18 01:47, 64 GB cards = 63.39 GiB visible, card 4
+39.53 GiB): non-weight 2.82 GiB (first stage), 2.31 GiB (last stage with
+DSpark), ≈ 2.3 GiB (middle), + ≈ 0.2 GiB PP buffers and ≈ 0.1 GiB rotary
+caches; KV 2.07 / ≈ 1.0 / 1.49 KB per token. At 0.97 and 131072 tokens of KV
+that gives ≈ 62.5, 38.3, 63.1 GB. Rows are weights as served: the drafter's
+input-embedding copy as INT8 rows (VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8, the lab
+unit's setting; ``--draft-embed-bf16`` otherwise) and shadow sources without
+their output projections. Prints the feasible partitions by smallest worst
+slack.
 """
 
 import argparse
@@ -76,6 +85,9 @@ def main() -> None:
     ap.add_argument("--w8", type=Path)
     ap.add_argument("--budgets-gb", required=True)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--no-dspark", action="store_true", help="no drafter (mtp.*) on the last stage")
+    ap.add_argument("--draft-embed-bf16", action="store_true",
+                    help="the drafter's embedding copy in BF16 (default: INT8 rows, half)")
     args = ap.parse_args()
     config = json.loads((args.model / "config.json").read_text())
     cfg = config.get("text_config", config)
@@ -93,12 +105,15 @@ def main() -> None:
         m = re.match(r"layers\.(\d+)\.", name)
         if m:
             layer_bytes[int(m[1])] += size
-            if ".attn." in name:
+            if ".attn." in name and not re.search(r"\.attn\.wo_[ab]\.", name):
                 attn_bytes[int(m[1])] += size
         elif name.startswith(("embed.", "vision.", "aligner.", "image_")):
             first += size
-            if name.startswith("embed."):
-                last += size  # the drafter's own embedding copy under PP
+            if name.startswith("embed.") and not args.no_dspark:
+                # the drafter's own embedding copy under PP
+                last += size if args.draft_embed_bf16 else size // 2
+        elif name.startswith("mtp.") and args.no_dspark:
+            continue
         else:  # head, norm, hc_head, mtp.*
             last += size
     for name, size in w8.items():
@@ -106,8 +121,10 @@ def main() -> None:
         m = re.match(r"layers\.(\d+)\.", name)
         if m:
             layer_bytes[int(m[1])] += size
-            if ".attn." in name:
+            if ".attn." in name and not re.search(r"\.attn\.wo_[ab]\.", name):
                 attn_bytes[int(m[1])] += size
+        elif name.startswith("mtp.") and args.no_dspark:
+            continue
         else:
             last += size
     stages = len(budgets)
