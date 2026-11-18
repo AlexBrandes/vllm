@@ -14,7 +14,7 @@ _registered = False
 
 
 # ---------------------------------------------------------------------------
-# Model code (GLM-5.3)
+# Model code (GLM-5.3, DeepSeek-V4.1)
 # ---------------------------------------------------------------------------
 
 # Architectures whose fork classes replace the upstream ones in vLLM's model
@@ -28,6 +28,15 @@ MODEL_OVERRIDES = {
     ),
     "Glm5NextForConditionalGeneration": (
         "vllm_cmp170hx.models.glm5next.sm80_model:Glm5NextForConditionalGeneration"
+    ),
+    # The DeepSeek-V4.1 vision wrapper (its text model is built inside it)
+    # and its DSpark drafter, whose class lives in the same model package
+    # (ported from vllm-sm80 plugin-dev b2c9487dd5).
+    "DeepseekV41ForCausalLM": (
+        "vllm_cmp170hx.models.deepseek_v41.sm80_model:DeepseekV41ForCausalLM"
+    ),
+    "DSparkV41DraftModel": (
+        "vllm_cmp170hx.models.deepseek_v41.sm80_model:DSparkDeepseekV4ForCausalLM"
     ),
 }
 
@@ -57,8 +66,12 @@ def register_models() -> None:
 
 # HF config attributes the fork's models default (architecture -> attribute
 # -> value), set by vLLM's model-config hook unless the checkpoint or
-# --hf-overrides sets them.
-HF_CONFIG_DEFAULTS: dict[str, dict[str, object]] = {}
+# --hf-overrides sets them. DeepSeek-V4.1's reference computes FP32 logits
+# (ParallelHead: an FP32 weight applied to x.float()), so its LM head, the
+# DSpark Markov head and the draft logits run in FP32 (ModelConfig.head_dtype).
+HF_CONFIG_DEFAULTS: dict[str, dict[str, object]] = {
+    "DeepseekV41ForCausalLM": {"head_dtype": "float32"},
+}
 
 
 def register_hf_config_defaults() -> None:
@@ -209,11 +222,14 @@ def register_lab_hidden_capture() -> None:
 
 
 def register_fork_parsers() -> None:
-    """The GLM-4.7 reasoning and tool parsers under their upstream names
-    (``vllm_cmp170hx/parsers``)."""
+    """The GLM-4.7 and DeepSeek V4.1 reasoning and tool parsers and the
+    DeepSeek V4.1 tokenizer under their upstream names (``vllm_cmp170hx/parsers``,
+    ``vllm_cmp170hx/tokenizers``)."""
     from vllm_cmp170hx.parsers import register_parsers
+    from vllm_cmp170hx.tokenizers import register_tokenizers
 
     register_parsers()
+    register_tokenizers()
 
 
 # ---------------------------------------------------------------- layers: mHC

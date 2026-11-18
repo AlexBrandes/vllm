@@ -107,6 +107,27 @@ if TYPE_CHECKING:
     VLLM_SM80_CAPTURE: str = ""
     VLLM_DEV_AB_SWITCH: str = ""
     VLLM_HOT_SWAP: str = ""
+    VLLM_DEEPSEEK_V41_FUSED_MHC: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2: bool = False
+    VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM: bool = False
+    VLLM_DEEPSEEK_V41_ROUTER_MMA: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ROUTE: bool = False
+    VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
+    VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
+    VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
+    VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
+    VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
+    VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH: bool = False
+    VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER: bool = False
+    VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL: bool = False
+    VLLM_DEEPSEEK_V41_SWA_META_BATCH: bool = False
+    VLLM_ENGRAM_PLACEMENT: str = "ssd"
+    VLLM_ENGRAM_ROW_CACHE_GIB: float = 1.0
+    VLLM_ENGRAM_ROW_CACHE_PRELOAD: bool = False
+    VLLM_ENGRAM_DIRECT_READ: bool = False
+    VLLM_ENGRAM_SEGMENT: str = ""
+    VLLM_ENGRAM_TELEMETRY_STEPS: int = 0
 
 # Same logger name as vllm/envs.py, so the retired-name warnings keep their
 # logger.
@@ -971,6 +992,205 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # POST /collective_rpc set_hot_arms (VLLM_SERVER_DEV_MODE=1) selects the
     # candidates between requests. Not for serving. Unset by default.
     "VLLM_HOT_SWAP": lambda: os.getenv("VLLM_HOT_SWAP", ""),
+    # DeepSeek-V4.1 (ported from vllm-sm80 plugin-dev b2c9487dd5)
+    # DeepSeek-V4.1 on sm_80: run the decoder layers' delayed mHC (the fused
+    # post + pre at every sublayer boundary and the pre-only entries) through
+    # the sm_80 mHC kernel A (ops/sm80_mhc_fused.py: post step, projection and
+    # squared-sum partials) instead of the reference's FP32 torch formulas
+    # (ops/sm80_mhc.py, about 155 kernels per call), with the reference's BF16
+    # rounding points; the finish stays the torch formulas unless
+    # VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH. Default OFF: unset, the torch formulas run.
+    # Read in vllm_sm80/models/deepseek_v41/sm80_model.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC: the finish after kernel A (coefficients,
+    # Sinkhorn, collapse, RMSNorm) as one Triton kernel, two kernels per call.
+    # Default OFF. Read in vllm_sm80/models/deepseek_v41/ops/sm80_mhc_fused.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: the finish v2 in its validated
+    # configuration (hidden 5120, 20 Sinkhorn iterations, 1..2048 rows, with the
+    # norm, sm_80): kernel A with its staging reuse from 17 rows, then the Gluon finish
+    # (ops/sm80_mhc_finish_v2.py: FP64 reciprocals by MUFU approximation and
+    # Newton steps, one-pass collapse) instead of the Triton finish kernel.
+    # Order-changing. Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/ops/sm80_mhc_fused.py.
+    "VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2", "0"))
+    ),
+    # With VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH: inside a decoder layer's forward,
+    # the mHC finish's coefficient CTAs (post, comb with its Sinkhorn, the next
+    # pre-mix: first read at the next sublayer boundary) of up to 64 rows run on
+    # a side stream beside the sublayer's TP all-reduce, forked as it starts and
+    # joined as it returns; the layer-input CTAs stay in place. Same kernels and
+    # inputs, so the same bytes. Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/ops/sm80_mhc_side.py.
+    "VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MHC_SIDE_STREAM", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE gate and routing of calls of 1 to 2047
+    # BF16 rows on the BF16 tensor cores (ops/sm80_router_mma.py): the gate
+    # weight held once, in BF16 (its BF16-valued checkpoint values exactly;
+    # the gate GEMV and the FP32 GEMM widen it exactly, so their bytes are
+    # unchanged), with exact BF16 products, FP32 sums
+    # per K chunk and FP64 across chunks, rounded once to FP32; the top-k
+    # selected in FP32 as the fused route, the weights in FP64 rounded once,
+    # from exactly recomputed logits for calls of up to 64 rows. Not the FP32
+    # GEMM's bytes: closer to the FP64 routing weights. Other calls keep the
+    # gate GEMV or the FP32 gate and the route. Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_ROUTER_MMA": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ROUTER_MMA", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE routing after the FP32 gate GEMM
+    # (sqrt-softplus, bias select and add, top-k, gather, renormalisation,
+    # scale, int32 ids: fifteen torch kernels per layer) as one Triton kernel
+    # (ops/sm80_route.py) with the torch ops' arithmetic and order, so the
+    # same bytes. Default OFF. Read in vllm_sm80/models/deepseek_v41/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ROUTE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the DSpark drafter's context-KV prologue per
+    # draft layer (kv_norm RMSNorm, RoPE, FP8 qdq and the window-cache write
+    # after the wkv projection: 26 torch and Triton kernels per layer) as one
+    # Triton kernel (ops/sm80_draft_prologue.py) with the torch ops'
+    # arithmetic and order (the RMSNorm sum in torch's CUDA reduction order),
+    # so the same cache bytes. Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the MoE gate GEMM of calls of at most 64 rows
+    # (decode, speculative verify, draft) as one Triton kernel
+    # (ops/sm80_gate_gemv.py) that reads the BF16 input as is and computes the
+    # logits in FP64, rounded once to FP32, in place of the FP32 copy of the
+    # input, the FP32 GEMM and its split-K reduce. Not the FP32 GEMM's bytes:
+    # the correctly rounded FP32 logits, except where the exact value lies
+    # within the FP64 summation error of an FP32 rounding midpoint. Default
+    # OFF. Read in vllm_sm80/models/deepseek_v41/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_GATE_GEMV": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the grouped MXFP8 wo_a (one Marlin GEMM per
+    # group and a concat) as one grouped Triton W8A16 GEMM over all groups
+    # that writes the [T, groups * o_lora_rank] result directly
+    # (ops/sm80_wo_a_grouped.py). It holds the loaded FP8 codes and E8M0
+    # scales instead of Marlin's repack (the same bytes); the decoded weights
+    # are Marlin's, the FP32 sums run in another order, so outputs change
+    # within rounding. Default OFF. Read in
+    # vllm_sm80/models/deepseek_v41/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the attention core of decode, speculative verify
+    # and draft steps (the norms and window row of prepare_layer, the query
+    # RoPE, sparse attention, output RoPE and qdq of attend_layer) as two
+    # fused calls per layer (ops/sm80_attn_fused.py), same rounding points.
+    # Default OFF. Read in vllm_sm80/models/deepseek_v41/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the routed experts of the decoder layers run MoE
+    # calls of 65..2048 rows in prefill steps on the tensor cores
+    # (csrc/exl3/moe_prefill_v2.cu, ops.moe_out_prefill_v2) at tensor parallel
+    # size 4, with every routed matrix of a layer at bits_x2 6 or 4, codebook 2,
+    # and 16-byte-aligned trellis bases; with a parallel drafter (DFlash,
+    # DSpark) a step counts as a prefill step only when some request has more
+    # than 1 + 2k tokens, its decode pass's widest query
+    # (vllm_sm80/kernels/exl3/quant.py _prefill_v2_decode_len). Other calls
+    # and every call of a decode step keep their kernels. Results differ from
+    # moe_out in the last bits. Default OFF: unset, prefill calls take moe_out.
+    # Read in vllm_sm80/models/deepseek_v41/sm80_moe.py.
+    "VLLM_DEEPSEEK_V41_MOE_PREFILL_TC": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_MOE_PREFILL_TC", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80, the attention pipeline's exact index selection:
+    # a call of at most 48 rows as one Triton launch (one program per
+    # 8192-column part of a row, the last part to finish merging the parts'
+    # candidates) in place of fifteen, with the same output bytes. Default
+    # OFF. Read in vllm_sm80/models/deepseek_v41/ops/sm80_index_topk.py.
+    "VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SELECT_ONE_LAUNCH", "0"))
+    ),
+    # Start Engram lookups, row gathers and WKV projections before decoder
+    # layers on the registered auxiliary stream. Its EXL3 scratch is disjoint
+    # from the main stream and ordered before shared-expert GEMMs. TP only;
+    # no sequence parallelism, batched Engram projection or microbatching.
+    "VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_EARLY_GATHER", "0"))
+    ),
+    # Every TP rank holds every rank's Engram wkv shard (gathered once after
+    # loading; the layer's own shard is a view of it) and projects steps of
+    # more rows than any decode step or CUDA graph capture from all shards,
+    # without the all-gather of the output: the same GEMM per shard, the
+    # gathered bytes. Smaller steps keep the sharded GEMM and the all-gather.
+    # Costs the other shards' bytes on every card. TP only; no sequence
+    # parallelism or batched Engram projection
+    # (vllm_sm80/models/deepseek_v41/sm80_engram_wkv.py). Default OFF.
+    "VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_ENGRAM_WKV_REPLICATED_PREFILL", "0"))
+    ),
+    # DeepSeek-V4.1 on sm_80: the sliding-window metadata of every SWA KV
+    # cache group of a step (one group per layer) in one Triton launch
+    # instead of three to five launches per group, the same bytes in the same
+    # builder buffers (vllm_sm80/models/deepseek_v41/sm80_swa_meta_batch.py).
+    # Eager step preparation only; captures and other shapes build per group.
+    # Default OFF. Read in vllm_sm80/models/deepseek_v41/sm80_attention.py.
+    "VLLM_DEEPSEEK_V41_SWA_META_BATCH": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_SWA_META_BATCH", "0"))
+    ),
+    # Where the sm_80 Engram storage keeps the E4M3 values of its owned table
+    # rows (vllm_sm80/models/deepseek_v41/sm80_engram.py): "ssd" reads them
+    # on demand from the base-checkpoint shards through a bounded host row
+    # cache; "ram" reads them whole at startup, past the page cache, into
+    # host memory of their exact size (~45.8 GiB per rank of DeepSeek V4.1
+    # Flash at TP4) and refuses to start when the host or a cgroup memory
+    # limit cannot hold them. Scales are resident host memory either way.
+    "VLLM_ENGRAM_PLACEMENT": lambda: _env_with_choices(
+        "VLLM_ENGRAM_PLACEMENT", "ssd", ["ssd", "ram"]
+    )(),
+    # Host row cache of the sm_80 Engram SSD placement, in GiB per rank,
+    # split evenly over the Engram tables; includes its tags. 0 disables the
+    # cache (every row is read from the file). Unused by "ram".
+    "VLLM_ENGRAM_ROW_CACHE_GIB": lambda: float(
+        os.getenv("VLLM_ENGRAM_ROW_CACHE_GIB", "1")
+    ),
+    # Fill the host row cache of the sm_80 Engram SSD placement at startup:
+    # one sequential pass over each rank's value extent per table, read past
+    # the page cache, stores rows in empty cache ways only and stops once
+    # every way holds a row (vllm_sm80/models/deepseek_v41/sm80_engram.py).
+    # Startup reads up to the whole extent (~24.6 GB per table and rank of
+    # DeepSeek V4.1 Flash at TP4); the fetch counters do not count the
+    # stored rows. Unused by "ram" and by a zero cache. Off by default.
+    "VLLM_ENGRAM_ROW_CACHE_PRELOAD": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_ROW_CACHE_PRELOAD", "0"))
+    ),
+    # Read the rows the sm_80 Engram row cache misses with O_DIRECT through
+    # aligned 4 KiB spans instead of buffered 256 B reads, so the misses
+    # leave no pages in the page cache (about 4 KiB of page cache per missed
+    # row otherwise). A file system that refuses O_DIRECT is refused at
+    # startup; there is no buffered fallback. Unused by "ram". Off by
+    # default.
+    "VLLM_ENGRAM_DIRECT_READ": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_DIRECT_READ", "0"))
+    ),
+    # Socket of a table segment holder (vllm_sm80.table_segment) that
+    # holds the Engram checkpoint files in memory: with placement "ram" each
+    # rank maps its rows of the held files instead of reading them from
+    # storage. A missing holder, or a file that is not the one it read, is
+    # refused at startup; there is no fallback to reading. Refused with
+    # "ssd". Default empty: off.
+    "VLLM_ENGRAM_SEGMENT": lambda: os.getenv("VLLM_ENGRAM_SEGMENT", ""),
+    # Diagnostic: log the counters of each sm_80 Engram table (rows, cache
+    # hits and misses, page-cache and storage bytes, host read and wait
+    # time) every N steps, and at close and exit
+    # (vllm_sm80/models/deepseek_v41/sm80_engram.py). The counters are
+    # kept either way. Default 0: never logged.
+    "VLLM_ENGRAM_TELEMETRY_STEPS": lambda: int(
+        os.getenv("VLLM_ENGRAM_TELEMETRY_STEPS", "0")
+    ),
 }
 
 

@@ -7,6 +7,8 @@
   (``VLLM_TOOL_CHOICE_NONE_MASK``).
 - ``ling3``: ``vllm_cmp170hx.parsers.ling3``, upstream's Ling3 parser (built on
   the GLM-4.7 parser) plus the same decode mask.
+- ``deepseek_v41``: ``vllm_cmp170hx.parsers.deepseek_v41``, upstream's V4.1
+  parser with damaged-call recovery (``vllm_cmp170hx.deepseek_v41_recovery``).
 
 :func:`register_parsers` (plugin registration) points those names of vLLM's
 tool and reasoning parser registries at the fork classes. Both registries
@@ -30,6 +32,11 @@ PARSERS = {
         "vllm_cmp170hx.parsers.ling3",
         "Sm80Ling3ToolParser",
         "Sm80Ling3ReasoningParser",
+    ),
+    "deepseek_v41": (
+        "vllm_cmp170hx.parsers.deepseek_v41",
+        "Sm80DeepSeekV41ToolParser",
+        "Sm80DeepSeekV41ReasoningParser",
     ),
 }
 

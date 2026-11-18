@@ -1009,3 +1009,42 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=_linear_meta,
 )
+
+
+def engram_host_fetch(
+    fd: int,
+    base: int,
+    row_bytes: int,
+    owner_lo: int,
+    owner_hi: int,
+    scales: torch.Tensor,
+    table: torch.Tensor,
+    ids: torch.Tensor,
+    values: torch.Tensor,
+    scales_out: torch.Tensor,
+    cache_bytes: int,
+    ways: int,
+    retries: int,
+    max_threads: int,
+    slots: int,
+):
+    """The native fetch of one rank's DeepSeek V4.1 Engram rows into the
+    values/scales staging (csrc/exl3/engram_fetch.cpp, EngramHostFetch)."""
+    ensure_extension()
+    return torch.classes._exl3_C.EngramHostFetch(
+        fd,
+        base,
+        row_bytes,
+        owner_lo,
+        owner_hi,
+        scales,
+        table,
+        ids,
+        values,
+        scales_out,
+        cache_bytes,
+        ways,
+        retries,
+        max_threads,
+        slots,
+    )

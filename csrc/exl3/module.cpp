@@ -3,6 +3,7 @@
 #include "ops.h"
 #include "ple.h"
 #include "dense_splitk.h"
+#include "engram_fetch.h"
 #include <Python.h>
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
@@ -38,6 +39,7 @@ TORCH_LIBRARY(_exl3_C, m) {
         "Tensor head_offsets, Tensor head_vocab_sizes, int retries, "
         "int max_threads) -> Tensor");
   register_ple_host_reader(m);
+  register_engram_host_fetch(m);
   // No tensor arguments: these are catch-all CPU arithmetic functions, not
   // CUDA-dispatched ops, and never inspect a device or initialize CUDA.
   m.def("linear_workspace_size(int max_rows, int padded_in, int padded_out) -> int",
