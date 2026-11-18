@@ -399,6 +399,7 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
         from vllm.config import get_current_vllm_config
 
         sm80_pp_shadow.attach_shadows(model, get_current_vllm_config())
+        trim_rope_caches(model, get_current_vllm_config())
 
     def make_empty_intermediate_tensors(self, batch_size, dtype, device):
         tensors = super().make_empty_intermediate_tensors(batch_size, dtype, device)
@@ -444,6 +445,36 @@ class DeepseekV4Model(upstream_model.DeepseekV4Model):
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_by_layer[self.end_layer] = hidden_states.mean(dim=1)
         return hidden_states
+
+
+def trim_rope_caches(module: torch.nn.Module, vllm_config) -> None:
+    """With ``VLLM_DEEPSEEK_V41_TRIM_ROPE=1``, cut every rotary
+    ``cos_sin_cache`` of ``module`` to the positions the server can reach
+    (``max_model_len`` plus a 4096-row margin for draft positions): the
+    caches are built for ``max_position_embeddings`` (1,048,576 rows x 64
+    FP32 = 0.27 GB each, two kinds per stage), most of which a 128k server
+    never reads. Rows kept are the same values."""
+    if os.environ.get("VLLM_DEEPSEEK_V41_TRIM_ROPE") != "1":
+        return
+    rows = vllm_config.model_config.max_model_len + 4096
+    seen: dict[int, torch.Tensor] = {}
+    saved = 0
+    for sub in module.modules():
+        cache = getattr(sub, "cos_sin_cache", None)
+        if not isinstance(cache, torch.Tensor) or cache.shape[0] <= rows:
+            continue
+        if id(cache) not in seen:
+            seen[id(cache)] = cache[:rows].clone()
+            saved += (cache.shape[0] - rows) * cache.shape[1] * cache.element_size()
+        if "cos_sin_cache" in getattr(sub, "_buffers", {}):
+            sub._buffers["cos_sin_cache"] = seen[id(cache)]
+        else:
+            sub.cos_sin_cache = seen[id(cache)]
+    if saved:
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: rotary caches cut to %d positions (%.2f GB freed)",
+            rows, saved / 1e9, scope="local",
+        )
 
 
 def _init_ce_ring(model) -> None:
@@ -572,6 +603,9 @@ class DSparkDeepseekV4Model(upstream_dspark.DSparkDeepseekV4Model):
         if not keep_embed:
             # Aliased from the target by the DSpark loader (load_dspark_model).
             model.embed_tokens = PPMissingLayer()
+        from vllm.config import get_current_vllm_config
+
+        trim_rope_caches(model, get_current_vllm_config())
         if sm80_writes_context_kv(model) and hasattr(model, "context_wkv_proj"):
             # The sm_80 stages write their context KV from their own wkv
             # (precompute_and_store_context_kv), so the stacked context
