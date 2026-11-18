@@ -54,7 +54,8 @@ LAB_ENV = {
 
 
 def build(
-    out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int], realistic: bool = False
+    out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int], realistic: bool = False,
+    stage: str = "default",
 ) -> None:
     from tests.models.deepseek_v41.sm80 import exl3_fixture as fixture
     from tests.models.deepseek_v41.sm80.test_engram_storage import _write_table
@@ -80,6 +81,17 @@ def build(
     text["engram_layer_ids"] = [text["engram_layer_ids"][i] for i in keep]
     text["engram_num_embeddings"] = [text["engram_num_embeddings"][i] for i in keep]
     text["dspark_target_layer_ids"] = list(range(layers - 3, layers))
+    if stage == "last":
+        # A last-pipeline-stage-like cut: every layer ratio 1 reading one
+        # ratio-1 KV / candidate source (as layers 25-39 read layer 20, here
+        # the first layer stands in for the shadow), a non-KV index source
+        # every 4 layers (24, 28, ...), no Engram.
+        text["compress_ratios"] = [1] * layers + [0] * text["num_nextn_predict_layers"]
+        text["kv_source_layer_ids"] = [0]
+        text["index_source_layer_ids"] = list(range(0, layers, 4))
+        text["candidate_source_layer_id"] = 0
+        text["engram_layer_ids"] = []
+        text["engram_num_embeddings"] = []
     tables = out / "engram-tables"
     config["engram_table_dir"] = str(tables)
     if out.exists():
@@ -218,6 +230,41 @@ def profile(
     return {"kernel_us_total": round(total), "top": [[n, round(us)] for n, us in top]}
 
 
+def measure(out: Path, w8: Path | None, dspark: bool, max_len: int, util: float,
+            spec_tokens: int) -> dict:
+    """Boot as a serving rank would (FULL_DECODE_ONLY, 4 sequences, 2048-token
+    steps, the given max-model-len and utilization, optional DSpark) and run
+    one short request; the memory accounting is in vLLM's own log lines
+    (model loading, memory profiling, KV cache, CUDA graphs)."""
+    os.environ.update(LAB_ENV)
+    if w8 is not None:
+        os.environ["VLLM_EXL3_DENSE_W8"] = str(w8)
+    from vllm import LLM, SamplingParams
+
+    kwargs = dict(
+        model=str(out), quantization="exl3", load_format="exl3", dtype="bfloat16",
+        max_model_len=max_len, max_num_seqs=4, max_num_batched_tokens=2048,
+        gpu_memory_utilization=util, mm_encoder_tp_mode="data",
+        tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
+        compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
+        swa_bounded_replay=False,
+    )
+    if dspark:
+        spec = {"method": "dspark"}
+        if spec_tokens:
+            spec["num_speculative_tokens"] = spec_tokens
+        kwargs["speculative_config"] = spec
+    llm = LLM(**kwargs)
+    prompts = [{"prompt_token_ids": [(13 * i) % 100000 + 3 for i in range(2048)]}] * 4
+    llm.generate(prompts, SamplingParams(max_tokens=16, temperature=0.0, ignore_eos=True))
+    import torch
+
+    free, total = torch.cuda.mem_get_info()
+    del llm
+    return {"measure": True, "dspark": dspark, "max_len": max_len, "util": util,
+            "client_view_free_gib": round(free / 2**30, 2), "total_gib": round(total / 2**30, 2)}
+
+
 def run(out: Path, w8: Path | None, dspark: bool, max_len: int) -> dict:
     os.environ.update(LAB_ENV)
     if w8 is not None:
@@ -274,6 +321,10 @@ def main() -> None:
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--realistic", action="store_true")
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--stage", default="default", choices=("default", "last"))
+    parser.add_argument("--measure", action="store_true")
+    parser.add_argument("--util", type=float, default=0.97)
+    parser.add_argument("--spec-tokens", type=int, default=0)
     parser.add_argument("--profile-mode", default="decode", choices=("decode", "prefill"))
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
@@ -282,11 +333,15 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     routed_25 = {int(x) for x in args.routed_25.split(",") if x}
     if not args.skip_build:
-        build(args.out, args.tokenizer_dir, args.layers, routed_25, args.realistic)
+        build(args.out, args.tokenizer_dir, args.layers, routed_25, args.realistic, args.stage)
     w8 = None
     if args.w8_header is not None:
         w8 = sparse_sidecar(args.w8_header, args.out, args.w8_size)
     if args.build_only:
+        return
+    if args.measure:
+        print(json.dumps(measure(args.out, w8, args.dspark, args.max_len, args.util,
+                                 args.spec_tokens)), flush=True)
         return
     if args.profile_dir is not None:
         print(
