@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified for CMP 170HX support (vllm-cmp170hx plugin); see repository history.
 import typing
 from collections.abc import Callable, Iterable
 from functools import partial
@@ -8,6 +9,7 @@ from itertools import islice
 import regex as re
 import torch
 import torch.nn as nn
+from vllm_cmp170hx.models.deepseek_v41.sm80_attention import sm80_select_attn_cls
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -199,6 +201,7 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         return MoEOutput(routed=routed, shared_output=shared_output)
 
 
+@sm80_select_attn_cls
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """Pick the CUDA sparse-MLA attention class for the configured backend.
 

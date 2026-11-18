@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified for CMP 170HX support (vllm-cmp170hx plugin); see repository history.
 """Engram: n-gram hash lookups gated into the hyper-connection stream.
 
 Port of the reference ``inference/engram.py`` + ``Engram`` /
@@ -46,6 +47,8 @@ from contextlib import ExitStack
 import numpy as np
 import torch
 from torch import nn
+from vllm_cmp170hx.models.deepseek_v41.sm80_engram import sm80_engram_embedding
+from vllm_cmp170hx.models.deepseek_v41.sm80_engram_projection import project_kv
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -1725,6 +1728,7 @@ class Engram(nn.Module):
         max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
         self._init_staging(max_tokens, layout.head_dim)
 
+    @sm80_engram_embedding
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
     ) -> ParallelEngramEmbedding:
@@ -1833,10 +1837,7 @@ class Engram(nn.Module):
         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
         the gate so those positions pass through untouched."""
-        if self._batch is not None:
-            kv = self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
-        else:
-            kv = self.wkv(self.embed(hash_ids).flatten(-2))
+        kv = project_kv(self, hash_ids)
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
         if self.use_sequence_parallel:
