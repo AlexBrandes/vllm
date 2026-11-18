@@ -527,6 +527,22 @@ class DeepseekV41ForCausalLM(
             )
         Exl3HeadLogitsProcessor.adopt(self.language_model.logits_processor)
 
+    def load_weights(self, weights) -> set[str]:
+        """Upstream's; with ``VLLM_DEEPSEEK_V41_EMBED_INT8=1`` the target's
+        input embedding (first pipeline stage) is then held as INT8 rows
+        (:class:`Int8RowEmbedding`, 0.66 GB instead of 1.32 GB). Target
+        numerics change (row-wise INT8 rounding of the embedding): judge it
+        with fidelity-v1 before serving it."""
+        loaded = super().load_weights(weights)
+        backbone = self.language_model.model
+        if (
+            os.environ.get("VLLM_DEEPSEEK_V41_EMBED_INT8") == "1"
+            and any(n.endswith("model.embed_tokens.weight") for n in loaded)
+            and not isinstance(backbone.embed_tokens, (PPMissingLayer, Int8RowEmbedding))
+        ):
+            backbone.embed_tokens = Int8RowEmbedding.from_embedding(backbone.embed_tokens)
+        return loaded
+
 
 def sm80_writes_context_kv(model: upstream_dspark.DSparkDeepseekV4Model) -> bool:
     """Whether the DSpark drafter ``model``'s stages are sm_80 layers, which
