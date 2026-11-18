@@ -17,11 +17,17 @@ StartLimitBurst=10
 # the KV-sharing groups 14-19 and 20-39; the plugin's shadow sources (models/deepseek_v41/sm80_pp_shadow.py)
 # make that legal: stage 0 ships layer 14's attention input, stage 1 ships 20's and 24's (10 KB/token each).
 # Rebalance by measured memory at first boot (valid stage sizes are any; shadows are planned automatically).
-# Memory (real-shape meta build, allocation c1): 15,10,15 = 62.4 / 36.0 / 61.4 GB of weights; the DSpark
-# drafter adds 5.65 GB on rank 2, which does not fit c1 (≈ 3 GB over), so this first-boot unit runs without
-# speculation. To add it: --speculative-config '{"method": "dspark"}' (drafter block size from the checkpoint)
-# once ≈ 3-4 GB are freed on rank 2 (drafter experts at 2.0, 2-3 of layers 32-39 at 2.0, or EXL3 dense there).
-#
+# Memory (revised c1 allocation of 2026-11-18 02:34: routed 2.5 bpw on layers 0-6 and 36-39, 2.0 on 7-35, drafter
+# routed 2.0; real-shape meta build): weights 15,10,15 = 62.4 / 36.0 / 58.0 GB + DSpark drafter 4.8 GB on rank 2
+# (INT8 drafter-embedding copy). Non-weight measured on card 4 (engine log 2026-11-18 01:47 and 03:35): first stage
+# 2.82 GiB, last stage with DSpark 2.31 GiB, KV 2.07 / 1.49 KB per token on the first / last stage. At 0.97 the KV
+# room is ~0.8 GiB on rank 0 (with VLLM_DEEPSEEK_V41_EMBED_INT8=1; ~0.24 GiB without), ~2.2 on rank 1, ~0.37 on
+# rank 2: a pool of ~270k tokens, so max-model-len 131072 (engine log 03:36, ATTENTION coordinator). Fallbacks if
+# a rank's KV line at boot is short: --max-num-batched-tokens 1024 instead of the INT8 embedding (rank 0 +0.57 GiB,
+# no numerics change), 1536 (rank 2 +0.13 GiB), or a smaller max-model-len; run-lab.sh takes them as overrides.
+# DSpark under PP: the plugin backbone ships target-layer streams over PP (here targets 37-39 are all on rank 2);
+# PP2/PP3 runs on one card (tests/models/deepseek_v41/sm80/gpu_pp_one_card.py) match PP1 bit for bit: the tiny
+# checkpoint with and without DSpark, and real converter layers 0-5 (no drafter converted yet) with these switches.
 # Image: lab-dsv41-pp3:<plugin sha> built by recipes/dsv41-flash-pp3-lab/build.sh (dsv41/plugin + dsv41/vllm
 # on lab-glm53-q4nx-kf:6734e9fe03). Weights:
 #   /model  /home/alex/models/DeepSeek-V4.1-Flash-1017-Q4NX-c1   Q4N-X EXL3 conversion (routed 2.0/2.5 bpw)
@@ -33,7 +39,8 @@ StartLimitBurst=10
 #   Q4N-X INT8 routed prefill/decode (t2c4), wide decode calls (64 rows), combine_route wide, no route
 #   re-check; dense W8A8 sidecar incl. skinny decode GEMM; homogeneous PP steps, spread decodes,
 #   2048-token prefill chunk beside decodes (sched round-robin is in the plugin); expandable segments.
-# DeepSeek-V4.1 specific: drafter input-embedding copy on the last stage as INT8 rows (-0.66 GB); rotary caches cut to
+# DeepSeek-V4.1 specific: target input embedding (rank 0) and the drafter's copy (rank 2) as INT8 rows (-0.61 GiB
+# each; the target's changes numerics slightly, judged by fidelity-v1); rotary caches cut to
 # max-model-len + 4096 (-0.27 GB per cache kind); Engram SSD rows with an 8 GiB host row cache on rank 0; FP32 head (plugin
 # default head_dtype=float32); deterministic index top-k is the sm_80 stable radix select (no flag);
 # no hash routing (the 1017 checkpoint has no gate.tid2eid; every layer is noaux_tc sqrtsoftplus).
@@ -52,7 +59,7 @@ Restart=no
 TimeoutStartSec=600
 TimeoutStopSec=90
 ExecStartPre=-/usr/bin/docker rm -f dsv41-pp3-lab
-ExecStart=/usr/bin/docker run --entrypoint '' -e PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --name dsv41-pp3-lab --gpus '"device=GPU-bd10e096-f7db-16a4-557b-06ea1b258c2e,GPU-ee1699e3-cb4f-7f81-abe8-5329516228e6,GPU-348909a8-87b2-f694-f624-59fcaa7a9255"' -e CUDA_VISIBLE_DEVICES=GPU-bd10e096-f7db-16a4-557b-06ea1b258c2e,GPU-ee1699e3-cb4f-7f81-abe8-5329516228e6,GPU-348909a8-87b2-f694-f624-59fcaa7a9255 --network host --shm-size 16g -e HF_HUB_OFFLINE=1 -v /home/alex/models/DeepSeek-V4.1-Flash-1017-Q4NX-c1:/model:ro -v /home/alex/models/DeepSeek-V4.1-Flash-1017-dense-w8-v1:/w8:ro -v /home/alex/models/DeepSeek-V4.1-Flash-1017-src:/engram:ro -e VLLM_PP_LAYER_PARTITION=15,10,15 -e VLLM_PP_HOMOGENEOUS_STEPS=1 -e VLLM_PP_SPREAD_DECODES=1 -e VLLM_EXL3_MOE_PREFILL_TC=1 -e VLLM_EXL3_MOE_DECODE_TC=1 -e VLLM_EXL3_MOE_DECODE_TC_MODE=full -e VLLM_EXL3_Q4N_PREFILL=i8 -e VLLM_EXL3_Q4N_I8_GEMM=t2c4 -e VLLM_EXL3_Q4N_DECODE=i8 -e VLLM_EXL3_Q4N_DECODE_GEMM=t2c4 -e VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS=64 -e VLLM_EXL3_MOE_COMBINE_WIDE=1 -e VLLM_EXL3_ROUTE_CHECK=0 -e VLLM_EXL3_DENSE_PREFILL_TC=1 -e VLLM_EXL3_DENSE_DECODE_TC=1 -e VLLM_EXL3_DENSE_DECODE_TC_FAMILIES=all -e VLLM_EXL3_DENSE_DECODE_SPLITK=1 -e VLLM_EXL3_DECODE_VARIANT=off -e VLLM_EXL3_DENSE_W8=/w8/dense.safetensors -e VLLM_EXL3_DENSE_W8_DECODE=1 -e VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8=1 -e VLLM_DEEPSEEK_V41_TRIM_ROPE=1 -e VLLM_DEEPSEEK_V41_FUSED_MHC=1 -e VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH=1 -e VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2=1 -e VLLM_SM80_MHC_UNIFORM_KERNEL_A=1 -e VLLM_ENGRAM_PLACEMENT=ssd -e VLLM_ENGRAM_ROW_CACHE_GIB=8 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lab-dsv41-pp3:PLUGIN_SHA vllm serve /model --host 127.0.0.1 --port 18560 --served-model-name deepseek-v4.1-flash-q4nx-lab --quantization exl3 --load-format exl3 --dtype bfloat16 --tokenizer-mode deepseek_v41 --pipeline-parallel-size 3 --tensor-parallel-size 1 --mm-encoder-tp-mode data --max-model-len 131072 --max-num-seqs 4 --max-num-batched-tokens 2048 --prefill-chunk-with-decodes 2048 --gpu-memory-utilization 0.96 --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-prompt-tokens-details --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' --hf-overrides '{"engram_table_dir": "/engram"}'
+ExecStart=/usr/bin/docker run --entrypoint '' -e PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --name dsv41-pp3-lab --gpus '"device=GPU-bd10e096-f7db-16a4-557b-06ea1b258c2e,GPU-ee1699e3-cb4f-7f81-abe8-5329516228e6,GPU-348909a8-87b2-f694-f624-59fcaa7a9255"' -e CUDA_VISIBLE_DEVICES=GPU-bd10e096-f7db-16a4-557b-06ea1b258c2e,GPU-ee1699e3-cb4f-7f81-abe8-5329516228e6,GPU-348909a8-87b2-f694-f624-59fcaa7a9255 --network host --shm-size 16g -e HF_HUB_OFFLINE=1 -v /home/alex/models/DeepSeek-V4.1-Flash-1017-Q4NX-c1:/model:ro -v /home/alex/models/DeepSeek-V4.1-Flash-1017-dense-w8-v1:/w8:ro -v /home/alex/models/DeepSeek-V4.1-Flash-1017-src:/engram:ro -e VLLM_PP_LAYER_PARTITION=15,10,15 -e VLLM_PP_HOMOGENEOUS_STEPS=1 -e VLLM_PP_SPREAD_DECODES=1 -e VLLM_EXL3_MOE_PREFILL_TC=1 -e VLLM_EXL3_MOE_DECODE_TC=1 -e VLLM_EXL3_MOE_DECODE_TC_MODE=full -e VLLM_EXL3_Q4N_PREFILL=i8 -e VLLM_EXL3_Q4N_I8_GEMM=t2c4 -e VLLM_EXL3_Q4N_DECODE=i8 -e VLLM_EXL3_Q4N_DECODE_GEMM=t2c4 -e VLLM_EXL3_MOE_DECODE_TC_MAX_ROWS=64 -e VLLM_EXL3_MOE_COMBINE_WIDE=1 -e VLLM_EXL3_ROUTE_CHECK=0 -e VLLM_EXL3_DENSE_PREFILL_TC=1 -e VLLM_EXL3_DENSE_DECODE_TC=1 -e VLLM_EXL3_DENSE_DECODE_TC_FAMILIES=all -e VLLM_EXL3_DENSE_DECODE_SPLITK=1 -e VLLM_EXL3_DECODE_VARIANT=off -e VLLM_EXL3_DENSE_W8=/w8/dense.safetensors -e VLLM_EXL3_DENSE_W8_DECODE=1 -e VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8=1 -e VLLM_DEEPSEEK_V41_EMBED_INT8=1 -e VLLM_DEEPSEEK_V41_TRIM_ROPE=1 -e VLLM_DEEPSEEK_V41_FUSED_MHC=1 -e VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH=1 -e VLLM_DEEPSEEK_V41_FUSED_MHC_FINISH_V2=1 -e VLLM_SM80_MHC_UNIFORM_KERNEL_A=1 -e VLLM_ENGRAM_PLACEMENT=ssd -e VLLM_ENGRAM_ROW_CACHE_GIB=8 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lab-dsv41-pp3:PLUGIN_SHA vllm serve /model --host 127.0.0.1 --port 18560 --served-model-name deepseek-v4.1-flash-q4nx-lab --quantization exl3 --load-format exl3 --dtype bfloat16 --tokenizer-mode deepseek_v41 --pipeline-parallel-size 3 --tensor-parallel-size 1 --mm-encoder-tp-mode data --max-model-len 131072 --max-num-seqs 4 --max-num-batched-tokens 2048 --prefill-chunk-with-decodes 2048 --gpu-memory-utilization 0.97 --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-prompt-tokens-details --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' --hf-overrides '{"engram_table_dir": "/engram"}' --speculative-config '{"method": "dspark"}'
 ExecStop=-/usr/bin/docker stop -t 45 dsv41-pp3-lab
 ExecStopPost=-/usr/bin/docker rm -f dsv41-pp3-lab
 

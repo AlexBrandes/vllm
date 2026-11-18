@@ -128,7 +128,7 @@ def write_shim(directory: Path) -> None:
 
 def run_arm(
     out: Path, partition: str, dspark: bool, prompt_lens: list[int], lab: bool,
-    swa_replay: bool = True,
+    swa_replay: bool = True, batched_tokens: int = 1024,
 ) -> dict:
     stages = len(partition.split(","))
     if stages > 1:
@@ -139,7 +139,7 @@ def run_arm(
 
     kwargs = dict(
         model=str(out), quantization="exl3", load_format="exl3", dtype="bfloat16",
-        max_model_len=4096, max_num_seqs=4, max_num_batched_tokens=1024,
+        max_model_len=4096, max_num_seqs=4, max_num_batched_tokens=batched_tokens,
         gpu_memory_utilization=0.2, kv_cache_memory_bytes=1 << 30,
         mm_encoder_tp_mode="data", tokenizer_mode="deepseek_v41",
         enable_prefix_caching=False, seed=0,
@@ -185,6 +185,8 @@ def main() -> None:
     parser.add_argument("--arms", default="8,4:4,4:3:1,3:1:4")
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--lab", action="store_true")
+    parser.add_argument("--batched-tokens", type=int, default=1024,
+                        help="max-num-batched-tokens (smaller: prompts prefill in chunks)")
     parser.add_argument("--no-swa-replay", action="store_true",
                         help="every arm without upstream's decoder SWA replay (a cut "
                         "whose last KV source has ratio 2 cannot replay at PP1)")
@@ -203,7 +205,7 @@ def main() -> None:
     if args.arm:
         sys.path.insert(0, str(root))
         res = run_arm(args.out, args.arm.replace(":", ","), args.dspark, lens, args.lab,
-                      not args.no_swa_replay)
+                      not args.no_swa_replay, args.batched_tokens)
         Path(args.result).write_text(json.dumps(res))
         return
     shim = Path(tempfile.mkdtemp(prefix="dsv41-pp-one-card-"))
@@ -236,6 +238,7 @@ def main() -> None:
                "--result", str(result), "--prompt-lens", args.prompt_lens]
         cmd += ["--dspark"] * args.dspark + ["--lab"] * args.lab
         cmd += ["--no-swa-replay"] * args.no_swa_replay
+        cmd += ["--batched-tokens", str(args.batched_tokens)]
         drafts = shim / f"{arm.replace(':', '-')}.drafts.jsonl"
         arm_env = dict(env, DSV41_PP_DRAFT_DUMP=str(drafts)) if args.dspark else env
         proc = subprocess.run(cmd, env=arm_env, capture_output=True, text=True, timeout=1500)
