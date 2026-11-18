@@ -6,7 +6,7 @@ kernels at the served shapes, without the converted checkpoint.
 Builds a header-only (sparse, all-zero data) EXL3 checkpoint with the real
 config cut to ``--layers`` decoder layers (hidden 5120, 384 routed experts as
 Q4N-X at 2.0 / 2.5 bpw, the real attention, indexer, compressor, mHC, Engram
-on layer 1, the three DSpark stages with 128 Q4N-X experts at 2.5 bpw) and a
+on layer 1, the three DSpark stages with 128 Q4N-X experts at 2.5 or 2.0 bpw) and a
 header-only dense W8 sidecar copied from the real one's header, then serves
 it through vLLM with the lab unit's kernel switches and times prefill and
 decode. All weights are zero, so the tokens are meaningless; the point is
@@ -55,7 +55,7 @@ LAB_ENV = {
 
 def build(
     out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int], realistic: bool = False,
-    stage: str = "default",
+    stage: str = "default", draft_bits_x2: int = 5,
 ) -> None:
     from tests.models.deepseek_v41.sm80 import exl3_fixture as fixture
     from tests.models.deepseek_v41.sm80.test_engram_storage import _write_table
@@ -115,7 +115,7 @@ def build(
         if ".ffn.experts." in name and name.endswith(".trellis"):
             draft = name.startswith("mtp.")
             layer = int(name.split(".")[1])
-            bits_x2 = 5 if draft or layer in routed_25 else 4
+            bits_x2 = draft_bits_x2 if draft else (5 if layer in routed_25 else 4)
             tensors[name] = (dtype, (*shape[:-1], 8 * bits_x2))
     header, offset = {}, 0
     for name, (dtype, shape) in sorted(tensors.items()):
@@ -321,6 +321,8 @@ def main() -> None:
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--routed-25", default="0")
     parser.add_argument("--dspark", action="store_true")
+    parser.add_argument("--draft-bits-x2", type=int, default=5,
+                        help="the DSpark drafter's routed experts: 5 (2.5 bpw) or 4 (2.0)")
     parser.add_argument("--realistic", action="store_true")
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--stage", default="default", choices=("default", "last"))
@@ -338,7 +340,8 @@ def main() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     routed_25 = {int(x) for x in args.routed_25.split(",") if x}
     if not args.skip_build:
-        build(args.out, args.tokenizer_dir, args.layers, routed_25, args.realistic, args.stage)
+        build(args.out, args.tokenizer_dir, args.layers, routed_25, args.realistic, args.stage,
+              args.draft_bits_x2)
     w8 = None
     if args.w8_header is not None:
         w8 = sparse_sidecar(args.w8_header, args.out, args.w8_size)
