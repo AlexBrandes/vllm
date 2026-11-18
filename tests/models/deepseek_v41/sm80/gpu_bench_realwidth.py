@@ -176,7 +176,6 @@ def profile(out: Path, w8: Path | None, max_len: int, profile_dir: Path) -> dict
     os.environ.update(LAB_ENV)
     if w8 is not None:
         os.environ["VLLM_EXL3_DENSE_W8"] = str(w8)
-    os.environ["VLLM_TORCH_PROFILER_DIR"] = str(profile_dir)
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -185,6 +184,7 @@ def profile(out: Path, w8: Path | None, max_len: int, profile_dir: Path) -> dict
         gpu_memory_utilization=0.85, mm_encoder_tp_mode="data",
         tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
         enforce_eager=True,
+        profiler_config={"profiler": "torch", "torch_profiler_dir": str(profile_dir)},
     )
     prompt = [{"prompt_token_ids": [(13 * i) % 100000 + 3 for i in range(512)]}]
     params = SamplingParams(max_tokens=65, temperature=0.0, ignore_eos=True)
