@@ -207,9 +207,11 @@ class Exl3Config(QuantizationConfig):
             or getattr(text, "model_type", "") == "glm5_next_text"
         )
         self.mtp_start_layer_idx = getattr(text, "num_hidden_layers", 0)
-        self.is_dsv41 = model_type == "deepseek_v41" or getattr(
-            text, "model_type", ""
-        ) in ("deepseek_v41", "deepseek_v41_text")
+        self.is_dsv41 = (
+            model_type == "deepseek_v41"
+            or getattr(text, "model_type", "") in ("deepseek_v41", "deepseek_v41_text")
+            or "DSparkV41DraftModel" in (getattr(hf_config, "architectures", None) or ())
+        )
         if self.is_dsv41:
             from vllm_cmp170hx.models.deepseek_v41.sm80_exl3 import (
                 DeepseekV41Exl3Layout,
