@@ -62,9 +62,18 @@ def build(out: Path, tokenizer_dir: Path, layers: int, routed_25: set[int]) -> N
     ratios = text["compress_ratios"]
     text["compress_ratios"] = ratios[:layers] + ratios[-text["num_nextn_predict_layers"]:]
     text["num_hidden_layers"] = layers
-    text["kv_source_layer_ids"] = [s for s in text["kv_source_layer_ids"] if s < layers]
-    text["index_source_layer_ids"] = [s for s in text["index_source_layer_ids"] if s < layers]
-    text["candidate_source_layer_id"] = max(text["kv_source_layer_ids"])
+    # The last layer becomes a ratio-1 KV / index / candidate source (as layer
+    # 20 is in the full model), so both compressor ratios run and the cut
+    # model stays valid (upstream's decoder replay needs ratio <= 1 at the
+    # last KV source).
+    text["compress_ratios"][layers - 1] = 1
+    text["kv_source_layer_ids"] = sorted(
+        {s for s in text["kv_source_layer_ids"] if s < layers} | {layers - 1}
+    )
+    text["index_source_layer_ids"] = sorted(
+        {s for s in text["index_source_layer_ids"] if s < layers} | {layers - 1}
+    )
+    text["candidate_source_layer_id"] = layers - 1
     keep = [i for i, l in enumerate(text["engram_layer_ids"]) if l < layers]
     text["engram_layer_ids"] = [text["engram_layer_ids"][i] for i in keep]
     text["engram_num_embeddings"] = [text["engram_num_embeddings"][i] for i in keep]
