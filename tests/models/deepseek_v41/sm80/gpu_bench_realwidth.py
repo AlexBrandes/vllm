@@ -167,7 +167,9 @@ def sparse_sidecar(header_file: Path, out: Path, size: int) -> Path:
     return path
 
 
-def profile(out: Path, w8: Path | None, max_len: int, profile_dir: Path) -> dict:
+def profile(
+    out: Path, w8: Path | None, max_len: int, profile_dir: Path, mode: str = "decode"
+) -> dict:
     """Eager decode under the torch profiler: CUDA time per kernel name over
     64 decode steps at batch 1 (kernel durations; launch gaps excluded)."""
     import glob
@@ -186,8 +188,16 @@ def profile(out: Path, w8: Path | None, max_len: int, profile_dir: Path) -> dict
         enforce_eager=True,
         profiler_config={"profiler": "torch", "torch_profiler_dir": str(profile_dir)},
     )
-    prompt = [{"prompt_token_ids": [(13 * i) % 100000 + 3 for i in range(512)]}]
-    params = SamplingParams(max_tokens=65, temperature=0.0, ignore_eos=True)
+    if mode == "prefill":
+        # Two 2048-token prompts, one token each: prefill chunks only.
+        prompt = [
+            {"prompt_token_ids": [(13 * i + b) % 100000 + 3 for i in range(2048)]}
+            for b in range(2)
+        ]
+        params = SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True)
+    else:
+        prompt = [{"prompt_token_ids": [(13 * i) % 100000 + 3 for i in range(512)]}]
+        params = SamplingParams(max_tokens=65, temperature=0.0, ignore_eos=True)
     llm.generate(prompt, params)
     llm.start_profile()
     llm.generate(prompt, params)
@@ -258,6 +268,7 @@ def main() -> None:
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--realistic", action="store_true")
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--profile-mode", default="decode", choices=("decode", "prefill"))
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--max-len", type=int, default=16384)
@@ -272,7 +283,12 @@ def main() -> None:
     if args.build_only:
         return
     if args.profile_dir is not None:
-        print(json.dumps(profile(args.out, w8, args.max_len, args.profile_dir)), flush=True)
+        print(
+            json.dumps(
+                profile(args.out, w8, args.max_len, args.profile_dir, args.profile_mode)
+            ),
+            flush=True,
+        )
         return
     print(json.dumps(run(args.out, w8, args.dspark, args.max_len)), flush=True)
 
