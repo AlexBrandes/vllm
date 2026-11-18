@@ -14,7 +14,8 @@ Opt-in (writes sparse files of the real checkpoint's size into
     pytest -s tests/models/deepseek_v41/sm80/test_real_shape_stages.py
 
 Routed experts take bits_x2 5 (2.5 bpw) on the ``DSV41_ROUTED_25`` layers and
-4 (2.0) elsewhere; the drafter's routed experts 5. Prints one JSON line per
+4 (2.0) elsewhere; the drafter's routed experts ``DSV41_DRAFT_BITS_X2`` (default
+5). Prints one JSON line per
 stage; asserts only that every stage builds and loads its plan.
 """
 
@@ -44,7 +45,9 @@ def _ranges(spec: str) -> set[int]:
     return out
 
 
-def _write_sparse(directory: Path, config: dict, routed_25: set[int]) -> None:
+def _write_sparse(
+    directory: Path, config: dict, routed_25: set[int], draft_bits_x2: int = 5
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(config))
     tensors = fixture.checkpoint_tensors(config)
@@ -64,7 +67,10 @@ def _write_sparse(directory: Path, config: dict, routed_25: set[int]) -> None:
     for name, (dtype, shape) in sorted(tensors.items()):
         if ".ffn.experts." in name and name.endswith(".trellis"):
             layer = int(name.split(".")[1])
-            bits_x2 = 5 if name.startswith("mtp.") or layer in routed_25 else 4
+            if name.startswith("mtp."):
+                bits_x2 = draft_bits_x2
+            else:
+                bits_x2 = 5 if layer in routed_25 else 4
             shape = (*shape[:-1], 8 * bits_x2)
         size = fixture.tensor_bytes(dtype, tuple(shape))
         header[name] = {
@@ -135,7 +141,9 @@ def test_real_shape_stage_bytes(monkeypatch, meta_platform):  # noqa: F811
     directory = Path(ROOT)
     routed_25 = _ranges(os.environ.get("DSV41_ROUTED_25", "0-6,32-39"))
     if not (directory / "config.json").exists():
-        _write_sparse(directory, config, routed_25)
+        _write_sparse(
+            directory, config, routed_25, int(os.environ.get("DSV41_DRAFT_BITS_X2", "5"))
+        )
     partition = os.environ.get("DSV41_PP_PARTITION", "16,9,15")
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
     stages = len(partition.split(","))

@@ -5,10 +5,9 @@
 Builds a checkpoint directory from the converter's finished per-module files
 (``qtensors/layers.<i>.safetensors``, the Engram projection, the embedding;
 linked, not copied), cut to those layers: the real config with
-``num_hidden_layers`` = the number of layers, the last one turned into the
-ratio-1 KV / index / candidate source when it is not one already (ratio 2 is
-kept when it is the last KV source; the decoder replay then stays off), the
-real Engram tables (``engram_table_dir`` = the official shards), unit final
+``num_hidden_layers`` = the number of layers and the real KV-sharing groups
+cut there (the later layers of a cut group keep reading its source; with a
+ratio-2 last KV source the decoder replay stays off), the real Engram tables (``engram_table_dir`` = the official shards), unit final
 norm and a header-only EXL3 head the dense W8 sidecar serves (its real INT8
 head). Then serves it: greedy tokens for a few prompts with and without the
 W8 sidecar (dense from EXL3 instead), eager vs FULL_DECODE_ONLY graphs, the

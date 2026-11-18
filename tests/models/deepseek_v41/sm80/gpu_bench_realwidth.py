@@ -231,7 +231,7 @@ def profile(
 
 
 def measure(out: Path, w8: Path | None, dspark: bool, max_len: int, util: float,
-            spec_tokens: int, images: int | None = None) -> dict:
+            spec_tokens: int, images: int | None = None, batched_tokens: int = 2048) -> dict:
     """Boot as a serving rank would (FULL_DECODE_ONLY, 4 sequences, 2048-token
     steps, the given max-model-len and utilization, optional DSpark) and run
     one short request; the memory accounting is in vLLM's own log lines
@@ -243,7 +243,7 @@ def measure(out: Path, w8: Path | None, dspark: bool, max_len: int, util: float,
 
     kwargs = dict(
         model=str(out), quantization="exl3", load_format="exl3", dtype="bfloat16",
-        max_model_len=max_len, max_num_seqs=4, max_num_batched_tokens=2048,
+        max_model_len=max_len, max_num_seqs=4, max_num_batched_tokens=batched_tokens,
         gpu_memory_utilization=util, mm_encoder_tp_mode="data",
         tokenizer_mode="deepseek_v41", enable_prefix_caching=False, seed=0,
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
@@ -332,6 +332,8 @@ def main() -> None:
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--max-len", type=int, default=16384)
+    parser.add_argument("--batched-tokens", type=int, default=2048,
+                        help="--measure: max-num-batched-tokens")
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
     routed_25 = {int(x) for x in args.routed_25.split(",") if x}
@@ -344,7 +346,8 @@ def main() -> None:
         return
     if args.measure:
         print(json.dumps(measure(args.out, w8, args.dspark, args.max_len, args.util,
-                                 args.spec_tokens, args.images)), flush=True)
+                                 args.spec_tokens, args.images, args.batched_tokens)),
+              flush=True)
         return
     if args.profile_dir is not None:
         print(
