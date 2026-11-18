@@ -43,6 +43,7 @@ layer topology this supports is TP with whole-expert EP and no sequence
 parallelism, mHC overlap or fused all-reduce (none of which sm_80 enables).
 """
 
+import os
 from itertools import islice
 
 import torch
@@ -657,4 +658,48 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
         confidence_head = self.model.confidence_head
         loaded = super().load_weights(weights)
         self.model.confidence_head = confidence_head
+        if (
+            "model.embed_tokens.weight" in loaded
+            and self.has_own_embed_tokens
+            and os.environ.get("VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8") == "1"
+        ):
+            self.model.embed_tokens = Int8RowEmbedding.from_embedding(
+                self.model.embed_tokens
+            )
         return loaded
+
+
+class Int8RowEmbedding(torch.nn.Module):
+    """The DSpark drafter's own input-embedding copy on the last pipeline
+    stage, stored as INT8 rows with one FP32 scale per row (half the bytes
+    of the BF16 table: 0.66 GB less on the most loaded stage). A lookup
+    gathers the rows and scales them back to BF16. Only the drafter's
+    embedding is stored this way (draft numerics, not the target's), with
+    ``VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8=1``."""
+
+    def __init__(self, q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype):
+        super().__init__()
+        self.register_buffer("q", q, persistent=False)
+        self.register_buffer("scale", scale, persistent=False)
+        self.out_dtype = dtype
+
+    @classmethod
+    def from_embedding(cls, embedding: torch.nn.Module) -> "Int8RowEmbedding":
+        weight = embedding.weight.data
+        if getattr(embedding, "tp_size", 1) != 1:
+            raise ValueError("The INT8 drafter embedding runs at TP=1 only")
+        amax = weight.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+        scale = amax / 127.0
+        q = torch.round(weight.float() / scale).clamp_(-127, 127).to(torch.int8)
+        logger.info_once(
+            "DeepSeek-V4.1 DSpark: the drafter's input embedding is INT8 rows "
+            "(%.2f GB instead of %.2f GB)",
+            q.numel() / 1e9, weight.numel() * weight.element_size() / 1e9,
+            scope="global",
+        )
+        return cls(q, scale.squeeze(1).contiguous(), weight.dtype)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        rows = self.q.index_select(0, input_ids.reshape(-1).long())
+        out = rows.float() * self.scale.index_select(0, input_ids.reshape(-1).long())[:, None]
+        return out.to(self.out_dtype).reshape(*input_ids.shape, -1)
