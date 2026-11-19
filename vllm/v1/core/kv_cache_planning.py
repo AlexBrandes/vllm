@@ -1726,15 +1726,23 @@ def get_stage_pool_kv_cache_config(
     )
 
 
+# Address space each worker reserves per pool of an extensible KV cache at
+# least: the post-warmup budget is unknown at planning (and can exceed what
+# profiling reports), and only committed blocks take memory.
+EXTENSIBLE_POOL_RESERVATION_BYTES = 64 << 30
+
+
 def extensible_stage_pool_capacities(
     pool_bytes_by_worker: list[dict[int, int]], available_memory: list[int]
 ) -> dict[int, int]:
     """Blocks to reserve (address space only) for each pool of an extensible
     KV cache: as many as the pool could take if every worker holding it gave
-    it all of its budget, so the post-warmup split never hits the
-    reservation."""
+    it all of its budget, the larger of the planning budget and
+    `EXTENSIBLE_POOL_RESERVATION_BYTES`, so the post-warmup split does not hit
+    the reservation."""
     capacity: dict[int, int] = {}
     for pool_bytes, memory in zip(pool_bytes_by_worker, available_memory):
+        memory = max(memory, EXTENSIBLE_POOL_RESERVATION_BYTES)
         budget = max(0, memory - sum(pool_bytes.values()))
         for pool_id, block_bytes in pool_bytes.items():
             blocks = budget // block_bytes + 1
@@ -1891,9 +1899,13 @@ def get_kv_cache_configs(
             builder, vllm_config, projected_groups_per_worker, check_memory
         )
 
-    # Check if the available memory is enough per worker.
+    # Check if the available memory is enough per worker. Stage pools with an
+    # extensible KV cache defer it to the memory measured after warmup
+    # (`finalize_extensible_kv_cache`): before warmup a stage whose model and
+    # profiled activations fill the device reports almost nothing.
+    deferred = stage_pools and vllm_config.cache_config.enable_extensible_kv_cache
     for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
-        if not groups:
+        if not groups or deferred:
             continue
         _check_enough_kv_cache_memory(
             avail_mem,

@@ -769,3 +769,36 @@ def test_extensible_kv_cache_commits_each_pool(monkeypatch):
     # Warmup commits one count everywhere, within the budget.
     budget_blocks = cache.blocks_within(cache.physical_bytes_for(50))
     assert budget_blocks >= 50
+
+
+def test_extensible_stage_pools_defer_the_fit_check_to_warmup():
+    """Before warmup rank 2 (model + drafter) reports almost no memory; with
+    the extensible cache the one-request check and the reservations wait for
+    the measured budgets (boot 8)."""
+    from vllm.v1.worker.worker_base import CompilationTimes
+
+    planning = [int(0.92 * 2**30), int(0.5 * 2**30), int(0.01 * 2**30)]
+    vllm_config, _, configs = _extensible_dsv41_configs(planning)
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    reserved = {0: scheduler_config.num_blocks, **scheduler_config.pool_num_blocks}
+    floor = kv_cache_planning.EXTENSIBLE_POOL_RESERVATION_BYTES
+    assert min(reserved.values()) >= (floor - 3 * PAGE) // PAGE // 3
+
+    # After warmup rank 2 has 0.6 GiB (these BF16 pages need 0.45 GiB there).
+    measured = [int(0.81 * 2**30), int(1.0 * 2**30), int(0.6 * 2**30)]
+    times = [CompilationTimes(0.0, 0.0, kv_cache_bytes=b) for b in measured]
+    num_blocks = kv_cache_planning.finalize_extensible_kv_cache(
+        vllm_config, configs, scheduler_config, times
+    )
+    sized = {0: num_blocks, **scheduler_config.pool_num_blocks}
+    assert all(sized[p] <= reserved[p] for p in sized)
+    # Rank 2 holds pools 3 and 4 and uses its measured budget.
+    used2 = (sized[3] + sized[4]) * PAGE
+    assert measured[2] - 2 * PAGE <= used2 <= measured[2]
+
+    # The non-extensible path still checks at planning.
+    vllm_config = _dsv41_vllm_config(262144, stage_pools=True)
+    specs = _dsv41_pp3_specs()
+    groups = kv_cache_planning.get_global_kv_cache_groups(vllm_config, specs)
+    with pytest.raises(ValueError, match="larger than the available KV cache"):
+        kv_cache_planning.get_kv_cache_configs(vllm_config, specs, planning, groups)
