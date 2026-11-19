@@ -640,3 +640,132 @@ def test_block_copies_apply_to_their_own_pool(monkeypatch):
     copy_kv_cache_blocks_inplace([pool1], 6, copies, 1)
     assert torch.equal(pool0, want0)
     assert torch.equal(pool1, want1)
+
+
+# --------------------------------------------------------------------------
+# Extensible KV cache: pools sized from the memory measured after warmup
+# --------------------------------------------------------------------------
+
+
+def _extensible_dsv41_configs(available: list[int]):
+    vllm_config = _dsv41_vllm_config(262144, stage_pools=True)
+    vllm_config.cache_config.enable_extensible_kv_cache = True
+    specs = _dsv41_pp3_specs()
+    groups = kv_cache_planning.get_global_kv_cache_groups(vllm_config, specs)
+    configs = kv_cache_planning.get_kv_cache_configs(
+        vllm_config, specs, available, groups
+    )
+    return vllm_config, groups, configs
+
+
+def test_extensible_stage_pools_sized_after_warmup():
+    """Reservations are generous; after warmup each worker reports its budget
+    in bytes and the pools are water-filled over those budgets, the same plan
+    as without the extensible cache on that memory."""
+    from vllm.v1.worker.worker_base import CompilationTimes
+
+    vllm_config, groups, configs = _extensible_dsv41_configs([8 << 30] * 3)
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    reserved = {0: scheduler_config.num_blocks, **scheduler_config.pool_num_blocks}
+    # Every pool can take its tightest holder's whole 8 GiB budget.
+    assert min(reserved.values()) >= (8 << 30) // PAGE // 3
+
+    measured = [20736 * PAGE, 32831 * PAGE, 32831 * PAGE]
+    times = [CompilationTimes(0.0, 0.0, kv_cache_bytes=b) for b in measured]
+    num_blocks = kv_cache_planning.finalize_extensible_kv_cache(
+        vllm_config, configs, scheduler_config, times
+    )
+    sized = {0: num_blocks, **scheduler_config.pool_num_blocks}
+    builder = kv_cache_planning.DefaultKVCacheConfigBuilder()
+    pool_bytes = kv_cache_planning._pool_bytes_per_block_by_worker(
+        builder, vllm_config, [c.kv_cache_groups for c in configs]
+    )
+    assert sized == plan_stage_pool_num_blocks(
+        vllm_config, groups, pool_bytes, measured
+    )
+    assert sized == {0: 14946, 1: 5789, 2: 4394, 3: 22647, 4: 10184}
+    assert all(sized[p] <= reserved[p] for p in sized)
+    for config in configs:
+        assert {0: config.num_blocks, **config.pool_num_blocks} == sized
+    assert vllm_config.cache_config.num_gpu_blocks == sized[0]
+
+
+def test_extensible_stage_pools_refuse_a_budget_too_small():
+    from vllm.v1.worker.worker_base import CompilationTimes
+
+    vllm_config, _, configs = _extensible_dsv41_configs([8 << 30] * 3)
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    # Rank 0 needs 19,278 blocks (+2 null) for one 262144-token request.
+    measured = [19000 * PAGE, 32831 * PAGE, 32831 * PAGE]
+    times = [CompilationTimes(0.0, 0.0, kv_cache_bytes=b) for b in measured]
+    with pytest.raises(ValueError, match="stage pools"):
+        kv_cache_planning.finalize_extensible_kv_cache(
+            vllm_config, configs, scheduler_config, times
+        )
+
+
+class _FakeExtensibleTensor:
+    """Records commits instead of mapping device memory."""
+
+    granularity = 2 << 20
+
+    def __init__(self, size, device, segment_capacities):
+        self.capacities = list(segment_capacities)
+        self.committed = [0] * len(self.capacities)
+
+    def resize_segments_(self, sizes, zero_new=False):
+        for old, new, capacity in zip(self.committed, sizes, self.capacities):
+            assert old <= new <= capacity
+        self.committed = list(sizes)
+
+    def release_physical(self):
+        self.committed = [0] * len(self.capacities)
+
+    def segments_backed_by_one_chunk(self, sizes):
+        return [True] * len(sizes)
+
+    @property
+    def physical_bytes(self):
+        g = self.granularity
+        return sum(-(-c // g) * g for c in self.committed)
+
+
+def test_extensible_kv_cache_commits_each_pool(monkeypatch):
+    """Rank 1 backs pools 1, 2 and 3: each pool's layer regions are segments
+    of that pool's reservation, and commits are capped per pool."""
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker import extensible_kv_cache
+
+    monkeypatch.setattr(extensible_kv_cache, "ExtensibleTensor", _FakeExtensibleTensor)
+    _, _, configs = _extensible_dsv41_configs([1 << 30, 2 << 30, 2 << 30])
+    config = configs[1]
+    cache = extensible_kv_cache.ExtensibleKVCache(
+        config, torch.device("cpu"), KVCacheLayout.LBNHC
+    )
+    reserved = {p: config.num_blocks_of_pool(p) for p in (1, 2, 3)}
+    assert cache.capacity_by_pool == reserved
+    assert set(cache.segment_pools) == {1, 2, 3}
+    assert cache.bytes_per_block == len(cache.segment_pools) * PAGE
+
+    cache.commit(10)
+    assert cache.committed_by_pool == {1: 10, 2: 10, 3: 10}
+    assert cache.num_committed_blocks == 10
+    counts = {0: 5, 1: 100, 2: 7, 3: reserved[3] + 5}
+    cache.commit(counts, shrink=True)  # pool 2 shrinks: remap
+    assert cache.committed_by_pool == {1: 100, 2: 7, 3: reserved[3]}
+    sizes = [
+        cache.committed_by_pool[p] * s
+        for p, s in zip(cache.segment_pools, cache.segment_strides)
+    ]
+    assert cache.buffer.committed == sizes
+    tensors = cache.committed_kv_cache_tensors(
+        config, KVCacheLayout.LBNHC, cache.committed_by_pool
+    )
+    for tensor in tensors:
+        assert tensor.pool_id in (1, 2, 3)
+        assert tensor.layer_stride == (
+            cache.committed_by_pool[tensor.pool_id] * tensor.block_stride
+        )
+    # Warmup commits one count everywhere, within the budget.
+    budget_blocks = cache.blocks_within(cache.physical_bytes_for(50))
+    assert budget_blocks >= 50

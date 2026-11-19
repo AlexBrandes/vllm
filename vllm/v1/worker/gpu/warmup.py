@@ -92,6 +92,7 @@ def _warmup_block_allocator(
     kv_cache_config = model_runner.kv_cache_config
     kv_cache_groups = kv_cache_config.kv_cache_groups
     pooled = bool(kv_cache_config.pool_num_blocks)
+    kv_cache = getattr(model_runner, "extensible_kv_cache", None)
     next_block_ids: defaultdict[int, int] = defaultdict(lambda: 1)
 
     def alloc_blocks(num_blocks_per_group: Sequence[int]) -> tuple[list[int], ...]:
@@ -106,7 +107,14 @@ def _warmup_block_allocator(
             next_block_ids[pool_id] += num_blocks
             if pooled:
                 num_usable = kv_cache_config.num_blocks_of_pool(pool_id) - 1
-                assert num_usable > 0, f"KV cache pool {pool_id} has no blocks"
+                if kv_cache is not None and pool_id in kv_cache.committed_by_pool:
+                    # Only the committed prefix of an extensible cache is mapped.
+                    num_usable = min(
+                        num_usable, kv_cache.num_committed_of_pool(pool_id) - 1
+                    )
+                if num_usable <= 0:
+                    block_ids.append([0] * num_blocks)
+                    continue
                 block_ids.append(
                     [(start + i - 1) % num_usable + 1 for i in range(num_blocks)]
                 )

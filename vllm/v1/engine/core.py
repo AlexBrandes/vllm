@@ -411,7 +411,9 @@ class EngineCore:
                 scheduler_kv_cache_config,
                 compilation_times,
             )
-            self.model_executor.extend_kv_cache(num_blocks)
+            self.model_executor.extend_kv_cache(
+                num_blocks, scheduler_kv_cache_config.pool_num_blocks or None
+            )
         # Under the extensible KV cache, workers create the connector in
         # `extend_kv_cache`, so ask for its block count only afterwards.
         kv_transfer_config = vllm_config.kv_transfer_config

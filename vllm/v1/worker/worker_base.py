@@ -42,6 +42,10 @@ class CompilationTimes(NamedTuple):
     num_kv_blocks: int | None = None
     """KV cache blocks that fit in the memory measured after warmup, reported
     by workers with an extensible KV cache."""
+    kv_cache_bytes: int | None = None
+    """This worker's measured KV cache budget in bytes, reported instead of
+    num_kv_blocks by an extensible KV cache with per-PP-stage pools: the
+    engine splits it among the worker's pools."""
 
 
 class WorkerBase:
@@ -138,7 +142,9 @@ class WorkerBase:
     def disable_extensible_kv_cache(self) -> None:
         self.vllm_config.cache_config.enable_extensible_kv_cache = False
 
-    def extend_kv_cache(self, num_blocks: int) -> None:
+    def extend_kv_cache(
+        self, num_blocks: int, pool_num_blocks: dict[int, int] | None = None
+    ) -> None:
         """Commit the final size of an extensible KV cache."""
         raise NotImplementedError(
             f"{type(self).__name__} does not support the extensible KV cache."
@@ -374,11 +380,13 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
 
-    def extend_kv_cache(self, num_blocks: int) -> None:
+    def extend_kv_cache(
+        self, num_blocks: int, pool_num_blocks: dict[int, int] | None = None
+    ) -> None:
         # The KV connector created here reads the current config.
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
-            self.worker.extend_kv_cache(num_blocks)  # type: ignore
+            self.worker.extend_kv_cache(num_blocks, pool_num_blocks)  # type: ignore
 
     def init_device(self):
         assert self.vllm_config is not None

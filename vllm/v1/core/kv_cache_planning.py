@@ -1549,8 +1549,6 @@ def _check_stage_pools_supported(vllm_config: VllmConfig) -> None:
         or parallel_config.prefill_context_parallel_size > 1
     ):
         reasons.append("context parallelism")
-    if vllm_config.cache_config.enable_extensible_kv_cache:
-        reasons.append("the extensible KV cache")
     if reasons:
         raise ValueError(
             "--kv-cache-pool-per-pp-stage does not support " + ", ".join(reasons) + "."
@@ -1728,12 +1726,29 @@ def get_stage_pool_kv_cache_config(
     )
 
 
+def extensible_stage_pool_capacities(
+    pool_bytes_by_worker: list[dict[int, int]], available_memory: list[int]
+) -> dict[int, int]:
+    """Blocks to reserve (address space only) for each pool of an extensible
+    KV cache: as many as the pool could take if every worker holding it gave
+    it all of its budget, so the post-warmup split never hits the
+    reservation."""
+    capacity: dict[int, int] = {}
+    for pool_bytes, memory in zip(pool_bytes_by_worker, available_memory):
+        budget = max(0, memory - sum(pool_bytes.values()))
+        for pool_id, block_bytes in pool_bytes.items():
+            blocks = budget // block_bytes + 1
+            capacity[pool_id] = min(capacity.get(pool_id, blocks), blocks)
+    return capacity
+
+
 def _log_stage_pools(
     vllm_config: VllmConfig,
     global_kv_cache_groups: list[KVCacheGroupSpec],
     pool_bytes_by_worker: list[dict[int, int]],
     available_memory: list[int],
     num_blocks_by_pool: dict[int, int],
+    title: str = "KV cache stage pools",
 ) -> None:
     max_model_len = vllm_config.model_config.max_model_len
     parts = []
@@ -1755,7 +1770,8 @@ def _log_stage_pools(
         for pool_bytes in pool_bytes_by_worker
     ]
     logger.info_once(
-        "KV cache stage pools: %s. Per worker GiB used/available: %s",
+        "%s: %s. Per worker GiB used/available: %s",
+        title,
         "; ".join(parts),
         ", ".join(
             f"{format_gib(u)}/{format_gib(a)}" for u, a in zip(used, available_memory)
@@ -1888,18 +1904,29 @@ def get_kv_cache_configs(
         )
 
     if stage_pools:
-        num_blocks_by_pool = plan_stage_pool_num_blocks(
-            vllm_config,
-            global_kv_cache_groups,
-            pool_bytes_by_worker,
-            available_memory,
-        )
+        extensible = vllm_config.cache_config.enable_extensible_kv_cache
+        if extensible:
+            # Reserve generously; `finalize_extensible_kv_cache` sizes the pools
+            # from the memory measured after warmup.
+            num_blocks_by_pool = extensible_stage_pool_capacities(
+                pool_bytes_by_worker, available_memory
+            )
+        else:
+            num_blocks_by_pool = plan_stage_pool_num_blocks(
+                vllm_config,
+                global_kv_cache_groups,
+                pool_bytes_by_worker,
+                available_memory,
+            )
         _log_stage_pools(
             vllm_config,
             global_kv_cache_groups,
             pool_bytes_by_worker,
             available_memory,
             num_blocks_by_pool,
+            "KV cache stage pool reservations (extensible)"
+            if extensible
+            else "KV cache stage pools",
         )
         pool_configs: list[KVCacheConfig] = []
         for projected_groups, kv_cache_spec_one_worker in zip(
@@ -2126,6 +2153,66 @@ def shrink_kv_cache_configs(
         kv_cache_config.num_blocks = num_blocks
 
 
+def _finalize_extensible_stage_pools(
+    vllm_config: VllmConfig,
+    kv_cache_configs: list[KVCacheConfig],
+    scheduler_kv_cache_config: KVCacheConfig,
+    compilation_times: list["CompilationTimes"],
+) -> int:
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+
+    budgets = [times.kv_cache_bytes for times in compilation_times]
+    if len(budgets) != len(kv_cache_configs) or any(b is None for b in budgets):
+        raise RuntimeError(
+            "Every worker must report its KV cache budget to size per-PP-stage "
+            f"KV cache pools; got {budgets}."
+        )
+    worker_budgets = [int(b) for b in budgets if b is not None]
+    builder = get_kv_cache_config_builder(vllm_config)
+    pool_bytes_by_worker = _pool_bytes_per_block_by_worker(
+        builder, vllm_config, [cfg.kv_cache_groups for cfg in kv_cache_configs]
+    )
+    groups = scheduler_kv_cache_config.kv_cache_groups
+    num_blocks_by_pool = plan_stage_pool_num_blocks(
+        vllm_config, groups, pool_bytes_by_worker, worker_budgets
+    )
+    num_blocks_by_pool = {
+        pool_id: min(blocks, scheduler_kv_cache_config.num_blocks_of_pool(pool_id))
+        for pool_id, blocks in num_blocks_by_pool.items()
+    }
+    max_model_len = vllm_config.model_config.max_model_len
+    short = {
+        pool_id: (num_blocks_by_pool[pool_id] - 1, demand)
+        for pool_id, pool in pool_groups(groups).items()
+        if num_blocks_by_pool[pool_id] - 1
+        < (demand := sum(group_blocks_per_request(vllm_config, g) for g in pool))
+    }
+    if short:
+        raise ValueError(
+            f"The KV cache memory measured after warmup cannot hold one "
+            f"{max_model_len}-token request in KV cache stage pools "
+            f"{sorted(short)} (usable blocks, blocks needed: {short}); worker "
+            f"budgets {[format_gib(b) for b in worker_budgets]} GiB. "
+            f"{_more_kv_cache_memory_hint(vllm_config)} Decreasing "
+            "`max_model_len` also reduces what is needed."
+        )
+    pool_num_blocks = {p: n for p, n in sorted(num_blocks_by_pool.items()) if p}
+    for cfg in (*kv_cache_configs, scheduler_kv_cache_config):
+        cfg.num_blocks = num_blocks_by_pool[0]
+        cfg.pool_num_blocks = dict(pool_num_blocks)
+    vllm_config.cache_config.num_gpu_blocks = num_blocks_by_pool[0]
+    _log_stage_pools(
+        vllm_config,
+        groups,
+        pool_bytes_by_worker,
+        worker_budgets,
+        num_blocks_by_pool,
+        "KV cache stage pools sized after warmup",
+    )
+    update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
+    return num_blocks_by_pool[0]
+
+
 def finalize_extensible_kv_cache(
     vllm_config: VllmConfig,
     kv_cache_configs: list[KVCacheConfig],
@@ -2136,7 +2223,17 @@ def finalize_extensible_kv_cache(
 
     Every rank must agree on one block count, so the minimum becomes the
     scheduler's num_blocks; the caller commits it on the workers.
+
+    With per-PP-stage pools each worker reports its budget in bytes instead,
+    and the pools are water-filled over those budgets (as at planning, see
+    `plan_stage_pool_num_blocks`), capped by their reservations; every config
+    gets the same per-pool counts, pool 0's is returned and the others are in
+    `scheduler_kv_cache_config.pool_num_blocks`.
     """
+    if scheduler_kv_cache_config.pool_num_blocks:
+        return _finalize_extensible_stage_pools(
+            vllm_config, kv_cache_configs, scheduler_kv_cache_config, compilation_times
+        )
     # No measurements: the elastic-EP scale-up path skips warmup. Elastic EP
     # leaves the extensible KV cache off, so this branch is not reached; it
     # keeps the capacity.

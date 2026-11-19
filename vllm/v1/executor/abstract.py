@@ -169,9 +169,13 @@ class Executor(ABC):
         self.vllm_config.cache_config.enable_extensible_kv_cache = False
         self.collective_rpc("disable_extensible_kv_cache")
 
-    def extend_kv_cache(self, num_blocks: int) -> None:
-        """Commit the final size of an extensible KV cache on the workers."""
-        self.collective_rpc("extend_kv_cache", args=(num_blocks,))
+    def extend_kv_cache(
+        self, num_blocks: int, pool_num_blocks: dict[int, int] | None = None
+    ) -> None:
+        """Commit the final size of an extensible KV cache on the workers;
+        pool_num_blocks sizes the pools other than pool 0
+        (--kv-cache-pool-per-pp-stage)."""
+        self.collective_rpc("extend_kv_cache", args=(num_blocks, pool_num_blocks))
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """Register a function to be called if the executor enters a permanent

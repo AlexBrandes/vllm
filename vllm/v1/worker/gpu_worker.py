@@ -1049,9 +1049,16 @@ class Worker(WorkerBase):
         assert self.use_v2_model_runner
         return cast("GPUModelRunnerV2", self.model_runner)
 
-    def extend_kv_cache(self, num_blocks: int) -> None:
+    def extend_kv_cache(
+        self, num_blocks: int, pool_num_blocks: dict[int, int] | None = None
+    ) -> None:
         """Commit the final size of an extensible KV cache."""
-        extend_kv_cache(self._v2_model_runner(), self._kv_cache_config, num_blocks)
+        extend_kv_cache(
+            self._v2_model_runner(),
+            self._kv_cache_config,
+            num_blocks,
+            pool_num_blocks,
+        )
         self.cache_config.num_gpu_blocks = num_blocks
 
     @instrument(span_name="Warmup (GPU)")
@@ -1289,24 +1296,29 @@ class Worker(WorkerBase):
         enable_gpu_sync_check()
 
         num_kv_blocks = None
+        kv_cache_bytes = None
         if self.cache_config.enable_extensible_kv_cache:
             kv_cache = self._v2_model_runner().extensible_kv_cache
             assert kv_cache is not None
-            # Every rank must size the KV cache identically.
-            num_kv_blocks = _min_across_ranks(
-                measure_kv_cache_blocks(
-                    kv_cache,
-                    self.vllm_config,
-                    self.device,
-                    init_free_memory=self.init_snapshot.free_memory,
-                    requested_memory=int(self.requested_memory),
-                )
+            measured = measure_kv_cache_blocks(
+                kv_cache,
+                self.vllm_config,
+                self.device,
+                init_free_memory=self.init_snapshot.free_memory,
+                requested_memory=int(self.requested_memory),
             )
+            if self._kv_cache_config.pool_num_blocks:
+                # Per-PP-stage pools: the engine splits each worker's budget.
+                kv_cache_bytes = measured
+            else:
+                # Every rank must size the KV cache identically.
+                num_kv_blocks = _min_across_ranks(measured)
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
             num_kv_blocks=num_kv_blocks,
+            kv_cache_bytes=kv_cache_bytes,
         )
 
     def _maybe_activate_jit_monitor(self) -> None:

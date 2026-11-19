@@ -5,7 +5,7 @@
 import copy
 import gc
 from bisect import bisect_right
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from itertools import pairwise
@@ -78,6 +78,10 @@ class ExtensibleKVCache:
     layer for block-compact layer-outermost layouts (sized by that layer's
     block stride, possibly padded apart by `pad_kv_cache_segments`), one
     overall for block-outermost. Host-resident tensors live outside it.
+
+    With several device block pools (--kv-cache-pool-per-pp-stage) each pool
+    reserves its own block count and commits its own prefix: a segment holds
+    the blocks of the pool its tensors index (`KVCacheTensor.pool_id`).
     """
 
     def __init__(
@@ -95,12 +99,21 @@ class ExtensibleKVCache:
         sizes = {tensor.size for tensor in tensors}
         assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
         self.size = sizes.pop()
-        self.capacity_blocks = kv_cache_config.num_blocks
-        if self.capacity_blocks <= 0:
-            raise ValueError(f"Invalid KV cache capacity {self.capacity_blocks}.")
-        self.segment_offsets, self.segment_strides = self._segments(tensors, layout)
+        # Reserved blocks of each device pool this worker backs.
+        self.capacity_by_pool = {
+            pool_id: kv_cache_config.num_blocks_of_pool(pool_id)
+            for pool_id in sorted({tensor.pool_id for tensor in tensors})
+        }
+        self.capacity_blocks = max(self.capacity_by_pool.values())
+        if min(self.capacity_by_pool.values()) <= 0:
+            raise ValueError(f"Invalid KV cache capacity {self.capacity_by_pool}.")
+        self.segment_offsets, self.segment_strides, self.segment_pools = self._segments(
+            tensors, layout
+        )
+        # Bytes one block of every pool takes: the cost of committing the same
+        # block count in each pool.
         self.bytes_per_block = sum(self.segment_strides)
-        self.num_committed_blocks = 0
+        self.committed_by_pool = dict.fromkeys(self.capacity_by_pool, 0)
         # Memory to keep free while committing before the final sizing, e.g.
         # the profiled activation peak the warmup steps are about to hit.
         self.reserved_headroom_bytes = 0
@@ -119,15 +132,46 @@ class ExtensibleKVCache:
             ],
         )
 
+    @property
+    def pooled(self) -> bool:
+        """Whether the cache backs pools other than pool 0."""
+        return any(self.capacity_by_pool)
+
+    @property
+    def num_committed_blocks(self) -> int:
+        """Blocks committed in every pool (pool 0's with a single pool)."""
+        return min(self.committed_by_pool.values())
+
+    @num_committed_blocks.setter
+    def num_committed_blocks(self, num_blocks: int) -> None:
+        """Record num_blocks committed in every pool."""
+        pools = getattr(self, "committed_by_pool", None) or {0: 0}
+        self.committed_by_pool = dict.fromkeys(pools, num_blocks)
+
+    def num_committed_of_pool(self, pool_id: int) -> int:
+        return self.committed_by_pool.get(pool_id, 0)
+
+    def _pool_counts(self, num_blocks: int | Mapping[int, int]) -> dict[int, int]:
+        """Blocks to back in each pool, capped by its capacity: the same count
+        in every pool for an int."""
+        if isinstance(num_blocks, int):
+            num_blocks = dict.fromkeys(self.capacity_by_pool, num_blocks)
+        return {
+            pool_id: min(num_blocks.get(pool_id, 0), capacity)
+            for pool_id, capacity in self.capacity_by_pool.items()
+        }
+
     def _segments(
         self, tensors: list[KVCacheTensor], layout: KVCacheLayout
-    ) -> tuple[list[int], list[int]]:
-        """Segment offsets and block strides covering the allocation.
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Segment offsets, block strides and pools covering the allocation.
 
-        Block-compact layer-outermost layouts give each layer a num_blocks-block
-        region, which may be padded apart. Otherwise the segments are implied by
-        the one block stride.
+        Block-compact layer-outermost layouts give each layer a region of its
+        pool's block count, which may be padded apart. Otherwise the segments
+        are implied by the one block stride (of each pool).
         """
+        if self.pooled:
+            return self._pool_segments(tensors, layout)
         if not layout.is_block_compact or layout.is_block_outermost:
             block_strides = {tensor.block_stride for tensor in tensors}
             if len(block_strides) != 1:
@@ -144,9 +188,11 @@ class ExtensibleKVCache:
                     f"number of {self.capacity_blocks}-block segments."
                 )
             num_segments = self.size // segment_bytes
-            return [i * segment_bytes for i in range(num_segments)], [
-                stride
-            ] * num_segments
+            return (
+                [i * segment_bytes for i in range(num_segments)],
+                [stride] * num_segments,
+                [0] * num_segments,
+            )
         segments: dict[int, int] = {}
         for tensor in tensors:
             for layer_idx in range(len(tensor.layers)):
@@ -166,7 +212,52 @@ class ExtensibleKVCache:
             end = offset + self.capacity_blocks * stride
         if offsets[0] != 0 or end > self.size:
             raise ValueError("KV cache tensors do not tile the allocation.")
-        return offsets, strides
+        return offsets, strides, [0] * len(offsets)
+
+    def _pool_segments(
+        self, tensors: list[KVCacheTensor], layout: KVCacheLayout
+    ) -> tuple[list[int], list[int], list[int]]:
+        """`_segments` for several pools: each layer region (layer-outermost)
+        or each pool region (block-outermost) holds its pool's capacity."""
+        if not layout.is_block_compact:
+            raise ValueError(
+                "Per-PP-stage KV cache pools need a block-compact layout for the "
+                "extensible KV cache."
+            )
+        segments: dict[int, tuple[int, int]] = {}
+        for tensor in tensors:
+            if layout.is_block_outermost:
+                starts = [tensor.offset]
+            else:
+                starts = [
+                    tensor.offset + layer_idx * tensor.layer_stride
+                    for layer_idx in range(len(tensor.layers))
+                ]
+            for start in starts:
+                if layout.is_block_outermost:
+                    # Groups of a pool overlay its region from its first byte.
+                    start = min(
+                        t.offset for t in tensors if t.pool_id == tensor.pool_id
+                    )
+                stride_pool = segments.setdefault(
+                    start, (tensor.block_stride, tensor.pool_id)
+                )
+                if stride_pool != (tensor.block_stride, tensor.pool_id):
+                    raise ValueError(
+                        f"KV cache tensors alias offset {start} with different "
+                        "block strides or pools."
+                    )
+        offsets = sorted(segments)
+        strides = [segments[offset][0] for offset in offsets]
+        pools = [segments[offset][1] for offset in offsets]
+        end = 0
+        for offset, stride, pool_id in zip(offsets, strides, pools):
+            if offset != end:
+                raise ValueError("KV cache tensors do not tile the allocation.")
+            end = offset + self.capacity_by_pool[pool_id] * stride
+        if end != self.size:
+            raise ValueError("KV cache tensors do not tile the allocation.")
+        return offsets, strides, pools
 
     def allocate(self, size: int) -> torch.Tensor:
         """Allocator hook for allocate_kv_cache; commits only the null block."""
@@ -175,31 +266,45 @@ class ExtensibleKVCache:
         return self.buffer.full_view()
 
     def commit(
-        self, num_blocks: int, defragment: bool = False, shrink: bool = False
+        self,
+        num_blocks: int | Mapping[int, int],
+        defragment: bool = False,
+        shrink: bool = False,
     ) -> None:
-        """Back the first num_blocks blocks; new blocks are zeroed.
+        """Back the first num_blocks blocks (of each pool, or per pool for a
+        mapping); new blocks are zeroed.
 
         Grow-only unless shrink is set, which remaps a smaller prefix and
         discards contents. defragment remaps each segment as one driver
         allocation (discarding contents): UCX cannot RDMA a range spanning
         several allocations.
         """
-        num_blocks = min(num_blocks, self.capacity_blocks)
-        sizes = [num_blocks * stride for stride in self.segment_strides]
+        counts = self._pool_counts(num_blocks)
+        sizes = [
+            counts[pool_id] * stride
+            for stride, pool_id in zip(self.segment_strides, self.segment_pools)
+        ]
         remap = (
             defragment and not all(self.buffer.segments_backed_by_one_chunk(sizes))
-        ) or (shrink and num_blocks < self.num_committed_blocks)
+        ) or (shrink and any(counts[p] < self.committed_by_pool[p] for p in counts))
         if remap:
             self.buffer.release_physical()
-            self.num_committed_blocks = 0
-        if num_blocks <= self.num_committed_blocks:
+            self.committed_by_pool = dict.fromkeys(self.committed_by_pool, 0)
+        if all(counts[p] <= self.committed_by_pool[p] for p in counts):
             return
-        self.buffer.resize_segments_(sizes, zero_new=True)
-        self.num_committed_blocks = num_blocks
+        counts = {p: max(n, self.committed_by_pool[p]) for p, n in counts.items()}
+        self.buffer.resize_segments_(
+            [
+                counts[pool_id] * stride
+                for stride, pool_id in zip(self.segment_strides, self.segment_pools)
+            ],
+            zero_new=True,
+        )
+        self.committed_by_pool = counts
         logger.debug(
-            "Committed %d of %d KV cache blocks (%.2f GiB physical).",
-            num_blocks,
-            self.capacity_blocks,
+            "Committed %s of %s KV cache blocks (%.2f GiB physical).",
+            counts,
+            self.capacity_by_pool,
             self.physical_bytes / (1 << 30),
         )
 
@@ -218,7 +323,10 @@ class ExtensibleKVCache:
         """
         if not layout.is_block_compact:
             return None
-        assert kv_cache_config.num_blocks == self.num_committed_blocks
+        assert all(
+            kv_cache_config.num_blocks_of_pool(pool_id) == committed
+            for pool_id, committed in self.committed_by_pool.items()
+        )
         kv_caches: dict[str, torch.Tensor] = {}
         for tensor in kv_cache_config.kv_cache_tensors:
             if tensor.host_resident:
@@ -239,7 +347,7 @@ class ExtensibleKVCache:
                 (view,) = create_kv_cache_views(
                     self.buffer.segment_view(segment),
                     spec,
-                    kv_cache_config.num_blocks,
+                    kv_cache_config.num_blocks_of(tensor),
                     layout,
                     replace(tensor, layers=[layer_name], offset=offset),
                     kernel_block_size=kernel_block_size,
@@ -272,12 +380,13 @@ class ExtensibleKVCache:
         """Physically mapped bytes, including granule rounding."""
         return self.buffer.physical_bytes
 
-    def physical_bytes_for(self, num_blocks: int) -> int:
+    def physical_bytes_for(self, num_blocks: int | Mapping[int, int]) -> int:
         """Bytes a commit of num_blocks maps, each segment rounded to granules."""
         granule = self.buffer.granularity
+        counts = self._pool_counts(num_blocks)
         return sum(
-            -(-num_blocks * stride // granule) * granule
-            for stride in self.segment_strides
+            -(-counts[pool_id] * stride // granule) * granule
+            for stride, pool_id in zip(self.segment_strides, self.segment_pools)
         )
 
     def blocks_within(self, num_bytes: int) -> int:
@@ -293,7 +402,10 @@ class ExtensibleKVCache:
         return segment, start - self.segment_offsets[segment]
 
     def committed_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, layout: KVCacheLayout, num_blocks: int
+        self,
+        kv_cache_config: KVCacheConfig,
+        layout: KVCacheLayout,
+        num_blocks: int | Mapping[int, int],
     ) -> list[KVCacheTensor]:
         """Tensor placements matching committed_views for num_blocks.
 
@@ -304,7 +416,11 @@ class ExtensibleKVCache:
         has its own storage over its committed prefix: describe it as a
         one-layer tensor placed at the start of that storage.
         """
-        size = num_blocks * self.bytes_per_block
+        counts = self._pool_counts(num_blocks)
+        size = sum(
+            counts[pool_id] * stride
+            for stride, pool_id in zip(self.segment_strides, self.segment_pools)
+        )
         tensors = [
             tensor if tensor.host_resident else replace(tensor, size=size)
             for tensor in kv_cache_config.kv_cache_tensors
@@ -327,9 +443,10 @@ class ExtensibleKVCache:
                     KVCacheTensor(
                         size=size,
                         layers=[layer_name],
-                        layer_stride=num_blocks * tensor.block_stride,
+                        layer_stride=counts[tensor.pool_id] * tensor.block_stride,
                         block_stride=tensor.block_stride,
                         offset=offset,
+                        pool_id=tensor.pool_id,
                     )
                 )
         return committed
@@ -340,9 +457,9 @@ class ExtensibleKVCache:
 
     def recommit(self) -> None:
         """Map fresh zeroed pages for the blocks committed before release."""
-        num_blocks = self.num_committed_blocks
-        self.num_committed_blocks = 0
-        self.commit(num_blocks)
+        counts = dict(self.committed_by_pool)
+        self.committed_by_pool = dict.fromkeys(counts, 0)
+        self.commit(counts)
 
     def set_torch_memory_limit(self, num_bytes: int | None) -> None:
         """Cap what torch's caching allocator reserves on this device, or lift
@@ -431,25 +548,33 @@ def ensure_kv_cache_blocks(runner: "GPUModelRunner", num_blocks: int) -> None:
 
 
 def extend_kv_cache(
-    runner: "GPUModelRunner", kv_cache_config: KVCacheConfig, num_blocks: int
+    runner: "GPUModelRunner",
+    kv_cache_config: KVCacheConfig,
+    num_blocks: int,
+    pool_num_blocks: dict[int, int] | None = None,
 ) -> None:
     """Commit the final size once post-warmup memory is known.
 
     Afterwards the runner matches one that allocated num_blocks up front:
     views are rebuilt over the committed bytes (same addresses) and the KV
     connector is created against final memory. kv_cache_config is the
-    engine's config the cache was allocated from.
+    engine's config the cache was allocated from. pool_num_blocks gives the
+    block counts of the pools other than pool 0 (num_blocks), with
+    --kv-cache-pool-per-pp-stage.
     """
     kv_cache = runner.extensible_kv_cache
     assert kv_cache is not None
+    pool_num_blocks = dict(pool_num_blocks or {})
+    counts = {0: num_blocks, **pool_num_blocks}
     kv_cache_config = copy.copy(kv_cache_config)
     kv_cache_config.num_blocks = num_blocks
+    kv_cache_config.pool_num_blocks = pool_num_blocks
     # Connectors that derive geometry from the config must see the committed
     # storages the rebuilt views will have.
     kv_cache_config.kv_cache_tensors = kv_cache.committed_kv_cache_tensors(
         kv_cache_config,
         runner.cache_config.get_resolved_kv_cache_layout(),
-        num_blocks,
+        counts,
     )
     ensure_kv_transfer_initialized(runner.vllm_config, kv_cache_config)
     # Config resolution rejects `custom_mem_pool`; a connector that wants the
@@ -463,25 +588,38 @@ def extend_kv_cache(
             "which the extensible KV cache cannot use. Disable it with "
             "--no-enable-extensible-kv-cache."
         )
-    if num_blocks < kv_cache.num_committed_blocks:
+    if any(
+        counts.get(pool_id, 0) < committed
+        for pool_id, committed in kv_cache.committed_by_pool.items()
+    ):
         # Warmup committed more than the measured budget fits (its transient
         # peak exceeded the reserve); the contents are warmup garbage.
         logger.info(
-            "Remapping the KV cache from %d to %d blocks to fit the measured budget.",
-            kv_cache.num_committed_blocks,
-            num_blocks,
+            "Remapping the KV cache from %s to %s blocks to fit the measured budget.",
+            kv_cache.committed_by_pool,
+            counts,
         )
     kv_cache.commit(
-        num_blocks,
+        counts,
         defragment=registers_kv_cache_memory(runner.vllm_config),
         shrink=True,
     )
-    runner.kv_cache_config.num_blocks = kv_cache.num_committed_blocks
-    logger.info(
-        "Extended KV cache to %d blocks (%.2f GiB).",
-        kv_cache.num_committed_blocks,
-        kv_cache.physical_bytes / (1 << 30),
-    )
+    if kv_cache.pooled:
+        # Every worker keeps the engine's counts, also of pools it does not back.
+        runner.kv_cache_config.num_blocks = num_blocks
+        runner.kv_cache_config.pool_num_blocks = pool_num_blocks
+        logger.info(
+            "Extended KV cache stage pools to %s blocks (%.2f GiB).",
+            kv_cache.committed_by_pool,
+            kv_cache.physical_bytes / (1 << 30),
+        )
+    else:
+        runner.kv_cache_config.num_blocks = kv_cache.num_committed_blocks
+        logger.info(
+            "Extended KV cache to %d blocks (%.2f GiB).",
+            kv_cache.num_committed_blocks,
+            kv_cache.physical_bytes / (1 << 30),
+        )
     forward_context = runner.compilation_config.static_forward_context
     committed = kv_cache.committed_views(
         runner.kv_cache_config,
@@ -518,6 +656,8 @@ def extend_kv_cache(
             for cache in runner.kv_caches_by_layer.values()
             if cache.device == runner.device
         ]
+        if kv_cache.pooled:
+            runner.index_kv_caches_by_pool(runner.kv_caches_by_layer)
     runner.kv_connector = get_kv_connector(
         runner.vllm_config, runner.kv_caches_by_layer
     )
@@ -566,7 +706,15 @@ def measure_kv_cache_blocks(
     first: its blocks may not fit the large workspaces the first real steps
     allocate. Then caps torch's caching allocator to leave
     KV_CACHE_NON_TORCH_RESERVE_BYTES free for allocations outside it.
+
+    With several block pools (``kv_cache.pooled``) the engine splits each
+    worker's budget among its pools (see ``finalize_extensible_kv_cache``), so
+    this returns the budget in bytes instead of a block count, less one
+    granule per segment for the rounding of each segment's commit. Torch's cap
+    assumes the whole budget gets committed.
     """
+    # Duck-typed stand-ins (tests) have no pools.
+    pooled = getattr(kv_cache, "pooled", False)
     torch.accelerator.synchronize()
     gc.collect()
     torch.accelerator.empty_cache()
@@ -584,17 +732,43 @@ def measure_kv_cache_blocks(
         vllm_config.model_config.multimodal_config,
         getattr(vllm_config.parallel_config, "_api_process_count", 1),
     )
-    num_blocks = kv_cache.blocks_within(kv_cache_bytes)
+    if pooled:
+        num_blocks = 0
+        budget = max(
+            0,
+            kv_cache_bytes
+            - len(kv_cache.segment_strides) * kv_cache.buffer.granularity,
+        )
+        final_bytes = max(kv_cache_bytes, kv_cache.physical_bytes)
+    else:
+        num_blocks = kv_cache.blocks_within(kv_cache_bytes)
+        budget = num_blocks
+        final_bytes = kv_cache.physical_bytes_for(num_blocks)
     # Torch may grow into what stays free once the cache is extended, less the
     # memory kept for multimodal IPC and for allocations outside torch.
     left_free = (
         free_memory
-        - (kv_cache.physical_bytes_for(num_blocks) - kv_cache.physical_bytes)
+        - (final_bytes - kv_cache.physical_bytes)
         - (available - kv_cache_bytes)
         - KV_CACHE_NON_TORCH_RESERVE_BYTES
     )
     torch_memory_limit = torch.accelerator.memory_reserved(device) + max(left_free, 0)
     kv_cache.set_torch_memory_limit(torch_memory_limit)
+    if pooled:
+        logger.info(
+            "Memory after warmup: %s GiB free, %s GiB committed to the KV cache, "
+            "%s GiB kept for transient activations; %s GiB for the KV cache "
+            "stage pools (%s) within the requested %s GiB. Torch may reserve up "
+            "to %s GiB.",
+            format_gib(free_memory),
+            format_gib(kv_cache.physical_bytes),
+            format_gib(transient_peak),
+            format_gib(budget),
+            ", ".join(f"pool {p}" for p in kv_cache.capacity_by_pool),
+            format_gib(requested_memory),
+            format_gib(torch_memory_limit),
+        )
+        return budget
     logger.info(
         "Memory after warmup: %s GiB free, %s GiB committed to the KV cache, "
         "%s GiB kept for transient activations; %d KV cache blocks (%s GiB) "
@@ -607,7 +781,7 @@ def measure_kv_cache_blocks(
         format_gib(requested_memory),
         format_gib(torch_memory_limit),
     )
-    return num_blocks
+    return budget
 
 
 # A layerwise weight update holds a layer's checkpoint-format copy while weight

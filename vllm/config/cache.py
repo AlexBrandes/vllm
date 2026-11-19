@@ -367,7 +367,8 @@ class CacheConfig:
     from one pool whose blocks every stage backs, and the stage with the least
     memory bounds the whole model's KV cache. Groups that span every stage
     stay in one pool, so models whose groups are not stage-local are
-    unaffected. Turns the extensible KV cache off."""
+    unaffected. With the extensible KV cache, each pool is sized from the
+    memory measured after warmup on the workers that back it."""
 
     kv_sharing_fast_prefill: bool = False
     """In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),
