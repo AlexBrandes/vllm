@@ -800,9 +800,18 @@ class Int8RowEmbedding(torch.nn.Module):
         weight = embedding.weight.data
         if getattr(embedding, "tp_size", 1) != 1:
             raise ValueError("The INT8 drafter embedding runs at TP=1 only")
-        amax = weight.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-        scale = amax / 127.0
-        q = torch.round(weight.float() / scale).clamp_(-127, 127).to(torch.int8)
+        # Row chunks: every op is row-wise, so the result is bit-identical to the whole-table formula, but the
+        # FP32 temporaries stay ~0.1 GB instead of two full FP32 copies (2.47 GiB each for the 129,280 x 5,120
+        # target table, which overflowed rank 0 at load in the first PP3 boot, 2026-11-19)
+        rows = weight.shape[0]
+        q = torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
+        scale = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
+        for r0 in range(0, rows, 4096):
+            w = weight[r0:r0 + 4096].float()
+            s = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
+            scale[r0:r0 + 4096] = s
+            q[r0:r0 + 4096] = torch.round(w / s).clamp_(-127, 127).to(torch.int8)
+            del w, s
         logger.info_once(
             "DeepSeek-V4.1 DSpark: the drafter's input embedding is INT8 rows "
             "(%.2f GB instead of %.2f GB)",
