@@ -194,7 +194,7 @@ def _index_score_stats_kernel(q, w, nvis, req, cache, bt, candidates, scores,
             total = tl.full((64,), float('-inf'), tl.float32)
             if seg * B + tile * 64 < visible:
                 total = score_tile(q, w, req, cache, bt, t, cols, visible,
-                    qs, qh, ws, kb, ke, bts, E, H, D, HPR, 64)
+                    qs, qh, ws, kb, ke, bts, E, H, D, HPR, 64, False)
             if MASK:
                 # Candidate IDs are sorted and -1 padded. Binary search the
                 # sorted valid prefix using -1 as +infinity, without a mask spool.

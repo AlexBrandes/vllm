@@ -19,6 +19,10 @@ on a cache, so :data:`INDEX_SCORES_WARMUP`, registered by each index-source
 layer, compiles everything a served run can reach at boot. No boot dummy run
 reaches the kernel: dummy and capture batches have padding slots or position
 0, where no compressed position is visible yet.
+
+The key cache may hold exact packed MXFP4 records instead of BF16 rows
+(``sm80_kv_pack``); they decode to the same BF16 MMA operand, so the scores
+are bit for bit the same.
 """
 
 from dataclasses import dataclass, field
@@ -30,6 +34,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_scalar_specialization_rep,
 )
 from vllm.triton_utils import tl, triton
+from vllm_cmp170hx.models.deepseek_v41.ops import sm80_kv_pack as kvpack
+from vllm_cmp170hx.models.deepseek_v41.ops.sm80_kv_pack import load_records_tl
 
 _BLOCK_N = 64
 # Output row stride granule: a multiple of 16 keeps one specialisation class.
@@ -46,13 +52,16 @@ def _row(s, hidx, h: tl.constexpr):
 def score_tile(q_ptr, w_ptr, req_ptr, k_ptr, bt_ptr, t, cols, n_vis,
                stride_qt, stride_qh, stride_wt, stride_kb, stride_ke, stride_bt,
                ENTRIES: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
-               HPR: tl.constexpr, BLOCK_N: tl.constexpr):
+               HPR: tl.constexpr, BLOCK_N: tl.constexpr, PACKED: tl.constexpr):
     valid = cols < n_vis
     req = tl.load(req_ptr + t).to(tl.int64)
     blk = tl.load(bt_ptr + req * stride_bt + cols // ENTRIES, mask=valid, other=0)
     koff = blk.to(tl.int64) * stride_kb + (cols % ENTRIES).to(tl.int64) * stride_ke
     d = tl.arange(0, D)
-    k = tl.load(k_ptr + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0)
+    if PACKED:
+        k = load_records_tl(k_ptr, koff, valid, D, True, 32, False, D // 2)
+    else:
+        k = tl.load(k_ptr + koff[:, None] + d[None, :], mask=valid[:, None], other=0.0)
     hidx = tl.arange(0, H)
     q = tl.load(q_ptr + t * stride_qt + hidx[:, None] * stride_qh + d[None, :])
     s = tl.dot(q, tl.trans(k))  # [H, BLOCK_N] fp32
@@ -95,6 +104,7 @@ def _index_scores_kernel(
     D: tl.constexpr,
     HPR: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PACKED: tl.constexpr = False,
 ):
     t = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
@@ -111,7 +121,7 @@ def _index_scores_kernel(
         return
     total = score_tile(q_ptr, w_ptr, req_ptr, k_ptr, bt_ptr, t, cols, n_vis,
         stride_qt, stride_qh, stride_wt, stride_kb, stride_ke, stride_bt,
-        ENTRIES, H, D, HPR, BLOCK_N)
+        ENTRIES, H, D, HPR, BLOCK_N, PACKED)
     tl.store(out_ptr + t * stride_ot + cols, total, mask=cols < n_cols)
 
 
@@ -128,10 +138,14 @@ def index_scores_triton(
     """``[n, n_cols]`` fp32 index scores; see ``index_scores_torch``.
 
     q: [n, H, D] BF16 (stride 1 on D); w: [n, H] BF16; n_vis, req: [n];
-    idxk: [blocks, E, D] BF16 (any block stride); block_table: [R, nb] int32.
+    idxk: [blocks, E, D] BF16 or [blocks, E, >= 68] packed MXFP4 records
+    (any block stride); block_table: [R, nb] int32.
     """
     n, h, d = q.shape
     assert q.stride(2) == 1 and idxk.stride(2) == 1 and w.stride(1) == 1
+    packed = kvpack.is_packed(idxk)
+    if packed:
+        kvpack.check_cache(idxk, kvpack.MXFP4, d)
     assert h % heads_per_rank == 0
     padded = triton.cdiv(max(n_cols, 1), _ROW_ALIGN) * _ROW_ALIGN
     out = torch.empty((n, padded), dtype=torch.float32, device=q.device)[:, :n_cols]
@@ -159,6 +173,7 @@ def index_scores_triton(
         D=d,
         HPR=heads_per_rank,
         BLOCK_N=_BLOCK_N,
+        PACKED=packed,
         num_warps=4,
     )
     return out
@@ -178,6 +193,7 @@ class IndexScoresWarmup(VllmJitKernel["IndexScoresWarmup.Key"]):
         heads_per_rank: int
         block_stride_class: int
         aligned: bool
+        packed: bool
         cache: torch.Tensor = field(compare=False, hash=False, repr=False)
 
     def get_warmup_keys(
@@ -194,6 +210,7 @@ class IndexScoresWarmup(VllmJitKernel["IndexScoresWarmup.Key"]):
                 heads_per_rank=heads_per_rank,
                 block_stride_class=triton_scalar_specialization_rep(cache.stride(0)),
                 aligned=cache.data_ptr() % 16 == 0,
+                packed=kvpack.is_packed(cache),
                 cache=cache,
             )
         ]

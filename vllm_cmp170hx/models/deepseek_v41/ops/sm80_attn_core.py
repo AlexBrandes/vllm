@@ -24,8 +24,11 @@ order, rounded to BF16 per group) and the groups added in rank order with
 BF16 rounding, which is what the reference's sharded heads plus all-reduce
 compute. Attention output has the inverse RoPE on its tail and is FP8 (32,
 UE8M0) qdq'd per group before ``wo_a``. Caches hold plain BF16 rows of those
-exact values. RoPE is the reference's own arithmetic (``torch.polar`` of the
-fp32 angles, complex multiply in fp32).
+exact values, or (uint8 caches) the exact packed records of them
+(``sm80_kv_pack``: MXFP8 window rows, NVFP4 compressed rows, MXFP4 index
+keys), which every reader decodes to the same BF16 values. RoPE is the
+reference's own arithmetic (``torch.polar`` of the fp32 angles, complex
+multiply in fp32).
 
 Selections are canonical: ties at the top-k boundary go to the lowest
 position (score descending, index ascending), and the kept positions are
@@ -56,6 +59,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_cmp170hx.models.deepseek_v41.ops import sm80_kv_pack as kvpack
 from vllm_cmp170hx.models.deepseek_v41.ops.sm80_act_quant import qdq_fp4, qdq_fp8
 
 FLT_MAX = torch.finfo(torch.float32).max
@@ -131,6 +135,9 @@ class Sm80AttnBatch:
 
 @dataclass
 class Sm80AttnCaches:
+    """BF16 rows, or uint8 packed records ``[blocks, E, record stride]``
+    (swa MXFP8, comp NVFP4, idxk MXFP4; ``sm80_kv_pack``)."""
+
     swa: torch.Tensor  # [blocks, block_size, head_dim] bf16
     topk: torch.Tensor  # [>= T, index_topk] int32, shared by the layers
     comp: torch.Tensor | None = None  # [blocks, E, head_dim] bf16 (kv source's)
@@ -235,6 +242,7 @@ def store_rows(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> 
     """``cache[slot] = row`` for every ``slot >= 0`` (valid slots are
     distinct), without a host sync: the other rows write slot 0 -- the null
     block, which no request owns -- with the value it already holds."""
+    assert not kvpack.is_packed(cache), "packed caches are written by sm80_kv_pack.store"
     keep = slots >= 0
     blk, off = _paged(cache, torch.where(keep, slots, 0))
     keep = keep.view((-1,) + (1,) * (rows.dim() - 1))
@@ -246,12 +254,26 @@ def gather_compressed_rows(
     block_table: torch.Tensor,
     req: torch.Tensor,
     local: torch.Tensor,
+    record: "kvpack.KVRecord | None" = None,
+    dim: int = 0,
 ) -> torch.Tensor:
-    """Rows of compressed positions ``local`` (>= 0) of requests ``req``."""
+    """Rows of compressed positions ``local`` (>= 0) of requests ``req``; a
+    packed cache's ``record`` (``dim`` values) decoded to BF16."""
     entries = cache.shape[1]
     local = local.to(torch.int64)
     blk = block_table[req.to(torch.int64), local // entries].to(torch.int64)
+    if kvpack.is_packed(cache):
+        assert record is not None and dim > 0, "a packed cache needs its record"
+        return kvpack.gather(cache, blk, local % entries, record, dim)
     return cache[blk, local % entries]
+
+
+def window_rows(cache: torch.Tensor, blk: torch.Tensor, off: torch.Tensor,
+                dim: int) -> torch.Tensor:
+    """BF16 rows ``cache[blk, off]`` of a window cache (packed: decoded)."""
+    if kvpack.is_packed(cache):
+        return kvpack.gather(cache, blk, off, kvpack.MXFP8, dim)
+    return cache[blk, off]
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +287,21 @@ def window_kv(
     """Reference ``_window_kv`` before the cache write: RoPE, then FP8 qdq
     over all 512 dims (RoPE tail included)."""
     return qdq_fp8(rope(kv, positions, freqs), 32)
+
+
+def store_window_kv(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    freqs: torch.Tensor,
+) -> None:
+    """Write :func:`window_kv` of ``kv`` at ``slots``: the BF16 rows, or into a
+    packed cache the MXFP8 records of the same RoPE'd rows."""
+    if kvpack.is_packed(cache):
+        kvpack.store(cache, slots, rope(kv, positions, freqs), kvpack.MXFP8)
+    else:
+        store_rows(cache, slots, window_kv(kv, positions, freqs))
 
 
 def compress(
@@ -402,8 +439,7 @@ def store_kv(
     ``kv`` is ``kv_norm(wkv(x))`` (BF16, pre-RoPE). Without ``window`` the
     window rows are already written (the fused prologue) and ``kv`` is unused."""
     if window:
-        rows = window_kv(kv, batch.positions, weights.freqs)
-        store_rows(caches.swa, batch.swa_slots, rows)
+        store_window_kv(caches.swa, batch.swa_slots, kv, batch.positions, weights.freqs)
     if not cfg.is_kv_source:
         return
     assert kv_score is not None and caches.comp is not None
@@ -412,17 +448,21 @@ def store_kv(
     group_pos = batch.positions + 1 - cfg.compress_ratio
     if cfg.owns_k:
         assert caches.idxk is not None and batch.idxk_slots is not None
-        store_rows(
-            caches.idxk,
-            torch.where(closes, batch.idxk_slots, -1),
-            index_keys(cfg, weights, latent, group_pos),
-        )
+        slots = torch.where(closes, batch.idxk_slots, -1)
+        if kvpack.is_packed(caches.idxk):
+            assert weights.wk is not None and weights.k_norm is not None
+            k = rms_norm(weights.wk(latent), weights.k_norm, cfg.eps)
+            kvpack.store(caches.idxk, slots, rope(k, group_pos, weights.freqs),
+                         kvpack.MXFP4)
+        else:
+            store_rows(caches.idxk, slots, index_keys(cfg, weights, latent, group_pos))
     assert batch.comp_slots is not None
-    store_rows(
-        caches.comp,
-        torch.where(closes, batch.comp_slots, -1),
-        compressed_kv(latent, group_pos, weights.freqs),
-    )
+    slots = torch.where(closes, batch.comp_slots, -1)
+    if kvpack.is_packed(caches.comp):
+        kvpack.store(caches.comp, slots, rope(latent, group_pos, weights.freqs),
+                     kvpack.NVFP4)
+    else:
+        store_rows(caches.comp, slots, compressed_kv(latent, group_pos, weights.freqs))
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +531,7 @@ def index_scores_torch(
             continue
         cols = torch.arange(width, device=q.device)
         k = gather_compressed_rows(
-            idxk, block_table, torch.full_like(cols, r), cols
+            idxk, block_table, torch.full_like(cols, r), cols, kvpack.MXFP4, q.shape[-1]
         ).float()
         dots = torch.einsum("thd,nd->thn", q[sel].float(), k)
         s = combine_head_scores(dots, w[sel], heads_per_rank)
@@ -694,14 +734,15 @@ def sparse_attention_torch(
     rows = []
     valid = []
     blk, off = _paged(swa_cache, swa_indices.clamp_min(0))
-    rows.append(swa_cache[blk, off])
+    rows.append(window_rows(swa_cache, blk, off, d))
     valid.append(swa_indices >= 0)
     if comp_local is not None and comp_local.shape[1]:
         assert comp_cache is not None and comp_block_table is not None
         r = req.to(torch.int64)[:, None].expand_as(comp_local)
         rows.append(
             gather_compressed_rows(
-                comp_cache, comp_block_table, r, comp_local.clamp_min(0)
+                comp_cache, comp_block_table, r, comp_local.clamp_min(0),
+                kvpack.NVFP4, d,
             )
         )
         valid.append(comp_local >= 0)

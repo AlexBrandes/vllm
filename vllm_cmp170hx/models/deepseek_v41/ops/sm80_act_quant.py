@@ -98,13 +98,19 @@ def _blocks(x: torch.Tensor, block: int) -> torch.Tensor:
     return x.float().unflatten(-1, (n // block, block))
 
 
-def act_quant_qdq_fp8(x: torch.Tensor, block: int = 32) -> torch.Tensor:
-    """Reference ``act_quant(x, block, "ue8m0", inplace=True)``; returns a new
-    tensor of ``x``'s dtype."""
+def fp8_quant(x: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """The factors of :func:`act_quant_qdq_fp8`: fp32 ``q`` ``[..., n, block]``
+    on the E4M3 grid and the power-of-two scales ``s`` ``[..., n, 1]``."""
     xf = _blocks(x, block)
     amax = xf.abs().amax(-1, keepdim=True).clamp_min(_FP8_AMAX_FLOOR)
     s = _pow2_ceil(amax * _FP8_MAX_INV)
-    q = round_e4m3((xf / s).clamp(-FP8_MAX, FP8_MAX))
+    return round_e4m3((xf / s).clamp(-FP8_MAX, FP8_MAX)), s
+
+
+def act_quant_qdq_fp8(x: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """Reference ``act_quant(x, block, "ue8m0", inplace=True)``; returns a new
+    tensor of ``x``'s dtype."""
+    q, s = fp8_quant(x, block)
     return (q * s).flatten(-2).to(x.dtype)
 
 
@@ -118,12 +124,20 @@ def fp4_scale(amax: torch.Tensor, scale: str) -> torch.Tensor:
     raise ValueError(f"scale must be one of {SCALE_FORMATS}, got {scale!r}")
 
 
+def fp4_quant(
+    x: torch.Tensor, block: int, scale: str = "e8m0"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The factors of :func:`fp4_qdq`: fp32 ``q`` on the E2M1 grid and the
+    per-block scales ``s`` ``[..., n, 1]``."""
+    xf = _blocks(x, block)
+    s = fp4_scale(xf.abs().amax(-1, keepdim=True), scale)
+    return round_e2m1((xf / s).clamp(-FP4_MAX, FP4_MAX)), s
+
+
 def fp4_qdq(x: torch.Tensor, block: int, scale: str = "e8m0") -> torch.Tensor:
     """Reference ``fp4_act_quant(x, block, inplace=True, scale_dtype=...)``;
     returns a new tensor of ``x``'s dtype."""
-    xf = _blocks(x, block)
-    s = fp4_scale(xf.abs().amax(-1, keepdim=True), scale)
-    q = round_e2m1((xf / s).clamp(-FP4_MAX, FP4_MAX))
+    q, s = fp4_quant(x, block, scale)
     return (q * s).flatten(-2).to(x.dtype)
 
 
@@ -174,18 +188,28 @@ def round_e2m1_tl(v):
 
 
 @triton.jit
-def qdq_fp8_tile(x):
-    """FP8/UE8M0 qdq of an fp32 ``[rows, BLOCK]`` tile, one block per row.
-    Returns fp32 values that are exact in BF16."""
+def fp8_quant_tile(x):
+    """The two factors of :func:`qdq_fp8_tile`: ``(q, s)`` with ``q`` the
+    fp32 ``[rows, BLOCK]`` values on the E4M3 grid and ``s`` the ``[rows]``
+    power-of-two UE8M0 scales (the packed KV records store their codes)."""
     amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
     s = _pow2_ceil_tl(amax * 0.0022321429569274187)  # fp32(1/448)
     v = tl.minimum(tl.maximum(tl.div_rn(x, s[:, None]), -448.0), 448.0)
-    return round_e4m3_tl(v) * s[:, None]
+    return round_e4m3_tl(v), s
 
 
 @triton.jit
-def qdq_fp4_tile(x, E4M3_SCALE: tl.constexpr):
-    """FP4 qdq of an fp32 ``[rows, BLOCK]`` tile, one block per row."""
+def qdq_fp8_tile(x):
+    """FP8/UE8M0 qdq of an fp32 ``[rows, BLOCK]`` tile, one block per row.
+    Returns fp32 values that are exact in BF16."""
+    q, s = fp8_quant_tile(x)
+    return q * s[:, None]
+
+
+@triton.jit
+def fp4_quant_tile(x, E4M3_SCALE: tl.constexpr):
+    """The two factors of :func:`qdq_fp4_tile`: ``(q, s)`` with ``q`` on the
+    E2M1 grid and ``s`` the per-row E4M3 or power-of-two (E8M0) scale."""
     amax = tl.max(tl.abs(x), axis=1)
     if E4M3_SCALE:
         # 0.01171875 == 6 * 2**-9
@@ -195,7 +219,14 @@ def qdq_fp4_tile(x, E4M3_SCALE: tl.constexpr):
         # 7.052966104933725e-38 == 6 * 2**-126; 0.1666666716337204 == fp32(1/6)
         s = _pow2_ceil_tl(tl.maximum(amax, 7.052966104933725e-38) * 0.1666666716337204)
     v = tl.minimum(tl.maximum(tl.div_rn(x, s[:, None]), -6.0), 6.0)
-    return round_e2m1_tl(v) * s[:, None]
+    return round_e2m1_tl(v), s
+
+
+@triton.jit
+def qdq_fp4_tile(x, E4M3_SCALE: tl.constexpr):
+    """FP4 qdq of an fp32 ``[rows, BLOCK]`` tile, one block per row."""
+    q, s = fp4_quant_tile(x, E4M3_SCALE)
+    return q * s[:, None]
 
 
 @triton.jit(do_not_specialize=["num_blocks"])

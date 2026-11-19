@@ -10,11 +10,17 @@ softmax scale, a finite running-max floor (-1e30) so a query with no valid
 row ends at zero output, probabilities rounded to BF16 before they weight the
 rows (the running sum keeps them in fp32), and the per-head sink added to the
 denominator at the end. Every paged offset is int64. No split-K, no atomics.
+
+Either cache may hold exact packed records instead (``sm80_kv_pack``: MXFP8
+window rows, NVFP4 compressed rows): they are decoded to the same BF16 tile
+the BF16 rows load as, so the result is bit for bit the same.
 """
 
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm_cmp170hx.models.deepseek_v41.ops import sm80_kv_pack as kvpack
+from vllm_cmp170hx.models.deepseek_v41.ops.sm80_kv_pack import load_records_tl
 
 _BLOCK_H = 16
 _BLOCK_N = 32
@@ -64,6 +70,8 @@ def _sparse_attn_kernel(
     D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SWA_PACKED: tl.constexpr = False,
+    COMP_PACKED: tl.constexpr = False,
 ):
     t = tl.program_id(0).to(tl.int64)
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -84,7 +92,10 @@ def _sparse_attn_kernel(
         ok = slot >= 0
         s64 = tl.maximum(slot, 0).to(tl.int64)
         off = (s64 // SWA_E) * stride_sb + (s64 % SWA_E) * stride_se
-        kv = tl.load(swa_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0)
+        if SWA_PACKED:
+            kv = load_records_tl(swa_ptr, off, ok, D, False, 32, False, D)
+        else:
+            kv = tl.load(swa_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0)
         m, l, acc = _attend(q, kv, ok, m, l, acc, scale)
     if HAS_COMP:
         req = tl.load(req_ptr + t).to(tl.int64)
@@ -95,7 +106,12 @@ def _sparse_attn_kernel(
             j64 = tl.maximum(j, 0).to(tl.int64)
             blk = tl.load(comp_bt_ptr + req * stride_bt + j64 // COMP_E, mask=ok, other=0)
             off = blk.to(tl.int64) * stride_cb + (j64 % COMP_E) * stride_ce
-            kv = tl.load(comp_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0)
+            if COMP_PACKED:
+                kv = load_records_tl(comp_ptr, off, ok, D, True, 16, True, D // 2)
+            else:
+                kv = tl.load(
+                    comp_ptr + off[:, None] + d[None, :], mask=ok[:, None], other=0.0
+                )
             m, l, acc = _attend(q, kv, ok, m, l, acc, scale)
     sink = tl.load(sink_ptr + heads, mask=hmask, other=float("-inf"))
     l = l + tl.exp(sink - m)
@@ -118,17 +134,24 @@ def sparse_attention_triton(
     attn_sink: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """See ``sm80_attn_core.sparse_attention_torch`` (same contract)."""
+    """See ``sm80_attn_core.sparse_attention_torch`` (same contract); either
+    cache may be packed (uint8 records, ``sm80_kv_pack``)."""
     n, h, d = q.shape
     out = torch.empty((n, h, d), dtype=torch.bfloat16, device=q.device)
     if n == 0:
         return out
     assert q.stride(2) == 1 and swa_cache.stride(2) == 1
     assert swa_indices.stride(1) == 1
+    swa_packed = kvpack.is_packed(swa_cache)
+    if swa_packed:
+        kvpack.check_cache(swa_cache, kvpack.MXFP8, d)
     has_comp = comp_local is not None and comp_local.shape[1] > 0
+    comp_packed = has_comp and kvpack.is_packed(comp_cache)
     if has_comp:
         assert comp_cache is not None and comp_block_table is not None
         assert comp_cache.stride(2) == 1 and comp_local.stride(1) == 1
+        if comp_packed:
+            kvpack.check_cache(comp_cache, kvpack.NVFP4, d)
         comp_args = (
             comp_cache,
             comp_block_table,
@@ -175,6 +198,8 @@ def sparse_attention_triton(
         D=d,
         BLOCK_H=_BLOCK_H,
         BLOCK_N=_BLOCK_N,
+        SWA_PACKED=swa_packed,
+        COMP_PACKED=comp_packed,
         num_warps=8,
     )
     return out

@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV: bool = False
     VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS: int = 64
+    VLLM_DEEPSEEK_V41_KV_PACK: bool = False
     VLLM_DEEPSEEK_V41_WO_A_GROUPED_GEMM: bool = False
     VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE: bool = False
     VLLM_DEEPSEEK_V41_MOE_PREFILL_TC: bool = False
@@ -1085,6 +1086,17 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     # consecutive 256-row launches (16 MB of FP64 scratch per rank).
     "VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS": lambda: int(
         os.getenv("VLLM_DEEPSEEK_V41_GATE_GEMV_MAX_ROWS", "64")
+    ),
+    # DeepSeek-V4.1 on sm_80: the sliding-window, compressed and index-key
+    # caches hold the reference's exact packed records (MXFP8 528 B, NVFP4
+    # 288 B, MXFP4 68 B at a 72 B stride; ops/sm80_kv_pack.py) instead of BF16
+    # rows of the same values (1024 / 1024 / 256 B): every reader decodes them
+    # to the same BF16 operands, so outputs are bit for bit unchanged, and the
+    # KV planner charges the packed pages (36,864 B; window blocks of 64 rows).
+    # The fused attention core, the attention pipeline and the fused draft
+    # prologue read BF16 rows only and stay off with it. Default OFF.
+    "VLLM_DEEPSEEK_V41_KV_PACK": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V41_KV_PACK", "0"))
     ),
     # DeepSeek-V4.1 on sm_80: the grouped MXFP8 wo_a (one Marlin GEMM per
     # group and a concat) as one grouped Triton W8A16 GEMM over all groups

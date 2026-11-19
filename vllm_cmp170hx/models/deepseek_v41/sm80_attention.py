@@ -12,6 +12,15 @@ and computes the reference model's attention through
 in software, so the cached rows carry the reference's quantize-dequantize
 values exactly.
 
+With ``VLLM_DEEPSEEK_V41_KV_PACK=1`` the three caches hold those values as
+exact packed records instead (``ops/sm80_kv_pack.py``: MXFP8 window rows of
+528 B, NVFP4 compressed rows of 288 B, MXFP4 index keys of 68 B at a 72 B
+stride), 1.9-3.8x smaller and decoded to the same BF16 values by every
+reader, so outputs are bit for bit those of the BF16 rows. Every packed page
+is 36,864 B (window blocks of 64 rows padded from 33,792 B, 128 compressed
+states, 512 index keys), so the planner unifies them by block size; the
+compressor's FP32 ring (32 KiB) is padded to that page.
+
 Selection is by the platform: :func:`sm80_select_attn_cls` wraps upstream's
 ``_select_dsv4_attn_cls`` and returns :class:`DeepseekV41Sm80Attention` on
 compute capability 8.x; the DSpark draft layers are built by the same
@@ -59,6 +68,7 @@ from vllm.models.deepseek_v41.attention import (
 )
 from vllm_cmp170hx.models.deepseek_v41 import sm80_swa_meta_batch
 from vllm_cmp170hx.models.deepseek_v41.ops import sm80_attn_core as core
+from vllm_cmp170hx.models.deepseek_v41.ops import sm80_kv_pack as kvpack
 from vllm_cmp170hx.models.deepseek_v41.ops import sm80_mhc_side
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend,
@@ -72,8 +82,15 @@ from vllm_cmp170hx.kernels.exl3.step_phase import max_decode_query_len, prefill_
 from vllm_cmp170hx.layers.grouped_linear import GroupedLinearMethod
 from vllm_cmp170hx.distributed import ce_ring_all_reduce
 from vllm.v1.attention.backend import MultipleOf
-from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWABackend,
+    DeepseekV4SWACache,
+)
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 logger = init_logger(__name__)
 
@@ -169,10 +186,75 @@ class Sm80SWABackend(DeepseekSparseSWABackend):
         return Sm80SWAMetadataBuilder
 
 
+def kv_pack_enabled() -> bool:
+    """VLLM_DEEPSEEK_V41_KV_PACK: the caches hold exact packed records."""
+    return bool(envs.VLLM_DEEPSEEK_V41_KV_PACK)
+
+
+def packed_state_spec(
+    block_size: int, dim: int, record: kvpack.KVRecord, tokens_per_state: int,
+    cache_dtype_str: str | None = None,
+) -> MLAAttentionSpec:
+    """A compressed or index-key cache of ``record`` states (uint8). No
+    alignment padding: whole pages of 36,864 B hold 128 compressed states or
+    512 index keys, and a padded smaller page would go stale when the planner
+    scales its block size up to the shared page."""
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=dim,
+        dtype=torch.uint8,
+        tokens_per_state=tokens_per_state,
+        cache_dtype_str=cache_dtype_str,
+        model_version="deepseek_v4",
+        state_content_bytes=record.stride(dim),
+    )
+
+
+def packed_swa_spec(
+    block_size: int, dim: int, window: int, cache_dtype_str: str | None,
+    bounded_replay: bool,
+) -> SlidingWindowMLASpec:
+    """A sliding-window cache of MXFP8 records. The alignment pads the page
+    (64 x 528 = 33,792 B) to the shared 36,864 B, and any multiple of 64 rows
+    the planner scales it to onto a multiple of that page."""
+    return SlidingWindowMLASpec(
+        bounded_replay=bounded_replay,
+        block_size=block_size,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=dim,
+        dtype=torch.uint8,
+        sliding_window=window,
+        cache_dtype_str=cache_dtype_str,
+        state_content_bytes=kvpack.MXFP8.stride(dim),
+        alignment=kvpack.PACKED_PAGE_BYTES,
+        model_version="deepseek_v4",
+    )
+
+
+def packed_swa_block(vllm_config: VllmConfig, head_dim: int) -> int:
+    """Rows per packed window block: 64 (a 36,864 B page), or the multiple of
+    64 whose page first holds the compressor's FP32 ring page (``rows x 2 x
+    head_dim x 4`` B, rows = max(8, next power of two of speculative tokens
+    + 2), as upstream's ``CompressorStateCache``), so the largest page is a
+    multiple of every packed page and the ring is the one padded."""
+    rows_per_step = vllm_config.num_speculative_tokens + 2
+    ring_rows = max(8, 1 << (rows_per_step - 1).bit_length())
+    ring_page = ring_rows * 2 * head_dim * 4
+    return kvpack.PACKED_SWA_BLOCK * -(-ring_page // kvpack.PACKED_PAGE_BYTES)
+
+
 class Sm80IndexKCache(DeepseekV4IndexerCache):
-    """Index keys as BF16 rows of ``index_head_dim`` (256 B per key)."""
+    """Index keys as BF16 rows of ``index_head_dim`` (256 B per key), or with
+    a uint8 ``dtype`` as packed MXFP4 records (72 B per key)."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if self.dtype == torch.uint8:
+            return packed_state_spec(
+                self.cache_config.block_size, self.head_dim, kvpack.MXFP4,
+                self.compress_ratio,
+            )
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
@@ -184,6 +266,19 @@ class Sm80IndexKCache(DeepseekV4IndexerCache):
 
     def get_attn_backend(self) -> type[Sm80IndexKBackend]:
         return Sm80IndexKBackend
+
+
+class Sm80PackedSWACache(DeepseekV4SWACache):
+    """A sliding-window cache of MXFP8 records (528 B per row) in blocks of
+    64 rows (:func:`packed_swa_block`), the page padded to 36,864 B. The block
+    size is explicit: at 32 rows (16.5 KiB) the 32 KiB compressor ring would
+    be the largest page and this non-MLA page would be padded back to it."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        return packed_swa_spec(
+            self.block_size, self.head_dim, self.window_size,
+            self.cache_config.cache_dtype, self.bounded_replay,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +352,7 @@ class DeepseekV41Sm80Indexer(DeepseekV4Indexer):
             context.pop(k_cache.prefix)
             k_cache = Sm80IndexKCache(
                 head_dim=self.head_dim,
-                dtype=torch.bfloat16,
+                dtype=torch.uint8 if kv_pack_enabled() else torch.bfloat16,
                 prefix=k_cache.prefix,
                 cache_config=cache_config,
                 compress_ratio=compress_ratio,
@@ -356,6 +451,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 "DeepSeek V4.1 on sm_80 stores BF16 KV rows; got kv-cache dtype "
                 f"{self.kv_cache_dtype}."
             )
+        self._sm80_kv_pack = kv_pack_enabled()
+        if self._sm80_kv_pack:
+            self._sm80_use_packed_swa_cache(vllm_config)
         config = vllm_config.model_config.hf_config
         if self.compressor is not None:
             # The compressor projection takes the model's quantization config
@@ -488,6 +586,61 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
 
     # -- pieces -------------------------------------------------------------
 
+    def _sm80_use_packed_swa_cache(self, vllm_config: VllmConfig) -> None:
+        """Swap the BF16 window cache the base layer built for a packed one
+        (same prefix, window and replay policy; 64-row blocks)."""
+        old = self.swa_cache_layer
+        context = vllm_config.compilation_config.static_forward_context
+        context.pop(old.prefix)
+        self.swa_cache_layer = Sm80PackedSWACache(
+            head_dim=old.head_dim,
+            window_size=old.window_size,
+            dtype=torch.uint8,
+            prefix=old.prefix,
+            cache_config=old.cache_config,
+            backend_cls=old.backend_cls,
+            block_size=packed_swa_block(vllm_config, old.head_dim),
+            bounded_replay=old.bounded_replay,
+        )
+        if vllm_config.kernel_config.enable_jit_warmup:
+            # The base layer warmed the window-index kernels for its block size.
+            from vllm.v1.attention.backends.mla.sparse_swa import (
+                _COMPUTE_SWA_INDICES_AND_LENS_KERNEL,
+            )
+
+            _COMPUTE_SWA_INDICES_AND_LENS_KERNEL.register_warmup(
+                window_size=self.window_size,
+                block_size=self.swa_cache_layer.block_size,
+            )
+            spec_config = vllm_config.speculative_config
+            if spec_config is not None and spec_config.use_dspark():
+                from vllm.v1.attention.backends.mla.sparse_swa import (
+                    _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
+                )
+
+                _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL.register_warmup(
+                    window_size=self.window_size,
+                    num_speculative_tokens=spec_config.num_speculative_tokens,
+                    block_size=self.swa_cache_layer.block_size,
+                )
+        logger.info_once(
+            "DeepSeek-V4.1 sm_80: KV caches hold exact packed records "
+            "(window MXFP8 528 B, compressed NVFP4 288 B, index keys MXFP4 72 B; "
+            "pages of %d B, window blocks of %d rows; VLLM_DEEPSEEK_V41_KV_PACK=1)",
+            kvpack.PACKED_PAGE_BYTES, self.swa_cache_layer.block_size, scope="global",
+        )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """The kv source's compressed cache: upstream's BF16 spec, or with
+        packed records NVFP4 states of 288 B (no alignment padding: 128
+        states fill a 36,864 B page)."""
+        if not getattr(self, "_sm80_kv_pack", False) or not self.is_kv_source:
+            return super().get_kv_cache_spec(vllm_config)
+        return packed_state_spec(
+            vllm_config.cache_config.block_size, self.head_dim, kvpack.NVFP4,
+            self.compress_ratio, self.kv_cache_dtype,
+        )
+
     def _sm80_draft_prologue_gate(self) -> bool:
         """Whether this layer's DSpark context-KV prologue may run as one
         kernel (``VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED``, taken by
@@ -501,6 +654,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
             self.kv_cache_torch_dtype,
             current_platform.get_device_capability(),
         )
+        if self._sm80_kv_pack:
+            reason = "the window cache holds packed records (VLLM_DEEPSEEK_V41_KV_PACK)"
         if reason is not None and envs.VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED:
             logger.warning_once(
                 "DeepSeek-V4.1 sm_80: VLLM_DEEPSEEK_V41_DRAFT_PROLOGUE_FUSED=1 but "
@@ -515,6 +670,13 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         layer has the configuration the fused kernels were validated for.
         Which calls take it is :meth:`_sm80_fused_attn_call`."""
         if not envs.VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE:
+            return False
+        if self._sm80_kv_pack:
+            logger.warning_once(
+                "DeepSeek-V4.1 sm_80: VLLM_DEEPSEEK_V41_FUSED_ATTN_DECODE=1 but the "
+                "attention core stays unfused: it reads BF16 cache rows and the "
+                "caches hold packed records (VLLM_DEEPSEEK_V41_KV_PACK)", scope="global",
+            )
             return False
         from vllm_cmp170hx.models.deepseek_v41.ops import sm80_attn_fused
 
@@ -568,6 +730,8 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         reason = reason or sm80_attn_pipeline.supports(self.sm80_cfg,
             self._sm80_pipeline_max_rows, self.max_model_len, self.q_lora_rank,
             min(self._sm80_chunk_bytes, core.DEFAULT_SCORE_CHUNK_BYTES))
+        if self._sm80_kv_pack:
+            reason = "the caches hold packed records (VLLM_DEEPSEEK_V41_KV_PACK)"
         if reason is not None and self._sm80_pipeline_reserved:
             logger.warning_once("DeepSeek-V4.1 attention pipeline disabled: %s",
                                 reason, scope="global")
@@ -871,8 +1035,9 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
         n = min(slot_mapping.shape[0], qr_kv.shape[0])
         kv = core.rms_norm(qr_kv[:n, self.q_lora_rank :], self.kv_norm.weight, self.eps)
         freqs = self._sm80_weights(kv.device).freqs
-        rows = core.window_kv(kv, positions[:n], freqs)
-        core.store_rows(self.swa_cache_layer.kv_cache, slot_mapping[:n], rows)
+        core.store_window_kv(
+            self.swa_cache_layer.kv_cache, slot_mapping[:n], kv, positions[:n], freqs
+        )
 
     def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """``wo_a`` per group (the reference's einsum over its block-diagonal
@@ -928,11 +1093,11 @@ _PREEMPTING_BACKENDS = (
 )
 
 
-def _window_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+def _window_rows(cache: torch.Tensor, slots: torch.Tensor, dim: int = 512) -> torch.Tensor:
     """Rows of window slots ``slots`` (-1: row of slot 0, masked by the
-    slots themselves)."""
+    slots themselves); packed records decoded to BF16."""
     slots = slots.clamp_min(0).to(torch.int64)
-    return cache[slots // cache.shape[1], slots % cache.shape[1]]
+    return core.window_rows(cache, slots // cache.shape[1], slots % cache.shape[1], dim)
 
 
 def _capture_attention_inputs(record, batch, caches, weights, qr_kv: torch.Tensor):
@@ -983,7 +1148,8 @@ def _capture_attention_outputs(record, cfg, batch, caches, out: torch.Tensor) ->
         values.update(
             comp_local=local,
             comp_rows=core.gather_compressed_rows(
-                caches.comp, batch.comp_block_table, req, local.clamp_min(0)
+                caches.comp, batch.comp_block_table, req, local.clamp_min(0),
+                kvpack.NVFP4, cfg.head_dim,
             ),
         )
     record.put(**values).done()
