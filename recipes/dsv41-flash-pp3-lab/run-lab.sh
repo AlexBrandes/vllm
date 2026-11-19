@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the lab unit's container by hand on the CMP host, inside a lease that holds cards 1, 2 and 4
+# Run the lab unit's container by hand on the CMP host, inside a lease that holds cards 1, 2 and 3
 # (the coordinator's two-step host/fleet protocol; never without it). Reads ExecStart from
 # cmp-dsv41-pp3-lab.service next to this script, so the unit file stays the single source of flags.
 #   IMAGE=lab-dsv41-pp3:<sha> [PARTITION=15,10,15] [DSPARK=0] [EMBED_INT8=0] [BATCHED=1024]
