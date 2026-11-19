@@ -29,6 +29,13 @@ targets 5-7), each in a fresh process, FULL_DECODE_ONLY graphs:
   (homogeneous PP steps, spread decodes, 512-token prefill chunks beside
   decodes, fused mHC with finish v2 and the uniform kernel A).
 
+An arm ``P@V`` runs partition ``P`` with the environment of variant ``V``
+(``--variant V=KEY=VALUE``, repeatable), e.g. ``8,8@pack`` with
+``--variant pack=VLLM_DEEPSEEK_V41_KV_PACK=1`` compares packed KV records to
+the BF16 rows of arm ``8``. ``--prefix-caching`` adds prompts that share a
+2048-token prefix with an earlier one (prefix-cache hits; each output records
+its ``num_cached_tokens``).
+
 The first arm is the reference (any checkpoint works with ``--out``, e.g. a
 real-layer cut of ``gpu_real_layers.py --build-only`` with ``--w8`` and
 ``--bench-env``). Each prompt is generated alone (identical batch composition in every arm),
@@ -137,6 +144,7 @@ def write_shim(directory: Path) -> None:
 def run_arm(
     out: Path, partition: str, dspark: bool, prompt_lens: list[int], lab: bool,
     swa_replay: bool = True, batched_tokens: int = 1024, image: bool = False,
+    prefix_caching: bool = False,
 ) -> dict:
     stages = len(partition.split(","))
     if stages > 1:
@@ -150,7 +158,7 @@ def run_arm(
         max_model_len=4096, max_num_seqs=4, max_num_batched_tokens=batched_tokens,
         gpu_memory_utilization=0.2, kv_cache_memory_bytes=1 << 30,
         mm_encoder_tp_mode="data", tokenizer_mode="deepseek_v41",
-        enable_prefix_caching=False, seed=0,
+        enable_prefix_caching=prefix_caching, seed=0,
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
         pipeline_parallel_size=stages, distributed_executor_backend="mp",
     )
@@ -166,6 +174,16 @@ def run_arm(
         {"prompt_token_ids": [(7 * i + 13 * n) % 100000 + 3 for i in range(n)]}
         for n in prompt_lens
     ]
+    if prefix_caching:
+        # A 2300-token prompt, then two that share its first 2048 tokens (hits
+        # once it is cached), then the first again (a hit on all of it).
+        base = [(11 * i + 5) % 100000 + 3 for i in range(2300)]
+        prompts += [
+            {"prompt_token_ids": base},
+            {"prompt_token_ids": base[:2048] + [(17 * i + 9) % 100000 + 3 for i in range(200)]},
+            {"prompt_token_ids": base[:2048] + [(19 * i + 2) % 100000 + 3 for i in range(37)]},
+            {"prompt_token_ids": base},
+        ]
     alone = [llm.generate([p], params)[0] for p in prompts]
     batched = llm.generate(prompts, params)
     image_out = None
@@ -189,6 +207,7 @@ def run_arm(
             for o in alone
         ],
         "batched_tokens": [list(o.outputs[0].token_ids) for o in batched],
+        "num_cached_tokens": [o.num_cached_tokens for o in alone],
         "image": image_out,
         "batched_first_logprobs": [
             sorted((t, lp.logprob) for t, lp in o.outputs[0].logprobs[0].items())
@@ -217,6 +236,9 @@ def main() -> None:
     parser.add_argument("--bench-env", action="store_true",
                         help="the lab unit's EXL3 kernel switches (gpu_bench_realwidth.LAB_ENV)")
     parser.add_argument("--prompt-lens", default="12,300,900")
+    parser.add_argument("--variant", action="append", default=[],
+                        help="NAME=KEY=VALUE: arm P@NAME runs with KEY=VALUE")
+    parser.add_argument("--prefix-caching", action="store_true")
     parser.add_argument("--arm")
     parser.add_argument("--result")
     parser.add_argument("--log-dir", help="keep each arm's engine log here")
@@ -225,8 +247,9 @@ def main() -> None:
     root = Path(__file__).resolve().parents[4]
     if args.arm:
         sys.path.insert(0, str(root))
-        res = run_arm(args.out, args.arm.replace(":", ","), args.dspark, lens, args.lab,
-                      not args.no_swa_replay, args.batched_tokens, args.image)
+        res = run_arm(args.out, args.arm.split("@")[0].replace(":", ","), args.dspark,
+                      lens, args.lab, not args.no_swa_replay, args.batched_tokens,
+                      args.image, args.prefix_caching)
         Path(args.result).write_text(json.dumps(res))
         return
     shim = Path(tempfile.mkdtemp(prefix="dsv41-pp-one-card-"))
@@ -252,21 +275,30 @@ def main() -> None:
     env.setdefault("NCCL_SOCKET_IFNAME", "lo")
     env.setdefault("NCCL_P2P_DISABLE", "1")
     env.setdefault("NCCL_SHM_DISABLE", "1")
+    variants: dict[str, dict[str, str]] = {}
+    for item in args.variant:
+        name, _, kv = item.partition("=")
+        key, _, value = kv.partition("=")
+        variants.setdefault(name, {})[key] = value
     results, errors = {}, {}
     for arm in args.arms.split(","):
-        result = shim / f"{arm.replace(':', '-')}.json"
+        tag = arm.replace(":", "-").replace("@", "-")
+        result = shim / f"{tag}.json"
         cmd = [sys.executable, __file__, "--out", str(args.out), "--arm", arm,
                "--result", str(result), "--prompt-lens", args.prompt_lens]
         cmd += ["--dspark"] * args.dspark + ["--lab"] * args.lab
         cmd += ["--no-swa-replay"] * args.no_swa_replay
         cmd += ["--batched-tokens", str(args.batched_tokens)] + ["--image"] * args.image
-        drafts = shim / f"{arm.replace(':', '-')}.drafts.jsonl"
-        arm_env = dict(env, DSV41_PP_DRAFT_DUMP=str(drafts)) if args.dspark else env
+        cmd += ["--prefix-caching"] * args.prefix_caching
+        drafts = shim / f"{tag}.drafts.jsonl"
+        arm_env = dict(env, **variants.get(arm.partition("@")[2], {}))
+        if args.dspark:
+            arm_env["DSV41_PP_DRAFT_DUMP"] = str(drafts)
         proc = subprocess.run(cmd, env=arm_env, capture_output=True, text=True, timeout=1500)
         if drafts.exists():
             results.setdefault("_drafts", {})[arm] = drafts.read_text().splitlines()
         if args.log_dir:
-            log = Path(args.log_dir) / f"pp-one-card-{arm.replace(':', '-')}.log"
+            log = Path(args.log_dir) / f"pp-one-card-{tag}.log"
             log.write_text(proc.stdout + proc.stderr)
             for keep in (result, drafts):
                 if keep.exists():
@@ -305,6 +337,10 @@ def main() -> None:
                 for ta, tb in zip(res["tokens"], reference["tokens"])
             ]
             entry["batched_tokens_equal"] = res["batched_tokens"] == reference["batched_tokens"]
+            entry["batched_first_logprobs_equal"] = (
+                res["batched_first_logprobs"] == reference["batched_first_logprobs"]
+            )
+            entry["num_cached_tokens"] = res.get("num_cached_tokens")
         entry["batched_equals_alone"] = res["batched_tokens"] == res["tokens"]
         if res.get("image") is not None and reference is not None and arm != first:
             entry["image_equal"] = res["image"] == reference.get("image")

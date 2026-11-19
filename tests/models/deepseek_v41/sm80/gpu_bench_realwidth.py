@@ -308,6 +308,24 @@ def run(out: Path, w8: Path | None, dspark: bool, max_len: int) -> dict:
     result["decode_ms_per_step_b4"] = round(
         (result["b4_p2048_o129_s"] - result["b1_p2048_o1_s"] * 4) / 128 * 1000, 2
     )
+    # DSV41_BENCH_LONG=N[,N...]: one N-token prompt, prefill alone and with 64
+    # decode steps (median of DSV41_BENCH_REPEATS), at a max-model-len >= N + 65.
+    for n in [int(x) for x in os.environ.get("DSV41_BENCH_LONG", "").split(",") if x]:
+        prompt = [{"prompt_token_ids": [(13 * i + 5) % 100000 + 3 for i in range(n)]}]
+        for out_len in (1, 65):
+            params = SamplingParams(max_tokens=out_len, temperature=0.0, ignore_eos=True)
+            llm.generate(prompt, params)  # warm
+            times = []
+            for _ in range(int(os.environ.get("DSV41_BENCH_REPEATS", "3"))):
+                t0 = time.time()
+                llm.generate(prompt, params)
+                times.append(time.time() - t0)
+            times.sort()
+            result[f"long{n}_o{out_len}_s"] = round(times[len(times) // 2], 4)
+            result[f"long{n}_o{out_len}_spread"] = round(times[-1] - times[0], 4)
+        result[f"long{n}_decode_ms_per_step"] = round(
+            (result[f"long{n}_o65_s"] - result[f"long{n}_o1_s"]) / 64 * 1000, 2
+        )
     del llm
     return result
 

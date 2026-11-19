@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_cmp170hx.models.deepseek_v41.ops import sm80_attn_core as core
+from vllm_cmp170hx.models.deepseek_v41.ops import sm80_kv_pack as kvpack
 from vllm_cmp170hx.models.deepseek_v41.ops.sm80_act_quant import (
     act_quant_qdq_fp8,
     fp4_qdq,
@@ -535,9 +536,22 @@ class _Req:
     ring: int = -1
 
 
+def packed_cache(num_blocks: int, entries: int, rec: "kvpack.KVRecord", dim: int,
+                 device, page_pad: int = 0) -> torch.Tensor:
+    """A uint8 cache of ``rec`` records ``[num_blocks, entries, stride]`` whose
+    blocks are ``page_pad`` bytes further apart than their records (a padded
+    page, as the KV planner lays out a page smaller than the group's)."""
+    stride = rec.stride(dim)
+    page = entries * stride + page_pad
+    flat = torch.zeros(num_blocks * page, dtype=torch.uint8, device=device)
+    return flat.as_strided((num_blocks, entries, stride), (page, stride, 1))
+
+
 class PagedRun:
     """Paged caches and per-step metadata for a stack of layers sharing one
-    compressed/index-key source, as vLLM lays them out."""
+    compressed/index-key source, as vLLM lays them out. ``packed``: the
+    window, compressed and index-key caches hold packed records
+    (``sm80_kv_pack``) in pages ``page_pad`` bytes longer than their records."""
 
     def __init__(
         self,
@@ -550,6 +564,8 @@ class PagedRun:
         low_block: int = 700,
         ring_capacity: int = 8,
         seed: int = 0,
+        packed: bool = False,
+        page_pad: int = 0,
     ):
         self.args, self.specs, self.device = args, specs, device
         self.rng = random.Random(seed)
@@ -561,16 +577,29 @@ class PagedRun:
             k: BlockPool(num_blocks, low_block, self.rng)
             for k in ("swa", "comp", "idxk", "ring")
         }
-        self.swa_caches = [
-            torch.zeros(num_blocks, swa_block, args.head_dim, dtype=BF16, device=device)
-            for _ in specs
-        ]
-        self.comp = torch.zeros(
-            num_blocks, self.comp_e, args.head_dim, dtype=BF16, device=device
-        )
-        self.idxk = torch.zeros(
-            num_blocks, self.comp_e, args.index_head_dim, dtype=BF16, device=device
-        )
+        self.packed = packed
+        if packed:
+            self.swa_caches = [
+                packed_cache(num_blocks, swa_block, kvpack.MXFP8, args.head_dim,
+                             device, page_pad)
+                for _ in specs
+            ]
+            self.comp = packed_cache(num_blocks, self.comp_e, kvpack.NVFP4,
+                                     args.head_dim, device, page_pad)
+            self.idxk = packed_cache(num_blocks, self.comp_e, kvpack.MXFP4,
+                                     args.index_head_dim, device, page_pad)
+        else:
+            self.swa_caches = [
+                torch.zeros(num_blocks, swa_block, args.head_dim, dtype=BF16,
+                            device=device)
+                for _ in specs
+            ]
+            self.comp = torch.zeros(
+                num_blocks, self.comp_e, args.head_dim, dtype=BF16, device=device
+            )
+            self.idxk = torch.zeros(
+                num_blocks, self.comp_e, args.index_head_dim, dtype=BF16, device=device
+            )
         self.ring = torch.zeros(
             num_blocks, ring_capacity, 2 * args.head_dim, device=device
         )
@@ -671,15 +700,25 @@ class PagedRun:
         )
 
     def window_row(self, layer: int, rid: int, p: int) -> torch.Tensor:
+        """The BF16 window row (a packed record decoded)."""
         req = self.reqs[rid]
         blk = req.swa[p // self.swa_block]
-        return self.swa_caches[layer][blk, p % self.swa_block]
+        row = self.swa_caches[layer][blk, p % self.swa_block]
+        if self.packed:
+            return kvpack.unpack(row, kvpack.MXFP8, self.args.head_dim).to(BF16)
+        return row
 
     def comp_row(self, rid: int, j: int, idxk: bool = False) -> torch.Tensor:
+        """The BF16 compressed row or index key (a packed record decoded)."""
         req = self.reqs[rid]
         table = req.idxk if idxk else req.comp
         cache = self.idxk if idxk else self.comp
-        return cache[table[j // self.comp_e], j % self.comp_e]
+        row = cache[table[j // self.comp_e], j % self.comp_e]
+        if self.packed:
+            if idxk:
+                return kvpack.unpack(row, kvpack.MXFP4, self.args.index_head_dim).to(BF16)
+            return kvpack.unpack(row, kvpack.NVFP4, self.args.head_dim).to(BF16)
+        return row
 
 
 # ---------------------------------------------------------------------------

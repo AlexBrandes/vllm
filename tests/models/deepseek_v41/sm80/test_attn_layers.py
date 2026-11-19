@@ -78,8 +78,8 @@ def make_inputs(args: RefArgs, n_layers: int, seed: int) -> list[dict[int, torch
     ]
 
 
-def run_sm80(args, specs, weights, xs, schedule, device="cpu"):
-    run = PagedRun(args, specs, device=device)
+def run_sm80(args, specs, weights, xs, schedule, device="cpu", **run_kw):
+    run = PagedRun(args, specs, device=device, **run_kw)
     cfgs = [core_config(args, s) for s in specs]
     cws = [core_weights(args, s, w, device) for s, w in zip(specs, weights)]
     h = args.n_heads // args.world_size
