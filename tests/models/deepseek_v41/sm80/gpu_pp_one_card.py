@@ -28,6 +28,10 @@ targets 5-7), each in a fresh process, FULL_DECODE_ONLY graphs:
 * ``--lab``: every arm with the lab unit's scheduling and mHC switches
   (homogeneous PP steps, spread decodes, 512-token prefill chunks beside
   decodes, fused mHC with finish v2 and the uniform kernel A).
+* ``--stage-pools``: PP arms with ``--kv-cache-pool-per-pp-stage`` (one KV
+  block pool per set of stages holding a cache group; shadow sources share
+  their source's pool); ``--prefix-caching`` turns prefix caching on, so the
+  batched pass hits the prefixes the alone pass cached, in every pool.
 
 The first arm is the reference (any checkpoint works with ``--out``, e.g. a
 real-layer cut of ``gpu_real_layers.py --build-only`` with ``--w8`` and
@@ -150,12 +154,15 @@ def run_arm(
         max_model_len=4096, max_num_seqs=4, max_num_batched_tokens=batched_tokens,
         gpu_memory_utilization=0.2, kv_cache_memory_bytes=1 << 30,
         mm_encoder_tp_mode="data", tokenizer_mode="deepseek_v41",
-        enable_prefix_caching=False, seed=0,
+        enable_prefix_caching=os.environ.get("DSV41_PP_PREFIX_CACHING") == "1",
+        seed=0,
         compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
         pipeline_parallel_size=stages, distributed_executor_backend="mp",
     )
     if dspark:
         kwargs["speculative_config"] = {"method": "dspark", "num_speculative_tokens": 4}
+    if stages > 1 and os.environ.get("DSV41_PP_STAGE_POOLS") == "1":
+        kwargs["kv_cache_pool_per_pp_stage"] = True
     if not swa_replay:
         kwargs["swa_bounded_replay"] = False
     if lab:
@@ -206,6 +213,10 @@ def main() -> None:
     parser.add_argument("--dspark", action="store_true")
     parser.add_argument("--lab", action="store_true")
     parser.add_argument("--image", action="store_true", help="also one image chat per arm")
+    parser.add_argument("--stage-pools", action="store_true",
+                        help="PP arms with --kv-cache-pool-per-pp-stage")
+    parser.add_argument("--prefix-caching", action="store_true",
+                        help="every arm with prefix caching on")
     parser.add_argument("--batched-tokens", type=int, default=1024,
                         help="max-num-batched-tokens (smaller: prompts prefill in chunks)")
     parser.add_argument("--no-swa-replay", action="store_true",
@@ -235,6 +246,10 @@ def main() -> None:
     env["DSV41_PP_ONE_CARD"] = "1"
     if args.lab:
         env.update(LAB_ENV)
+    if args.stage_pools:
+        env["DSV41_PP_STAGE_POOLS"] = "1"
+    if args.prefix_caching:
+        env["DSV41_PP_PREFIX_CACHING"] = "1"
     if args.bench_env:
         sys.path.insert(0, str(root))
         from tests.models.deepseek_v41.sm80.gpu_bench_realwidth import LAB_ENV as BENCH_ENV
@@ -276,7 +291,8 @@ def main() -> None:
             continue
         results[arm] = json.loads(result.read_text())
     drafts = results.pop("_drafts", {})
-    summary = {"dspark": args.dspark, "lab": args.lab, "errors": errors}
+    summary = {"dspark": args.dspark, "lab": args.lab, "errors": errors,
+               "stage_pools": args.stage_pools, "prefix_caching": args.prefix_caching}
     first = args.arms.split(",")[0]
     reference = results.get(first)
     for arm, res in results.items():
