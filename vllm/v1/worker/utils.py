@@ -259,6 +259,50 @@ class KVBlockZeroer:
             self.zero_block_ids([0])
 
 
+class PooledKVBlockZeroer:
+    """A `KVBlockZeroer` per device block pool (--kv-cache-pool-per-pp-stage).
+
+    A block ID names memory in one pool only, so each pool's layers are
+    zeroed by their own zeroer, sized to that pool's block count.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        attn_groups_iter: Iterable["AttentionGroup"],
+        kernel_block_sizes: list[int],
+        static_forward_context: dict[str, Any],
+        kv_cache_config: KVCacheConfig,
+        runner_only_attn_layers: set[str] | None = None,
+    ) -> None:
+        attn_groups = list(attn_groups_iter)
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+        self.zeroers = {
+            pool_id: KVBlockZeroer(
+                device,
+                attn_groups_iter=(
+                    group
+                    for group in attn_groups
+                    if group.kv_cache_group_id < len(kv_cache_groups)
+                    and kv_cache_groups[group.kv_cache_group_id].pool_id == pool_id
+                ),
+                kernel_block_sizes=kernel_block_sizes,
+                static_forward_context=static_forward_context,
+                num_blocks=kv_cache_config.num_blocks_of_pool(pool_id),
+                runner_only_attn_layers=runner_only_attn_layers,
+            )
+            for pool_id in range(kv_cache_config.num_pools)
+        }
+
+    def zero_block_ids(self, block_ids: list[int], pool_id: int = 0) -> None:
+        """Zero the given block IDs of device pool ``pool_id``."""
+        self.zeroers[pool_id].zero_block_ids(block_ids)
+
+    def warmup(self, num_kv_blocks: int) -> None:
+        for zeroer in self.zeroers.values():
+            zeroer.warmup(num_kv_blocks)
+
+
 @dataclass(eq=False)
 class AttentionGroup:
     backend: type[AttentionBackend]
@@ -944,11 +988,18 @@ def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    pool_id: int = 0,
 ) -> None:
-    if not kv_cache_block_copies:
+    """Apply the copies of device pool `pool_id`, whose caches are `kv_caches`."""
+    pairs = [
+        (copy.src_block_id, copy.dst_block_id)
+        for copy in kv_cache_block_copies
+        if copy.pool_id == pool_id
+    ]
+    if not pairs:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    indices_np = np.array(pairs, dtype=np.int64)
     indices: torch.Tensor | None = None
     seen: set[tuple[Any, ...]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()

@@ -3220,6 +3220,14 @@ class VllmConfig:
             )
         elif not self.use_v2_model_runner:
             unsupported = "it requires the V2 model runner"
+        elif (
+            cache_config.kv_cache_pool_per_pp_stage
+            and self.parallel_config.pipeline_parallel_size > 1
+        ):
+            unsupported = (
+                "--kv-cache-pool-per-pp-stage sizes each stage's block pools "
+                "at planning"
+            )
         elif self.parallel_config.enable_elastic_ep:
             unsupported = (
                 "elastic EP scale-up skips warmup and reuses the profiled KV "

@@ -8,6 +8,7 @@ import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
+from fractions import Fraction
 from functools import partial, reduce
 from typing import TYPE_CHECKING, Any
 
@@ -1282,25 +1283,41 @@ def _max_memory_usage_bytes_from_groups(
 
     Each group independently claims blocks from the shared pool, so a request consumes
     the sum of the per-group block counts, i.e. ``bytes_per_block * total_blocks``.
+
+    With per-PP-stage pools (``KVCacheGroupSpec.pool_id``) a worker backs only
+    the pools whose layers it holds, so it pays each of those pools' per-request
+    blocks at that pool's bytes per block, and nothing for the others.
     """
     kv_cache_groups = [group for group in kv_cache_groups if not group.host_resident]
     if not kv_cache_groups:
         return 0
+    if has_stage_pools(kv_cache_groups):
+        return sum(
+            _single_pool_max_memory_usage_bytes(builder, vllm_config, pool_groups)
+            for pool_groups in held_pool_groups(kv_cache_groups).values()
+        )
+    return _single_pool_max_memory_usage_bytes(builder, vllm_config, kv_cache_groups)
 
+
+def group_blocks_per_request(vllm_config: VllmConfig, group: KVCacheGroupSpec) -> int:
+    """Blocks one max_model_len request takes from the group's pool."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.max_memory_usage_pages(vllm_config)
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+
+
+def _single_pool_max_memory_usage_bytes(
+    builder: KVCacheConfigBuilder,
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
     bytes_per_block = _pool_bytes_per_block_from_builder(
         builder, vllm_config, kv_cache_groups
     )
-    total_blocks = 0
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            total_blocks += spec.max_memory_usage_pages(vllm_config)
-        else:
-            total_blocks += cdiv(
-                spec.max_memory_usage_bytes(vllm_config),
-                spec.page_size_bytes,
-            )
-
+    total_blocks = sum(
+        group_blocks_per_request(vllm_config, group) for group in kv_cache_groups
+    )
     return bytes_per_block * total_blocks
 
 
@@ -1472,9 +1489,278 @@ def _project_kv_cache_groups_to_worker(
                 host_resident=group.host_resident,
                 enable_kv_transfer=group.enable_kv_transfer,
                 role=group.role,
+                pool_id=group.pool_id,
             )
         )
     return projected_groups
+
+
+# --------------------------------------------------------------------------
+# Per-PP-stage block pools (--kv-cache-pool-per-pp-stage)
+# --------------------------------------------------------------------------
+
+
+def has_stage_pools(kv_cache_groups: Iterable[KVCacheGroupSpec]) -> bool:
+    """Whether the groups use more than the one device pool (pool 0)."""
+    return any(group.pool_id for group in kv_cache_groups)
+
+
+def pool_groups(
+    kv_cache_groups: Iterable[KVCacheGroupSpec],
+) -> dict[int, list[KVCacheGroupSpec]]:
+    """Device groups by pool id, in pool order."""
+    pools: defaultdict[int, list[KVCacheGroupSpec]] = defaultdict(list)
+    for group in kv_cache_groups:
+        if not group.host_resident:
+            pools[group.pool_id].append(group)
+    return dict(sorted(pools.items()))
+
+
+def held_pool_groups(
+    kv_cache_groups: Iterable[KVCacheGroupSpec],
+) -> dict[int, list[KVCacheGroupSpec]]:
+    """The pools a worker backs: those with layers in its projected groups.
+
+    Stage pools are built so that every group of a pool has layers on every
+    worker of the pool's stage set, so a pool is held whole or not at all.
+    """
+    return {
+        pool_id: groups
+        for pool_id, groups in pool_groups(kv_cache_groups).items()
+        if any(group.layer_names for group in groups)
+    }
+
+
+def _check_stage_pools_supported(vllm_config: VllmConfig) -> None:
+    """Refuse features that assume one device pool of block ids."""
+    reasons = []
+    if vllm_config.attention_config.hisparse_config is not None:
+        reasons.append("HiSparse")
+    if vllm_config.kv_transfer_config is not None:
+        reasons.append("KV connectors (their block ids name one pool)")
+    kv_events_config = vllm_config.kv_events_config
+    if kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+        reasons.append("KV cache events (their block ids name one pool)")
+    if not vllm_config.use_v2_model_runner:
+        reasons.append("the V1 model runner")
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.decode_context_parallel_size > 1
+        or parallel_config.prefill_context_parallel_size > 1
+    ):
+        reasons.append("context parallelism")
+    if vllm_config.cache_config.enable_extensible_kv_cache:
+        reasons.append("the extensible KV cache")
+    if reasons:
+        raise ValueError(
+            "--kv-cache-pool-per-pp-stage does not support " + ", ".join(reasons) + "."
+        )
+
+
+def assign_stage_pools(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> None:
+    """Give each global group the pool of the workers holding its layers.
+
+    A pool is a set of workers (the TP ranks of one or more PP stages): its
+    block ids are backed only there. A group whose layers sit on one stage
+    gets that stage's pool; a group shared by two stages (e.g. a DeepSeek-V4.1
+    PP shadow source, which reuses its source layer's name) gets the pool of
+    both. Pools are numbered by their lowest worker, then size, so pool 0 is
+    the first stage's. When every group spans the same workers there is one
+    pool and nothing changes.
+    """
+    if vllm_config.parallel_config.pipeline_parallel_size <= 1:
+        logger.info_once(
+            "--kv-cache-pool-per-pp-stage has no effect without pipeline parallelism."
+        )
+        return
+    worker_layers = [set(specs) for specs in kv_cache_specs]
+    stage_sets = [
+        frozenset(
+            worker
+            for worker, layers in enumerate(worker_layers)
+            if not layers.isdisjoint(group.layer_names)
+        )
+        for group in kv_cache_groups
+    ]
+    keys = sorted(
+        {key for key, group in zip(stage_sets, kv_cache_groups) if key},
+        key=lambda key: (min(key), len(key), sorted(key)),
+    )
+    if len(keys) <= 1:
+        logger.info_once(
+            "--kv-cache-pool-per-pp-stage: every KV cache group spans the same "
+            "workers, so they keep one block pool."
+        )
+        return
+    _check_stage_pools_supported(vllm_config)
+    pool_of_key = {key: pool_id for pool_id, key in enumerate(keys)}
+    for group, key in zip(kv_cache_groups, stage_sets):
+        group.pool_id = pool_of_key.get(key, 0)
+    logger.info_once(
+        "--kv-cache-pool-per-pp-stage: %d KV cache block pools: %s",
+        len(keys),
+        "; ".join(
+            f"pool {pool_of_key[key]}: workers {sorted(key)}, "
+            f"{sum(1 for k in stage_sets if k == key)} groups"
+            for key in keys
+        ),
+    )
+
+
+def _pool_bytes_per_block_by_worker(
+    builder: KVCacheConfigBuilder,
+    vllm_config: VllmConfig,
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]],
+) -> list[dict[int, int]]:
+    """Bytes one block of each pool takes on each worker that holds it."""
+    return [
+        {
+            pool_id: _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            for pool_id, groups in held_pool_groups(projected).items()
+        }
+        for projected in projected_groups_per_worker
+    ]
+
+
+def plan_stage_pool_num_blocks(
+    vllm_config: VllmConfig,
+    global_kv_cache_groups: list[KVCacheGroupSpec],
+    pool_bytes_by_worker: list[dict[int, int]],
+    available_memory: list[int],
+) -> dict[int, int]:
+    """Block count of every pool, the null block included.
+
+    A pool's blocks cost memory on each worker of its stage set. The pools are
+    sized in proportion to their blocks per max_model_len request (d_p) by
+    max-min water-filling: the worker that fits the fewest such requests in its
+    budget fixes all its pools at that many requests' worth; their bytes come
+    off every worker holding them; the next tightest worker fixes its remaining
+    pools, and so on. Every worker's budget is used, the tightest one decides
+    how long a request fits, and the others give the rest to their own pools.
+    """
+    pool_ids = sorted({group.pool_id for group in global_kv_cache_groups})
+    demand = {
+        pool_id: max(
+            1, sum(group_blocks_per_request(vllm_config, group) for group in groups)
+        )
+        for pool_id, groups in pool_groups(global_kv_cache_groups).items()
+    }
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        short = {p: d for p, d in demand.items() if override - 1 < d}
+        if short:
+            raise ValueError(
+                f"num_gpu_blocks_override={override} cannot hold a "
+                f"{vllm_config.model_config.max_model_len}-token request in KV "
+                f"cache pools {sorted(short)} (blocks needed: {short})."
+            )
+        return dict.fromkeys(pool_ids, override)
+    # Each pool's null block is never handed out.
+    budget = [
+        max(0, memory - sum(pool_bytes.values()))
+        for memory, pool_bytes in zip(available_memory, pool_bytes_by_worker)
+    ]
+    num_blocks: dict[int, int] = {}
+    while True:
+        tightest: tuple[Fraction, int, list[int]] | None = None
+        for worker, pool_bytes in enumerate(pool_bytes_by_worker):
+            unfixed = [pool_id for pool_id in pool_bytes if pool_id not in num_blocks]
+            if not unfixed:
+                continue
+            cost = sum(demand[pool_id] * pool_bytes[pool_id] for pool_id in unfixed)
+            scale = Fraction(budget[worker], cost)
+            if tightest is None or scale < tightest[0]:
+                tightest = (scale, worker, unfixed)
+        if tightest is None:
+            break
+        scale, _, unfixed = tightest
+        for pool_id in unfixed:
+            usable = math.floor(scale * demand[pool_id])
+            num_blocks[pool_id] = usable + 1
+            for worker, pool_bytes in enumerate(pool_bytes_by_worker):
+                if pool_id in pool_bytes:
+                    budget[worker] -= usable * pool_bytes[pool_id]
+    for pool_id in pool_ids:
+        num_blocks.setdefault(pool_id, 1)
+    return num_blocks
+
+
+def get_stage_pool_kv_cache_config(
+    builder: KVCacheConfigBuilder,
+    vllm_config: VllmConfig,
+    projected_groups: list[KVCacheGroupSpec],
+    num_blocks_by_pool: dict[int, int],
+) -> KVCacheConfig:
+    """One worker's config: the pools it holds, one after another in its single
+    backing allocation, each placed by the builder for its own block count."""
+    kv_cache_tensors: list[KVCacheTensor] = []
+    offset = 0
+    for pool_id, groups in held_pool_groups(projected_groups).items():
+        pool_config = builder.get_kv_cache_config_from_groups(
+            vllm_config, groups, num_blocks_by_pool[pool_id]
+        )
+        pool_tensors = pool_config.kv_cache_tensors
+        if not pool_tensors:
+            continue
+        sizes = {tensor.size for tensor in pool_tensors}
+        assert len(sizes) == 1 and not any(t.host_resident for t in pool_tensors)
+        kv_cache_tensors.extend(
+            replace(tensor, offset=offset + tensor.offset, pool_id=pool_id)
+            for tensor in pool_tensors
+        )
+        offset += sizes.pop()
+    return KVCacheConfig(
+        num_blocks=num_blocks_by_pool[0],
+        kv_cache_tensors=[replace(tensor, size=offset) for tensor in kv_cache_tensors],
+        kv_cache_groups=projected_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        pool_num_blocks={
+            pool_id: blocks
+            for pool_id, blocks in sorted(num_blocks_by_pool.items())
+            if pool_id
+        },
+    )
+
+
+def _log_stage_pools(
+    vllm_config: VllmConfig,
+    global_kv_cache_groups: list[KVCacheGroupSpec],
+    pool_bytes_by_worker: list[dict[int, int]],
+    available_memory: list[int],
+    num_blocks_by_pool: dict[int, int],
+) -> None:
+    max_model_len = vllm_config.model_config.max_model_len
+    parts = []
+    for pool_id, groups in pool_groups(global_kv_cache_groups).items():
+        demand = sum(group_blocks_per_request(vllm_config, g) for g in groups)
+        workers = [
+            w
+            for w, pool_bytes in enumerate(pool_bytes_by_worker)
+            if pool_id in pool_bytes
+        ]
+        parts.append(
+            f"pool {pool_id} (workers {workers}, {len(groups)} groups): "
+            f"{num_blocks_by_pool[pool_id]} blocks, {demand} per "
+            f"{max_model_len}-token request "
+            f"({(num_blocks_by_pool[pool_id] - 1) / max(demand, 1):.2f}x)"
+        )
+    used = [
+        sum(num_blocks_by_pool[p] * b for p, b in pool_bytes.items())
+        for pool_bytes in pool_bytes_by_worker
+    ]
+    logger.info_once(
+        "KV cache stage pools: %s. Per worker GiB used/available: %s",
+        "; ".join(parts),
+        ", ".join(
+            f"{format_gib(u)}/{format_gib(a)}" for u, a in zip(used, available_memory)
+        ),
+    )
 
 
 def get_kv_cache_configs(
@@ -1525,6 +1811,14 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+    stage_pools = has_stage_pools(global_kv_cache_groups)
+    pool_bytes_by_worker = (
+        _pool_bytes_per_block_by_worker(
+            builder, vllm_config, projected_groups_per_worker
+        )
+        if stage_pools
+        else []
+    )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`. Reflect
@@ -1537,6 +1831,13 @@ def get_kv_cache_configs(
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
             if not groups:
                 adjusted_memory.append(avail_mem)
+                continue
+            if stage_pools:
+                # Every pool gets `override` blocks; a worker backs its own.
+                worker = len(adjusted_memory)
+                adjusted_memory.append(
+                    override * sum(pool_bytes_by_worker[worker].values())
+                )
                 continue
             bytes_per_block = _pool_bytes_per_block_from_builder(
                 builder, vllm_config, groups
@@ -1552,13 +1853,21 @@ def get_kv_cache_configs(
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
+    # With stage pools a worker holds back the null block of each pool it backs.
     check_memory = [
         (
-            avail_mem - _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            avail_mem
+            - (
+                sum(pool_bytes_by_worker[worker].values())
+                if stage_pools
+                else _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            )
             if groups
             else avail_mem
         )
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+        for worker, (groups, avail_mem) in enumerate(
+            zip(projected_groups_per_worker, available_memory)
+        )
     ]
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -1577,6 +1886,34 @@ def get_kv_cache_configs(
             partial(_estimate_max_model_len_from_groups, builder, vllm_config, groups),
             _more_kv_cache_memory_hint(vllm_config),
         )
+
+    if stage_pools:
+        num_blocks_by_pool = plan_stage_pool_num_blocks(
+            vllm_config,
+            global_kv_cache_groups,
+            pool_bytes_by_worker,
+            available_memory,
+        )
+        _log_stage_pools(
+            vllm_config,
+            global_kv_cache_groups,
+            pool_bytes_by_worker,
+            available_memory,
+            num_blocks_by_pool,
+        )
+        pool_configs: list[KVCacheConfig] = []
+        for projected_groups, kv_cache_spec_one_worker in zip(
+            projected_groups_per_worker, kv_cache_specs
+        ):
+            assert sum(len(group.layer_names) for group in projected_groups) == len(
+                kv_cache_spec_one_worker
+            ), "Some layers are not assigned to any group."
+            pool_configs.append(
+                get_stage_pool_kv_cache_config(
+                    builder, vllm_config, projected_groups, num_blocks_by_pool
+                )
+            )
+        return _finish_kv_cache_configs(vllm_config, pool_configs)
 
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
@@ -1613,7 +1950,12 @@ def get_kv_cache_configs(
             kv_cache_config.kv_cache_groups,
             min_num_blocks,
         )
+    return _finish_kv_cache_configs(vllm_config, kv_cache_configs)
 
+
+def _finish_kv_cache_configs(
+    vllm_config: VllmConfig, kv_cache_configs: list[KVCacheConfig]
+) -> list[KVCacheConfig]:
     for kv_cache_config in kv_cache_configs:
         kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
             kv_cache_config.kv_cache_groups,
@@ -1679,6 +2021,8 @@ def get_global_kv_cache_groups(
         for group in global_kv_cache_groups:
             group.is_eagle_group = not draft_layer_names.isdisjoint(group.layer_names)
         _warn_if_unannotated_eagle_mamba(spec_config, global_kv_cache_groups)
+    if vllm_config.cache_config.kv_cache_pool_per_pp_stage:
+        assign_stage_pools(vllm_config, kv_cache_specs, global_kv_cache_groups)
     return global_kv_cache_groups
 
 

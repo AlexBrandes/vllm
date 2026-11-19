@@ -1499,6 +1499,7 @@ class KVCacheTensor:
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
     host_resident: bool = False
+    pool_id: int = 0  # the device block pool whose block IDs index this tensor
 
 
 class KVCacheGroupRole(str, Enum):
@@ -1526,6 +1527,11 @@ class KVCacheGroupSpec:
     # source group after a connector load.
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
+    # Device block pool of this group. Pool 0 holds `KVCacheConfig.num_blocks`
+    # blocks, the others `KVCacheConfig.pool_num_blocks`. With
+    # --kv-cache-pool-per-pp-stage, a pool is the set of pipeline stages that
+    # hold the group's layers, and only those stages back its blocks.
+    pool_id: int = 0
 
 
 @dataclass
@@ -1563,6 +1569,9 @@ class KVCacheConfig:
 
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
+
+    pool_num_blocks: dict[int, int] = field(default_factory=dict)
+    """Block counts of the device pools other than pool 0 (`num_blocks`)."""
 
     needs_kv_cache_zeroing: bool = field(init=False)
     """Whether newly allocated attention blocks must be zeroed before use.
@@ -1639,9 +1648,26 @@ class KVCacheConfig:
     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
         """Number of blocks addressable by the pool backing ``tensor``."""
         if not tensor.host_resident:
-            return self.num_blocks
+            return self.num_blocks_of_pool(tensor.pool_id)
         assert self.hisparse_host_num_blocks is not None
         return self.hisparse_host_num_blocks
+
+    @property
+    def num_pools(self) -> int:
+        """Number of device block pools (1 unless groups have a `pool_id`)."""
+        return 1 + len(self.pool_num_blocks)
+
+    def num_blocks_of_pool(self, pool_id: int) -> int:
+        """Number of blocks of device pool ``pool_id``."""
+        return self.pool_num_blocks[pool_id] if pool_id else self.num_blocks
+
+    def num_blocks_of_group(self, group_id: int) -> int:
+        """Number of blocks of the pool backing cache group ``group_id``."""
+        group = self.kv_cache_groups[group_id]
+        if group.host_resident:
+            assert self.hisparse_host_num_blocks is not None
+            return self.hisparse_host_num_blocks
+        return self.num_blocks_of_pool(group.pool_id)
 
     @property
     def has_mamba_layers(self) -> bool:

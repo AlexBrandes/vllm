@@ -258,6 +258,8 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    # Block IDs are per device pool; see KVCacheGroupSpec.pool_id.
+    pool_id: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -1099,7 +1101,25 @@ def get_max_concurrency_for_kv_cache_config(
     call sites agree.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
+    So do the device pools of --kv-cache-pool-per-pp-stage: each is bounded
+    by its own groups, and the fullest one limits admission.
     """
+    if kv_cache_config.pool_num_blocks:
+        return min(
+            max_concurrency_for_kv_cache_config(
+                vllm_config,
+                KVCacheConfig(
+                    num_blocks=kv_cache_config.num_blocks_of_pool(pool_id),
+                    kv_cache_tensors=[],
+                    kv_cache_groups=[
+                        group
+                        for group in kv_cache_config.kv_cache_groups
+                        if group.pool_id == pool_id
+                    ],
+                ),
+            )
+            for pool_id in range(kv_cache_config.num_pools)
+        )
     return max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
     num_blocks_per_request = 0
     host_blocks_per_request = 0
@@ -1130,6 +1150,10 @@ def generate_scheduler_kv_cache_config(
     )
     assert all(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
+        for cfg in kv_cache_configs
+    )
+    assert all(
+        cfg.pool_num_blocks == kv_cache_configs[0].pool_num_blocks
         for cfg in kv_cache_configs
     )
     # Worker configs share scheduler geometry and the resolved zeroing
@@ -1172,6 +1196,8 @@ def update_kv_cache_capacity(
     pools = _kv_cache_device_name(vllm_config)
     if vllm_config.attention_config.hisparse_config is not None:
         pools += " + host"
+    if kv_cache_config.pool_num_blocks:
+        pools += f" ({kv_cache_config.num_pools} stage pools)"
     logger.info_once(
         "%s KV cache size: %s tokens, "
         "Maximum concurrency for %s tokens per request: %.2fx",

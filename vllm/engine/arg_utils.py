@@ -850,6 +850,7 @@ class EngineArgs:
     stream_interval: int = SchedulerConfig.stream_interval
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
+    kv_cache_pool_per_pp_stage: bool = CacheConfig.kv_cache_pool_per_pp_stage
     swa_bounded_replay: bool = CacheConfig.swa_bounded_replay
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
@@ -1429,6 +1430,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
+        )
+        cache_group.add_argument(
+            "--kv-cache-pool-per-pp-stage",
+            **cache_kwargs["kv_cache_pool_per_pp_stage"],
         )
         cache_group.add_argument(
             "--swa-bounded-replay", **cache_kwargs["swa_bounded_replay"]
@@ -2333,6 +2338,7 @@ class EngineArgs:
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
+            kv_cache_pool_per_pp_stage=self.kv_cache_pool_per_pp_stage,
             swa_bounded_replay=self.swa_bounded_replay,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,

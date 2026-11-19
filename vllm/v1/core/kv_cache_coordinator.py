@@ -125,6 +125,24 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
+        # Device block pools by `KVCacheGroupSpec.pool_id`; pool 0 is
+        # `block_pool`. More than one only with --kv-cache-pool-per-pp-stage.
+        self.block_pools: list[BlockPool] = [self.block_pool]
+        for pool_id in range(1, kv_cache_config.num_pools):
+            if enable_kv_cache_events:
+                raise ValueError(
+                    "KV cache events do not support several KV cache block pools."
+                )
+            self.block_pools.append(
+                BlockPool(
+                    num_gpu_blocks=kv_cache_config.num_blocks_of_pool(pool_id),
+                    enable_caching=enable_caching,
+                    hash_block_size=hash_block_size,
+                    enable_kv_cache_events=enable_kv_cache_events,
+                    metrics_collector=metrics_collector,
+                    num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+                )
+            )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -163,7 +181,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[kv_cache_group.pool_id],
                 role=kv_cache_group.role,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
@@ -230,17 +248,47 @@ class KVCacheCoordinator(ABC):
                 state, so it is ignored (0).
 
         Returns:
-            The number of blocks to allocate.
+            The number of blocks to allocate, summed over the device pools
+            (see `get_num_blocks_to_allocate_by_pool`).
 
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self.get_num_blocks_to_allocate_by_pool(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_local_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+                prefill_end=prefill_end,
+            )
+        )
+
+    def get_num_blocks_to_allocate_by_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> list[int]:
+        """`get_num_blocks_to_allocate` for each device block pool, indexed
+        by `KVCacheGroupSpec.pool_id`."""
+        num_blocks_to_allocate = [0] * len(self.block_pools)
         if self.retention_interval != 0:
             prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
+            pool_id = self.kv_cache_config.kv_cache_groups[i].pool_id
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks_to_allocate[pool_id] += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -250,7 +298,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks_to_allocate[pool_id] += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],

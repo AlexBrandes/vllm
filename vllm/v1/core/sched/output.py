@@ -304,6 +304,9 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    # The same for device pools other than pool 0
+    # (--kv-cache-pool-per-pp-stage), by pool id.
+    pool_block_ids_to_zero: dict[int, list[int]] | None = None
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None

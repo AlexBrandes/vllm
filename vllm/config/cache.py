@@ -360,6 +360,15 @@ class CacheConfig:
     """Token granularity at which prefix-cache hits land: `hash_block_size`
     with partial hash hits, otherwise the scheduler block size."""
 
+    kv_cache_pool_per_pp_stage: bool = False
+    """Under pipeline parallelism, give each set of stages that holds a KV
+    cache group's layers its own block pool, so a stage backs and is charged
+    for only the KV cache of layers it holds. Without it every group draws
+    from one pool whose blocks every stage backs, and the stage with the least
+    memory bounds the whole model's KV cache. Groups that span every stage
+    stay in one pool, so models whose groups are not stage-local are
+    unaffected. Turns the extensible KV cache off."""
+
     kv_sharing_fast_prefill: bool = False
     """In some KV sharing setups, e.g. YOCO (https://arxiv.org/abs/2405.05254),
     some layers can skip tokens corresponding to prefill. This flag enables
@@ -447,6 +456,7 @@ class CacheConfig:
             "swa_bounded_replay",
             # Runtime memory allocation strategy, not graph structure.
             "enable_extensible_kv_cache",
+            "kv_cache_pool_per_pp_stage",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
