@@ -776,7 +776,8 @@ class DSparkDeepseekV4ForCausalLM(upstream_dspark.DSparkDeepseekV4ForCausalLM):
             and os.environ.get("VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8") == "1"
         ):
             self.model.embed_tokens = Int8RowEmbedding.from_embedding(
-                self.model.embed_tokens
+                self.model.embed_tokens,
+                host=os.environ.get("VLLM_DEEPSEEK_V41_DSPARK_EMBED_HOST") == "1",
             )
         return loaded
 
@@ -787,16 +788,23 @@ class Int8RowEmbedding(torch.nn.Module):
     of the BF16 table: 0.66 GB less on the most loaded stage). A lookup
     gathers the rows and scales them back to BF16. Only the drafter's
     embedding is stored this way (draft numerics, not the target's), with
-    ``VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8=1``."""
+    ``VLLM_DEEPSEEK_V41_DSPARK_EMBED_INT8=1``. With ``host=True``
+    (``VLLM_DEEPSEEK_V41_DSPARK_EMBED_HOST=1``) the INT8 rows live in pinned
+    host memory and the lookup reads them through a UVA device view (one
+    5 KB row per drafted token over PCIe; graph-capturable, same values), which
+    frees the 0.66 GB on the last stage."""
 
-    def __init__(self, q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype):
+    def __init__(self, q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype,
+                 host_q: torch.Tensor | None = None):
         super().__init__()
+        # host_q keeps the pinned host rows alive while q is their UVA view
+        self._host_q = host_q
         self.register_buffer("q", q, persistent=False)
         self.register_buffer("scale", scale, persistent=False)
         self.out_dtype = dtype
 
     @classmethod
-    def from_embedding(cls, embedding: torch.nn.Module) -> "Int8RowEmbedding":
+    def from_embedding(cls, embedding: torch.nn.Module, host: bool = False) -> "Int8RowEmbedding":
         weight = embedding.weight.data
         if getattr(embedding, "tp_size", 1) != 1:
             raise ValueError("The INT8 drafter embedding runs at TP=1 only")
@@ -804,7 +812,10 @@ class Int8RowEmbedding(torch.nn.Module):
         # FP32 temporaries stay ~0.1 GB instead of two full FP32 copies (2.47 GiB each for the 129,280 x 5,120
         # target table, which overflowed rank 0 at load in the first PP3 boot, 2026-11-19)
         rows = weight.shape[0]
-        q = torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
+        if host:
+            q = torch.empty(weight.shape, dtype=torch.int8, device="cpu", pin_memory=True)
+        else:
+            q = torch.empty(weight.shape, dtype=torch.int8, device=weight.device)
         scale = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
         for r0 in range(0, rows, 4096):
             w = weight[r0:r0 + 4096].float()
@@ -818,6 +829,16 @@ class Int8RowEmbedding(torch.nn.Module):
             q.numel() / 1e9, weight.numel() * weight.element_size() / 1e9,
             scope="global",
         )
+        if host:
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+            torch.cuda.synchronize(weight.device)
+            view = get_accelerator_view_from_cpu_tensor(q)
+            logger.info_once(
+                "DeepSeek-V4.1 DSpark: the drafter's INT8 embedding rows are in pinned "
+                "host memory (%.2f GB), read through a UVA view", q.numel() / 1e9,
+                scope="global",
+            )
+            return cls(view, scale.squeeze(1).contiguous(), weight.dtype, host_q=q)
         return cls(q, scale.squeeze(1).contiguous(), weight.dtype)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
