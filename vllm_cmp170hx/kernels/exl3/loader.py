@@ -346,7 +346,7 @@ def load_exl3_weights(model: torch.nn.Module, model_config) -> set[str]:
         for name, header in manifest.tensors.items():
             if name in ledger.entries:
                 continue
-            if name.endswith((".trellis", ".suh", ".svh", ".mcg", ".mul1", ".q4n", ".q4nx")):
+            if name.endswith((".trellis", ".suh", ".svh", ".mcg", ".mul1", ".q4n", ".a4nx", ".q4nx")):
                 raise ValueError(f"EXL3 packed tensor has no runtime owner: {name}")
             tensor = files[header.path].get_tensor(name)
             if quant.is_dsv41 and name.endswith(".attn.compressor.ape"):
