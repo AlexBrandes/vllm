@@ -247,3 +247,22 @@ def test_ple_layout_rejects_inconsistent_headers(tmp_path, change, match):
     _write(tmp_path / "ngram_embedding.safetensors", tensors, {**metadata, **change})
     with pytest.raises(ValueError, match=match):
         Exl3Manifest(tmp_path)
+
+
+@pytest.mark.parametrize("marker", ["a4nx", "q4nx"])
+def test_a4nx_marker_and_its_pre_rename_alias_are_codebook_4(tmp_path, marker):
+    tensors = _matrix(bits_x2=5)
+    del tensors["proj.mul1"]
+    tensors[f"proj.{marker}"] = ("I32", [], struct.pack("<I", 0x83DCD12D))
+    _write(tmp_path / "model.safetensors", tensors)
+    assert Exl3Manifest(tmp_path).matrices["proj"].codebook == 4
+
+
+def test_a4nx_and_q4nx_markers_together_conflict(tmp_path):
+    tensors = _matrix(bits_x2=5)
+    del tensors["proj.mul1"]
+    for marker in ("a4nx", "q4nx"):
+        tensors[f"proj.{marker}"] = ("I32", [], struct.pack("<I", 0x83DCD12D))
+    _write(tmp_path / "model.safetensors", tensors)
+    with pytest.raises(ValueError, match="conflicting"):
+        Exl3Manifest(tmp_path)
