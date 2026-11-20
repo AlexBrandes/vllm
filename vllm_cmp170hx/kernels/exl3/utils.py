@@ -20,7 +20,15 @@ _DTYPE_BYTES = {
     "I64": 8,
     "F64": 8,
 }
-_MARKERS = {"mcg": (1, 0xCBAC1FED), "mul1": (2, 0x83DCD12D), "q4n": (3, 0x83DCD12D), "q4nx": (4, 0x83DCD12D)}
+# Codebook markers: key suffix -> (codebook id, multiplier). "a4nx" is A4NX (codebook 4); "q4nx" is the same
+# marker as written before the rename from Q4NX (FastFlowLM's Q4NX is an unrelated format), accepted as an alias.
+_MARKERS = {
+    "mcg": (1, 0xCBAC1FED),
+    "mul1": (2, 0x83DCD12D),
+    "q4n": (3, 0x83DCD12D),
+    "a4nx": (4, 0x83DCD12D),
+    "q4nx": (4, 0x83DCD12D),
+}
 PLE_AUXILIARIES = (
     "head_bias",
     "head_offsets",
@@ -194,7 +202,7 @@ class Exl3Manifest:
             self.matrices[prefix] = self._matrix(prefix, tensor)
         packed_keys = {k for matrix in self.matrices.values() for k in matrix.keys}
         for name in self.tensors:
-            if name.endswith((".suh", ".svh", ".mcg", ".mul1", ".q4n", ".q4nx")):
+            if name.endswith((".suh", ".svh", ".mcg", ".mul1", ".q4n", ".a4nx", ".q4nx")):
                 if name not in packed_keys:
                     raise ValueError(f"Orphan EXL3 quantization tensor: {name}")
             if (
