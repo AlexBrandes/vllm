@@ -106,6 +106,8 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "HYV4MTPModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
+        "Inkling2ForConditionalGeneration",
+        "Inkling2LoopForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
         "KimiK3MTPModel",
         "KimiLinearForCausalLM",
@@ -2600,7 +2602,9 @@ class VllmConfig:
                             ):
                                 widest_batch[num_spec + 1] = batch_size
                             decode_tiers = list(widest_batch.items())
-                    from vllm_cmp170hx.spec_decode.adaptive_k import adaptive_k_decode_tiers
+                    from vllm_cmp170hx.spec_decode.adaptive_k import (
+                        adaptive_k_decode_tiers,
+                    )
 
                     if tiers := adaptive_k_decode_tiers(self, default_max_graph_size):
                         max_cudagraph_capture_size, decode_tiers = tiers

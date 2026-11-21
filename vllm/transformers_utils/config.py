@@ -173,6 +173,9 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     unlimited_ocr="UnlimitedOCRConfig",
     **{"deepseek_v41": "DeepseekV41Config"},
     flint="FlintConfig",
+    inkling2="Inkling2MMConfig",
+    inkling2_loop="Inkling2LoopMMConfig",
+    inkling2_model="Inkling2ModelConfig",
     inkling_mm_model="InklingMMConfig",
     inkling_model="InklingModelConfig",
 )
