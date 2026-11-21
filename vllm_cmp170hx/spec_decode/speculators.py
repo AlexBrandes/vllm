@@ -21,6 +21,8 @@ from vllm.config import VllmConfig
 
 # The upstream speculator Sm80DFlash2Speculator extends.
 UPSTREAM_DFLASH2 = "vllm.v1.worker.gpu.spec_decode.dflash2.speculator.DFlash2Speculator"
+# vLLM's stock DSpark speculator; the plugin's Sm80DSparkSpeculator replaces it.
+UPSTREAM_DSPARK = "vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator"
 
 
 def create_speculator(vllm_config: VllmConfig, device: torch.device):
@@ -28,6 +30,11 @@ def create_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "dspark":
+        declared = getattr(speculative_config.speculator_config, "speculator_class", None)
+        if declared not in (None, UPSTREAM_DSPARK):
+            # The draft model declares its own DSpark speculator (Inkling 2's stores
+            # all tapped target features and runs a Markov head): vLLM builds it.
+            return None
         from vllm_cmp170hx.spec_decode.dspark_width import create_dspark_speculator
 
         return create_dspark_speculator(vllm_config, device)
