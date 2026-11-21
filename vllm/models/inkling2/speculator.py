@@ -15,6 +15,9 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 class Inkling2DSparkSpeculator(DSparkSpeculator):
     _speculator_name = "Inkling2 DSpark"
+    # The draft forward reshapes into blocks of num_speculative_tokens + 1; the
+    # target's per-batch-size verify K never narrows the draft block.
+    fixed_draft_block = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, req_states=None):
         super().__init__(vllm_config, device)

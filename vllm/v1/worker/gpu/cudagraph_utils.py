@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+from vllm_cmp170hx.worker import adaptive_k_graphs as sm80_ak
 
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
@@ -55,7 +56,6 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
-from vllm_cmp170hx.worker import adaptive_k_graphs as sm80_ak
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -160,6 +160,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        fixed_decode_query_len: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -168,6 +169,9 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        # Capture decode graphs at decode_query_len only: a drafter whose block is
+        # always the full width ignores the target's dynamic-SD verify lengths.
+        self.fixed_decode_query_len = fixed_decode_query_len
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
@@ -281,7 +285,9 @@ class CudaGraphManager:
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
         decode_max_reqs: dict[int, int] = {}
-        if (
+        if self.fixed_decode_query_len:
+            decode_query_lens = [self.decode_query_len]
+        elif (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
             and self.decode_query_len > self.vllm_config.num_speculative_tokens
