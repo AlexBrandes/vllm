@@ -14,6 +14,8 @@ Group-128 int8 round-to-nearest needs no calibration and works on the
 released checkpoint as is.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -65,6 +67,104 @@ def _w8_kernel(
     )
 
 
+@triton.jit
+def _w8_splitk_kernel(
+    X, W, S, P, M, N, K, SX, SW, SS, SPK, SPM, GROUPS_PER_SPLIT,
+    BM: tl.constexpr, BN: tl.constexpr, G: tl.constexpr,
+):  # fmt: skip
+    # Decode / verify (M <= 64): every row in one tile; program (n, k) covers one
+    # column tile and one K range and writes its fp32 partial to P[k] (no atomics:
+    # the reduce kernel sums the splits in a fixed order, so results do not depend
+    # on scheduling). The split count depends only on N and K, so a row's
+    # arithmetic is the same at any M (batch invariant).
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rows = tl.arange(0, BM)
+    cols = pid_n * BN + tl.arange(0, BN)
+    col_ok = cols < N
+    row_ok = rows[:, None] < M
+    ks = tl.arange(0, G)
+    acc = tl.zeros((BM, BN), tl.float32)
+    g0 = pid_k * GROUPS_PER_SPLIT
+    g1 = tl.minimum(g0 + GROUPS_PER_SPLIT, tl.cdiv(K, G))
+    for g in range(g0, g1):
+        w = tl.load(
+            W + cols[:, None].to(tl.int64) * SW + (g * G + ks)[None, :],
+            col_ok[:, None],
+            other=0,
+        )
+        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
+        x = tl.load(
+            X + rows[:, None].to(tl.int64) * SX + g * G + ks[None, :], row_ok, other=0
+        )
+        acc += tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
+    tl.store(
+        P + pid_k.to(tl.int64) * SPK + rows[:, None].to(tl.int64) * SPM + cols[None, :],
+        acc,
+        row_ok & col_ok[None, :],
+    )
+
+
+@triton.jit
+def _w8_reduce_kernel(P, Y, M, N, SPK, SPM, SY, SPLITS, BLOCK: tl.constexpr):
+    row = tl.program_id(1)
+    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = cols < N
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for s in range(0, SPLITS):
+        acc += tl.load(P + s * SPK + row * SPM + cols, ok, other=0.0)
+    tl.store(Y + row.to(tl.int64) * SY + cols, acc.to(Y.dtype.element_ty), ok)
+
+
+# Split-K decode path (VLLM_INKLING2_W8_SPLITK=1). Tunables for the CMP 170HX
+# sweep; the defaults are set from that sweep.
+W8_SPLITK = os.environ.get("VLLM_INKLING2_W8_SPLITK", "0") == "1"
+W8_SK_BN = int(os.environ.get("VLLM_INKLING2_W8_SK_BN", "64"))
+W8_SK_WARPS = int(os.environ.get("VLLM_INKLING2_W8_SK_WARPS", "4"))
+W8_SK_STAGES = int(os.environ.get("VLLM_INKLING2_W8_SK_STAGES", "3"))
+W8_SK_PROGRAMS_PER_SM = int(os.environ.get("VLLM_INKLING2_W8_SK_PPSM", "4"))
+_NUM_SMS: int | None = None
+
+
+def _num_sms(device: torch.device) -> int:
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    return _NUM_SMS
+
+
+def w8_splitk_plan(n: int, k: int, device: torch.device) -> tuple[int, int, int]:
+    """(column tiles, splits, groups per split): a function of N and K only."""
+    groups = k // GROUP
+    tiles = triton.cdiv(n, W8_SK_BN)
+    programs = W8_SK_PROGRAMS_PER_SM * _num_sms(device)
+    splits = max(1, min(groups, triton.cdiv(programs, tiles)))
+    per_split = triton.cdiv(groups, splits)
+    return tiles, triton.cdiv(groups, per_split), per_split
+
+
+def w8_matmul_splitk(
+    x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.shape
+    n = q.shape[0]
+    tiles, splits, per_split = w8_splitk_plan(n, k, x.device)
+    bm = max(16, triton.next_power_of_2(m))
+    part = torch.empty((splits, m, n), dtype=torch.float32, device=x.device)
+    _w8_splitk_kernel[(tiles, splits)](
+        x, q, scale, part, m, n, k,
+        x.stride(0), q.stride(0), scale.stride(0), part.stride(0), part.stride(1),
+        per_split, BM=bm, BN=W8_SK_BN, G=GROUP,
+        num_warps=W8_SK_WARPS, num_stages=W8_SK_STAGES,
+    )  # fmt: skip
+    block = 1024
+    _w8_reduce_kernel[(triton.cdiv(n, block), m)](
+        part, out, m, n, part.stride(0), part.stride(1), out.stride(0), splits,
+        BLOCK=block, num_warps=4,
+    )  # fmt: skip
+    return out
+
+
 def w8_matmul(
     x: torch.Tensor,
     q: torch.Tensor,
@@ -79,6 +179,8 @@ def w8_matmul(
         out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     if m == 0:
         return out
+    if W8_SPLITK and m <= 64:
+        return w8_matmul_splitk(x, q, scale, out)
     # Tiles tuned on an RTX 3090 Ti (L2-cold weights; tests/test_linear_w8.py
     # covers every branch). Decode: one row tile, column tiles narrow enough
     # to spread the weight over every SM.
