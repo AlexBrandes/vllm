@@ -106,6 +106,65 @@ def _w8_splitk_kernel(
 
 
 @triton.jit
+def _w8_gemv_kernel(
+    X, W, S, Y, M, N, K, SX, SW, SS, SY,
+    BN: tl.constexpr, G: tl.constexpr, MP: tl.constexpr,
+):  # fmt: skip
+    # M <= MP rows, no tensor cores: each program owns BN output channels and
+    # walks all of K in 128-wide groups (one scale each), int8 -> fp32 FMA with
+    # fp32 accumulation. Avoids the 16-row MMA padding and the shared-memory
+    # operand round trip that make the dot kernel latency bound at M = 1.
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    col_ok = cols < N
+    ks = tl.arange(0, G)
+    ms = tl.arange(0, MP)
+    acc = tl.zeros((BN, MP), tl.float32)
+    for g in range(0, tl.cdiv(K, G)):
+        w = tl.load(
+            W + cols[:, None].to(tl.int64) * SW + (g * G + ks)[None, :],
+            col_ok[:, None],
+            other=0,
+        ).to(tl.float32)
+        s = tl.load(S + cols.to(tl.int64) * SS + g, col_ok, other=0).to(tl.float32)
+        x = tl.load(
+            X + ms[:, None].to(tl.int64) * SX + (g * G + ks)[None, :],
+            ms[:, None] < M,
+            other=0,
+        ).to(tl.float32)
+        part = tl.sum(w[:, None, :] * x[None, :, :], axis=2)
+        acc += part * s[:, None]
+    tl.store(
+        Y + ms[None, :].to(tl.int64) * SY + cols[:, None],
+        acc.to(Y.dtype.element_ty),
+        col_ok[:, None] & (ms[None, :] < M),
+    )
+
+
+# FMA GEMV path for M <= W8_GEMV_MAX_M (VLLM_INKLING2_W8_GEMV=1).
+W8_GEMV = os.environ.get("VLLM_INKLING2_W8_GEMV", "0") == "1"
+W8_GEMV_MAX_M = int(os.environ.get("VLLM_INKLING2_W8_GEMV_MAX_M", "4"))
+W8_GEMV_BN = int(os.environ.get("VLLM_INKLING2_W8_GEMV_BN", "8"))
+W8_GEMV_WARPS = int(os.environ.get("VLLM_INKLING2_W8_GEMV_WARPS", "4"))
+W8_GEMV_STAGES = int(os.environ.get("VLLM_INKLING2_W8_GEMV_STAGES", "3"))
+
+
+def w8_matmul_gemv(
+    x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    m, k = x.shape
+    n = q.shape[0]
+    mp = max(1, triton.next_power_of_2(m))
+    _w8_gemv_kernel[(triton.cdiv(n, W8_GEMV_BN),)](
+        x, q, scale, out, m, n, k,
+        x.stride(0), q.stride(0), scale.stride(0), out.stride(0),
+        BN=W8_GEMV_BN, G=GROUP, MP=mp,
+        num_warps=W8_GEMV_WARPS, num_stages=W8_GEMV_STAGES,
+    )  # fmt: skip
+    return out
+
+
+@triton.jit
 def _w8_reduce_kernel(P, Y, M, N, SPK, SPM, SY, SPLITS, BLOCK: tl.constexpr):
     row = tl.program_id(1)
     cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -181,6 +240,8 @@ def w8_matmul(
         out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     if m == 0:
         return out
+    if W8_GEMV and m <= W8_GEMV_MAX_M:
+        return w8_matmul_gemv(x, q, scale, out)
     if W8_SPLITK and m <= 64:
         return w8_matmul_splitk(x, q, scale, out)
     # Tiles tuned on an RTX 3090 Ti (L2-cold weights; tests/test_linear_w8.py
