@@ -123,6 +123,8 @@ W8_SK_BN = int(os.environ.get("VLLM_INKLING2_W8_SK_BN", "64"))
 W8_SK_WARPS = int(os.environ.get("VLLM_INKLING2_W8_SK_WARPS", "4"))
 W8_SK_STAGES = int(os.environ.get("VLLM_INKLING2_W8_SK_STAGES", "3"))
 W8_SK_PROGRAMS_PER_SM = int(os.environ.get("VLLM_INKLING2_W8_SK_PPSM", "4"))
+# Rows at which W8Linear(keep_bf16=True) switches to the bf16 weight (0 = off).
+W8_PREFILL_BF16_MIN_M = int(os.environ.get("VLLM_INKLING2_W8_PREFILL_BF16_MIN_M", "0"))
 _NUM_SMS: int | None = None
 
 
@@ -209,13 +211,20 @@ def w8_matmul(
 class W8Linear:
     """`x @ weight.T` for a bf16 `weight [N, K]`, as int8 W8A16."""
 
-    def __init__(self, weight: torch.Tensor) -> None:
+    def __init__(self, weight: torch.Tensor, keep_bf16: bool = False) -> None:
         self.size_n, self.size_k = weight.shape
         self.q, self.scale = quantize_int8(weight)
+        # Prefill (M >= W8_PREFILL_BF16_MIN_M) on the original bf16 weight via
+        # cuBLAS, which beats the dequantizing Triton kernel at large M.
+        self.bf16 = weight.contiguous() if keep_bf16 else None
 
     def __call__(
         self, x: torch.Tensor, out: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if self.bf16 is not None and x.shape[0] >= W8_PREFILL_BF16_MIN_M:
+            if out is None:
+                return torch.nn.functional.linear(x, self.bf16)
+            return torch.matmul(x, self.bf16.t(), out=out)
         return w8_matmul(x.contiguous(), self.q, self.scale, out)
 
     def multi(
@@ -224,6 +233,11 @@ class W8Linear:
         """`inputs[i] @ weight[col_ranges[i]].T` for each i, reading the weight
         once when the stacked rows fit one decode tile, else one launch each."""
         rows = [x.shape[0] for x in inputs]
+        if self.bf16 is not None and min(rows) >= W8_PREFILL_BF16_MIN_M:
+            return [
+                torch.nn.functional.linear(x, self.bf16[lo:hi])
+                for x, (lo, hi) in zip(inputs, col_ranges)
+            ]
         if sum(rows) <= 32:
             y = w8_matmul(torch.cat(inputs), self.q, self.scale)
             out, start = [], 0

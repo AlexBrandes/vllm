@@ -50,7 +50,7 @@ from vllm.v1.kv_cache_interface import (
 
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
-from .ops import is_sm8x, use_sm12x_path, use_sm100_kernels
+from .ops import is_sm8x, linear_w8, use_sm12x_path, use_sm100_kernels
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
@@ -313,12 +313,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
         # HyperInkling: int8 W8A16 projections (`ops.linear_w8`); the bf16
         # weights are then dropped.
-        self.w8: dict[str, W8Linear] | None = None
+        self.w8 = None
         if os.environ.get("HYPERINKLING_ATTN_W8") == "1":
             used = sum(self.split_sizes[:6])  # without the alignment pad rows
+            keep = linear_w8.W8_PREFILL_BF16_MIN_M > 0
             self.w8 = {
-                "qkvr": W8Linear(self.qkvr.weight.data[:used]),
-                "wo": W8Linear(self.wo_ud.weight.data),
+                "qkvr": W8Linear(self.qkvr.weight.data[:used], keep_bf16=keep),
+                "wo": W8Linear(self.wo_ud.weight.data, keep_bf16=keep),
             }
             for layer in (self.qkvr, self.wo_ud):
                 layer.weight.data = layer.weight.data.new_empty((0,))
