@@ -12,6 +12,7 @@ controller. Each sublayer's short conv runs fused with the next AttnRes mix
 (and small batches at TP > 1 with its all-reduce); without sequence parallel.
 """
 
+import os
 from collections.abc import Sequence
 
 import torch
@@ -29,12 +30,15 @@ from .model import (
 from .ops import use_sm12x_path
 from .ops.attn_res import attn_res
 from .ops.bgemv import MAX_M as BGEMV_MAX_M
-from .ops.bgemv import controller_gemv
+from .ops.bgemv import controller_gemv, pair_controller_gemv
 from .ops.linear import linear_k_groups
 from .ops.loop import blend_rms_norm, pair_rms_norm
 from .sconv import conv_metadata
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
+
+
+_FUSE_PAIRNORM = os.environ.get("VLLM_INKLING2_FUSE_PAIRNORM", "0") == "1"
 
 
 class Inkling2MessageController(nn.Module):
@@ -123,6 +127,20 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
         broadcast over streams) and `message`, each output RMS-normalized
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
+        if (
+            _FUSE_PAIRNORM
+            and message.shape[1] <= BGEMV_MAX_M
+            and use_sm12x_path()
+            and message.is_contiguous()
+        ):
+            # pair_rms_norm folded into the controller GEMVs (pair_controller_gemv).
+            gain_forget = pair_controller_gemv(
+                dest,
+                message,
+                self.controller_down[streams],
+                self.controller_gain_forget[streams],
+            )
+            return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
         pair = pair_rms_norm(dest, message)
         if pair.shape[1] <= BGEMV_MAX_M and use_sm12x_path():
             # HyperInkling: decode-size controllers on a batched Triton GEMV
