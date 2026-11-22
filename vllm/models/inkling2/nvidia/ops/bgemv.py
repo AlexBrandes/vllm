@@ -251,8 +251,9 @@ def _pair_up_from_partials_kernel(
             P + base_m * R + rows[:, None] * R + rs[None, :], rs[None, :] < R, other=0.0
         )
         sqm += tl.load(Q + base_m + rows)
-    rstd_d = 1.0 / tl.sqrt(tl.div_rn(sqd, D) + eps)
-    rstd_m = 1.0 / tl.sqrt(tl.div_rn(sqm, D) + eps)
+    d_f = D.to(tl.float32)
+    rstd_d = 1.0 / tl.sqrt(tl.div_rn(sqd, d_f) + eps)
+    rstd_m = 1.0 / tl.sqrt(tl.div_rn(sqm, d_f) + eps)
     hidden = hd * rstd_d[:, None] + hm * rstd_m[:, None]
     w = tl.load(
         W + s.to(tl.int64) * SWS + cols[None, :].to(tl.int64) * SWN + rs[:, None],
