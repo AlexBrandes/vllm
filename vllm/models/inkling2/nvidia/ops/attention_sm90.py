@@ -14,11 +14,125 @@ of the rows' visible range, so a split count that depends only on the batch
 holds for every replay of a CUDA graph.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
 
-from .fp8_emu import e4m3_decode_fp16_scaled
+from .fp8_emu import (
+    e4m3_decode_bf16,
+    e4m3_decode_fp16_scaled,
+    e4m3_decode_fp16_scaled_x4,
+)
+
+# VLLM_INKLING2_FP8_PRMT=1: decode SM8x E4M3 KV four codes per word (prmt/lop3),
+# bit-identical to the scalar decode.
+_FP8_PRMT = tl.constexpr(os.environ.get("VLLM_INKLING2_FP8_PRMT", "0") == "1")
+# Screening knobs for the SM8x E4M3 prefill path: load K codes already transposed
+# ([D, N], as the bf16 path does) instead of [N, D] + .T; query tile rows and warps
+# for byte-KV launches with more than 128 rows (0 = the default tiling).
+_FP8_KT = tl.constexpr(os.environ.get("VLLM_INKLING2_FP8_KT", "0") == "1")
+_FP8_BM = int(os.environ.get("VLLM_INKLING2_FP8_BM", "0"))
+_FP8_WARPS = int(os.environ.get("VLLM_INKLING2_FP8_WARPS", "0"))
+_FP8_BN = int(os.environ.get("VLLM_INKLING2_FP8_BN", "0"))
+# VLLM_INKLING2_FP8_STAGE=1: for full-layer prefill tiles over a byte (E4M3) cache,
+# decode each request's visible pages once into a bf16 scratch (exact: every E4M3
+# value is a bf16) and run the bf16 kernel on it, instead of every query tile
+# re-decoding every key block.
+_FP8_STAGE = os.environ.get("VLLM_INKLING2_FP8_STAGE", "0") == "1"
+_STAGE_SCRATCH: dict = {}
+
+
+def ensure_fp8_stage_scratch(max_model_len: int, num_kv_heads: int, row: int) -> None:
+    """Allocate the bf16 staging scratch once per device (VLLM_INKLING2_FP8_STAGE=1):
+    `round_up(max_model_len, 256) + 256` tokens x `num_kv_heads` x `row` (K|V)
+    elements, so one request at max_model_len always fits; larger batches fall back
+    to the in-kernel decode."""
+    if not _FP8_STAGE or not torch.accelerator.is_available():
+        return
+    device = torch.accelerator.current_accelerator()
+    assert device is not None
+    device = torch.device(device.type, torch.accelerator.current_device_index())
+    tokens = (max_model_len + 255) // 256 * 256 + 256
+    need = tokens * num_kv_heads * row
+    buf = _STAGE_SCRATCH.get(device)
+    if buf is None or buf.numel() < need:
+        _STAGE_SCRATCH[device] = torch.empty(need, dtype=torch.bfloat16, device=device)
+
+
+@triton.jit
+def _stage_fp8_kv_kernel(
+    KV,
+    BlockTable,
+    SeqLens,
+    Out,
+    stride_kv_blk,
+    stride_kv_slot,
+    stride_kv_h,
+    stride_bt,
+    max_pages,
+    PAGE: tl.constexpr,
+    HEADS: tl.constexpr,
+    C: tl.constexpr,
+):
+    """Decode page `p` of request `r` (one [PAGE, KV heads, K|V] block of bytes)
+    into scratch page `r * max_pages + p` (bf16, same layout)."""
+    p = tl.program_id(0)
+    r = tl.program_id(1)
+    seqlen = tl.load(SeqLens + r)
+    if p * PAGE >= seqlen:
+        return
+    blk = tl.load(BlockTable + r.to(tl.int64) * stride_bt + p).to(tl.int64)
+    dst = (r.to(tl.int64) * max_pages + p) * (PAGE * HEADS * C)
+    offs_h = tl.arange(0, HEADS)
+    offs_c = tl.arange(0, C)
+    src = KV + blk * stride_kv_blk + offs_h[:, None] * stride_kv_h + offs_c[None, :]
+    out = Out + dst + offs_h[:, None] * C + offs_c[None, :]
+    for slot in range(PAGE):
+        codes = tl.load(src + slot * stride_kv_slot)
+        tl.store(out + slot * (HEADS * C), e4m3_decode_bf16(codes))
+
+
+def _stage_fp8_kv(
+    kv_bytes: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """bf16 copy of each request's first `ceil(seqlen / PAGE)` pages and its block
+    table (request r owns scratch pages `r * max_pages ...`); `kv_bytes` is the
+    layer's [blocks, PAGE, KV heads, 2 * D] byte cache. None if the preallocated
+    scratch is too small (the caller then decodes in the kernel)."""
+    num_reqs = cache_seqlens.shape[0]
+    page, heads, c = kv_bytes.shape[1:4]
+    assert kv_bytes.stride(3) == 1
+    max_pages = triton.cdiv(max_seq_len, page)
+    need = num_reqs * max_pages * page * heads * c
+    buf = _STAGE_SCRATCH.get(kv_bytes.device)
+    if buf is None or buf.numel() < need:
+        return None
+    _stage_fp8_kv_kernel[(max_pages, num_reqs)](
+        kv_bytes,
+        block_table,
+        cache_seqlens,
+        buf,
+        kv_bytes.stride(0),
+        kv_bytes.stride(1),
+        kv_bytes.stride(2),
+        block_table.stride(0),
+        max_pages,
+        PAGE=page,
+        HEADS=heads,
+        C=c,
+        num_warps=4,
+    )
+    scratch = buf[:need].view(num_reqs * max_pages, page, heads, c)
+    table = torch.arange(
+        num_reqs * max_pages, device=kv_bytes.device, dtype=torch.int32
+    )
+    return scratch, table.view(num_reqs, max_pages)
+
 
 # SM8x E4M3 KV loads come back scaled by 2^-8 (`e4m3_decode_fp16_scaled`).
 _U8_KV_SCALE = tl.constexpr(256.0)
@@ -49,6 +163,8 @@ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
             other=0,
         )
         # fp16 holding value * 2^-8 (see `_U8_KV_SCALE` in the kernel).
+        if _FP8_PRMT:
+            return e4m3_decode_fp16_scaled_x4(codes)
         return e4m3_decode_fp16_scaled(codes)
     # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
     half = tl.arange(0, D // 2)
@@ -177,7 +293,17 @@ def _rel_attention_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        if K.dtype.element_ty.primitive_bitwidth == 8:
+        if U8_KV and _FP8_KT:
+            k_codes = tl.load(
+                K + kv_ptrs[None, :] + offs_d[:, None],
+                mask=key_valid[None, :],
+                other=0,
+            )
+            if _FP8_PRMT:
+                k = e4m3_decode_fp16_scaled_x4(k_codes)
+            else:
+                k = e4m3_decode_fp16_scaled(k_codes)
+        elif K.dtype.element_ty.primitive_bitwidth == 8:
             k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
         else:
             k = tl.load(
@@ -275,6 +401,7 @@ def rel_attention(
     window: int,
     num_splits: int,
     mode: int,
+    max_seq_len: int = 0,
 ) -> None:
     """Launch `_rel_attention_kernel` over the requests of `cu_seqlens_q`.
 
@@ -289,6 +416,25 @@ def rel_attention(
     """
     num_tokens, num_heads, head_dim = q.shape
     page, num_kv_heads = key_cache.shape[1:3]
+    if (
+        _FP8_STAGE
+        and key_cache.dtype == torch.uint8
+        and window == 0
+        and rel_logits is not None
+        and max_query_len * (num_heads // num_kv_heads) > 128
+        and max_seq_len
+    ):
+        # key_cache / value_cache: K / V halves of one [blocks, PAGE, KV, 2D] cache.
+        kv_bytes = torch.as_strided(
+            key_cache,
+            (key_cache.shape[0], page, num_kv_heads, 2 * head_dim),
+            key_cache.stride(),
+            key_cache.storage_offset(),
+        )
+        staged = _stage_fp8_kv(kv_bytes, block_table, cache_seqlens, max_seq_len)
+        if staged is not None:
+            scratch, block_table = staged
+            key_cache, value_cache = scratch.split(head_dim, dim=-1)
     group = num_heads // num_kv_heads
     assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
     assert q.stride(2) == 1
@@ -309,6 +455,11 @@ def rel_attention(
     if lse is None:
         lse = out
     block_m = _block_m(max_query_len, group)
+    u8_wide = (
+        key_cache.dtype == torch.uint8 and _FP8_BM > 0 and max_query_len * group > 128
+    )
+    if u8_wide:
+        block_m = _FP8_BM
     tokens_per_tile = block_m // group
     num_reqs = cache_seqlens.shape[0]
     grid = (
@@ -358,7 +509,17 @@ def rel_attention(
         DRAFT=draft,
         MODE=mode,
         BLOCK_M=block_m,
-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
-        num_warps=8 if block_m >= 128 else 4,
+        BLOCK_N=(
+            _FP8_BN
+            if u8_wide and _FP8_BN
+            else 64
+            if block_m >= 128
+            else 128
+            if block_m <= 32
+            else 64
+        ),
+        num_warps=(
+            _FP8_WARPS if u8_wide and _FP8_WARPS else 8 if block_m >= 128 else 4
+        ),
         num_stages=2,
     )

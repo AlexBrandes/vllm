@@ -40,6 +40,36 @@ def e4m3_decode_fp16_scaled(b):
 
 
 @triton.jit
+def e4m3_decode_fp16_scaled_x4(b):
+    """`e4m3_decode_fp16_scaled`, bit-identical, four codes per 32-bit word:
+    `prmt` puts two codes into the high bytes of a register's 16-bit lanes
+    (code << 8), then `(x >> 1) & 0x3F80` lands the magnitude bits in FP16's
+    exponent/mantissa field and `lop3` keeps the sign bit. About 2 integer
+    ops per element instead of 6-7: the prefill attention's per-tile decode
+    is ALU-bound on SM8x (each query tile re-decodes the visible keys)."""
+    return tl.inline_asm_elementwise(
+        """{
+        .reg .b32 x, y;
+        prmt.b32 x, $2, 0, 0x1404;
+        shr.b32 y, x, 1;
+        and.b32 y, y, 0x3F803F80;
+        lop3.b32 $0, x, y, 0x80008000, 0xEC;
+        prmt.b32 x, $2, 0, 0x3424;
+        shr.b32 y, x, 1;
+        and.b32 y, y, 0x3F803F80;
+        lop3.b32 $1, x, y, 0x80008000, 0xEC;
+        }""",
+        # One fp16 output, four elements per instance: two 32-bit registers
+        # ($0 = elements 0-1, $1 = elements 2-3) from one register of codes.
+        "=r,=r,r",
+        [b],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=4,
+    )
+
+
+@triton.jit
 def e4m3_decode_bf16(b):
     """uint8 E4M3 codes -> bf16, integer ops only (every E4M3 value is exact
     in bf16): the attention's inner-loop decode."""

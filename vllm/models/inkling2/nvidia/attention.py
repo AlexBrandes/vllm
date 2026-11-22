@@ -58,7 +58,7 @@ from .ops.attention import (
     plan_decode_attention,
     rel_decode_attention,
 )
-from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
+from .ops.attention_sm90 import MODE_OUT_LSE, ensure_fp8_stage_scratch, rel_attention
 from .ops.linear import linear
 from .ops.linear_w8 import W8Linear
 from .ops.sconv import attention_prologue, shift_rel_proj
@@ -298,6 +298,15 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
+        if self.fp8_kv and is_sm8x() and not is_local:
+            # Full-layer prefill decodes E4M3 pages into a bf16 scratch
+            # (VLLM_INKLING2_FP8_STAGE), allocated here before the KV cache is sized,
+            # for one max_model_len request.
+            ensure_fp8_stage_scratch(
+                vllm_config.model_config.max_model_len,
+                self.num_kv_heads,
+                2 * self.head_dim,
+            )
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         self.kv_cache = torch.tensor([])
@@ -662,6 +671,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 window=self.sliding_window if self.is_local else 0,
                 num_splits=1,
                 mode=MODE_OUT_LSE,
+                max_seq_len=md.max_seq_len,
             )
             out[nt:].zero_()
             lse[:, nt:].zero_()
