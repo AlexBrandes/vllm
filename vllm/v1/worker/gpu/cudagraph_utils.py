@@ -303,11 +303,12 @@ class CudaGraphManager:
                 vllm_max_batch_size=self.max_num_reqs,
                 vllm_num_speculative_tokens=self.vllm_config.num_speculative_tokens,
             )
+            from vllm.v1.spec_decode.dynamic.adaptive_k import adaptive_candidates
+
+            # HyperInkling adaptive verify length: any candidate can be chosen.
+            spec_lens = set(dense_schedule[1:]) | set(adaptive_candidates() or [])
             decode_query_lens = sorted(
-                {
-                    num_spec + num_new_sampled_tokens_per_step
-                    for num_spec in dense_schedule[1:]
-                }
+                {num_spec + num_new_sampled_tokens_per_step for num_spec in spec_lens}
             )
         elif ak := sm80_ak.decode_query_lens(self):
             decode_query_lens, decode_max_reqs = ak

@@ -83,12 +83,30 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.adaptive_k import (
+    AdaptiveVerifyLength,
+    adaptive_candidates,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _uniform_decode_key(scheduler_output: SchedulerOutput) -> tuple[int, int] | None:
+    """(batch, verify length) of a step whose every request decoded 1 + k tokens
+    with the same k, else None (HyperInkling adaptive verify length)."""
+    tokens = scheduler_output.num_scheduled_tokens
+    if not tokens:
+        return None
+    spec = scheduler_output.scheduled_spec_decode_tokens
+    lengths = set(tokens.values())
+    if len(lengths) != 1 or len(spec) != len(tokens):
+        return None
+    (n,) = lengths
+    return len(tokens), n - 1
 
 
 class Scheduler(SchedulerInterface):
@@ -328,6 +346,7 @@ class Scheduler(SchedulerInterface):
             self.num_lookahead_tokens > 0 and vllm_config.use_v2_model_runner
         )
         self.dynamic_sd_lookup: list[int] | None = None
+        self.hi_adaptive_k: AdaptiveVerifyLength | None = None
         # Per-step verify / draft widths; the fork scheduler's adaptive k sets them.
         self.cur_num_spec_tokens = self.num_spec_tokens
         self.next_num_spec_tokens = self.num_spec_tokens
@@ -338,6 +357,9 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
+            # HyperInkling: the verify length chosen online (adaptive_k.py).
+            if self.dynamic_sd_lookup is not None and (cands := adaptive_candidates()):
+                self.hi_adaptive_k = AdaptiveVerifyLength(cands, self.num_spec_tokens)
             self.use_eagle = speculative_config.uses_target_hidden_states
             self.use_eagle_block_drop = speculative_config.use_eagle_block_drop()
             if (
@@ -1775,9 +1797,11 @@ class Scheduler(SchedulerInterface):
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.next_num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+            num_spec_tokens_to_schedule = (
+                self.dynamic_sd_lookup[len(num_scheduled_tokens)]
+                if self.hi_adaptive_k is None
+                else self.hi_adaptive_k.choose(len(num_scheduled_tokens))
+            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -2346,6 +2370,8 @@ class Scheduler(SchedulerInterface):
             model_runner_output.prompt_token_id_logprobs_dict
         )
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self.hi_adaptive_k is not None:
+            self.hi_adaptive_k.observe_step(_uniform_decode_key(scheduler_output))
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
@@ -2434,6 +2460,8 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                if self.hi_adaptive_k is not None and not output_is_stale:
+                    self.hi_adaptive_k.observe_request(num_draft_tokens, num_accepted)
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption
