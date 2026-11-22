@@ -269,15 +269,89 @@ def w8_matmul(
     return out
 
 
+# Marlin W8A16 (uint8b128, g128) for M <= W8_MARLIN_MAX_M (VLLM_INKLING2_W8_MARLIN=1).
+W8_MARLIN = os.environ.get("VLLM_INKLING2_W8_MARLIN", "0") == "1"
+W8_MARLIN_MAX_M = int(os.environ.get("VLLM_INKLING2_W8_MARLIN_MAX_M", "64"))
+
+
+def to_marlin_w8(q: torch.Tensor, scale: torch.Tensor):
+    """int8 `[N, K]` + bf16 scales `[N, K / GROUP]` -> Marlin uint8b128 weight,
+    permuted scales and the padded N (a multiple of 64)."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_permute_scales,
+    )
+
+    n, k = q.shape
+    pad = -n % 64
+    if pad:
+        q = torch.nn.functional.pad(q, (0, 0, 0, pad))
+        scale = torch.nn.functional.pad(scale, (0, 0, 0, pad), value=1.0)
+    n_pad = n + pad
+    packed = torch.empty((k // 4, n_pad), dtype=torch.int32, device=q.device)
+    for lo in range(0, n_pad, 16384):
+        qu = (q[lo : lo + 16384].to(torch.int64) + 128).t()  # GPTQ [K, N] rows
+        acc = torch.zeros((k // 4, qu.shape[1]), dtype=torch.int64, device=q.device)
+        for i in range(4):
+            acc |= qu[i::4] << (8 * i)
+        packed[:, lo : lo + 16384] = torch.where(acc >= 2**31, acc - 2**32, acc).to(
+            torch.int32
+        )
+    marlin_q = ops.gptq_marlin_repack(packed, k, n_pad, 8)
+    marlin_s = marlin_permute_scales(scale.t().contiguous(), k, n_pad, GROUP)
+    return marlin_q, marlin_s, n_pad
+
+
+def w8_matmul_marlin(x: torch.Tensor, lin: "W8Linear") -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        apply_gptq_marlin_linear,
+    )
+    from vllm.scalar_type import scalar_types
+
+    y = apply_gptq_marlin_linear(
+        input=x,
+        weight=lin.marlin_q,
+        weight_scale=lin.marlin_s,
+        weight_zp=lin.marlin_zp,
+        workspace=lin.marlin_ws,
+        wtype=scalar_types.uint8b128,
+        output_size_per_partition=lin.marlin_n,
+        input_size_per_partition=lin.size_k,
+    )
+    return y[:, : lin.size_n] if lin.marlin_n != lin.size_n else y
+
+
 class W8Linear:
     """`x @ weight.T` for a bf16 `weight [N, K]`, as int8 W8A16."""
 
-    def __init__(self, weight: torch.Tensor, keep_bf16: bool = False) -> None:
+    def __init__(
+        self, weight: torch.Tensor, keep_bf16: bool = False, marlin: bool = False
+    ) -> None:
         self.size_n, self.size_k = weight.shape
         self.q, self.scale = quantize_int8(weight)
         # Prefill (M >= W8_PREFILL_BF16_MIN_M) on the original bf16 weight via
         # cuBLAS, which beats the dequantizing Triton kernel at large M.
         self.bf16 = weight.contiguous() if keep_bf16 else None
+        self.marlin_q = None
+        if W8_MARLIN and marlin:
+            from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+                marlin_make_empty,
+                marlin_make_workspace_new,
+            )
+
+            self.marlin_q, self.marlin_s, self.marlin_n = to_marlin_w8(
+                self.q, self.scale
+            )
+            self.marlin_zp = marlin_make_empty(weight.device)
+            self.marlin_ws = marlin_make_workspace_new(weight.device)
+
+    def _small(self, x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+        if self.marlin_q is not None and x.shape[0] <= W8_MARLIN_MAX_M:
+            y = w8_matmul_marlin(x.contiguous(), self)
+            if out is None:
+                return y
+            return out.copy_(y)
+        return w8_matmul(x.contiguous(), self.q, self.scale, out)
 
     def __call__(
         self, x: torch.Tensor, out: torch.Tensor | None = None
@@ -286,7 +360,7 @@ class W8Linear:
             if out is None:
                 return torch.nn.functional.linear(x, self.bf16)
             return torch.matmul(x, self.bf16.t(), out=out)
-        return w8_matmul(x.contiguous(), self.q, self.scale, out)
+        return self._small(x, out)
 
     def multi(
         self, inputs: list[torch.Tensor], col_ranges: list[tuple[int, int]]
@@ -299,8 +373,10 @@ class W8Linear:
                 torch.nn.functional.linear(x, self.bf16[lo:hi])
                 for x, (lo, hi) in zip(inputs, col_ranges)
             ]
-        if sum(rows) <= 32:
-            y = w8_matmul(torch.cat(inputs), self.q, self.scale)
+        if sum(rows) <= 32 or (
+            self.marlin_q is not None and sum(rows) <= W8_MARLIN_MAX_M
+        ):
+            y = self._small(torch.cat(inputs), None)
             out, start = [], 0
             for r, (lo, hi) in zip(rows, col_ranges):
                 out.append(y[start : start + r, lo:hi])

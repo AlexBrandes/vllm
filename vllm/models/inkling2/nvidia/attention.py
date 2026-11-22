@@ -318,8 +318,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             used = sum(self.split_sizes[:6])  # without the alignment pad rows
             keep = linear_w8.W8_PREFILL_BF16_MIN_M > 0
             self.w8 = {
-                "qkvr": W8Linear(self.qkvr.weight.data[:used], keep_bf16=keep),
-                "wo": W8Linear(self.wo_ud.weight.data, keep_bf16=keep),
+                "qkvr": W8Linear(
+                    self.qkvr.weight.data[:used], keep_bf16=keep, marlin=True
+                ),
+                "wo": W8Linear(self.wo_ud.weight.data, keep_bf16=keep, marlin=True),
             }
             for layer in (self.qkvr, self.wo_ud):
                 layer.weight.data = layer.weight.data.new_empty((0,))
