@@ -62,6 +62,16 @@ def _resolve_reasoning_effort(value: object) -> float | int | None:
     return value
 
 
+def _requested_reasoning_effort(kwargs: dict) -> object:
+    """The request's ``reasoning_effort``; when it gives none, the common
+    ``enable_thinking: false`` switch (Qwen/GLM/DeepSeek templates) maps to
+    ``"none"`` instead of silently thinking at the default effort."""
+    effort = kwargs.get("reasoning_effort")
+    if effort is None and kwargs.get("enable_thinking") is False:
+        return "none"
+    return effort
+
+
 def _resolve_inkling2_reasoning_effort(value: object) -> float:
     """Like the reference, also accept numeric strings and reject the rest."""
     if isinstance(value, str) and value not in _NAMED_REASONING_EFFORT:
@@ -158,7 +168,7 @@ class InklingRenderer(BaseRenderer[HfTokenizer]):
                     # a0d ChatParams has no parallel_tool_calls (upstream default True)
                     parallel_tool_calls=getattr(params, "parallel_tool_calls", True),
                     reasoning_effort=_resolve_inkling2_reasoning_effort(
-                        kwargs.get("reasoning_effort")
+                        _requested_reasoning_effort(kwargs)
                     ),
                     continue_final_message=bool(kwargs.get("continue_final_message")),
                 )
@@ -168,7 +178,7 @@ class InklingRenderer(BaseRenderer[HfTokenizer]):
                 add_generation_prompt=kwargs.get("add_generation_prompt", True),
                 tools=kwargs.get("tools"),
                 reasoning_effort=_resolve_reasoning_effort(
-                    kwargs.get("reasoning_effort")
+                    _requested_reasoning_effort(kwargs)
                 ),
             )
         except ValueError:

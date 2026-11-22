@@ -13,6 +13,7 @@ import pytest
 from vllm.renderers.inkling import (
     InklingRenderer,
     _HfBackedTmlTokenizer,
+    _requested_reasoning_effort,
     _resolve_reasoning_effort,
 )
 from vllm.renderers.inkling_encoding import (
@@ -482,3 +483,17 @@ def test_render_inkling_messages_direct_protocol():
         add_generation_prompt=True,
     )
     assert ids == [200000, 200004, ord("h"), ord("i"), 200010, 200001]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, None),
+        ({"enable_thinking": False}, "none"),
+        ({"enable_thinking": True}, None),
+        ({"enable_thinking": False, "reasoning_effort": "high"}, "high"),
+        ({"reasoning_effort": 0.2}, 0.2),
+    ],
+)
+def test_requested_reasoning_effort(kwargs, expected):
+    assert _requested_reasoning_effort(kwargs) == expected
