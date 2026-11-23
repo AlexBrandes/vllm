@@ -36,6 +36,12 @@ _FP8_KT = tl.constexpr(os.environ.get("VLLM_INKLING2_FP8_KT", "0") == "1")
 _FP8_BM = int(os.environ.get("VLLM_INKLING2_FP8_BM", "0"))
 _FP8_WARPS = int(os.environ.get("VLLM_INKLING2_FP8_WARPS", "0"))
 _FP8_BN = int(os.environ.get("VLLM_INKLING2_FP8_BN", "0"))
+# Prefill tiling knobs for any KV dtype (launches with more than 128 rows; 0 = default):
+# VLLM_INKLING2_PF_BM / _BN / _WARPS / _STAGES.
+_PF_BM = int(os.environ.get("VLLM_INKLING2_PF_BM", "0"))
+_PF_BN = int(os.environ.get("VLLM_INKLING2_PF_BN", "0"))
+_PF_WARPS = int(os.environ.get("VLLM_INKLING2_PF_WARPS", "0"))
+_PF_STAGES = int(os.environ.get("VLLM_INKLING2_PF_STAGES", "0"))
 # VLLM_INKLING2_FP8_STAGE=1: for full-layer prefill tiles over a byte (E4M3) cache,
 # decode each request's visible pages once into a bf16 scratch (exact: every E4M3
 # value is a bf16) and run the bf16 kernel on it, instead of every query tile
@@ -460,6 +466,9 @@ def rel_attention(
     )
     if u8_wide:
         block_m = _FP8_BM
+    pf_tune = max_query_len * group > 128 and not u8_wide
+    if pf_tune and _PF_BM:
+        block_m = _PF_BM
     tokens_per_tile = block_m // group
     num_reqs = cache_seqlens.shape[0]
     grid = (
@@ -512,6 +521,8 @@ def rel_attention(
         BLOCK_N=(
             _FP8_BN
             if u8_wide and _FP8_BN
+            else _PF_BN
+            if pf_tune and _PF_BN
             else 64
             if block_m >= 128
             else 128
@@ -519,7 +530,13 @@ def rel_attention(
             else 64
         ),
         num_warps=(
-            _FP8_WARPS if u8_wide and _FP8_WARPS else 8 if block_m >= 128 else 4
+            _FP8_WARPS
+            if u8_wide and _FP8_WARPS
+            else _PF_WARPS
+            if pf_tune and _PF_WARPS
+            else 8
+            if block_m >= 128
+            else 4
         ),
-        num_stages=2,
+        num_stages=_PF_STAGES if pf_tune and _PF_STAGES else 2,
     )
