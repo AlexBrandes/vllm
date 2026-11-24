@@ -154,6 +154,33 @@ def _w8_linear(x: torch.Tensor, w8: torch.Tensor, sw: torch.Tensor,
     return out
 
 
+# One launch for every wo_a group (w8_decode_grouped_mm; each group's arithmetic is w8_decode_mm's, so the output
+# is bit for bit the per-group loop's) instead of G launches + G column copies. Card 1, 6 rows, wo_a 8 x [1024,
+# 4096]: 96.6 -> 25.4 us per layer. VLLM_EXL3_DENSE_W8_GROUPED=0 restores the loop.
+GROUPED = os.environ.get("VLLM_EXL3_DENSE_W8_GROUPED", "1") == "1"
+# VLLM_EXL3_DENSE_W8_GROUPED_ACT=1: the grouped projection's activation quantisation reads x [T, G, K] in place
+# (exl3_i8_lab.act_int8_dec_grouped, register-resident) instead of a transposed copy + act_int8; same bytes.
+GROUPED_ACT = os.environ.get("VLLM_EXL3_DENSE_W8_GROUPED_ACT", "0") == "1"
+_tables: dict[tuple[int, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _group_tables(w8s: list[torch.Tensor], sws: list[torch.Tensor]):
+    """Device int64 tables of the groups' weight / scale pointers, built once per layer (outside CUDA graph
+    capture; None while capturing an unseen layer, which then takes the per-group loop)."""
+    key = tuple(w.data_ptr() for w in w8s) + tuple(s.data_ptr() for s in sws)
+    tab = _tables.get(key)
+    if tab is None:
+        if not all(w.is_contiguous() for w in w8s) or not all(s.is_contiguous() for s in sws):
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        dev = w8s[0].device
+        tab = (torch.tensor([w.data_ptr() for w in w8s], dtype=torch.int64, device=dev),
+               torch.tensor([s.data_ptr() for s in sws], dtype=torch.int64, device=dev))
+        _tables[key] = tab
+    return tab
+
+
 def _w8_grouped(x: torch.Tensor, w8s: list[torch.Tensor], sws: list[torch.Tensor],
                 suh: torch.Tensor) -> torch.Tensor:
     """A block-diagonal projection whose groups share one input sign vector
@@ -168,14 +195,28 @@ def _w8_grouped(x: torch.Tensor, w8s: list[torch.Tensor], sws: list[torch.Tensor
     if t == 0:
         return x.new_empty((0, g * n))
     m = g * t
-    xs = x.transpose(0, 1).reshape(m, k).contiguous()
     xq = torch.empty((m, k), dtype=torch.int8, device=x.device)
     sx = torch.empty((m,), dtype=torch.float32, device=x.device)
-    if DECODE and m <= 16 and k % 128 == 0:
+    if (GROUPED_ACT and DECODE and GROUPED and t <= 16 and k % 128 == 0 and x.is_contiguous()
+            and hasattr(torch.ops.exl3_i8_lab, "act_int8_dec_grouped")):
+        # Group-major rows read in place (no transposed copy); the same per-row quantisation.
+        torch.ops.exl3_i8_lab.act_int8_dec_grouped(x, suh, xq, sx)
+        xs = None
+    else:
+        xs = x.transpose(0, 1).reshape(m, k).contiguous()
+    if xs is None:
+        pass
+    elif DECODE and m <= 16 and k % 128 == 0:
         torch.ops.exl3_i8_lab.act_int8_dec(xs, suh, xq, sx)
     else:
         torch.ops.exl3_i8_lab.act_int8(xs, suh, xq, sx)
     out = torch.empty((t, g * n), dtype=torch.bfloat16, device=x.device)
+    if DECODE and GROUPED and t <= 16 and n % 16 == 0 and k % 128 == 0:
+        tables = _group_tables(w8s, sws)
+        if tables is not None:
+            torch.ops.exl3_i8_lab.w8_decode_grouped_mm(out, xq, tables[0], tables[1], sx, n, k)
+            _log(f"grouped-1launch g={g} k={k} n={n}", t)
+            return out
     for i in range(g):
         xq_i, sx_i = xq[i * t : (i + 1) * t], sx[i * t : (i + 1) * t]
         w8, sw = w8s[i], sws[i]
@@ -204,6 +245,14 @@ def _w8_linear_fake(x, w8, sw, suh):
     return x.new_empty((x.shape[0], w8.shape[0]))
 
 
+# Batch invariance (VLLM_EXL3_DENSE_W8_LM_HEAD_ROWS, default 64; 0 = one call of m rows as before): Marlin picks its
+# tiling and k-partition from size_m, so a row's logits depended on how many rows shared the call
+# (tests/verify/batch_invariance/w8_m_sweep.py: 1-2 bf16 ulps below 1024 rows). The head now always runs as Marlin
+# calls of exactly LM_HEAD_ROWS rows (the last one zero-padded), so every row takes the same configuration whatever
+# the step's row count; the sweep's shifted-batch test checks the in-call row position does not matter either.
+LM_HEAD_ROWS = int(os.environ.get("VLLM_EXL3_DENSE_W8_LM_HEAD_ROWS", "64"))
+
+
 def _w8_lm_head(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, n: int,
                 k: int) -> torch.Tensor:
     from vllm import _custom_ops as ops
@@ -213,11 +262,43 @@ def _w8_lm_head(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, n: int,
     if m == 0:
         return x.new_empty((0, n))
     _log(f"lm_head k={k} n={n}", m)
-    out = ops.marlin_gemm(
-        x.half(), None, q, None, s, None, None, None, _workspace(x.device),
-        scalar_types.uint8b128, m, n, k, False, True, False,
-    )
-    return out.to(torch.bfloat16)
+    rows = LM_HEAD_ROWS
+    if rows <= 0:
+        out = ops.marlin_gemm(
+            x.half(), None, q, None, s, None, None, None, _workspace(x.device),
+            scalar_types.uint8b128, m, n, k, False, True, False,
+        )
+        return out.to(torch.bfloat16)
+    xpad, ypad = _lm_head_buffers(x.device, rows, n, k)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    for lo in range(0, m, rows):
+        hi = min(m, lo + rows)
+        # Rows are independent in the GEMM, so stale padding rows only change the discarded outputs.
+        xpad[: hi - lo].copy_(x[lo:hi])
+        ops.marlin_gemm(
+            xpad, ypad, q, None, s, None, None, None, _workspace(x.device),
+            scalar_types.uint8b128, rows, n, k, False, True, False,
+        )
+        out[lo:hi] = ypad[: hi - lo]
+    return out
+
+
+_lm_bufs: dict = {}
+
+
+def _lm_head_buffers(device: torch.device, rows: int, n: int, k: int):
+    """Persistent FP16 input/output staging for the fixed-shape head calls (one pair per device and shape), so the
+    head allocates nothing per call: per-call buffers were charged once per captured CUDA-graph size and cost the
+    first stack12 screen 4.6 % of its KV cache."""
+    key = (device.index, rows, n, k)
+    bufs = _lm_bufs.get(key)
+    if bufs is None:
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("the LM head staging buffers are allocated by its first call, which must run outside a CUDA graph capture")
+        bufs = (torch.zeros((rows, k), dtype=torch.float16, device=device),
+                torch.empty((rows, n), dtype=torch.float16, device=device))
+        _lm_bufs[key] = bufs
+    return bufs
 
 
 def _w8_lm_head_fake(x, q, s, n, k):

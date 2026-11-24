@@ -49,6 +49,8 @@ hundreds to thousands, where the GEMM's tiles reuse each weight across many
 rows and reading the weight no longer bounds the call.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -73,7 +75,22 @@ _DEFAULT_SMS = 74
 _SCRATCH: dict = {}
 _SMS: dict = {}
 # Gate weight dtypes the kernel reads.
-_WEIGHT_DTYPES = (torch.float32, torch.bfloat16)
+_WEIGHT_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+# VLLM_DEEPSEEK_V41_GATE_GEMV_TUNE=1: per-call launch configurations measured
+# on the 74-SM part (runtime/dsv41/gate/t_gate.out). They change only the
+# expert block size and the warps / pipeline stages: SPLIT stays the served
+# one (split_for with BLOCK_E), so every logit's FP64 summation order -- and
+# with it every output bit -- is unchanged.
+TUNE = os.environ.get("VLLM_DEEPSEEK_V41_GATE_GEMV_TUNE", "0") == "1"
+
+
+def launch_config(rows: int, weight_dtype: torch.dtype) -> tuple[int, int, int]:
+    """(BLOCK_E, num_warps, num_stages) of a call of ``rows`` rows."""
+    if not TUNE:
+        return BLOCK_E, 4, 3
+    if weight_dtype != torch.float32 and rows <= 8:
+        return 32, 2, 2
+    return 32, 4, 3
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -94,6 +111,7 @@ def _gate_gemv_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_K: tl.constexpr,
     W_PAIRS: tl.constexpr,
+    W_FP16: tl.constexpr = False,
 ):
     """``x_ptr``: BF16 x read as int32 pairs (``stride_xm`` in pairs);
     ``w_ptr``: the FP32 weight, or with ``W_PAIRS`` the BF16 weight read as
@@ -127,7 +145,15 @@ def _gate_gemv_kernel(
     x_ptrs = x_ptr + rows_t[:, None] * stride_xm + (k0 // 2 + tl.arange(0, HALF))[None, :]
     acc = tl.zeros([BLOCK_E, BLOCK_T], dtype=tl.float64)
     for _ in range(KS // BLOCK_K):
-        if W_PAIRS:
+        if W_PAIRS and W_FP16:
+            # An FP16-held weight (the checkpoint's FP16 gate values): each
+            # half widened exactly, so the products are those of the FP32-held
+            # weight. The low / high 16 bits by truncation, then bitcast.
+            w_pairs = tl.load(w_ptrs)
+            w_even = w_pairs.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float64)
+            w_odd = (w_pairs >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float64)
+            w_ptrs += HALF
+        elif W_PAIRS:
             # The FP32 values of the BF16 weights, as x's below: exactly the
             # values an FP32-held weight loads.
             w_pairs = tl.load(w_ptrs)
@@ -225,20 +251,21 @@ def token_tile(rows: int) -> tuple[int, int]:
     return tile, triton.cdiv(rows, tile)
 
 
-def _scratch(device: torch.device, num_experts: int, split: int):
-    """(FP64 partials, zeroed int32 counters), once per (device, N, SPLIT),
-    large enough for one launch: min(:data:`MAX_ROWS`, :data:`CHUNK_ROWS`) rows."""
-    key = (str(device), num_experts, split)
+def _scratch(device: torch.device, num_experts: int, split: int, block_e: int = BLOCK_E):
+    """(FP64 partials, zeroed int32 counters), once per (device, N, SPLIT,
+    BLOCK_E), large enough for one launch: min(:data:`MAX_ROWS`,
+    :data:`CHUNK_ROWS`) rows."""
+    key = (str(device), num_experts, split, block_e)
     if key not in _SCRATCH:
         if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "the gate GEMV's scratch is allocated by its first call, which "
                 "must run outside a CUDA graph capture"
             )
-        blocks = triton.cdiv(num_experts, BLOCK_E)
+        blocks = triton.cdiv(num_experts, block_e)
         rows = min(MAX_ROWS, CHUNK_ROWS)
         _SCRATCH[key] = (
-            torch.empty(split * blocks * BLOCK_E * rows, dtype=torch.float64,
+            torch.empty(split * blocks * block_e * rows, dtype=torch.float64,
                         device=device),
             torch.zeros(blocks * triton.cdiv(rows, MAX_BLOCK_T),
                         dtype=torch.int32, device=device),
@@ -261,14 +288,15 @@ def gate_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if M == 0:
         return out
     split = split_for(N, K, _sm_count(x.device))
-    part, count = _scratch(x.device, N, split)
-    w_pairs = weight.dtype == torch.bfloat16
+    w_pairs = weight.dtype in (torch.bfloat16, torch.float16)
     w = weight.view(torch.int32) if w_pairs else weight
     for start in range(0, M, CHUNK_ROWS):
         rows = min(CHUNK_ROWS, M - start)
         block_t, token_blocks = token_tile(rows)
+        block_e, warps, stages = launch_config(rows, weight.dtype)
+        part, count = _scratch(x.device, N, split, block_e)
         xs = x[start : start + rows]
-        _gate_gemv_kernel[(triton.cdiv(N, BLOCK_E), split, token_blocks)](
+        _gate_gemv_kernel[(triton.cdiv(N, block_e), split, token_blocks)](
             xs.view(torch.int32),
             w,
             out[start : start + rows],
@@ -282,10 +310,11 @@ def gate_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             K=K,
             SPLIT=split,
             BLOCK_T=block_t,
-            BLOCK_E=BLOCK_E,
+            BLOCK_E=block_e,
             BLOCK_K=BLOCK_K,
             W_PAIRS=w_pairs,
-            num_warps=4,
-            num_stages=3,
+            W_FP16=weight.dtype == torch.float16,
+            num_warps=warps,
+            num_stages=stages,
         )
     return out

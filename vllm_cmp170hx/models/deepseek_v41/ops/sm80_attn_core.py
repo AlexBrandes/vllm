@@ -54,6 +54,7 @@ Only the CPU fallbacks of the Triton kernels (``index_scores_torch``,
 
 import dataclasses
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -164,9 +165,19 @@ class Sm80AttnWeights:
 # ---------------------------------------------------------------------------
 
 
+def _exact_glue() -> bool:
+    import os
+    return os.environ.get("VLLM_DEEPSEEK_V41_EXACT_GLUE") == "1"
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Reference ``RMSNorm.forward``: fp32 statistics, product with the
     weight in fp32, one rounding to ``x``'s dtype."""
+    if _exact_glue():
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_exact_glue
+        out = sm80_exact_glue.rms_norm(x, weight, eps)
+        if out is not None:
+            return out
     dtype = x.dtype
     xf = x.float()
     var = xf.square().mean(-1, keepdim=True)
@@ -208,18 +219,33 @@ def rope_freqs(
     return freqs
 
 
+_ROPE_INPLACE = os.environ.get("VLLM_DEEPSEEK_V41_ROPE_INPLACE", "0") == "1"
+
+
 def rope(
     x: torch.Tensor,
     positions: torch.Tensor,
     freqs: torch.Tensor,
     inverse: bool = False,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """Reference ``apply_rotary_emb`` on the last ``2 * len(freqs)`` dims of
-    ``x`` ([T, ..., D], adjacent pairs as complex numbers), out of place.
+    ``x`` ([T, ..., D], adjacent pairs as complex numbers), out of place
+    (``inplace``: callers that discard ``x`` may get it rotated in place,
+    VLLM_DEEPSEEK_V41_ROPE_INPLACE; the same values).
 
     The rotation is the reference's: ``polar(1, fp32(position) * freq)``
     (the rows of its outer-product table), a complex64 multiply (by the
     conjugate for ``inverse``), one rounding to ``x``'s dtype."""
+    if _exact_glue():
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_exact_glue
+        if inplace and _ROPE_INPLACE:
+            out = sm80_exact_glue.rope_(x, positions, freqs, inverse)
+            if out is not None:
+                return out
+        out = sm80_exact_glue.rope(x, positions, freqs, inverse)
+        if out is not None:
+            return out
     rd = 2 * freqs.numel()
     angles = positions.to(torch.float32).unsqueeze(-1) * freqs.to(positions.device)
     cis = torch.polar(torch.ones_like(angles), angles)
@@ -364,6 +390,21 @@ def compress_rows(
 
     assert compress_ratio == 2 and ring is not None and ring_slots is not None
     assert kv_score.dtype == torch.float32 and kv_score.shape[1] == 2 * d
+    if _exact_glue():
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_exact_glue
+        got = sm80_exact_glue.compress2(kv_score, norm_weight, ring, positions, token_to_req,
+                                        query_start_loc, comp_slots, ring_slots, d, eps)
+        if got is not None:
+            closes, latent = got
+            T = pos.shape[0]
+            t = torch.arange(T, device=pos.device)
+            req = token_to_req.to(torch.int64)
+            qsl = query_start_loc.to(torch.int64)
+            capacity = ring.shape[1]
+            end = qsl[req + 1]
+            tail = (ring_slots >= 0) & (t >= end - capacity) & (t < end)
+            store_rows(ring, torch.where(tail, ring_slots, -1), kv_score[:T])
+            return closes, latent
     closes = (comp_slots >= 0) & ((pos + 1) % 2 == 0)
     t = torch.arange(T, device=pos.device)
     req = token_to_req.to(torch.int64)
@@ -588,6 +629,14 @@ def topk_canonical_cuda(
     from vllm_cmp170hx.kernels.indexer.topk_tiefix import topk_tiefix_
 
     n, n_cols = scores.shape
+    if _exact_glue() and n > 0 and k > 0 and scores.dtype == torch.float32 and scores.stride(1) == 1:
+        # The attention pipeline's stable radix selection (sm80_index_topk.select): the same canonical set
+        # (score descending, earliest column first among equals, ascending, -1 padded), honouring n_vis directly.
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_index_topk as itk
+        out = torch.empty((n, k), dtype=torch.int32, device=scores.device)
+        itk.select(scores, n_vis.to(torch.int32) if n_vis.dtype != torch.int32 else n_vis, out,
+                   itk.SelectionWorkspace(n, n_cols, scores.device))
+        return out
     out = torch.full((n, k), -1, dtype=torch.int32, device=scores.device)
     width = min(k, n_cols)
     if n == 0 or width == 0:
@@ -613,6 +662,11 @@ def select_candidate_blocks(
     is its best position, the block holding the newest visible position is
     pinned in, the best ``topk_blocks`` reachable blocks are kept (canonical
     ties), ``-1`` padded to width ``topk_blocks``."""
+    if _exact_glue():
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_exact_glue
+        got = sm80_exact_glue.select_candidate_blocks(scores, n_vis, topk_blocks, block_size)
+        if got is not None:
+            return got
     n, n_cols = scores.shape
     pad = -n_cols % block_size
     blocks = torch.nn.functional.pad(scores, (0, pad), value=float("-inf"))
@@ -639,6 +693,11 @@ def mask_to_candidates(
     scores: torch.Tensor, candidates: torch.Tensor, block_size: int
 ) -> torch.Tensor:
     """Level two: visible positions outside the candidate blocks -> -FLT_MAX."""
+    if _exact_glue():
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_exact_glue
+        got = sm80_exact_glue.mask_to_candidates(scores, candidates, block_size)
+        if got is not None:
+            return got
     n, n_cols = scores.shape
     num_blocks = -(-n_cols // block_size)
     keep = torch.zeros((n, num_blocks + 1), dtype=torch.bool, device=scores.device)
@@ -780,7 +839,7 @@ def output_qdq(
     """Inverse RoPE on the output tail, then FP8 (32, UE8M0) qdq of each
     group's ``[heads_per_group * head_dim]`` slice (the ``wo_a`` input)."""
     n, h, d = o.shape
-    o = rope(o, positions, freqs, inverse=True)
+    o = rope(o, positions, freqs, inverse=True, inplace=True)
     return qdq_fp8(o.view(n, n_groups, (h // n_groups) * d), 32).view(n, h, d)
 
 
@@ -869,7 +928,7 @@ def prepare_layer(
         qr, kv = qr_kv[:T].split([qr_kv.shape[1] - d, d], dim=-1)
         qr = rms_norm(qr, weights.q_norm, cfg.eps)
         kv = rms_norm(kv, weights.kv_norm, cfg.eps)
-        q = rope(weights.wq_b(qr).view(T, cfg.n_local_heads, d), pos, weights.freqs)
+        q = rope(weights.wq_b(qr).view(T, cfg.n_local_heads, d), pos, weights.freqs, inplace=True)
     store_kv(
         cfg,
         weights,

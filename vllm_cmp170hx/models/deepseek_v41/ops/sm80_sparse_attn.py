@@ -16,6 +16,8 @@ window rows, NVFP4 compressed rows): they are decoded to the same BF16 tile
 the BF16 rows load as, so the result is bit for bit the same.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -24,6 +26,14 @@ from vllm_cmp170hx.models.deepseek_v41.ops.sm80_kv_pack import load_records_tl
 
 _BLOCK_H = 16
 _BLOCK_N = 32
+_SMS = {}
+
+
+def _sm_count(device) -> int:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _SMS:
+        _SMS[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _SMS[idx]
 
 
 @triton.jit
@@ -123,6 +133,132 @@ def _sparse_attn_kernel(
     )
 
 
+# ---------------------------------------------------------------------------
+# All-heads CUDA kernel (VLLM_DEEPSEEK_V41_ATTN_MLA=1, csrc/dsv41_mla): one CTA per (row, segment of 32-entry
+# tiles) over all 64 heads, Q staged in shared memory once and each tile's records decoded once (instead of once
+# per 16-head program); the same reference arithmetic (fp32 scores x scale, finite floor, BF16 probabilities for
+# the value product, fp32 sum, sink in the denominator) in a different accumulation order: a numerics change.
+# Segments per row: about 64 CTAs per call (_mla_segments).
+# Results differ by <= 1 BF16 ulp between segment counts (not batch invariant).
+# ---------------------------------------------------------------------------
+_MLA_LIB = None
+
+
+def _mla() -> bool:
+    import os
+    return os.environ.get("VLLM_DEEPSEEK_V41_ATTN_MLA") in ("1", "2", "3")
+
+
+def _mla_invariant() -> bool:
+    import os
+    return os.environ.get("VLLM_DEEPSEEK_V41_ATTN_MLA") == "2"
+
+
+def _mla_fixed() -> bool:
+    import os
+    return os.environ.get("VLLM_DEEPSEEK_V41_ATTN_MLA") == "3"
+
+
+# VLLM_DEEPSEEK_V41_ATTN_MLA=3: the 64-head kernel with a FIXED segment size for every call (VLLM_DEEPSEEK_V41_MLA_TPS
+# tiles of 32 entries, default 4) and always split + combine, so a row's computation never depends on the call
+# (batch invariant); rows go in sub-calls of _MLA_FIXED_ROWS to bound the FP32 partial scratch.
+_MLA_FIXED_ROWS = 32
+
+
+def _mla_fixed_tps() -> int:
+    import os
+    return int(os.environ.get("VLLM_DEEPSEEK_V41_MLA_TPS", "4"))
+
+
+# Batch-invariant form (VLLM_DEEPSEEK_V41_ATTN_MLA=2, op sparse_mla_inv): fixed segments of _MLA_SEG_TILES 32-entry
+# tiles for every call, merged in segment order by one function, so a row's result does not depend on the call's
+# row count; split (one CTA per segment + combine) while the call has at most _MLA_SPLIT_MAX_CTAS segment CTAs,
+# else fused (one CTA per row and head group). Both give the same bits.
+_MLA_SEG_TILES = int(__import__("os").environ.get("VLLM_DEEPSEEK_V41_MLA_INV_TPS", "4"))
+_MLA_SPLIT_MAX_CTAS = int(__import__("os").environ.get("VLLM_DEEPSEEK_V41_MLA_SPLIT_MAX", "200"))
+
+
+def _mla_inv_heads() -> int:
+    import os
+    v = os.environ.get("VLLM_DEEPSEEK_V41_MLA_INV_HC", "64")
+    return int(v) if v in ("16", "32", "64") else 64
+
+
+def _mla_heads_per_cta() -> int:
+    import os
+    return 32 if os.environ.get("VLLM_DEEPSEEK_V41_MLA_HC") == "32" else 64
+
+
+def _mla_segments(rows: int, tiles: int, groups: int = 1) -> int:
+    if groups > 1:  # 32 heads per CTA: two CTAs per SM, so about twice the CTAs
+        return max(1, min(tiles, round(128 / max(rows * groups, 1))))
+    # About 64 CTAs: fewer under-fills the card, more costs combine traffic (card 4: 6 rows best at 10 segments,
+    # 12 at 5, 24 at 2-3; 18 rows at 2 segments was slower than the Triton path).
+    return max(1, min(tiles, round(64 / max(rows, 1))))
+
+
+def _mla_call(q, swa_cache, swa_indices, comp_cache, comp_block_table, comp_local, req, attn_sink, scale,
+              swa_packed, comp_packed, out):
+    global _MLA_LIB
+    import os
+    if _MLA_LIB is None:
+        torch.ops.load_library(os.environ.get("VLLM_DEEPSEEK_V41_MLA_LIB", "/opt/dsv41-mla/sparse_mla.so"))
+        _MLA_LIB = True
+    n = q.shape[0]
+    i32 = torch.int32
+    if comp_local is None:  # no compressed keys: an empty selection, the window's tensors as placeholders
+        comp_local = swa_indices[:, :0]
+        comp_block_table = swa_indices
+        comp_packed = swa_packed
+    comp_local = comp_local if comp_local.dtype == i32 else comp_local.to(i32)
+    comp_block_table = comp_block_table if comp_block_table.dtype == i32 else comp_block_table.to(i32)
+    swa_idx = swa_indices if swa_indices.dtype == i32 else swa_indices.to(i32)
+    sink = attn_sink if attn_sink.dtype == torch.float32 else attn_sink.float()
+    tiles = triton.cdiv(swa_idx.shape[1], 32) + triton.cdiv(comp_local.shape[1], 32)
+    if _mla_fixed():
+        tps = _mla_fixed_tps()
+        n_seg = triton.cdiv(tiles, tps)
+        r = min(n, _MLA_FIXED_ROWS)
+        pm = torch.empty((r, n_seg, 64), dtype=torch.float32, device=q.device)
+        pl = torch.empty_like(pm)
+        pacc = torch.empty((r, n_seg, 64, 512), dtype=torch.float32, device=q.device) if n_seg > 1 else pm
+        for s0 in range(0, n, _MLA_FIXED_ROWS):
+            s1 = min(n, s0 + _MLA_FIXED_ROWS)
+            torch.ops.dsv41_mla.sparse_mla(q[s0:s1], swa_cache, swa_idx[s0:s1], comp_cache, comp_block_table,
+                                           comp_local[s0:s1], req[s0:s1].to(i32), sink, float(scale),
+                                           bool(swa_packed), bool(comp_packed), tps, out[s0:s1], pm, pl, pacc)
+        return out
+    if _mla_invariant():
+        n_segs = triton.cdiv(tiles, _MLA_SEG_TILES)
+        fused = n * n_segs > _MLA_SPLIT_MAX_CTAS
+        # Every head grouping computes each head identically (bitwise, card 4), so split calls take the fastest:
+        # 1 row 16 heads 35 us / 32: 42 / 64: 58; 6 rows 32: 46 / 64: 59; 12-24 rows 64; 32 rows 32: 169 / 64: 182.
+        ih = 64 if fused else (16 if n <= 2 else 32 if n <= 8 else 64 if n <= 24 else 32)
+        if os.environ.get("VLLM_DEEPSEEK_V41_MLA_INV_HC"):
+            ih = _mla_inv_heads()
+        if fused:
+            pm = pl = pacc = torch.empty(1, dtype=torch.float32, device=q.device)
+        else:
+            pm = torch.empty((n, n_segs, 64), dtype=torch.float32, device=q.device)
+            pl = torch.empty_like(pm)
+            pacc = torch.empty((n, n_segs, 64, 512), dtype=torch.float32, device=q.device)
+        torch.ops.dsv41_mla.sparse_mla_inv(q, swa_cache, swa_idx, comp_cache, comp_block_table, comp_local,
+                                           req.to(i32), sink, float(scale), bool(swa_packed), bool(comp_packed),
+                                           _MLA_SEG_TILES, fused, out, pm, pl, pacc, ih)
+        return out
+    hc = _mla_heads_per_cta()
+    n_seg = _mla_segments(n, tiles, 64 // hc)
+    tps = triton.cdiv(tiles, n_seg)
+    n_seg = triton.cdiv(tiles, tps)
+    pm = torch.empty((n, n_seg, 64), dtype=torch.float32, device=q.device)
+    pl = torch.empty_like(pm)
+    pacc = torch.empty((n, n_seg, 64, 512), dtype=torch.float32, device=q.device) if n_seg > 1 else pm
+    torch.ops.dsv41_mla.sparse_mla(q, swa_cache, swa_idx, comp_cache, comp_block_table, comp_local,
+                                   req.to(i32), sink, float(scale), bool(swa_packed), bool(comp_packed), tps,
+                                   out, pm, pl, pacc, hc)
+    return out
+
+
 def sparse_attention_triton(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
@@ -166,7 +302,16 @@ def sparse_attention_triton(
     else:
         comp_args = (swa_cache, swa_indices, swa_indices, 0, 0, 0, 0, 0, 1)
     comp, comp_bt, comp_idx, s_cb, s_ce, s_bt, s_ci, n_comp, comp_e = comp_args
+    if _mla() and h == 64 and d == 512:
+        return _mla_call(q, swa_cache, swa_indices, comp_cache if has_comp else swa_cache,
+                         comp_block_table if has_comp else None, comp_local if has_comp else None,
+                         req, attn_sink, scale, swa_packed, comp_packed, out)
     grid = (n, triton.cdiv(h, _BLOCK_H))
+    # One program per SM at 8 warps (228 registers); 4 warps (255 registers) fit two per SM, faster once the
+    # grid exceeds one wave (card 4: packed 24 rows 204 -> 152 us, 2,048 rows 11.7 -> 8.4 ms) and slower
+    # below it (1 row 115 -> 143 us). Same bits either way (tested 1-2,048 rows, packed and BF16), so the
+    # choice by grid size keeps batch invariance.
+    warps = 4 if grid[0] * grid[1] > _sm_count(q.device) else 8
     _sparse_attn_kernel[grid](
         q,
         swa_cache,
@@ -200,6 +345,6 @@ def sparse_attention_triton(
         BLOCK_N=_BLOCK_N,
         SWA_PACKED=swa_packed,
         COMP_PACKED=comp_packed,
-        num_warps=8,
+        num_warps=warps,
     )
     return out

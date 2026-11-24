@@ -582,6 +582,30 @@ class DeepseekV41Sm80Attention(DeepseekV4Attention):
                 self.sm80_cfg.index_head_dim,
                 self.sm80_cfg.index_heads_per_rank,
             )
+        if vllm_config.kernel_config.enable_jit_warmup:
+            from vllm_cmp170hx.models.deepseek_v41.ops import sm80_exact_glue
+
+            if sm80_exact_glue.enabled():
+                # Every lane-width class of the exact RMSNorm kernels these norms reach, at boot.
+                norms = [self.q_norm.weight, self.kv_norm.weight]
+                if self.compressor is not None:
+                    norms.append(self.compressor.norm.weight)
+                if self.indexer is not None and getattr(self.indexer, "owns_k", False):
+                    norms.append(self.indexer.k_norm.weight)
+                for weight in norms:
+                    sm80_exact_glue.EXACT_GLUE_RMS_WARMUP.register_warmup(weight)
+            if self.sm80_cfg.is_index_source and self.compress_ratio:
+                # Every power-of-two width class of the prefill-path index selection (token top-k and, at the
+                # candidate source, the candidate blocks), at boot: their first use inside a request compiles.
+                from vllm_cmp170hx.models.deepseek_v41.ops.sm80_index_topk import SELECTION_WARMUP
+
+                cfg = self.sm80_cfg
+                SELECTION_WARMUP.register_warmup(
+                    max(vllm_config.model_config.max_model_len // self.compress_ratio, 1),
+                    cfg.index_topk,
+                    cfg.candidate_topk_blocks if cfg.is_candidate_source else 0,
+                    cfg.candidate_block_size if cfg.is_candidate_source else 0,
+                )
         self._wo_b_round_once = wo_b_round_once_switch()
 
     # -- pieces -------------------------------------------------------------

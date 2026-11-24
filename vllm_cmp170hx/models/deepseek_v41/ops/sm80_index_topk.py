@@ -63,9 +63,9 @@ def float_key(x):
     return bits ^ tl.where((bits & 0x80000000) != 0, 0xffffffff, 0x80000000).to(tl.uint32)
 
 
-@triton.jit
-def _selection_init(out, state, nvis, k: tl.constexpr, os: tl.constexpr,
-                    NS: tl.constexpr, B: tl.constexpr):
+@triton.jit(do_not_specialize=["NS"])
+def _selection_init(out, state, nvis, k: tl.constexpr, os,
+                    NS, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1) * B + tl.arange(0, B)
     tl.store(out + row * os + j, -1, j < k)
@@ -75,9 +75,9 @@ def _selection_init(out, state, nvis, k: tl.constexpr, os: tl.constexpr,
         tl.store(state + row * 3 + 2, 0)
 
 
-@triton.jit
-def _radix_hist(scores, nvis, state, hist, width, ss: tl.constexpr,
-                NS: tl.constexpr, SHIFT: tl.constexpr, B: tl.constexpr):
+@triton.jit(do_not_specialize=["width", "NS"])
+def _radix_hist(scores, nvis, state, hist, width, ss,
+                NS, SHIFT: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.program_id(1)
     visible = tl.minimum(tl.load(nvis + row), width)
@@ -94,8 +94,8 @@ def _radix_hist(scores, nvis, state, hist, width, ss: tl.constexpr,
         tl.store(hist + (row * NS + seg) * 256 + tl.arange(0, 256), counts)
 
 
-@triton.jit
-def _hist_reduce(hist, totals, nvis, width, NS: tl.constexpr, BS: tl.constexpr,
+@triton.jit(do_not_specialize=["width", "NS"])
+def _hist_reduce(hist, totals, nvis, width, NS, BS: tl.constexpr,
                  B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     byte = tl.program_id(1)
@@ -120,9 +120,9 @@ def _radix_cutoff(totals, state, SHIFT: tl.constexpr):
     tl.store(state + row * 3 + 1, remaining - above)
 
 
-@triton.jit
-def _selection_counts(scores, nvis, state, counts, width, ss: tl.constexpr,
-                      NS: tl.constexpr, B: tl.constexpr):
+@triton.jit(do_not_specialize=["width", "NS"])
+def _selection_counts(scores, nvis, state, counts, width, ss,
+                      NS, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.program_id(1)
     visible = tl.minimum(tl.load(nvis + row), width)
@@ -138,8 +138,8 @@ def _selection_counts(scores, nvis, state, counts, width, ss: tl.constexpr,
                  tl.sum((valid & (key == cutoff)).to(tl.int32), 0))
 
 
-@triton.jit
-def _selection_prefix(counts, prefixes, state, nvis, width, NS: tl.constexpr,
+@triton.jit(do_not_specialize=["width", "NS"])
+def _selection_prefix(counts, prefixes, state, nvis, width, NS,
                       BS: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.arange(0, BS)
@@ -150,9 +150,9 @@ def _selection_prefix(counts, prefixes, state, nvis, width, NS: tl.constexpr,
     tl.store(prefixes + (row * NS + seg) * 2 + 1, tl.cumsum(eq, 0) - eq, seg < NS)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["width", "NS"])
 def _selection_scatter(scores, nvis, state, prefixes, out, width,
-                       ss: tl.constexpr, os: tl.constexpr, NS: tl.constexpr,
+                       ss, os, NS,
                        K: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     seg = tl.program_id(1)
@@ -261,10 +261,10 @@ def _pad(out, kept, k, B: tl.constexpr):
         tl.store(out + j, -1, (j >= kept) & (j < k))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["width", "NS", "SLOTS", "PARTS"])
 def _select_one_launch(scores, nvis, hist, keys, cols, kept, tickets, out, width, k,
-                       ss: tl.constexpr, os: tl.constexpr, NS: tl.constexpr,
-                       SLOTS: tl.constexpr, PARTS: tl.constexpr, BP: tl.constexpr,
+                       ss, os, NS,
+                       SLOTS, PARTS, BP: tl.constexpr,
                        FIRST_HIST: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     part = tl.program_id(1)
@@ -381,3 +381,78 @@ def select(scores, n_vis, out, workspace, *, first_histogram=False):
         n_vis, width, ns, triton.next_power_of_2(ns), SEGMENT)
     _selection_scatter[(rows, ns)](scores, n_vis, workspace.state, workspace.prefixes,
         out, width, scores.stride(0), out.stride(0), ns, k, SEGMENT)
+
+
+# -- boot-time compile -----------------------------------------------------
+from dataclasses import dataclass  # noqa: E402
+
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel  # noqa: E402
+
+
+class SelectionWarmup(VllmJitKernel["SelectionWarmup.Key"]):
+    """Boot-time compile of the selection kernels for every class an index width reaches.
+
+    The kernels take widths, strides and counts at run time; what still selects a
+    compiled variant is ``BS = next_power_of_2(NS)`` (segment reductions), ``BP``
+    (one-launch part merge), the row count's path (one launch or not), ``k``, and
+    the row stride's divisibility by 16. Without this the first request whose
+    width enters a new power-of-two class compiles inside the request (0.6-2.7 s
+    of TTFT per class in public-v1). Registered by each indexed attention layer
+    with its served ``k`` / candidate settings; ``compile`` runs the real
+    prefill-path entry points (``sm80_attn_core.select_topk`` and
+    ``select_candidate_blocks``) on dummy scores, so the keys are the served ones.
+    """
+
+    @dataclass(frozen=True)
+    class Key:
+        kind: str          # "topk" or "blocks"
+        rows: int
+        width: int
+        k: int
+        block_size: int
+
+    @staticmethod
+    def _widths(max_width):
+        widths, c = [], 1
+        top = triton.cdiv(max(max_width, 1), SEGMENT)
+        while True:
+            w = min(c * SEGMENT, max(max_width, 1))
+            widths += [w, w - 1] if w > 1 else [w]
+            if c >= top:
+                break
+            c *= 2
+        return sorted(set(x for x in widths if x >= 1))
+
+    def get_warmup_keys(self, max_width: int, k: int, topk_blocks: int = 0,
+                        block_size: int = 0) -> list["SelectionWarmup.Key"]:
+        keys = []
+        # Integer arguments also specialise on == 1 and on divisibility by 16 (the row strides keep it, for
+        # aligned loads): width 1 / 2 cover the shortest contexts; for the candidate blocks the score stride
+        # (width) and the block-maxima stride (cdiv(width, block_size)) take each divisibility pair.
+        base = sorted(set(self._widths(max_width)) | {w for w in (1, 2) if w <= max(max_width, 1)})
+        for rows in (1, ONE_LAUNCH_MAX_ROWS + 1):
+            if k > 0:
+                for width in base:
+                    keys.append(self.Key("topk", rows, width, k, 0))
+            if topk_blocks > 0 and block_size > 0:
+                widths = set(base)
+                for width in base:
+                    widths |= {width - block_size, width - 2 * block_size}
+                widths |= {block_size + 1}
+                for width in sorted(w for w in widths if 1 <= w <= max(max_width, 1)):
+                    keys.append(self.Key("blocks", rows, width, topk_blocks, block_size))
+        return keys
+
+    def compile(self, compile_key: "SelectionWarmup.Key") -> None:
+        from vllm_cmp170hx.models.deepseek_v41.ops import sm80_attn_core
+        key = compile_key
+        dev = torch.device("cuda", torch.cuda.current_device())
+        scores = torch.zeros((key.rows, key.width), dtype=torch.float32, device=dev)
+        n_vis = torch.full((key.rows,), key.width, dtype=torch.int32, device=dev)
+        if key.kind == "topk":
+            sm80_attn_core.select_topk(scores, n_vis, key.k)
+        else:
+            sm80_attn_core.select_candidate_blocks(scores, n_vis, key.k, key.block_size)
+
+
+SELECTION_WARMUP = SelectionWarmup()

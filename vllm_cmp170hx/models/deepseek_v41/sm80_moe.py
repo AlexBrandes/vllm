@@ -51,6 +51,8 @@ prefill operator ``moe_out_prefill_v2`` for prefill calls (its gate decides
 when the weights have loaded).
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -300,6 +302,23 @@ def _fp32_gate_weight(gate: nn.Module) -> None:
     _hold_gate_weight(gate, torch.float32)
 
 
+_GATE_FP16 = os.environ.get("VLLM_DEEPSEEK_V41_GATE_FP16", "0") == "1"
+
+
+def _fp16_valued_loader(loader):
+    """``loader`` for the FP16-held gate weight, refusing a checkpoint tensor
+    whose values FP16 does not hold exactly (the copy would round them)."""
+
+    def load(param: nn.Parameter, loaded_weight: torch.Tensor, *args, **kwargs):
+        if loaded_weight.dtype != torch.float16 and not torch.equal(
+            loaded_weight.to(torch.float16).float(), loaded_weight.float()
+        ):
+            raise ValueError("VLLM_DEEPSEEK_V41_GATE_FP16: the gate weight is not FP16-valued")
+        return loader(param, loaded_weight, *args, **kwargs)
+
+    return load
+
+
 def _bf16_valued_loader(loader):
     """``loader`` for the BF16-held gate weight, refusing a checkpoint tensor
     whose values BF16 does not hold exactly (the copy would round them)."""
@@ -398,6 +417,15 @@ def adopt_moe(ffn: nn.Module, config) -> None:
         raise ValueError(f"Unsupported DeepSeek-V4.1 scoring: {ffn.scoring_func}")
     if envs.VLLM_DEEPSEEK_V41_ROUTER_MMA:
         _hold_gate_weight(ffn.gate, torch.bfloat16)
+    elif _GATE_FP16 and envs.VLLM_DEEPSEEK_V41_GATE_GEMV:
+        # VLLM_DEEPSEEK_V41_GATE_FP16=1: the checkpoint's FP16 gate values held
+        # in FP16 (exact; half the bytes the GEMV reads); a tensor FP16 does
+        # not hold exactly refuses to load.
+        _hold_gate_weight(ffn.gate, torch.float16)
+        weight = ffn.gate.weight
+        weight.weight_loader = _fp16_valued_loader(
+            getattr(weight, "weight_loader", default_weight_loader)
+        )
     else:
         _fp32_gate_weight(ffn.gate)
     router = ffn.experts.router
