@@ -13,13 +13,13 @@
 // The small-row schedule (moe_out_decode_tc, csrc/exl3/moe_prefill.h) runs
 // the GLM GEMMs on a decode-sized route: 8-row route tiles and GEMM blocks of
 // a single 8-row MMA group, so a block's operand stage is one eighth the size
-// and many more blocks share an SM. Decode combines expert contributions with
-// the original FP32 routing-weight FMAs; prefill retains its FP64 combine.
+// and many more blocks share an SM. Decode and prefill combine expert
+// contributions with the same FP32 routing-weight FMAs in route order.
 //
 // Arithmetic: the input and activation stages (including moe_out's SwiGLU
 // clipping for the family that has a limit) and the combine's per-route
-// transform are moe_out's FP32 operations. Decode also preserves its FP32
-// route sum; prefill sums in FP64 and rounds once to FP32, then to BF16. The
+// transform are moe_out's FP32 operations. Decode and prefill both keep the
+// FP32 route sum (route order), then round to BF16. The
 // expert GEMMs run m16n8k16 FP16 tensor-core MMAs on exactly decoded weights (A
 // = W^T: the trellis lane layout is the A fragment layout) and a hi/lo FP16
 // split of the FP32 activations (B; scaled exactly by one power of two per row
@@ -876,23 +876,155 @@ __device__ __forceinline__ int block_isum(int v, int lane, int warp) {
 // gate_up_operand with one block per (sorted position, projection) task:
 // warp w holds iteration w's 512 columns (lane group g: 128-block 4 w + g).
 // kI8: the fused per-row INT8 epilogue of gate_up_operand<F, true> (bitwise).
+template <class F, bool kI8>
+__device__ __forceinline__ void gate_up_operand_body(
+    const __nv_bfloat16* x, const Routing& routing, int64_t assignment,
+    int64_t expert, int64_t pos, int projection, __half* operand,
+    float* unscale);
+
 template <class F, bool kI8 = false>
 __global__ void __launch_bounds__(32 * (F::kHidden / 512))
     gate_up_operand_block(const __nv_bfloat16* x, Routing routing,
                           const int* table, __half* operand, float* unscale) {
-  constexpr int kHidden = F::kHidden;
-  constexpr int kBlockWarps = kHidden / 512;
-  const int lane = threadIdx.x & 31;
-  const int it = threadIdx.x >> 5;
-  const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
   const int* sorted = table + Layout::sorted_offset();
   const int64_t task = blockIdx.x;
   if (task >= int64_t(table[0]) * 2) return;  // block-uniform
   const int64_t pos = task >> 1;
   const int projection = static_cast<int>(task & 1);
   const int64_t assignment = sorted[pos];
-  const half* suh =
-      expert_part(routing, local_expert(routing, assignment), projection, 1);
+  gate_up_operand_body<F, kI8>(x, routing, assignment,
+                               local_expert(routing, assignment), pos,
+                               projection, operand, unscale);
+}
+
+// The decode route table with a stable order inside each expert (sorted
+// position of an assignment = assignments routed to lower local experts +
+// earlier assignments of its own expert) from the local experts ex[] of all
+// assignments, by one block of any size. route<F> places an expert's
+// assignments in atomic order; every consumer (GEMM rows, operand and down
+// rows, unscale, the combine's position lookup) is per sorted position, and
+// each row's GEMM result is independent of its tile neighbours (INT8 MMAs,
+// s32 exact; per-row epilogue), so outputs are bitwise route<F>'s.
+template <class F>
+__device__ __forceinline__ void route_stable_body(const int* ex,
+                                                  int assignments,
+                                                  int experts, int* table,
+                                                  int* shared) {
+  constexpr int kTileRows = F::kTileRows;
+  int* count = shared;
+  int* row_begin = count + experts;
+  int* tile_begin = row_begin + experts;  // experts + 1 entries
+  for (int e = threadIdx.x; e < experts; e += blockDim.x) count[e] = 0;
+  __syncthreads();
+  for (int a = threadIdx.x; a < assignments; a += blockDim.x) {
+    const int e = ex[a];
+    if (e >= 0) atomicAdd(&count[e], 1);
+  }
+  __syncthreads();
+  const int per = (experts + blockDim.x - 1) / blockDim.x;
+  const int e0 = min(experts, static_cast<int>(threadIdx.x) * per);
+  const int e1 = min(experts, e0 + per);
+  int rows = 0;
+  int tiles = 0;
+  for (int e = e0; e < e1; ++e) {
+    rows += count[e];
+    tiles += (count[e] + kTileRows - 1) / kTileRows;
+  }
+  int row_at, tile_at, row_total, tile_total;
+  block_scan2(rows, tiles, row_at, tile_at, row_total, tile_total);
+  for (int e = e0; e < e1; ++e) {
+    row_begin[e] = row_at;
+    tile_begin[e] = tile_at;
+    row_at += count[e];
+    tile_at += (count[e] + kTileRows - 1) / kTileRows;
+  }
+  if (threadIdx.x == 0) {
+    tile_begin[experts] = tile_total;
+    table[0] = row_total;
+    table[1] = tile_total;
+  }
+  __syncthreads();
+  int4* tile_table =
+      reinterpret_cast<int4*>(table + Layout::tiles_offset(assignments));
+  for (int t = threadIdx.x; t < tile_total; t += blockDim.x) {
+    int lo = 0;
+    int hi = experts;
+    while (hi - lo > 1) {
+      const int mid = (lo + hi) >> 1;
+      if (tile_begin[mid] <= t)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    const int first = row_begin[lo] + (t - tile_begin[lo]) * kTileRows;
+    const int end = lo + 1 < experts ? row_begin[lo + 1] : row_total;
+    tile_table[t] = make_int4(lo, first, min(kTileRows, end - first), 0);
+  }
+  int* sorted = table + Layout::sorted_offset();
+  int* position = table + Layout::position_offset(assignments);
+  for (int a = threadIdx.x; a < assignments; a += blockDim.x) {
+    const int e = ex[a];
+    int at = -1;
+    if (e >= 0) {
+      at = row_begin[e];
+      for (int b = 0; b < a; ++b) at += ex[b] == e;
+      sorted[at] = a;
+    }
+    position[a] = at;
+  }
+}
+
+// route<F> (stable order, above) and gate_up_operand_block<F, kI8> in one
+// launch: blocks 0 .. 2 assignments - 1 are the operand tasks (assignment
+// task / 2, projection task % 2), each computing its own sorted position from
+// the routing ids; the last block writes the route table. Dynamic shared
+// memory: (assignments + 3 experts + 1) ints. Bitwise route<F> +
+// gate_up_operand_block<F, kI8> (route_stable_body).
+template <class F, bool kI8>
+__global__ void __launch_bounds__(32 * (F::kHidden / 512))
+    route_gate_up_operand_block(const __nv_bfloat16* x, Routing routing,
+                                int64_t assignments, int* table,
+                                __half* operand, float* unscale) {
+  extern __shared__ int fused_shared[];
+  constexpr int kBlockWarps = F::kHidden / 512;
+  const int count = static_cast<int>(assignments);
+  int* ex = fused_shared;
+  for (int a = threadIdx.x; a < count; a += blockDim.x)
+    ex[a] = static_cast<int>(local_expert(routing, a));
+  __syncthreads();
+  if (blockIdx.x == gridDim.x - 1) {
+    route_stable_body<F>(ex, count, static_cast<int>(routing.local_experts),
+                         table, fused_shared + count);
+    return;
+  }
+  const int assignment = static_cast<int>(blockIdx.x >> 1);
+  const int projection = static_cast<int>(blockIdx.x & 1);
+  const int e = ex[assignment];
+  if (e < 0) return;  // block-uniform
+  int before = 0;
+  for (int b = threadIdx.x; b < count; b += blockDim.x) {
+    const int eb = ex[b];
+    before += (eb >= 0 && eb < e) || (eb == e && b < assignment);
+  }
+  const int pos = block_isum<kBlockWarps>(before, threadIdx.x & 31,
+                                          threadIdx.x >> 5);
+  __syncthreads();  // block_isum's shared slots are reused by the body
+  gate_up_operand_body<F, kI8>(x, routing, assignment, e, pos, projection,
+                               operand, unscale);
+}
+
+template <class F, bool kI8>
+__device__ __forceinline__ void gate_up_operand_body(
+    const __nv_bfloat16* x, const Routing& routing, int64_t assignment,
+    int64_t expert, int64_t pos, int projection, __half* operand,
+    float* unscale) {
+  constexpr int kHidden = F::kHidden;
+  constexpr int kBlockWarps = kHidden / 512;
+  const int lane = threadIdx.x & 31;
+  const int it = threadIdx.x >> 5;
+  const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
+  const int64_t task = 2 * pos + projection;
+  const half* suh = expert_part(routing, expert, projection, 1);
   const __nv_bfloat16* row = x + (assignment / routing.topk) * kHidden;
   const bool vec = aligned16(row) && aligned16(suh);
   float v[16];
@@ -1596,17 +1728,27 @@ __device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem,
 // out = (acc - 15 sum q) unscale kQ4NAlpha.
 // kBlock: per-128-k block scales (i8_operand<K, true>): s32 accumulation per
 // block (two chunks), then facc += (acc - 15 sum_b) scale_b per token row.
-template <int kG, class S, bool kBlock, class Load>
+// kSplit (VLLM_EXL3_Q4N_DECODE_NIBBLE=1, per-row decode tiles): the weight
+// byte hi + lo (q4n_nibble_sums) is not formed in the ALU. Each state's hash
+// product p (bytes 16 hi + lo) and p & 0xF0F0F0F0 (bytes 16 hi) feed two u8
+// IMMAs into separate s32 accumulators, and the epilogue forms
+// acc_p - 15 (acc_h >> 4) = sum((hi + lo) x) exactly (acc_h is a multiple of
+// 16; |acc| < 255 * 128 * K < 2^31), so the output is bitwise the served
+// path's; per four states it trades 4 SHF + 4 IMAD for one extra IMMA on the
+// otherwise idle tensor pipe (the decode GEMM is ALU-pipe bound).
+template <int kG, class S, bool kBlock, class Load, bool kSplit = false>
 __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
                                             Load& load, int rows, int first,
                                             int pi, int cb) {
   static_assert(S::kCodebook == 4, "INT8 path: Q4N-X only");
+  static_assert(!kSplit || !kBlock, "split nibbles: per-row scales only");
   static_assert(!kBlock || (128 % kKC == 0 && S::kK % 128 == 0), "128-k blocks");
   constexpr int TPW = S::kTPW;
   using R = Q4NRing<S::kBitsX2, S::kCodebook>;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   int acc[TPW][kG][4];
+  int acch[kSplit ? TPW : 1][kSplit ? kG : 1][4];
   float facc[TPW][kG][4];
 #pragma unroll
   for (int j = 0; j < TPW; ++j)
@@ -1616,6 +1758,7 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
       for (int i = 0; i < 4; ++i) {
         acc[j][g][i] = 0;
         facc[j][g][i] = 0.0f;
+        if constexpr (kSplit) acch[j][g][i] = 0;
       }
   // Block metadata (scales, then sums) of this lane's token rows 8 g + 2 t + c.
   const float* meta[kG][2];
@@ -1670,6 +1813,7 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
 #pragma unroll
     for (int s = 0; s < kSteps / 2; ++s) {
       uint32_t a[TPW][4];
+      uint32_t ah[kSplit ? TPW : 1][4];
 #pragma unroll
       for (int j = 0; j < TPW; ++j) {
 #pragma unroll
@@ -1681,8 +1825,17 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
           const uint32_t u = __funnelshift_l(lo, hi, shift);
           const uint32_t s0 = u >> (32 - R::kL);
           const uint32_t s1 = (u >> (32 - R::kL - R::kKV)) & ((1u << R::kL) - 1u);
-          a[j][2 * h] = q4n_nibble_sums(s0);
-          a[j][2 * h + 1] = q4n_nibble_sums(s1);
+          if constexpr (kSplit) {
+            const uint32_t p0 = s0 * 0x83DCD12Du;
+            const uint32_t p1 = s1 * 0x83DCD12Du;
+            a[j][2 * h] = p0;
+            a[j][2 * h + 1] = p1;
+            ah[j][2 * h] = p0 & 0xF0F0F0F0u;
+            ah[j][2 * h + 1] = p1 & 0xF0F0F0F0u;
+          } else {
+            a[j][2 * h] = q4n_nibble_sums(s0);
+            a[j][2 * h + 1] = q4n_nibble_sums(s1);
+          }
         }
       }
       const uint32_t vec = static_cast<uint32_t>(((2 * s + lv) ^ b_swz) * 16);
@@ -1697,13 +1850,20 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
           for (int j = 0; j < TPW; ++j) {
             mma_u8s8(a[j], b[0], b[1], acc[j][g]);
             mma_u8s8(a[j], b[2], b[3], acc[j][g + 1]);
+            if constexpr (kSplit) {
+              mma_u8s8(ah[j], b[0], b[1], acch[j][g]);
+              mma_u8s8(ah[j], b[2], b[3], acch[j][g + 1]);
+            }
           }
         }
         if constexpr (kG % 2 == 1) {
           uint32_t b[2];
           ldmatrix2_at(b_row + read + (kG - 1) * 8 * 64 + vec, b);
 #pragma unroll
-          for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][kG - 1]);
+          for (int j = 0; j < TPW; ++j) {
+            mma_u8s8(a[j], b[0], b[1], acc[j][kG - 1]);
+            if constexpr (kSplit) mma_u8s8(ah[j], b[0], b[1], acch[j][kG - 1]);
+          }
         }
       } else {
 #pragma unroll
@@ -1711,7 +1871,10 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
           uint32_t b[2];
           ldmatrix2_at(b_row + read + g * 8 * 64 + vec, b);
 #pragma unroll
-          for (int j = 0; j < TPW; ++j) mma_u8s8(a[j], b[0], b[1], acc[j][g]);
+          for (int j = 0; j < TPW; ++j) {
+            mma_u8s8(a[j], b[0], b[1], acc[j][g]);
+            if constexpr (kSplit) mma_u8s8(ah[j], b[0], b[1], acch[j][g]);
+          }
         }
       }
     }
@@ -1738,6 +1901,15 @@ __device__ __forceinline__ void run_tile_i8(const Gemm& p, uint32_t smem,
       }
     }
     read = next_stage<S>(read);
+  }
+  if constexpr (kSplit) {
+#pragma unroll
+    for (int j = 0; j < TPW; ++j)
+#pragma unroll
+      for (int g = 0; g < kG; ++g)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+          acc[j][g][i] -= 15 * (acch[j][g][i] >> 4);
   }
 
   const int t = lane & 3;
@@ -1812,7 +1984,7 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
   constexpr int kWVectors = kSteps * kStepVectors;
   // kPlanes 4 / 5 (lab INT8, per-row / per-128-k block scales): 4 vectors
   // (64 INT8 values) per row and chunk.
-  constexpr bool kI8 = kPlanes == 4 || kPlanes == 5;
+  constexpr bool kI8 = kPlanes == 4 || kPlanes == 5 || kPlanes == 6 || kPlanes == 7;
   constexpr int kOperandVectors = S::kTileRows * (kI8 ? 4 : 16);
   constexpr int kStageVectors = kOperandVectors + kWVectors;
   constexpr int kCopies = (kStageVectors + kThreads - 1) / kThreads;
@@ -1876,13 +2048,20 @@ __global__ void __launch_bounds__(kThreads, 2) gemm(Gemm p) {
     stage = next_stage<S>(stage);
   };
 
-  if constexpr (kI8) {
+  if constexpr (kPlanes == 6 || kPlanes == 7) {
+    // Decode route tiles hold one 8-row group, so only G = 1 is instantiated:
+    // the 1..8 group switch sizes the kernel's registers for G = 8 (126 regs,
+    // 2 blocks/SM) although decode never reaches G > 1. 6: split nibbles;
+    // 7: the served per-row INT8 tile (same code as kPlanes 4 at G = 1).
+    static_assert(S::kTileRows == 8, "G = 1 kernels: decode tiles");
+    run_tile_i8<1, S, false, decltype(load), kPlanes == 6>(p, smem, load, rows, tile.y, pi, cb);
+  } else if constexpr (kI8) {
     static_assert(S::kTileRows == 64 || S::kTileRows == 8,
                   "INT8 path: prefill (64-row) and decode (8-row) tiles");
     switch ((rows + 7) >> 3) {
 #define EXL3_GROUPS_I8(G)                                          \
   case G:                                                          \
-    run_tile_i8<G, S, kPlanes == 5>(p, smem, load, rows, tile.y, pi, cb); \
+    run_tile_i8<G, S, kPlanes == 5, decltype(load), kPlanes == 6>(p, smem, load, rows, tile.y, pi, cb); \
     break;
       EXL3_GROUPS_I8(1)
       EXL3_GROUPS_I8(2) EXL3_GROUPS_I8(3) EXL3_GROUPS_I8(4) EXL3_GROUPS_I8(5)
@@ -1937,7 +2116,10 @@ __global__ void combine(const float* down, const float* weights,
                         int64_t rows, Out* out) {
   constexpr int kHidden = F::kHidden;
   constexpr int kSpans = kHidden / 512;
-  using Accumulator = std::conditional_t<F::kTileRows == 8, float, double>;
+  // Batch invariance: every family sums its routes with the same FP32 FMAs in route order, so a token's combined
+  // output does not depend on whether its call took the decode or the prefill schedule (prefill used to sum in FP64
+  // and round once; tests/verify/batch_invariance/moe_m_sweep.py found the 1-ulp split at the 64/65-row switch).
+  using Accumulator = float;
   const int lane = threadIdx.x & 31;
   const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
   const int* position = table + Layout::position_offset(assignments);
@@ -1973,23 +2155,14 @@ __global__ void combine(const float* down, const float* weights,
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const float value = __fmul_rn(v[8 * h + j], s[j]);
-          if constexpr (F::kTileRows == 8) {
-            sum[8 * h + j] = __fmaf_rn(value, weight, sum[8 * h + j]);
-          } else {
-            sum[8 * h + j] =
-                fma(static_cast<double>(value), weight, sum[8 * h + j]);
-          }
+          sum[8 * h + j] = __fmaf_rn(value, weight, sum[8 * h + j]);
         }
       }
     }
     float rounded[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-      if constexpr (F::kTileRows == 8) {
-        rounded[i] = sum[i];
-      } else {
-        rounded[i] = __double2float_rn(sum[i]);
-      }
+      rounded[i] = sum[i];
     }
     Out* dst = out + row * kHidden + base;
     store8_sum(dst, out_vec, rounded);
@@ -2159,9 +2332,9 @@ inline int q4n_i8_gemm_variant() {
   }();
   return v;
 }
-template <class S>
+template <class S, int kPlanes = 4>
 void launch_gemm_items(const Gemm& p, int64_t max_tiles, cudaStream_t stream) {
-  launch_gemm<S, 4>(p, max_tiles * S::kProjections * S::kColBlocks, stream);
+  launch_gemm<S, kPlanes>(p, max_tiles * S::kProjections * S::kColBlocks, stream);
 }
 // gate/up (kGateUp) or down with the selected INT8 variant.
 template <class S, bool kGateUp>
@@ -2332,6 +2505,24 @@ struct StageTimer {
 // VLLM_EXL3_Q4N_DECODE_GEMM (with VLLM_EXL3_Q4N_DECODE=i8): base (the decode
 // shapes and VLLM_EXL3_MOE_DECODE_TC_STAGES) or t2c4 (compact INT8 stages 4
 // deep, gate/up TPW 2; the served choice). Bitwise equal.
+// VLLM_EXL3_Q4N_DECODE_NIBBLE=1: the t2c4 decode GEMM with split-nibble
+// IMMAs (run_tile_i8 kSplit; bitwise equal).
+inline bool q4n_decode_nibble_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_Q4N_DECODE_NIBBLE");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  return on;
+}
+// VLLM_EXL3_Q4N_DECODE_G1=1: the t2c4 decode GEMM instantiated for one
+// 8-row group only (bitwise the served kernel; fewer registers).
+inline bool q4n_decode_g1_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_Q4N_DECODE_G1");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  return on;
+}
 inline int q4n_decode_gemm_variant() {
   static const int v = [] {
     const char* e = std::getenv("VLLM_EXL3_Q4N_DECODE_GEMM");
@@ -2346,6 +2537,15 @@ inline int q4n_decode_gemm_variant() {
 // Lab (VLLM_EXL3_Q4N_DECODE=i8, Q4N-X decode families): per-row INT8
 // activations on the u8 x s8 IMMA path in the 8-row decode GEMMs too, with the
 // fused INT8 operand blocks. Changes decode numerics (as prefill i8 does).
+// VLLM_EXL3_MOE_ROUTE_FUSE=1: route + gate/up operand in one launch on the
+// INT8 decode path (bitwise; needs VLLM_EXL3_ROUTE_CHECK=0).
+inline bool route_fuse_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("VLLM_EXL3_MOE_ROUTE_FUSE");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  return on;
+}
 inline bool q4n_decode_i8_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("VLLM_EXL3_Q4N_DECODE");
@@ -2420,7 +2620,14 @@ void launch_i8_decode_gemm(const Gemm& p, int64_t max_tiles, int64_t items,
                            cudaStream_t stream) {
   constexpr int kBaseTpw = S::kTPW;
   switch (q4n_decode_gemm_variant()) {
-    case 4: launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>>(p, max_tiles, stream); return;
+    case 4:
+      if (q4n_decode_nibble_enabled())
+        launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>, 6>(p, max_tiles, stream);
+      else if (q4n_decode_g1_enabled())
+        launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>, 7>(p, max_tiles, stream);
+      else
+        launch_gemm_items<I8Shape<S, kGateUp ? 2 : kBaseTpw, 4>>(p, max_tiles, stream);
+      return;
     default: launch_decode_gemm<S, 4>(p, items, stream); return;
   }
 }
@@ -2459,9 +2666,17 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
   bool i8_decode = false;
   if constexpr (F::kCodebook == 4 && F::kTileRows == 8 && decode_glue_blocks<F>())
     i8_decode = q4n_decode_i8_enabled();
-  route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
-      routing, assignments, table, route_check_enabled());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // VLLM_EXL3_MOE_ROUTE_FUSE=1: the INT8 decode route and gate/up operand
+  // tasks in one launch (route_gate_up_operand_block, bitwise).
+  bool route_fused = false;
+  if constexpr (!kDownOnly && F::kCodebook == 4 && F::kTileRows == 8 &&
+                decode_glue_blocks<F>())
+    route_fused = i8_decode && route_fuse_enabled() && !route_check_enabled();
+  if (!route_fused) {
+    route<F><<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(
+        routing, assignments, table, route_check_enabled());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   timer.mark("route");
   const int64_t max_tiles = std::min<int64_t>(
       assignments, assignments / kTileRows +
@@ -2482,7 +2697,13 @@ void run_family(const __nv_bfloat16* x, const void* ids, bool ids64,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   } else {
     if constexpr (decode_glue_blocks<F>()) {
-      if (i8_decode) {
+      if (route_fused) {
+        if constexpr (F::kCodebook == 4)
+          route_gate_up_operand_block<F, true>
+              <<<static_cast<unsigned int>(2 * assignments + 1), 32 * (kHidden / 512),
+                 (assignments + 3 * local_experts + 1) * sizeof(int), stream>>>(
+                  x, routing, assignments, table, operand, unscale);
+      } else if (i8_decode) {
         if constexpr (F::kCodebook == 4)
           gate_up_operand_block<F, true>
               <<<static_cast<unsigned int>(2 * assignments), 32 * (kHidden / 512),

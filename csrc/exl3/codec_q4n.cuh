@@ -10,7 +10,7 @@
 namespace exl3 {
 
 constexpr int kQ4NFormatOffset = 64;  // bits_x2 key = bits_x2 + 64 marks a Q4N tensor
-constexpr float kQ4NAlpha = 0.15339208f;  // 1 / 6.519202405202649
+constexpr float kQ4NAlpha = 0.153392998f;  // float32(1 / 6.519202405202649) = 0x3e1d130e (was 0.15339208f, 62 ulps low)
 
 // Codebook 3 (Q4N): 16-bit state. Codebook 4 (Q4N-X): the longest state whose two lane states fit one 32-bit
 // window, L = 32 - KV (22 at 2.5 bpw, 20 at 3.0 bpw). Everything else is shared.
