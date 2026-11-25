@@ -55,6 +55,9 @@ _STAGE_SCRATCH: dict = {}
 # VLLM_INKLING2_FI_FP8_STAGE=1: the sm_80 FlashInfer far / Triton near hybrid also runs over
 # an E4M3 cache, on the bf16 staging scratch (needs VLLM_INKLING2_FP8_STAGE=1).
 _FI_FP8_STAGE = os.environ.get("VLLM_INKLING2_FI_FP8_STAGE", "0") == "1"
+# VLLM_INKLING2_LOCAL_FP8_STAGE=1: local-layer prefill over an E4M3 cache stages only
+# the window's pages to bf16 and runs the sm_80 local-window prefill kernel.
+_LOCAL_FP8_STAGE = os.environ.get("VLLM_INKLING2_LOCAL_FP8_STAGE", "0") == "1"
 
 
 def ensure_fp8_stage_scratch(max_model_len: int, num_kv_heads: int, row: int) -> None:
@@ -214,6 +217,93 @@ def stage_fp8_kv_like(
         num_reqs * max_pages, device=kv_bytes.device, dtype=torch.int32
     )
     return scratch, table.view(num_reqs, max_pages)
+
+
+@triton.jit
+def _stage_fp8_kv_window_kernel(
+    KV,
+    BlockTable,
+    SeqLens,
+    First,
+    Out,
+    stride_kv_blk,
+    stride_bt,
+    W_PAGES: tl.constexpr,
+    PAGE: tl.constexpr,
+    PAGE_ELEMS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Decode page `First[r] + i` of request `r` into scratch page `r * W_PAGES + i`."""
+    i = tl.program_id(0)
+    r = tl.program_id(1)
+    chunk = tl.program_id(2)
+    p = tl.load(First + r) + i
+    if p * PAGE >= tl.load(SeqLens + r):
+        return
+    blk = tl.load(BlockTable + r.to(tl.int64) * stride_bt + p).to(tl.int64)
+    offs = chunk * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < PAGE_ELEMS
+    codes = tl.load(KV + blk * stride_kv_blk + offs, mask=mask, other=0)
+    dst = (r.to(tl.int64) * W_PAGES + i) * PAGE_ELEMS
+    tl.store(Out + dst + offs, e4m3_decode_bf16(codes), mask=mask)
+
+
+def stage_fp8_kv_window(
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_query_len: int,
+    window: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Local-layer prefill over an E4M3 cache: bf16 copies of only the pages a
+    window-`window` prefill of each request reads (the chunk plus `window` keys),
+    in a compact scratch, and a block table mapping those pages to it (other
+    entries 0, never read). key_cache is the K half of [blocks, PAGE, KV, 2D]
+    bytes with each block contiguous. Returns (key, value, table) or None."""
+    num_reqs = cache_seqlens.shape[0]
+    page, heads = key_cache.shape[1:3]
+    kv_bytes = torch.as_strided(
+        key_cache,
+        (key_cache.shape[0], page, heads, 2 * head_dim),
+        key_cache.stride(),
+        key_cache.storage_offset(),
+    )
+    if not kv_bytes[0].is_contiguous():
+        return None
+    page_elems = kv_bytes[0].numel()
+    w_pages = triton.cdiv(max_query_len + window, page) + 1
+    need = num_reqs * w_pages * page_elems
+    buf = _STAGE_SCRATCH.get(key_cache.device)
+    if buf is None or buf.numel() < need:
+        return None
+    q_lens = cu_seqlens_q[1 : num_reqs + 1] - cu_seqlens_q[:num_reqs]
+    first = (
+        torch.clamp(cache_seqlens - q_lens - window + 1, min=0) // page
+    ).to(torch.int32)
+    block = 4096
+    _stage_fp8_kv_window_kernel[(w_pages, num_reqs, triton.cdiv(page_elems, block))](
+        kv_bytes,
+        block_table,
+        cache_seqlens,
+        first,
+        buf,
+        kv_bytes.stride(0),
+        block_table.stride(0),
+        W_PAGES=w_pages,
+        PAGE=page,
+        PAGE_ELEMS=page_elems,
+        BLOCK=block,
+        num_warps=4,
+    )
+    scratch = buf[:need].view(num_reqs * w_pages, page, heads, 2 * head_dim)
+    pidx = torch.arange(block_table.shape[1], device=key_cache.device, dtype=torch.int32)
+    rel = pidx[None, :] - first[:, None]
+    base = torch.arange(num_reqs, device=key_cache.device, dtype=torch.int32)[:, None] * w_pages
+    table = torch.where((rel >= 0) & (rel < w_pages), base + rel, 0).to(torch.int32)
+    k, v = scratch.split(head_dim, dim=-1)
+    return k, v, table
 
 
 # SM8x E4M3 KV loads come back scaled by 2^-8 (`e4m3_decode_fp16_scaled`).
@@ -1096,6 +1186,17 @@ def _rel_attention_near_causal_kernel(
     )
 
 
+_FI_DBG_SEEN: set = set()
+
+
+def _fi_dbg(site: int, env: dict) -> None:
+    if os.environ.get("VLLM_INKLING2_FI_DEBUG") == "1" and site not in _FI_DBG_SEEN:
+        _FI_DBG_SEEN.add(site)
+        kv = env.get("kv_cache")
+        print(f"[inkling2 fi-hybrid] declined at site {site}: kv "
+              f"{None if kv is None else (kv.dtype, tuple(kv.shape), kv.stride())}", flush=True)
+
+
 def rel_attention_full_hybrid(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1125,41 +1226,44 @@ def rel_attention_full_hybrid(
         or q.dtype != torch.bfloat16
         or kv_cache.ndim != 4
     ):
-        return False
+        _fi_dbg(1, locals()); return False
     if kv_cache.dtype != torch.bfloat16:
         # E4M3 cache (VLLM_INKLING2_FP8_STAGE=1): decode the visible blocks once into a
         # bf16 scratch in the cache's own layout and run the hybrid on that.
         if not (_FP8_STAGE and kv_cache.element_size() == 1 and _FI_FP8_STAGE):
-            return False
+            _fi_dbg(2, locals()); return False
         page = key_cache.shape[1]
+        # kv_cache is a [blocks, KV heads, PAGE, 2D] view of [blocks, PAGE, KV heads, 2D]
+        # storage: stage the storage order and hand back the same view.
         staged = stage_fp8_kv_like(
-            kv_cache.view(torch.uint8),
+            kv_cache.view(torch.uint8).transpose(1, 2),
             block_table,
             cache_seqlens,
             int(seq_lens_cpu.max()) if len(seq_lens_cpu) else 0,
             page,
         )
         if staged is None:
-            return False
-        kv_cache, block_table = staged
+            _fi_dbg(3, locals()); return False
+        scratch, block_table = staged
+        kv_cache = scratch.transpose(1, 2)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(q.shape[2], dim=-1)
     num_tokens, num_heads, head_dim = q.shape
     if num_tokens == 0:
-        return False
+        _fi_dbg(4, locals()); return False
     page, num_kv_heads = key_cache.shape[1:3]
     if (
         kv_cache.shape[1] != num_kv_heads
         or kv_cache.shape[2] != page
         or kv_cache.shape[3] != 2 * head_dim
     ):
-        return False
+        _fi_dbg(5, locals()); return False
     num_reqs = cache_seqlens.shape[0]
     if (
         len(q_lens_cpu) != num_reqs
         or len(seq_lens_cpu) != num_reqs
         or int(q_lens_cpu.sum()) != num_tokens
     ):
-        return False
+        _fi_dbg(6, locals()); return False
     gated = gate is not None and sinks is not None
     group = num_heads // num_kv_heads
     tokens_per_tile = 128 // group
@@ -1223,7 +1327,7 @@ def rel_attention_full_hybrid(
                 tok_off += ql
             if max_far_pages == 0:
                 plan_cache[plan_key] = (False, False, None, None, None)
-                return False
+                _fi_dbg(7, locals()); return False
             bt_cpu = (
                 block_table[:, :max_far_pages].to("cpu", non_blocking=False).numpy()
             )
@@ -1284,7 +1388,7 @@ def rel_attention_full_hybrid(
 
             if max_far_pages == 0:
                 plan_cache[plan_key] = (False, False, None, None, None)
-                return False
+                _fi_dbg(8, locals()); return False
 
             bt_cpu = (
                 block_table[:, :max_far_pages].to("cpu", non_blocking=False).numpy()
@@ -1315,7 +1419,7 @@ def rel_attention_full_hybrid(
 
     any_far, is_causal, fi_wrapper, far_meta_gpu, q_ranges = cached
     if not any_far:
-        return False
+        _fi_dbg(9, locals()); return False
 
     q_in = q if q.is_contiguous() else q.contiguous()
     kc_fi, vc_fi = kv_cache.split(head_dim, dim=-1)
@@ -1476,6 +1580,26 @@ def rel_attention(
     block_m = _block_m(max_query_len, group)
     tokens_per_tile = block_m // group
     num_reqs = cache_seqlens.shape[0]
+
+    # E4M3 cache (VLLM_INKLING2_LOCAL_FP8_STAGE=1): stage the window's pages to bf16
+    # so the local-window prefill fast path below can run.
+    if (
+        _LOCAL_FP8_STAGE
+        and mode == MODE_OUT_LSE
+        and window > 0
+        and not draft
+        and num_splits == 1
+        and block_m >= 128
+        and key_cache.dtype == torch.uint8
+        and current_platform.is_device_capability_family(80)
+        and lse is not None
+    ):
+        staged_w = stage_fp8_kv_window(
+            key_cache, block_table, cache_seqlens, cu_seqlens_q, max_query_len,
+            window, head_dim,
+        )
+        if staged_w is not None:
+            key_cache, value_cache, block_table = staged_w
 
     # sm_80 local-window prefill interior-block fast path (zero-spill OUT_LSE).
     if (

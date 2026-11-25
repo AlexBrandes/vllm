@@ -215,7 +215,18 @@ class Inkling2Experts(nn.Module):
         self.sm120 = use_sm12x_path()
         # HyperInkling: Ampere takes the SM12x path except for the experts,
         # which run Hopper's bf16-activation routing over Marlin GEMMs.
-        self.marlin = is_sm8x()
+        # VLLM_INKLING2_SM8X_HUMMING=1: NVFP4 / MXFP8 experts run Humming (bf16
+        # maths; sm_80 tiles and fused SiTU epilogue from snailbrainx/inkling-2-mini-sm80)
+        # instead of being repacked for Marlin. INT4 (GPTQ) experts stay on Marlin.
+        self.marlin = is_sm8x() and not (
+            not self.int4 and os.environ.get("VLLM_INKLING2_SM8X_HUMMING", "0") == "1"
+        )
+        if is_sm8x() and not self.marlin:
+            from .ops.sm80.humming_epilogue import install as _install_humming_epilogue
+
+            _install_humming_epilogue()
+            # The experts take the Hopper/Ampere Humming route, not the SM12x one.
+            self.sm120 = False
         vllm_config = get_current_vllm_config_or_none()
         self.humming_nvfp4 = (
             self.sm120
