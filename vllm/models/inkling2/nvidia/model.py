@@ -71,7 +71,7 @@ from .moe import Inkling2MoE, QuantFormat
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
-from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .ops.gemv import sm12x_bf16_gemv, sm80_lm_head_softcap, use_sm12x_bf16_gemv
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
@@ -80,6 +80,49 @@ from .vision import Inkling2VisionEncoder, VisionMetadata
 
 class Inkling2LogitsProcessor(LogitsProcessor):
     """Use the low-M projection while preserving vocab gathering and softcaps."""
+
+    def forward(
+        self,
+        lm_head,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+        skip_gather: bool = False,
+    ) -> torch.Tensor | None:
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            UnquantizedEmbeddingMethod,
+        )
+
+        if (
+            not self.logits_as_input
+            and getattr(lm_head, "hyperinkling_w8", None) is None
+            and self.head_dtype == torch.float32
+            and self.soft_cap is not None
+            and self.scale == 1.0
+            and (skip_gather or lm_head.tp_size == 1)
+            and isinstance(
+                lm_head.quant_method,
+                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+            )
+        ):
+            w_head = lm_head.weight
+            b_head = embedding_bias
+            if (
+                not skip_gather
+                and lm_head.tp_size == 1
+                and w_head.shape[0] > self.org_vocab_size
+            ):
+                w_head = w_head[: self.org_vocab_size]
+                if b_head is not None:
+                    b_head = b_head[: self.org_vocab_size]
+            logits = sm80_lm_head_softcap(
+                hidden_states, w_head, b_head, float(self.soft_cap)
+            )
+            if logits is not None:
+                if not skip_gather and logits.shape[-1] > self.org_vocab_size:
+                    logits = logits[..., : self.org_vocab_size]
+                return logits
+        return super().forward(lm_head, hidden_states, embedding_bias, skip_gather)
 
     def _apply_head(self, lm_head, hidden_states, embedding_bias):
         w8 = getattr(lm_head, "hyperinkling_w8", None)

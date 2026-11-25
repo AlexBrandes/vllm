@@ -5,6 +5,8 @@ reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
 
 import torch
 
+import vllm.envs as envs
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import is_flashinfer_autotuning
 
@@ -212,6 +214,15 @@ def k_group_partials(
     assert x.is_contiguous() and weight.is_contiguous()
     tokens, hidden = x.shape
     n = weight.shape[0]
+    # sm_80 (ported from snailbrainx/inkling-2-mini-sm80): cuBLAS fp32 GEMM is 1.6-10x faster than Triton
+    # _k_group_kernel for prefill-sized batches (tokens >= 512) with identical top-8 routing (md ~ 1e-5).
+    if (
+        tokens >= 512
+        and current_platform.is_device_capability_family(80)
+        and not envs.VLLM_BATCH_INVARIANT
+        and x.dtype == weight.dtype == torch.bfloat16
+    ):
+        return torch.mm(x, weight.t(), out_dtype=out_dtype).unsqueeze(0)
     sm120 = use_sm12x_path()
     if tokens >= TMA_MIN_TOKENS and not sm120:
         from triton.tools.tensor_descriptor import TensorDescriptor

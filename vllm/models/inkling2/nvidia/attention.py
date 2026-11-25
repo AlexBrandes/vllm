@@ -58,7 +58,14 @@ from .ops.attention import (
     plan_decode_attention,
     rel_decode_attention,
 )
-from .ops.attention_sm90 import MODE_OUT_LSE, ensure_fp8_stage_scratch, rel_attention
+from .ops.attention_sm90 import (
+    MODE_GATED,
+    MODE_OUT_LSE,
+    ensure_fp8_stage_scratch,
+    rel_attention,
+    rel_attention_full_hybrid,
+)
+from .ops.gemv import sm80_seg3_dyn_gemv, sm80_seg3_gemv
 from .ops.linear import linear
 from .ops.linear_w8 import W8Linear
 from .ops.sconv import attention_prologue, shift_rel_proj
@@ -367,6 +374,15 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             return list(projected.split(self.split_sizes, dim=-1)[:6])
         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
         k_end = q_side + kv_size
+        # sm_80 (Ampere): decode-sized batches run the three projections in one launch (ops/gemv.py).
+        fused = sm80_seg3_gemv((x_q, x_k, x_v), weight, (q_side, kv_size, kv_size))
+        if fused is not None:
+            projected = fused[:, :q_side]
+            k, v = fused[:, q_side:k_end], fused[:, k_end : k_end + kv_size]
+            add_linear_lora(self.qkvr, projected, x_q, range(4))
+            add_linear_lora(self.qkvr, k, x_k, [4])
+            add_linear_lora(self.qkvr, v, x_v, [5])
+            return [*projected.split(self.split_sizes[:4], dim=-1), k, v]
         projected = linear(x_q, weight[: sum(self.q_side_splits)])
         k = linear(x_k, weight[q_side:k_end])
         v = linear(x_v, weight[k_end : k_end + kv_size])
@@ -425,7 +441,40 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if self.is_local and x_k is None:
             x_k = x_v = x_q
         assert x_k is not None and x_v is not None
-        q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
+        k_dyn = v_dyn = None
+        if (
+            not self.is_local
+            and self.w8 is None
+            and self.k_sconv.dynamic
+            and self.v_sconv.dynamic
+            and self.k_sconv.weight_proj.shape[1] < 2560
+            and not (x_k is x_q and x_v is x_q)
+        ):
+            q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
+            fused_dyn = sm80_seg3_dyn_gemv(
+                (x_q, x_k, x_v),
+                self.qkvr.weight,
+                (q_side, kv_size, kv_size),
+                self.k_sconv.weight_proj,
+                self.v_sconv.weight_proj,
+            )
+            if fused_dyn is not None:
+                fused, k_dyn, v_dyn = fused_dyn
+                k_end = q_side + kv_size
+                projected = fused[:, :q_side]
+                k, v = fused[:, q_side:k_end], fused[:, k_end : k_end + kv_size]
+                add_linear_lora(self.qkvr, projected, x_q, range(4))
+                add_linear_lora(self.qkvr, k, x_k, [4])
+                add_linear_lora(self.qkvr, v, x_v, [5])
+                q, r, gate, sinks = projected.split(self.split_sizes[:4], dim=-1)
+            else:
+                q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
+                k_dyn = self.k_sconv.dynamic_taps(x_k)
+                v_dyn = self.v_sconv.dynamic_taps(x_v)
+        else:
+            q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
+            k_dyn = self.k_sconv.dynamic_taps(x_k)
+            v_dyn = self.v_sconv.dynamic_taps(x_v)
         output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
         self._attention(
             positions,
@@ -435,8 +484,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             sinks,
             k,
             v,
-            self.k_sconv.dynamic_taps(x_k),
-            self.v_sconv.dynamic_taps(x_v),
+            k_dyn,
+            v_dyn,
             tau,
             output,
             pass_idx,
@@ -636,6 +685,72 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             num_splits=num_splits,
         )
 
+    def _sm80_prefill_attention_gated(
+        self,
+        md: FlashAttentionMetadata,
+        kv_cache: torch.Tensor,
+        q: torch.Tensor,
+        rel_logits: torch.Tensor,
+        gate: torch.Tensor,
+        sinks: torch.Tensor,
+        output: torch.Tensor,
+        num_decodes: int,
+    ) -> None:
+        """sm_80 fused gated prefill attention writing bf16 directly into `output`."""
+        num_decode_tokens = md.num_decode_tokens if num_decodes else 0
+        nt = md.num_actual_tokens - num_decode_tokens
+        if nt <= 0:
+            output.zero_()
+            return
+        cu_seqlens_q = md.query_start_loc[num_decodes:]
+        if num_decodes:
+            cu_seqlens_q = cu_seqlens_q - num_decode_tokens
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
+        handled = False
+        if not self.is_local and isinstance(md, Inkling2AttentionMetadata):
+            handled = rel_attention_full_hybrid(
+                q[:nt],
+                kv_cache,
+                key_cache,
+                value_cache,
+                output[:nt],
+                None,
+                rel_logits,
+                gate[:nt],
+                sinks[:nt],
+                md=md,
+                num_decodes=num_decodes,
+                block_table=md.block_table[num_decodes:],
+                cache_seqlens=md.seq_lens[num_decodes:],
+                cu_seqlens_q=cu_seqlens_q,
+                q_lens_cpu=md.query_lens_cpu[num_decodes:],
+                seq_lens_cpu=md.seq_lens_cpu[num_decodes:],
+                max_query_len=md.max_query_len,
+                softmax_scale=self.scaling,
+            )
+        if not handled:
+            rel_attention(
+                q[:nt],
+                key_cache,
+                value_cache,
+                output[:nt],
+                None,
+                rel_logits,
+                gate[:nt],
+                sinks[:nt],
+                block_table=md.block_table[num_decodes:],
+                cache_seqlens=md.seq_lens[num_decodes:],
+                cu_seqlens_q=cu_seqlens_q,
+                max_query_len=md.max_query_len,
+                softmax_scale=self.scaling,
+                window=self.sliding_window if self.is_local else 0,
+                num_splits=1,
+                mode=MODE_GATED,
+                max_seq_len=md.max_seq_len,
+            )
+        if nt < output.shape[0]:
+            output[nt:].zero_()
+
     def _fa4_attention(
         self,
         md: FlashAttentionMetadata,
@@ -656,23 +771,44 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
         key_cache, value_cache = self._split_kv_cache(kv_cache)
         if not use_sm100_kernels():
-            rel_attention(
-                q[:nt],
-                key_cache,
-                value_cache,
-                out,
-                lse,
-                rel_logits,
-                block_table=md.block_table[num_decodes:],
-                cache_seqlens=md.seq_lens[num_decodes:],
-                cu_seqlens_q=cu_seqlens_q,
-                max_query_len=md.max_query_len,
-                softmax_scale=self.scaling,
-                window=self.sliding_window if self.is_local else 0,
-                num_splits=1,
-                mode=MODE_OUT_LSE,
-                max_seq_len=md.max_seq_len,
-            )
+            handled = False
+            if not self.is_local and isinstance(md, Inkling2AttentionMetadata):
+                handled = rel_attention_full_hybrid(
+                    q[:nt],
+                    kv_cache,
+                    key_cache,
+                    value_cache,
+                    out,
+                    lse,
+                    rel_logits,
+                    md=md,
+                    num_decodes=num_decodes,
+                    block_table=md.block_table[num_decodes:],
+                    cache_seqlens=md.seq_lens[num_decodes:],
+                    cu_seqlens_q=cu_seqlens_q,
+                    q_lens_cpu=md.query_lens_cpu[num_decodes:],
+                    seq_lens_cpu=md.seq_lens_cpu[num_decodes:],
+                    max_query_len=md.max_query_len,
+                    softmax_scale=self.scaling,
+                )
+            if not handled:
+                rel_attention(
+                    q[:nt],
+                    key_cache,
+                    value_cache,
+                    out,
+                    lse,
+                    rel_logits,
+                    block_table=md.block_table[num_decodes:],
+                    cache_seqlens=md.seq_lens[num_decodes:],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_query_len=md.max_query_len,
+                    softmax_scale=self.scaling,
+                    window=self.sliding_window if self.is_local else 0,
+                    num_splits=1,
+                    mode=MODE_OUT_LSE,
+                    max_seq_len=md.max_seq_len,
+                )
             out[nt:].zero_()
             lse[:, nt:].zero_()
             return

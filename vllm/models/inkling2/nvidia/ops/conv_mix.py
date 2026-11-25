@@ -3,12 +3,27 @@
 """Hidden-stream short conv fused with the AttnRes mix + RMSNorm of the next
 sublayer, for large batches of an already reduced input (CUDA)."""
 
+import os
+
 import torch
+
+from vllm.platforms import current_platform
 
 from . import use_sm12x_path
 from .attn_res import attn_res
 from .sconv import short_conv
 from .seq_parallel import SeqParallel
+
+try:
+    from vllm.models.inkling2.nvidia.ops.sm80.inkling_sm80_cuda import (
+        HAS_CUDA_EXT as _SM80_HAS_CUDA,
+    )
+    from vllm.models.inkling2.nvidia.ops.sm80.inkling_sm80_cuda import (
+        conv_mix_cuda as _sm80_conv_mix_cuda,
+    )
+except Exception:
+    _SM80_HAS_CUDA = False
+    _sm80_conv_mix_cuda = None
 
 
 def conv_mix(
@@ -89,6 +104,51 @@ def conv_mix(
     if sp is None:
         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
         if use_sm12x_path():
+            # sm_80: fused CUDA conv_mix (100% bit-exact):
+            # - Decode (T <= 256): 288t for n_stack<=3, 576t zero-spill for n_stack=4..7 (1.33x faster)
+            # - Prefill (T > 256, both Q == 1 AND Q == 3): 1-barrier intra-fast-path 288t CUDA conv_mix (1.33-1.73x faster)
+            if (
+                _SM80_HAS_CUDA
+                and current_platform.is_device_capability_family(80)
+                and os.environ.get("INKLING_SM80_NO_CUDA_CONVMIX") != "1"
+                and d == 2304
+                and stream_width % 8 == 0
+                and stream_offset % 8 == 0
+                and stack.shape[0] <= 7
+                and queries.shape[0] in (1, 3)
+                and conv_weight.dtype == torch.bfloat16
+                and cache.dtype == torch.bfloat16
+                and stack.dtype == torch.bfloat16
+                and conv_out.dtype == torch.bfloat16
+                and (norm_weight is None or norm_weight.dtype == torch.bfloat16)
+                and (residual is None or residual.dtype == torch.bfloat16)
+                and (addend is None or addend.dtype == torch.bfloat16)
+                and (last is None or last.dtype == torch.bfloat16)
+                and block_table.dtype == torch.int32
+                and seq_idx.dtype == torch.int32
+                and query_start.dtype == torch.int32
+            ):
+                return _sm80_conv_mix_cuda(
+                    x,
+                    conv_weight,
+                    cache,
+                    positions,
+                    block_table,
+                    seq_idx,
+                    slot_mapping,
+                    query_start,
+                    stream_offset,
+                    stream_width,
+                    conv_out,
+                    residual,
+                    addend,
+                    stack,
+                    last,
+                    queries,
+                    norm_weight,
+                    norm_eps,
+                    eps,
+                )
             # Native conv/mix kernels require Hopper or SM10x. Keep the
             # loop executor's cache writes and residual rounding on SM12x.
             short_conv(

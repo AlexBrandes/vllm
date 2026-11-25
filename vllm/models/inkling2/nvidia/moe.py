@@ -31,7 +31,7 @@ from .ops.block_scales import shuffle_rows, swizzle_block_scales
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
 from .ops.moe_humming import HummingNVFP4Experts
 from .ops.moe_marlin import INT4_GROUP, MarlinExperts
-from .ops.moe_sm90 import HummingExperts, select_experts
+from .ops.moe_sm90 import HummingExperts, select_and_align_experts_sm80, select_experts
 from .ops.moe_sm120 import bmm as bmm_sm120
 from .ops.seq_parallel import SeqParallel
 from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
@@ -381,6 +381,7 @@ class Inkling2Experts(nn.Module):
                 self.num_experts * self.ep_size,
                 self.gate_cap,
                 self.up_cap,
+                **({} if plan is None else {"alignment_8": plan}),
             )
         if push is not None:
             # Each rank's fp32 combine is rounded once to bf16.
@@ -465,6 +466,22 @@ class Inkling2MoE(nn.Module):
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             is_padding = get_forward_context().is_padding
+        if not experts.marlin and not (experts.sm100 or experts.sm120):
+            # sm_80 Humming experts: routing top-k fused with block alignment
+            # (snailbrainx/inkling-2-mini-sm80); the Marlin experts keep their own.
+            fused_sel = select_and_align_experts_sm80(
+                x,
+                gate.weight,
+                gate.bias,
+                gate.topk,
+                gate.route_scale,
+                experts.num_experts,
+                experts.ep_size,
+                is_padding,
+            )
+            if fused_sel is not None:
+                selected, align8 = fused_sel
+                return experts(x, selected, None, align8, reduce, push)
         if experts.marlin or not (experts.sm100 or experts.sm120):
             selected = select_experts(
                 x,

@@ -556,6 +556,7 @@ def _attn_prologue_kernel(
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
     FUSE_QR: tl.constexpr,
+    SKIP_IDLE_CACHE: tl.constexpr = False,
 ):
     gdc_wait()
     # The decode attention kernel prefetches cached keys meanwhile.
@@ -637,6 +638,7 @@ def _attn_prologue_kernel(
             D,
             DYNAMIC,
             BT,
+            SKIP_IDLE_CACHE,
         )
 
 
@@ -707,6 +709,216 @@ def _qr_rel_kernel(
 
 
 @triton.jit
+def _qr_clip_only_kernel(
+    q_ptr,
+    q_scale_ptr,
+    tau_ptr,
+    q_out_ptr,
+    T,
+    stride_q,
+    clip_threshold,
+    clip_eps,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    HAS_TAU: tl.constexpr,
+    BLOCK_HQ: tl.constexpr,
+    BT: tl.constexpr,
+):
+    t0 = tl.program_id(0) * BT
+    heads = tl.arange(0, BLOCK_HQ)[:, None]
+    h_mask = heads < HQ
+    q_cols = tl.arange(0, D)[None, :]
+    q_sc = tl.load(q_scale_ptr + heads * D + q_cols, mask=h_mask, other=0.0).to(
+        tl.float32
+    )
+    for i in tl.static_range(BT):
+        t = (t0 + i).to(tl.int64)
+        if t < T:
+            x = (
+                tl.load(
+                    q_ptr + t * stride_q + heads * D + q_cols,
+                    mask=h_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                * q_sc
+            )
+            sum_sq = tl.sum(x * x, axis=1)
+            norm = tl.where(sum_sq > 0, sum_sq * rsqrt(sum_sq), 0.0)
+            y = x * tl.minimum(tl.div_rn(clip_threshold, norm + clip_eps), 1.0)[:, None]
+            if HAS_TAU:
+                tau = tl.load(tau_ptr + t)
+                y = y.to(q_ptr.dtype.element_ty).to(tl.float32) * tau
+            tl.store(
+                q_out_ptr + t * HQ * D + heads * D + q_cols,
+                y.to(q_out_ptr.dtype.element_ty),
+                mask=h_mask,
+            )
+
+
+@triton.jit
+def _rel_sheared_batched_kernel(
+    r_ptr,
+    r_scale_ptr,
+    tau_ptr,
+    rel_proj_ptr,
+    rel_out_ptr,
+    cu_seqlens_q_ptr,
+    seq_lens_ptr,
+    stride_r,
+    rel_threshold,
+    clip_eps,
+    HQ: tl.constexpr,
+    D_REL: tl.constexpr,
+    E: tl.constexpr,
+    SHIFT_W: tl.constexpr,
+    HAS_TAU: tl.constexpr,
+    BM: tl.constexpr,
+    TPC: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    CHUNKS_PER_PROG: tl.constexpr,
+):
+    """Same-diag batched relative logits for single-request prefill.
+
+    All full 128-token tiles share the exact same sheared diagonal column
+    `diag` for a given in-tile offset `r_mod in [0, 128)`, allowing `TPC`
+    tokens x `HQ` heads to share one `rel_proj` load and reuse `r_clip`
+    in registers across `CHUNKS_PER_PROG` column chunks.
+    """
+    E_PAD: tl.constexpr = E + 256
+    r_mod = tl.program_id(0)
+    k_grp = tl.program_id(1)
+    c_grp = tl.program_id(2)
+
+    q_start = tl.load(cu_seqlens_q_ptr)
+    q_end = tl.load(cu_seqlens_q_ptr + 1)
+    q_len = q_end - q_start
+    n_full = q_len // 128
+    k_base = k_grp * TPC
+    if k_base < n_full:
+        past = tl.load(seq_lens_ptr) - q_len
+
+        m_idx = tl.arange(0, BM)
+        tok_slot = m_idx // HQ
+        h_idx = m_idx % HQ
+        k = k_base + tok_slot
+        valid = (m_idx < TPC * HQ) & (k < n_full)
+        t = q_start + k * 128 + r_mod
+        safe_t = tl.where(valid, t, 0).to(tl.int64)
+
+        r_cols = tl.arange(0, D_REL)
+        r_val = tl.load(
+            r_ptr
+            + safe_t[:, None] * stride_r
+            + h_idx[:, None] * D_REL
+            + r_cols[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        r_sc = tl.load(
+            r_scale_ptr + h_idx[:, None] * D_REL + r_cols[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        x = r_val * r_sc
+        sum_sq = tl.sum(x * x, axis=1)
+        norm = tl.where(sum_sq > 0, sum_sq * rsqrt(sum_sq), 0.0)
+        y = x * tl.minimum(tl.div_rn(rel_threshold, norm + clip_eps), 1.0)[:, None]
+        if HAS_TAU:
+            tau = tl.load(tau_ptr + safe_t, mask=valid, other=1.0)
+            y = y.to(r_ptr.dtype.element_ty).to(tl.float32) * tau[:, None]
+        r_clip = y.to(r_ptr.dtype.element_ty)
+
+        diag = past + r_mod + E_PAD - (tl.cdiv(past, 128) + 1) * 128
+        diag = tl.minimum(tl.maximum(diag, E + 1), E_PAD - 1)
+        diag8 = (diag // 8) * 8
+        table = rel_proj_ptr + (diag - diag8) * (D_REL + 1) * SHIFT_W + E + 256 - diag8
+
+        e_idx = tl.arange(0, BLOCK_E)[None, :]
+        r_rows = tl.arange(0, D_REL)[:, None]
+        out_row_base = (
+            rel_out_ptr + safe_t[:, None] * (HQ * E_PAD) + h_idx[:, None] * E_PAD
+        )
+        c_start = c_grp * CHUNKS_PER_PROG
+        for ci in tl.static_range(CHUNKS_PER_PROG):
+            col = (c_start + ci) * BLOCK_E + e_idx
+            proj = tl.load(table + r_rows * SHIFT_W + col)
+            pad = tl.load(table + D_REL * SHIFT_W + col)
+            rel = tl.dot(r_clip, proj) + pad.to(tl.float32)
+            tl.store(
+                out_row_base + col,
+                rel.to(rel_out_ptr.dtype.element_ty),
+                mask=valid[:, None],
+            )
+    gdc_wait()
+
+
+@triton.jit
+def _qr_rel_tail_kernel(
+    q_ptr,
+    r_ptr,
+    q_scale_ptr,
+    r_scale_ptr,
+    tau_ptr,
+    rel_proj_ptr,
+    q_out_ptr,
+    rel_out_ptr,
+    seq_idx_ptr,
+    cu_seqlens_q_ptr,
+    seq_lens_ptr,
+    stride_q,
+    stride_r,
+    clip_threshold,
+    rel_threshold,
+    clip_eps,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    D_REL: tl.constexpr,
+    E: tl.constexpr,
+    SHIFT_W: tl.constexpr,
+    HAS_TAU: tl.constexpr,
+    BLOCK_HQ: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    QR_TOKENS: tl.constexpr,
+):
+    q_start = tl.load(cu_seqlens_q_ptr)
+    q_end = tl.load(cu_seqlens_q_ptr + 1)
+    base = q_start + ((q_end - q_start) // 128) * 128
+    t0 = base + tl.program_id(0) * QR_TOKENS
+    if t0 < q_end:
+        qr_clip_rel_tokens(
+            t0,
+            QR_TOKENS,
+            tl.program_id(1),
+            q_end,
+            q_ptr,
+            r_ptr,
+            q_scale_ptr,
+            r_scale_ptr,
+            tau_ptr,
+            rel_proj_ptr,
+            q_out_ptr,
+            rel_out_ptr,
+            seq_idx_ptr,
+            cu_seqlens_q_ptr,
+            seq_lens_ptr,
+            stride_q,
+            stride_r,
+            clip_threshold,
+            rel_threshold,
+            clip_eps,
+            HQ,
+            D,
+            D_REL,
+            E,
+            SHIFT_W,
+            HAS_TAU,
+            BLOCK_HQ,
+            BLOCK_E,
+        )
+    gdc_wait()
+
+
+@triton.jit
 def _kv_conv_tile(
     k_ptr,
     v_ptr,
@@ -748,8 +960,14 @@ def _kv_conv_tile(
     D: tl.constexpr,
     DYNAMIC: tl.constexpr,
     BT: tl.constexpr,
+    SKIP_IDLE_CACHE: tl.constexpr = False,
 ):
-    toff = tl.program_id(0) * BT + tl.arange(0, BT)
+    first = tl.program_id(0) * BT
+    tile_reads_cache = True
+    if SKIP_IDLE_CACHE:
+        last = tl.minimum(first + BT, T) - 1
+        tile_reads_cache = tl.load(qstart_ptr + last) > first - (W - 1)
+    toff = first + tl.arange(0, BT)
     head = tl.program_id(1)
     is_v = tl.program_id(2) == 1
     d_idx = tl.arange(0, D)
@@ -794,6 +1012,9 @@ def _kv_conv_tile(
         dyn_ptr if DYNAMIC else None,
         stride_dyn,
         D,
+        SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
+        CACHE_FIRST=False,
+        tile_reads_cache=tile_reads_cache,
     )
     y = y.to(k_ptr.dtype.element_ty).to(tl.float32)
     sum_sq = tl.sum(y * y, axis=1)
@@ -914,8 +1135,14 @@ def attention_prologue(
     else:
         width = k_weight.shape[1]
         dyn_strides = (0, 0)
-    block_t = _prologue_block_t(num_tokens)
+    prefill = num_tokens > 256
     qr_tokens = _prologue_qr_tokens(num_tokens)
+    if qr_tokens:
+        block_t = 16 if dynamic else 8
+        kv_num_warps = 8 if dynamic else 4
+    else:
+        block_t = _prologue_block_t(num_tokens)
+        kv_num_warps = 4
     qr_blocks = 1 + (extent + 256) // block_e
     grid = (
         triton.cdiv(num_tokens, block_t),
@@ -985,39 +1212,130 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
-        num_warps=4,
+        SKIP_IDLE_CACHE=prefill,
+        num_warps=kv_num_warps,
         enable_fp_fusion=False,
         launch_pdl=PDL,
     )
     if qr_tokens:
-        _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
-            q,
-            r,
-            q_scale,
-            r_scale,
-            tau,
-            rel_proj,
-            q_out,
-            rel_out,
-            seq_idx,
-            cu_seqlens_q,
-            seq_lens,
-            num_tokens,
-            q.stride(0),
-            r.stride(0),
-            clip_threshold,
-            rel_threshold,
-            clip_eps,
-            HQ=num_q_heads,
-            D=head_dim,
-            D_REL=d_rel,
-            E=extent,
-            SHIFT_W=rel_proj.shape[2],
-            HAS_TAU=tau is not None,
-            BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
-            BLOCK_E=block_e,
-            QR_TOKENS=qr_tokens,
-            num_warps=4,
-            enable_fp_fusion=False,
-            launch_pdl=PDL,
-        )
+        if (
+            cu_seqlens_q.shape[0] == 2
+            and (extent + 256) % 128 == 0
+            and num_q_heads <= 64
+        ):
+            _qr_clip_only_kernel[(triton.cdiv(num_tokens, 8),)](
+                q,
+                q_scale,
+                tau,
+                q_out,
+                num_tokens,
+                q.stride(0),
+                clip_threshold,
+                clip_eps,
+                HQ=num_q_heads,
+                D=head_dim,
+                HAS_TAU=tau is not None,
+                BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+                BT=8,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+            # sm_80: BM=64, TPC=2 beats BM=128, TPC=5 across 4k (1.10x), 8k (1.05x), and 12k (1.06x)
+            bm = 64 if num_q_heads <= 32 else 128
+            max_tpc = bm // num_q_heads
+            n_chunks = (extent + 256) // 128
+            tpc = max_tpc
+            cpp = n_chunks
+            n_tiles_upper = num_tokens // 128
+            if n_tiles_upper > 0:
+                _rel_sheared_batched_kernel[
+                    (128, triton.cdiv(n_tiles_upper, tpc), n_chunks // cpp)
+                ](
+                    r,
+                    r_scale,
+                    tau,
+                    rel_proj,
+                    rel_out,
+                    cu_seqlens_q,
+                    seq_lens,
+                    r.stride(0),
+                    rel_threshold,
+                    clip_eps,
+                    HQ=num_q_heads,
+                    D_REL=d_rel,
+                    E=extent,
+                    SHIFT_W=rel_proj.shape[2],
+                    HAS_TAU=tau is not None,
+                    BM=bm,
+                    TPC=tpc,
+                    BLOCK_E=128,
+                    CHUNKS_PER_PROG=cpp,
+                    num_warps=4,
+                    num_stages=2,
+                    enable_fp_fusion=False,
+                    launch_pdl=PDL,
+                )
+            _qr_rel_tail_kernel[
+                (triton.cdiv(128, qr_tokens), (extent + 256) // block_e)
+            ](
+                q,
+                r,
+                q_scale,
+                r_scale,
+                tau,
+                rel_proj,
+                q_out,
+                rel_out,
+                seq_idx,
+                cu_seqlens_q,
+                seq_lens,
+                q.stride(0),
+                r.stride(0),
+                clip_threshold,
+                rel_threshold,
+                clip_eps,
+                HQ=num_q_heads,
+                D=head_dim,
+                D_REL=d_rel,
+                E=extent,
+                SHIFT_W=rel_proj.shape[2],
+                HAS_TAU=tau is not None,
+                BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+                BLOCK_E=block_e,
+                QR_TOKENS=qr_tokens,
+                num_warps=4,
+                enable_fp_fusion=False,
+                launch_pdl=PDL,
+            )
+        else:
+            _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
+                q,
+                r,
+                q_scale,
+                r_scale,
+                tau,
+                rel_proj,
+                q_out,
+                rel_out,
+                seq_idx,
+                cu_seqlens_q,
+                seq_lens,
+                num_tokens,
+                q.stride(0),
+                r.stride(0),
+                clip_threshold,
+                rel_threshold,
+                clip_eps,
+                HQ=num_q_heads,
+                D=head_dim,
+                D_REL=d_rel,
+                E=extent,
+                SHIFT_W=rel_proj.shape[2],
+                HAS_TAU=tau is not None,
+                BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+                BLOCK_E=block_e,
+                QR_TOKENS=qr_tokens,
+                num_warps=4,
+                enable_fp_fusion=False,
+                launch_pdl=PDL,
+            )

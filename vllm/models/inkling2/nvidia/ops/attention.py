@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling2 attention kernels: FA4 relative attention, gate/sink, log-scaling."""
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -16,6 +17,7 @@ from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
     _num_warps_bucket,
     bucket_max_seqlen_q,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import gl, gluon, tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -399,7 +401,24 @@ def plan_decode_attention(
     if is_local:
         if work <= (16 if max_query_len <= 2 else 8):
             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
+        if not current_platform.has_device_capability(90):
+            # 170HX (sm_80, 74 SMs): s=4 yields 128/256 CTAs (2-4 full waves) vs 96/128,
+            # cutting 4u/8u local decode from 35.1->30.5us and 49.0->43.8us (-0.21ms/step at 8u).
+            return 5 if work <= 16 else 4 if work <= 64 else 1
         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
+    if not current_platform.has_device_capability(90):
+        # 170HX (sm_80): target 2-4 waves of 74 SMs with BN=64 (1u: 18, 2u: 13, 4u/8u: 9).
+        cap = int(os.environ.get("INKLING_SM80_FULL_SPLITS", "18"))
+        return max(
+            1,
+            min(
+                cap,
+                max(
+                    cap if work <= 8 else (num_sms * 3 // work),
+                    9 if work <= 64 else num_sms // work,
+                ),
+            ),
+        )
     return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
 
 
