@@ -1,0 +1,12 @@
+The files in this directory, and the sm_80 kernel paths in the surrounding Inkling2 files that call them
+(attention, local-window and FlashInfer-hybrid prefill, conv/mix, loop controller, GEMV, Humming tiles and
+fused SiTU epilogue, MoE routing), are ported from
+
+  snailbrainx/inkling-2-mini-sm80 (https://github.com/snailbrainx/inkling-2-mini-sm80), commit 8b998e0a2f,
+  Apache License 2.0.
+
+Changes here: the CUDA extension is JIT-compiled by inkling_sm80_cuda.py instead of prebuilt; the Humming
+header is put on Humming's include path by humming_epilogue.py instead of sitecustomize; their kernels are
+merged with the HyperInkling SM8x path (INT4 drafter, INT8 attention / LM head, E4M3 KV with bf16 staging for
+the local-window and FlashInfer-hybrid prefill kernels). humming_include/ holds a modified Humming header
+(Apache-2.0, copyright the Humming contributors).
