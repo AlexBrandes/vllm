@@ -35,6 +35,7 @@ the [development guide](docs/development.md) has the rules and the steps.
 | `vllm/<upstream commit>` | Upstream vLLM at that commit plus our commits; the current one is `vllm/a0d7356b98` |
 | `qwen38-27b/vllm`, `qwen38-27b/plugin` | The Qwen3.8-27B engine: its vLLM commits over `vllm/a0d7356b98` and its plugin changes, pinned by its recipe |
 | `dsv41-flash/vllm`, `dsv41-flash/plugin` | The DeepSeek-V4.1-Flash engine: its vLLM commits (DeepSeek-V4.1 hooks, per-stage KV cache pools) over `vllm/a0d7356b98` and its plugin with the sm_80 DeepSeek-V4.1 kernels, pinned by its recipe |
+| `inkling2/vllm`, `inkling2/plugin` | The Inkling 2 Mini engine: its vLLM commits (Inkling 2 with HyperInkling's Ampere path and the sm_80 kernels from inkling-2-mini-sm80) over `vllm/a0d7356b98` and its plugin, pinned by its recipe |
 | `main` | A clean mirror of upstream vLLM |
 
 Each recipe pins the exact engine it was validated with.
@@ -48,6 +49,7 @@ Each recipe pins the exact engine it was validated with.
 | GLM-5.3-Flash | EXL3 2.6 bpw, A4NX routed experts | PP2 / TP1 | [EXL3 recipe](recipes/glm53-flash-exl3/README.md) — pinned container, INT8 dense weights, image and video input, DFlash2 drafter, download and launch scripts |
 | DeepSeek-V4.1-Flash | EXL3 2.2 bpw, A4NX routed experts | PP3 / TP1 | [EXL3 recipe](recipes/deepseek-v41-flash/README.md) — pinned container for three cards (64/40/64 GB), INT8 dense weights, image input, DSpark drafter, download and launch scripts |
 | Qwen3.8-27B | W4A16 AutoRound | one card | [W4A16 recipe](recipes/qwen38-27b/README.md) — pinned container for one 64 GB or 40 GB card, image and video input, DFlash2 drafter, download and launch scripts |
+| Inkling 2 Mini | NVFP4 (released checkpoint) | one card | [NVFP4 recipe](recipes/inkling2-mini/README.md) — pinned container for one 40 GB or 64 GB card, 524,288-token context, image input, DSpark drafter, download and launch scripts |
 
 Each recipe lists its hardware, storage and software requirements, its engine
 pins, and its launch settings.
@@ -55,7 +57,7 @@ pins, and its launch settings.
 ## Measured performance
 
 These are our measurements at **170 W/card on PCIe Gen2 ×4 links**: two 64 GiB
-cards for the PP2 recipes, three cards (64/40/64 GB) for DeepSeek-V4.1-Flash, one 40 GB card for Qwen3.8-27B.
+cards for the PP2 recipes, three cards (64/40/64 GB) for DeepSeek-V4.1-Flash, one 40 GB card for Qwen3.8-27B and Inkling 2 Mini.
 Decode uses the SparkDash `3e6d4ef` protocol: greedy sampling, thinking off,
 400 output tokens. Values are medians of three complete runs (GLM-5.3-Flash: one run). C4 and C8 mean
 total throughput across four or eight simultaneous requests, not the speed of
@@ -68,12 +70,14 @@ each request.
 | GLM-5.3-Flash EXL3 (A4NX) | 161.9 tok/s | 287.2 tok/s | N/A | 4,605 tok/s |
 | DeepSeek-V4.1-Flash EXL3 (A4NX) | 200.3 tok/s | 452.1 tok/s | N/A | 4,006 tok/s |
 | Qwen3.8-27B W4A16 (one card) | 343.5 tok/s | 868.3 tok/s | 1,233.8 tok/s | 3,629 tok/s |
+| Inkling 2 Mini NVFP4 (one card) | 221.6 tok/s | 495.0 tok/s | 699.2 tok/s | 6,621 tok/s |
 
 The [W4A16 results](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next/tree/501279ab072692f26f5638d134a9d40482f1788b#benchmarks)
 and [EXL3 results](recipes/qwen-flash-next-exl3/results.json), the
 [GLM-5.3-Flash results](https://github.com/AlexBrandes/cmp170hx-glm53-flash-exl3/blob/a28d4936adc08d6b1e7d42dcc6cd502c9666627d/results/q4nx-2.6bpw.json), the
-[DeepSeek-V4.1-Flash results](https://github.com/AlexBrandes/cmp170hx-deepseek-v41-flash/blob/828688311b9c448c92f854fcc6d9dc9c7490d95c/results/a4nx-2.2bpw.json), and the
-[Qwen3.8-27B results](https://github.com/AlexBrandes/cmp170hx-qwen38-27b/blob/6587a76a6fdccd1c355536cedf57564e6f0c800b/results/2026-11-11.json) identify their engine,
+[DeepSeek-V4.1-Flash results](https://github.com/AlexBrandes/cmp170hx-deepseek-v41-flash/blob/828688311b9c448c92f854fcc6d9dc9c7490d95c/results/a4nx-2.2bpw.json), the
+[Qwen3.8-27B results](https://github.com/AlexBrandes/cmp170hx-qwen38-27b/blob/6587a76a6fdccd1c355536cedf57564e6f0c800b/results/2026-11-11.json), and the
+[Inkling 2 Mini results](https://github.com/AlexBrandes/cmp170hx-inkling2-mini/blob/783a52b5cefff909f33c5c80ea6be42c6a61ce21/results/2026-11-24.json) identify their engine,
 configuration, and measurement runs. Each row measures a **whole recipe**: engine
 version, quantization, speculative depth and runtime settings differ between
 rows. Performance also depends on prompt content, concurrency, cooling, and
@@ -110,6 +114,9 @@ worked. In particular:
 - **[vLLM and its contributors](https://github.com/vllm-project/vllm)** for the
   serving engine, and **[turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3)**
   for EXL3 and its reference implementation.
+- **[snailbrainx / inkling-2-mini-sm80](https://github.com/snailbrainx/inkling-2-mini-sm80)**
+  for the sm_80 Inkling 2 kernels ported into our Inkling engine, and
+  **[Pento95 / HyperInkling](https://github.com/Pento95/HyperInkling)** for its Ampere path.
 - **The model and checkpoint authors**, and
   **[MiaAI-Lab / SparkDash](https://github.com/MiaAI-Lab/sparkDash)** for the
   public benchmark protocol.
