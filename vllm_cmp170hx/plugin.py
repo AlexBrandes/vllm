@@ -198,6 +198,19 @@ def register() -> None:
     register_fork_parsers()
     register_mhc_decode_op()
     register_lab_hidden_capture()
+    register_ple_gds()
+
+
+def register_ple_gds() -> None:
+    """Enable the optional FP8 PLE disk backend in model worker processes."""
+    from pathlib import Path
+
+    import vllm.envs as envs
+
+    if envs.VLLM_PLE_GDS_ARTIFACT:
+        from vllm_cmp170hx.ple import gds_reader
+
+        gds_reader.install(Path(envs.VLLM_PLE_GDS_ARTIFACT))
 
 
 def register_lab_hidden_capture() -> None:

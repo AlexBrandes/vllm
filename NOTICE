@@ -9,3 +9,8 @@ Its layout (plugin, vLLM branch and upstream seam pins), the startup guard and
 the seam tooling are adapted from vllm-sm80 by Morrowmake
 (https://github.com/Morrowmake/vllm-cmp170hx), Portions Copyright 2026
 Morrowmake, licensed under the Apache License, Version 2.0.
+
+The optional PLE GDS build adapts the persistent cuFile reader from
+Qwen-Flash-SM80-170HX (https://github.com/nguyenthimy2022kg-alt/Qwen-Flash-SM80-170HX).
+Copyright 2026 Qwen-Flash-SM80 contributors, licensed under the Apache
+License, Version 2.0. The source revision is pinned in csrc/ple_gds/build_standalone.py.
