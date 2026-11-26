@@ -15,11 +15,11 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | Path | Lines |
 |---|---:|
 | `.github/ISSUE_TEMPLATE/050-engine-bug.yml` | 43 |
-| `.gitignore` | 4 |
+| `.gitignore` | 5 |
 | `CITATION.cff` | 8 |
 | `LICENSE` | 201 |
-| `NOTICE` | 11 |
-| `README.md` | 122 |
+| `NOTICE` | 16 |
+| `README.md` | 133 |
 | `csrc/ampere_marlin/build_standalone.py` | 101 |
 | `csrc/ampere_marlin/common_tiles.h` | 19 |
 | `csrc/ampere_marlin/decode_orig.cu` | 416 |
@@ -61,6 +61,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `csrc/exl3/ple.h` | 53 |
 | `csrc/exl3/ple_read.cpp` | 549 |
 | `csrc/exl3/reference.cu` | 447 |
+| `csrc/ple_gds/build_standalone.py` | 85 |
 | `csrc/quantization/marlin/dequant.h` | 609 |
 | `csrc/quantization/marlin/marlin.cuh` | 152 |
 | `csrc/quantization/marlin/marlin_dtypes.cuh` | 149 |
@@ -68,12 +69,15 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `csrc/torch_utils.h` | 88 |
 | `docs/THIRD_PARTY.md` | 133 |
 | `docs/development.md` | 160 |
+| `docs/features/ple-gds.md` | 69 |
 | `docs/features/quantization/exl3.md` | 135 |
 | `docs/features/speculative_decoding/adaptive_k.md` | 168 |
 | `licenses/exl3/LICENSE` | 21 |
 | `licenses/exl3/NOTICE` | 45 |
 | `pyproject.toml` | 46 |
+| `recipes/deepseek-v41-flash/README.md` | 73 |
 | `recipes/glm53-flash-exl3/README.md` | 74 |
+| `recipes/inkling2-mini/README.md` | 75 |
 | `recipes/qwen-flash-next-exl3/Dockerfile` | 23 |
 | `recipes/qwen-flash-next-exl3/README.md` | 148 |
 | `recipes/qwen-flash-next-exl3/results.json` | 317 |
@@ -102,6 +106,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `tests/cmp170hx/test_moe_layers.py` | 277 |
 | `tests/cmp170hx/test_mrv2_prepare_inputs_padding.py` | 151 |
 | `tests/cmp170hx/test_ple_disk_reader.py` | 127 |
+| `tests/cmp170hx/test_ple_gds_artifact.py` | 76 |
 | `tests/cmp170hx/test_plugin_banner.py` | 36 |
 | `tests/cmp170hx/test_plugin_distribution.py` | 88 |
 | `tests/cmp170hx/test_plugin_guard.py` | 136 |
@@ -190,7 +195,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `tests/kernels/thin_gemm_real_cases.py` | 148 |
 | `tests/kernels/topk_reference.py` | 59 |
 | `tests/model_executor/layers/test_exl3_layers.py` | 632 |
-| `tests/model_executor/model_loader/test_exl3_manifest.py` | 249 |
+| `tests/model_executor/model_loader/test_exl3_manifest.py` | 268 |
 | `tests/model_executor/model_loader/test_exl3_pipeline.py` | 155 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_dflash2/config.json` | 61 |
 | `tests/models/fixtures/native_checkpoint_configs/glm53_flash/config.json` | 2636 |
@@ -257,6 +262,9 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `tests/v1/worker/test_state_index_check.py` | 351 |
 | `tools/cmp170hx/assemble.py` | 119 |
 | `tools/cmp170hx/fork_map.py` | 136 |
+| `tools/ple_gds/artifact.py` | 110 |
+| `tools/ple_gds/cufile.json` | 16 |
+| `tools/ple_gds/smoke.py` | 96 |
 | `vllm_cmp170hx/__init__.py` | 46 |
 | `vllm_cmp170hx/attention/__init__.py` | 2 |
 | `vllm_cmp170hx/attention/triton_mla_sparse.py` | 386 |
@@ -271,7 +279,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `vllm_cmp170hx/distributed/pcie_p2p.py` | 183 |
 | `vllm_cmp170hx/distributed/step_errors.py` | 167 |
 | `vllm_cmp170hx/engine_args.py` | 103 |
-| `vllm_cmp170hx/envs.py` | 1508 |
+| `vllm_cmp170hx/envs.py` | 1510 |
 | `vllm_cmp170hx/failed_inputs.py` | 207 |
 | `vllm_cmp170hx/fla/__init__.py` | 2 |
 | `vllm_cmp170hx/fla/autotune_pins.py` | 210 |
@@ -297,7 +305,7 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `vllm_cmp170hx/kernels/exl3/ops.py` | 1011 |
 | `vllm_cmp170hx/kernels/exl3/quant.py` | 1426 |
 | `vllm_cmp170hx/kernels/exl3/step_phase.py` | 108 |
-| `vllm_cmp170hx/kernels/exl3/utils.py` | 385 |
+| `vllm_cmp170hx/kernels/exl3/utils.py` | 393 |
 | `vllm_cmp170hx/kernels/idx_glue_gate.py` | 75 |
 | `vllm_cmp170hx/kernels/indexer/__init__.py` | 9 |
 | `vllm_cmp170hx/kernels/indexer/topk_tiefix.py` | 571 |
@@ -361,7 +369,9 @@ Section 1 lists every file of this branch. Section 2 lists the vLLM branch's 19 
 | `vllm_cmp170hx/platform.py` | 170 |
 | `vllm_cmp170hx/ple/__init__.py` | 2 |
 | `vllm_cmp170hx/ple/disk_reader.py` | 147 |
-| `vllm_cmp170hx/plugin.py` | 430 |
+| `vllm_cmp170hx/ple/gds_artifact.py` | 51 |
+| `vllm_cmp170hx/ple/gds_reader.py` | 138 |
+| `vllm_cmp170hx/plugin.py` | 443 |
 | `vllm_cmp170hx/sched/__init__.py` | 69 |
 | `vllm_cmp170hx/sched/hooks.py` | 124 |
 | `vllm_cmp170hx/sched/prefill_budget.py` | 102 |

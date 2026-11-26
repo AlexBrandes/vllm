@@ -2,3 +2,4 @@ __pycache__/
 *.egg-info/
 build/
 vllm_cmp170hx-*.dist-info/
+/vllm_cmp170hx/ple/_persistent_native*.so

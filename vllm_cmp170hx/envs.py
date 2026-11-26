@@ -618,6 +618,8 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_MIXED_PREFILL_CHUNK": lambda: int(
         os.getenv("VLLM_MIXED_PREFILL_CHUNK", "0") or 0
     ),
+    # Optional compact FP8 PLE artifact directory for strict cuFile reads.
+    "VLLM_PLE_GDS_ARTIFACT": lambda: os.getenv("VLLM_PLE_GDS_ARTIFACT"),
     # Threads of the page-cache gather that reads Qwen4Exp's disk-offload PLE
     # rows (vllm_cmp170hx.ple.disk_reader). 0 = upstream's serial preadv.
     "VLLM_PLE_DISK_READ_THREADS": lambda: int(
